@@ -1,0 +1,22 @@
+{
+  "id": "pp-ocrv6-medium-multilingual",
+  "family": "PP-OCR",
+  "version": "v6",
+  "languages": ["ch", "en", "ja", "latin"],
+  "detector": {
+    "file_name": "PP-OCRv6_det_medium.onnx",
+    "sha256": "<sha256>",
+    "source_url": "https://www.modelscope.cn/models/RapidAI/RapidOCR"
+  },
+  "recognizer": {
+    "file_name": "PP-OCRv6_rec_medium.onnx",
+    "sha256": "<sha256>",
+    "source_url": "https://www.modelscope.cn/models/RapidAI/RapidOCR"
+  },
+  "dictionary": {
+    "file_name": "ppocrv6_dict.txt",
+    "sha256": "<sha256>",
+    "source_url": "https://www.modelscope.cn/models/RapidAI/RapidOCR"
+  },
+  "classifier": null
+}

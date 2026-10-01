@@ -1,0 +1,17 @@
+rapid-ocr-rs
+Copyright 2026 rapid-ocr-rs Contributors
+
+This product includes software developed for the rapid-ocr-rs project and
+implementation work informed by the following open-source projects:
+
+* paddle-ocr-rs (Apache-2.0)
+* RapidOCR (Apache-2.0)
+* PaddleOCR model and pipeline conventions
+
+The rapid-ocr-rs source code is licensed under the Apache License, Version 2.0.
+See LICENSE for the full license text.
+
+Third-party Rust dependencies, ONNX Runtime binaries, OCR model weights, and
+model dictionaries are separate artifacts. Their licenses and redistribution
+terms are not changed by this notice and must be reviewed separately before
+redistribution. See THIRD_PARTY_NOTES.md for the project-level boundary.
