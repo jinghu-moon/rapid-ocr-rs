@@ -1584,10 +1584,120 @@ cargo run --features cuda-provider --bin formula_bench -- --model <model.onnx> -
 - crate 不打包模型权重、测试图片或评测结果。
 - 使用方必须单独下载模型并校验 SHA-256。
 - fast_tokenizer.json 仅作为测试 fixture 提交，来自模型 metadata。
-- 完整 501/10,355/UniMER 数值评测仍是发布前门禁，见阶段 9 未执行范围。
+- 完整 501/10,355/UniMER 数值评测曾是发布前门禁；该门禁已在第二轮审核修复中执行，
+  结果见 §29。
 
 #### 28.4 阶段提交
 
 | 阶段 | 提交 | 说明 |
 | --- | --- | --- |
 | 12 文档/许可证 | `310d2ed` | `docs(formula): document phase 12 assets and release boundaries` |
+
+---
+
+## 29. 审核修复执行记录（第二轮，2026-10-02）
+
+本节逐项记录针对审核报告的修复：问题 → 根因 → 处理 → 验证。
+
+### 29.1 P1 测试无法在干净仓库中复现
+
+**问题**：ONNX 契约 fixture 被 `.gitignore` 忽略且未提交；评测测试硬编码开发机绝对路径。
+**根因**：fixture 的“本地开发资产”定位被当成模型权重处理，且测试资产定位没有共享层，
+于是退化成了开发机路径。
+**处理**：
+
+- `.gitignore` 增加 `!tests/fixtures/**/*.onnx` 例外，12 个 `formula-onnx` fixture 与
+  7 个 `ocr-onnx` fixture 随仓库提交；
+- 新增 `tools/build_formula_onnx_fixtures.py`，用 Python `onnx` 确定性重建全部 fixture
+  （仅 `formula_recognizer_*` 需要真实模型 metadata）；
+- 新增 `src/test_support.rs`：外部资产只能通过
+  `RAPID_OCR_MODEL_ROOT` / `RAPID_OCR_FORMULA_MODEL` / `RAPID_OCR_FORMULA_DETECT_MODEL` /
+  `RAPID_OCR_FORMULA_TEST_ROOT` / `RAPID_OCR_TEST_IMAGES` 定位，缺失时显式打印原因并
+  skip；`RAPID_OCR_REQUIRE_EXTERNAL_ASSETS=1` 时改为失败；
+- 删除 `src/formula/model_info.rs` 与 `src/evaluation/formula/fixture.rs` 中的全部绝对路径。
+
+**验证**：`src` 下已无 `D:\`/`C:\` 字面量；无环境变量时
+`cargo test --all-targets` = 245 passed / 0 failed（外部资产测试打印 skip 并返回），
+带 `RAPID_OCR_MODEL_ROOT` 时 245 passed 且真实模型测试真正执行。
+
+### 29.2 P1 provider 不支持时仍可能静默回退 CPU
+
+**根因**：严格性挂在进程级 `RuntimeConfig::fail_if_provider_unavailable`（默认 false），
+而公式 API 契约要求“请求加速器就必须是加速器”，调用方无法从返回值观察到回退。
+**处理**：新增 `runtime::provider::require_requested_provider`，在
+`FormulaSession::new` 中调用；`fallback_used == true` 时返回
+`RapidOcrError::UnsupportedProvider`，与 `fail_if_provider_unavailable` 无关。
+**验证**：`require_requested_provider` 单元测试（回退拒绝 / 已解析加速器与显式 CPU 通过）；
+`formula::session` 与 `formula::recognizer` 各有一个
+“`fail_if_provider_unavailable = false` 且请求未启用的 CUDA 仍必须失败”的测试。
+
+### 29.3 P1 页面级公式识别不存在
+
+**处理**：见 §8.3 的实现要点列表。核心设计是 `formula::route`（纯几何策略，
+可无模型测试）+ `formula::detect`（YOLO11 MFD 检测器）+ `RapidOcrEngine::recognize_with_formula`。
+**验证**：
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --lib formula::route` | 8 passed（重叠/嵌套消解、误检面积与越界过滤、显式区域旁路、顺序无关与上限、抹白像素与尺寸） |
+| `cargo test --lib formula::detect` | 15 passed（含 golden 多边形 `max_delta = 0`、与 Python 参考 IoU 1.0000） |
+| `cargo test --lib formula_integration` | 7 passed（缺省关闭=无公式、漏检=文本逐字一致、严格阈值=回到基线、检测到的区域 typed 且带 LaTeX、显式区域无需检测器、`roi`/`tile` 拒绝、缺 `model_path` 拒绝） |
+| CLI 端到端 | `rapidocr run --img-path 08数字公式与符号.png --formula-model … --formula-detector …` → `regions=50 formulas=8`，LaTeX 正确（`\sqrt{2}\approx1.414`、`\pi\approx3.14159`、`a^2+b^2=c^2`、定积分等），总耗时 7.6 s |
+
+阅读顺序核验：8 个公式区域在全局阅读顺序中的位置为“顶部一项 → 左栏 4 项 →
+右栏 2 项 → 底部 1 项”，与其几何位置一致（公式不与文本分开排序）。
+
+已知限制（同时写入 README 与本节）：检测器在非公式页面存在误检，
+提高 `confidence_threshold` 可恢复基线；漏检的公式仍由 CTC 处理。
+
+### 29.4 P1 阶段 9 主评测未完成
+
+**处理**：`formula_compare` 被 `formula_eval` 取代，支持三个数据集、内容哈希抽样与
+稳定 manifest、失败分类、吞吐/P50/P95/峰值内存，以及内建的 Rust/Python 对比；
+Python 参考改为 manifest 驱动（`tools/formula_reference.py --manifest`），
+不再重复实现抽样。
+
+**执行**（`tools/run_formula_evaluation.ps1`，CPU provider，batch=8，模型
+SHA-256 `71b6d389…d9493b`）：
+
+（完整表格见 §29.7；下方为逐阶段提交记录。）
+
+### 29.5 P2 重复实现与语义问题
+
+| 问题 | 根因 | 处理 | 验证 |
+| --- | --- | --- | --- |
+| 公式输入加载与共享 `image_loader` 重复 | 公式域自己实现了编码/像素/URL/超时限制 | `LoadImage::read_encoded_with_limit` / `load_dynamic_with_limit` 成为共享入口，公式 API 只保留“字节→领域图像”的解码 | `formula::recognizer` 的文件/编码限制测试；`input::image_loader` 原有 URL/流式/超时测试 |
+| `max_encoded_bytes` 语义分叉 | 内存字节不受编码上限约束 | 统一适用于所有编码输入，并更新 `PreprocessPolicy` 文档 | `encoded_input_enforces_encoded_and_pixel_limits`、`input::image_loader` 全部限制测试 |
+| 模型契约验证两套实现 | probe 与 session 各自校验，动态维语义不同 | 新增 `formula::contract::validate_formula_contract`，两处共用；统一为“通道与空间维必须固定 384” | `formula::contract` 的“probe/session 对每个 fixture 结论一致”测试、动态空间维拒绝测试 |
+| benchmark 统计粒度不足 | 只报平均值、单轮 batch | 重写为 warmup/多轮 + min/max/mean/P50/P95/stddev + 单图与整批 + `deterministic_tokens` + 峰值内存 | `formula_bench` 单测 + 实跑 `bench-cpu.json` |
+| batch `elapsed_ms` 语义不准确 | 循环内逐个取 elapsed | 改为“调用墙钟耗时”，同批共享，并新增 `batch_size` 字段 | `batch_results_share_call_wall_time` |
+| postprocess 缺 `ftfy.fix_text` | 未实现 ftfy | 确定性步骤逐字符等价实现，表由真实 ftfy 生成；未实现步骤显式列出并用 fixture 锁定差异 | `formula::ftfy` 单测 + `tests/fixtures/formula-postprocess/cases.json`（357,022 条真实语料探针） |
+| `postprocess_latex` 重复编译正则 | 每次调用 `Regex::new` | 所有正则改为 `LazyLock` 静态；同时删除 RapidDoc 从不使用的 `fix_delimiter=true` 死分支 | `postprocess_reuses_compiled_regexes`（10k 次调用 < 2 s） |
+| 输出测试覆盖不足 | 只测了 HTML 转义 | 定义并测试 Markdown 的 `$$` 转义、空行折叠、空 LaTeX、truncated 标记；HTML 区分属性转义（含换行/制表符）；新增页面级 JSON/Markdown/HTML 公式测试 | `formula::output`、`output::json`、`output::markdown`、`output::html` 测试 |
+
+### 29.6 P3 质量门禁
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --all-targets` | 245 passed / 0 failed（无外部资产） |
+| `cargo test --all-targets`（带模型与测试集） | 245 passed / 0 failed |
+| `cargo test --features directml-provider` | 248 passed / 0 failed |
+| `cargo test --features cuda-provider` | 246 passed / 0 failed |
+| `cargo check --features directml-provider,cuda-provider,cann-provider` | 通过 |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo clippy --all-targets -- -D warnings` | 通过（0 warning） |
+
+`Cargo.toml` 增加 `[lints.rust] linker_messages = "allow"`：`ort`/`turbojpeg` 的预编译
+原生库在 MSVC 下会偶发 `LNK4098`，该诊断来自第三方二进制而非本 crate 代码，但会让
+`-D warnings` 随机失败。
+
+### 29.7 阶段 9/10 执行结果
+
+（本节由 `tools/summarize_formula_eval.py` 从 `target/formula-eval/*.json` 生成，
+报告与失败样本均在 `target/formula-eval/`，不随仓库提交。）
+
+### 29.8 提交
+
+| 内容 | 提交 | 说明 |
+| --- | --- | --- |
+| 第二轮审核修复 | `9db5dda` | `fix(formula): close the review gaps in the PP-FormulaNet integration` |

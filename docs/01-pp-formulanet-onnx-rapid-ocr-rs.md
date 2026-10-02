@@ -719,22 +719,22 @@ ONNX 输出 token
 
 ### 关键验收清单
 
-- [ ] 预处理 tensor 完全一致；
-- [ ] Backbone 输出误差可接受；
-- [ ] Head 单步 logits 的误差可接受；
-- [ ] token 序列一致或语义等价；
-- [ ] LaTeX 渲染结果一致；
-- [ ] EOS 位置一致；
-- [ ] 空白/裁剪预处理一致；
-- [ ] ONNX session 输入签名正确；
-- [ ] tokenizer 与 Paddle 端 token ID 一致；
-- [ ] Rust `ort` 能成功加载模型；
-- [ ] 新增 `FormulaRecognizer`，不复用 CTC `Recognizer`；
-- [ ] 新增 `FormulaSession`，独立处理 `INT64` rank 2 输出；
-- [ ] 新增 `FormulaTokenizer`，独立解码公式 token；
-- [ ] 不修改现有 `CtcLabelDecoder`；
-- [ ] 首版仅支持 CPU `CPUExecutionProvider`；
-- [ ] 后续再评估 docparser 拆分模型与流式解码。
+- [x] 预处理 tensor 完全一致（归一化张量 `max_abs <= 1e-5`，常量样本 bit-exact；见 `docs/02` 阶段 4）；
+- [x] Backbone 输出误差可接受（由端到端 token 一致性间接覆盖；未单独导出 backbone 张量）；
+- [x] Head 单步 logits 的误差可接受（由端到端 token 一致性间接覆盖；未单独导出 logits）；
+- [x] token 序列一致或语义等价（501 张 val 的 Rust/Python 逐项对比）；
+- [x] LaTeX 渲染结果一致（同上，且差异按链路/模型两类统计）；
+- [x] EOS 位置一致（同上）；
+- [x] 空白/裁剪预处理一致（纯白/全黑/单像素/窄/宽/透明样本 + Python golden）；
+- [x] ONNX session 输入签名正确（`FormulaModelInfo::probe` 与 `FormulaSession::new` 共用同一份契约校验）；
+- [x] tokenizer 与 Paddle 端 token ID 一致（真实 metadata + 30 个 Python golden 序列）；
+- [x] Rust `ort` 能成功加载模型；
+- [x] 新增 `FormulaRecognizer`，不复用 CTC `Recognizer`；
+- [x] 新增 `FormulaSession`，独立处理 `INT64` rank 2 输出；
+- [x] 新增 `FormulaTokenizer`，独立解码公式 token；
+- [x] 不修改现有 `CtcLabelDecoder`；
+- [x] 首版仅支持 CPU `CPUExecutionProvider`（DirectML/CUDA 为可选特性，公式域拒绝静默回退）；
+- [x] 后续再评估 docparser 拆分模型与流式解码（未实施，保留为后续方案）。
 
 ---
 
@@ -823,3 +823,54 @@ FormulaTokenizer
 - Rust `FormulaRecognizer` 已对真实 val 集固定子集与 Python ONNX Runtime 做
   token/latex/EOS 逐项比较；
 - CPU 为第一版支持范围；DirectML/CUDA 已实测可加载并运行，但性能不保证优于 CPU。
+
+---
+
+## 十一、第二轮审核修复后的事实核验（2026-10-02）
+
+### 11.1 新增能力
+
+- **页面级公式路由**：`OcrRequest.formula: FormulaPolicy`（默认关闭）+
+  `RegionKind::Formula` + `FormulaOutcome`。公式区域来自页面检测模型
+  （`pix2text-mfd-1.5.onnx`，可选）与调用方显式声明的区域；公式像素在进入普通文本
+  管线之前被抹白，因此 CTC 不会在公式上执行。
+- **公式检测模型契约**（实测）：输入 `images` `FLOAT32 [N,3,H,W]`，输出 `output0`
+  `FLOAT32 [N,6,A]`，IR 9 / opset 19，metadata `imgsz=[768,768]`、`stride=32`、
+  `names={0:'embedding',1:'isolated'}`；导出的图已包含 DFL/dist2bbox/sigmoid，
+  因此 6 个通道是 `[cx,cy,w,h,score0,score1]`（输入像素单位）。
+  768×768 输入的 `A = 96² + 48² + 24² = 12096`。
+- **评测工具**：`src/bin/formula_eval.rs`（三个数据集 + 稳定 manifest +
+  失败分类 + 吞吐/P50/P95/峰值内存 + Rust/Python 对比）、
+  `tools/formula_reference.py`（manifest 驱动）、
+  `tools/summarize_formula_eval.py`、`tools/run_formula_evaluation.ps1`。
+- **ftfy 等价边界**：确定性步骤已逐字符等价实现（表由真实 `ftfy` 生成），
+  启发式 mojibake 修复与 `unescape_html` 显式未实现，并由
+  `tests/fixtures/formula-postprocess/cases.json` 固化差异。
+
+### 11.2 根因修正
+
+- **序列长度上限**：模型图内 `Loop` 的输出宽度上限为 2561；当 batch 中任一 样本在
+  Loop 预算内没有 EOS 时，ONNX Runtime 把整个 batch 补齐到 2561 列。原默认上限
+  2560 会拒绝整批（实测 501 张 val 中 8 个 batch），连带丢掉同批识别正确的样本。
+  现在默认 4096，并加入编译期断言
+  `DEFAULT_MAX_FORMULA_SEQUENCE_LENGTH > FORMULA_MODEL_LOOP_BOUND`。
+- **输入限制语义分叉**：公式 API 不再自己实现编码/像素/URL 限制，统一走共享
+  `input::image_loader`；`max_encoded_bytes` 统一适用于所有编码输入。
+- **契约校验重复**：`FormulaModelInfo::probe` 与 `FormulaSession::new` 共用
+  `formula::contract::validate_formula_contract`，不再存在“探针成功但 session 失败”。
+- **`sha256_file` 栈溢出**：1 MiB 栈缓冲区改为堆分配（Windows 主线程默认仅 1 MiB 栈）。
+- **provider 静默回退**：公式域通过
+  `runtime::provider::require_requested_provider` 拒绝 `fallback_used`，与
+  `RuntimeConfig::fail_if_provider_unavailable` 无关。
+- **batch 耗时语义**：`FormulaRecognition.elapsed_ms` 明确为“产生该结果的调用耗时”，
+  同批结果共享同一值，并新增 `batch_size` 供折算。
+
+### 11.3 测试资产与可复现性
+
+- `tests/fixtures/**/*.onnx` 随仓库提交（`.gitignore` 例外
+  `!tests/fixtures/**/*.onnx`），干净 clone 可运行全部契约测试；
+- 所有开发机绝对路径已删除，外部模型/测试集通过
+  `RAPID_OCR_MODEL_ROOT` / `RAPID_OCR_FORMULA_TEST_ROOT` /
+  `RAPID_OCR_FORMULA_MODEL` / `RAPID_OCR_FORMULA_DETECT_MODEL` /
+  `RAPID_OCR_TEST_IMAGES` 引用，缺失时显式 skip；
+- `RAPID_OCR_REQUIRE_EXTERNAL_ASSETS=1` 可把 skip 变为失败，供已准备资产的环境使用。

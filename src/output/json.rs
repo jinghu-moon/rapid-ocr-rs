@@ -212,6 +212,37 @@ mod tests {
         assert_eq!(document["formulas"][0]["latex"], "\\frac{a}{b}");
         assert_eq!(document["regions"][1]["kind"], "formula");
         assert_eq!(document["regions"][1]["formula"]["eos_index"], 3);
+        assert_eq!(output.len(), 2, "formula regions are recognition results");
+        assert_eq!(output.text_len(), 1);
+        assert!(!output.is_empty(), "a formula-only page is not empty");
+    }
+
+    #[test]
+    fn formula_only_output_is_not_empty() {
+        let output = output_with(vec![OcrRegion {
+            source: RegionSource::Input,
+            kind: RegionKind::Formula,
+            polygon: Some(Polygon {
+                points: [[1.0, 1.0], [9.0, 1.0], [9.0, 4.0], [1.0, 4.0]],
+            }),
+            detection: None,
+            classification: None,
+            recognition: None,
+            formula: Some(FormulaOutcome {
+                latex: "x".into(),
+                eos_index: Some(1),
+                truncated: false,
+                model_id: "m".into(),
+                token_ids: None,
+            }),
+        }]);
+        output
+            .validate()
+            .expect("formula-only output must validate");
+        assert_eq!(output.len(), 1);
+        assert_eq!(output.text_len(), 0);
+        assert!(!output.is_empty());
+        assert!(output.plain_text(crate::TextOrder::Reading).is_empty());
     }
 
     #[test]

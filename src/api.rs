@@ -695,7 +695,16 @@ pub enum TextOrder {
     Detection,
 }
 impl OcrOutput {
+    /// 区域总数（文本 + 公式）。
+    ///
+    /// 公式区域也是识别结果：只有公式的页面不是空页面。需要文本数量时使用
+    /// [`OcrOutput::text_len`]。
     pub fn len(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// 带 CTC 文本结果的区域数。
+    pub fn text_len(&self) -> usize {
         self.regions
             .iter()
             .filter(|region| region.recognition.is_some())
