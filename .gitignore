@@ -35,3 +35,9 @@
 .DS_Store
 Thumbs.db
 desktop.ini
+# Local formula evaluation, benchmark, and Python cache artifacts
+/formula-eval/
+/formula-bench/
+__pycache__/
+*.pyc
+

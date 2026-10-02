@@ -77,6 +77,42 @@ All new integrations should use the generic `OcrEngine` trait and
 `OcrRequest`. The former scattered `run`/`OcrResult` API is internal and is not
 part of the public crate contract.
 
+## Formula recognition
+
+`rapid-ocr-rs` also exposes an independent PP-FormulaNet_plus-M ONNX formula
+API. It does not reuse the CTC `Recognizer` path.
+
+```rust,no_run
+use rapid_ocr_rs::{FormulaRecognizer, RuntimeConfig};
+
+let mut recognizer = FormulaRecognizer::from_model(
+    "pp_formulanet_plus_m.onnx".as_ref(),
+    &RuntimeConfig::default(),
+)?;
+let result = recognizer.recognize(&image::open("formula.png")?)?;
+println!("{}", result.latex);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+- `FormulaRecognizer::recognize_batch` preserves input order and defaults to a
+  maximum batch size of 16.
+- `FormulaRecognition` contains `latex`, raw `token_ids`, `eos_index`,
+  `truncated`, model id, and elapsed time.
+- `recognize_encoded`, `recognize_file`, and `recognize_url` apply encoded-byte,
+  decoded-pixel, streaming-read, and sequence-length limits.
+- CPU `CPUExecutionProvider` is the first supported provider. DirectML/CUDA
+  support is model/provider dependent and must not be assumed.
+
+Model asset:
+
+```text
+https://www.modelscope.cn/models/RapidAI/RapidDoc/resolve/v1.0.0/formula/PP-FormulaNet_plus-M/pp_formulanet_plus_m.onnx
+SHA-256 71b6d389cf7b857e45252a4b98cfced1a3ffca7bf24d9497d02d052a41d9493b
+```
+
+The model and tokenizer metadata are not bundled. Download them separately,
+verify SHA-256, and review upstream licenses before redistribution.
+
 ## Model integrity
 
 `ModelManifest::validate_files` verifies every detector, recognizer, dictionary,
@@ -209,6 +245,24 @@ functional regression check with explicit tolerances on the repository fixture
 
 Exact-image text match is reported for information only and is not required.
 The current small/medium comparison is inside these thresholds.
+
+## Formula benchmark and smoke evaluation
+
+```powershell
+# CPU warm timings and batch timing; add --features directml-provider/cuda-provider
+# and --provider directml/cuda for provider checks.
+cargo run --bin formula_bench -- --model <pp_formulanet_plus_m.onnx> --image <formula.png> --rounds 3 --provider cpu
+
+# Rust token/LaTeX output over a fixture subset.
+cargo run --bin formula_compare -- --model <pp_formulanet_plus_m.onnx> --dataset-root ../../Formula-TestSet/ocr_rec_latexocr_dataset_example --split val --limit 100 --output target/formula-rust.json
+
+# Python RapidDoc/ONNX reference for the same subset.
+python tools/formula_reference.py --model <pp_formulanet_plus_m.onnx> --dataset-root ../../Formula-TestSet/ocr_rec_latexocr_dataset_example --split val --limit 100 --output target/formula-python.json
+python tools/formula_compare_results.py --rust target/formula-rust.json --python target/formula-python.json --output target/formula-compare.json
+```
+
+The formula model file is not bundled. Use the RapidDoc `v1.0.0` URL and
+SHA-256 recorded in `THIRD_PARTY_NOTES.md`.
 
 ## Provider feature verification
 

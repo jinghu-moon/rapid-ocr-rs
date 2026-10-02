@@ -802,3 +802,24 @@ FormulaTokenizer
 ### 最终推荐一句话
 
 > **RapidDoc 更适合作为 `rapid-ocr-rs` 第一版公式识别的模型和算法参考；MinerU 更适合作为有强验证证据的交叉验证模型；docparser-rs 更适合作为后续性能优化的拆分解码方案。**
+
+---
+
+## 十、实现后事实核验（2026-10-02）
+
+以下内容已由 Rust 实现与本地 fixture 验证，不再是待确认项：
+
+- `pp_formulanet_plus_m.onnx` SHA-256：
+  `71b6d389cf7b857e45252a4b98cfced1a3ffca7bf24d9497d02d052a41d9493b`；
+- 输入：`x`，`FLOAT [N,1,384,384]`；
+- 输出：`fetch_name_0`，`INT64 [N,L]`；
+- IR 10 / opset 18，图内 `Loop`；
+- metadata `character.fast_tokenizer_file` version 1.0，含 50,000 vocab、BPE merges、
+  `<s>=0`、`<pad>=1`、`</s>=2`、`<unk>=3`；
+- Rust `FormulaPreprocessor` 已复现 RapidDoc 裁剪、Bilinear/Bicubic resize、黑色画布
+  居中、`mean=0.7931/std=0.1738` 与 BGR2GRAY 通道语义；
+- Rust `FormulaTokenizer` 已用真实 metadata 和 30 个 Python `tokenizers` golden 序列
+  验证；
+- Rust `FormulaRecognizer` 已对真实 val 集固定子集与 Python ONNX Runtime 做
+  token/latex/EOS 逐项比较；
+- CPU 为第一版支持范围；DirectML/CUDA 已实测可加载并运行，但性能不保证优于 CPU。
