@@ -1121,5 +1121,5 @@ Pillow 的 resize 与 Python OpenCV 的 SIMD BGR2GRAY 在当前环境下与 Rust
 
 | 阶段 | 提交 | 说明 |
 | --- | --- | --- |
-| 4 预处理 | 待记录 | `feat(formula): implement phase 4 preprocessing TDD` |
+| 4 预处理 | `a79be8c` | `feat(formula): implement phase 4 preprocessing TDD` |
 
