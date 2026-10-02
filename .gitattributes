@@ -1,0 +1,14 @@
+# 二进制测试资产必须禁止行尾规范化。
+#
+# `core.autocrlf=true`（Windows 常见默认）会在 **checkout** 时把 blob 中的 0x0A
+# 改写成 0x0D 0x0A。对 ONNX / NumPy / PNG 这类二进制文件，这会直接破坏内容：
+# 干净 clone 中的公式契约测试会报 “Protobuf parsing failed”，golden tensor 测试
+# 也会失败，而 blob 本身是正确的。`binary` 等价于 `-text -diff`。
+*.onnx binary
+*.npy binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.gif binary
