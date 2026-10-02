@@ -546,14 +546,14 @@ token_ids
 
 ### 7.2 TDD 任务
 
-- [ ] Red：`[0, 82, ..., 2, 1, 1]` 只解码 EOS 前内容。
-- [ ] Red：无 EOS 的序列按明确策略失败或标记 truncated，不能静默当作完整结果。
-- [ ] Red：全 PAD、空序列、未知 token、超出 vocab 均有测试。
-- [ ] Red：BOS/PAD/EOS ID 与 metadata 不一致时拒绝启动。
-- [ ] Green：实现 `FormulaTokenizer::from_metadata`。
-- [ ] Green：实现 `decode_ids`，返回 token IDs、EOS 状态、LaTeX。
-- [ ] Refactor：不复制 Hugging Face tokenizer 实现；仅实现模型所需 tokenizer JSON 语义，必要时引入成熟 Rust tokenizer crate。
-- [ ] 用 Python `tokenizers` 参考输出建立至少 20 个 token 序列 golden。
+- [x] Red：`[0, 82, ..., 2, 1, 1]` 只解码 EOS 前内容。
+- [x] Red：无 EOS 的序列按明确策略失败或标记 truncated，不能静默当作完整结果。
+- [x] Red：全 PAD、空序列、未知 token、超出 vocab 均有测试。
+- [x] Red：BOS/PAD/EOS ID 与 metadata 不一致时拒绝启动。
+- [x] Green：实现 `FormulaTokenizer::from_metadata`。
+- [x] Green：实现 `decode_ids`，返回 token IDs、EOS 状态、LaTeX。
+- [x] Refactor：不复制 Hugging Face tokenizer 实现；仅实现模型所需 tokenizer JSON 语义，必要时引入成熟 Rust tokenizer crate。
+- [x] 用 Python `tokenizers` 参考输出建立至少 20 个 token 序列 golden。
 
 ### 7.3 输出数据结构建议
 
@@ -1174,4 +1174,55 @@ Pillow 的 resize 与 Python OpenCV 的 SIMD BGR2GRAY 在当前环境下与 Rust
 | 阶段 | 提交 | 说明 |
 | --- | --- | --- |
 | 5 runtime 契约 | `0288762` | `refactor(runtime): implement typed OCR and formula sessions (phase 5)` |
+
+---
+
+### 22. 阶段 6 执行记录（2026-10-02）
+
+#### 22.1 实现内容
+
+- 引入成熟 Rust `tokenizers` crate（0.21，关闭默认 onig/进度条特性，启用纯 Rust `fancy-regex`），
+  不复制 Hugging Face tokenizer 实现。
+- 新增 `src/formula/tokenizer.rs`：
+  - `FormulaTokenizer::from_metadata` 从 `FormulaTokenizerMetadata.fast_tokenizer_file` 构造
+    HF `Tokenizer`；
+  - 用 tokenizer 自身解析 `<s>`/`<pad>`/`</s>`/`<unk>` ID，并与 metadata / 固定 0/1/2/3 双向校验；
+  - `decode_ids`：
+    - 保留原始 `token_ids`；
+    - 在第一个 EOS 处截断并记录 `eos_index`；
+    - 无 EOS 返回 `truncated=true`；
+    - `skip_special_tokens=true` 做 tokenizer decode；
+  - `FormulaDecode { latex, token_ids, eos_index, truncated }`。
+- 重构 `FormulaTokenizerMetadata` 的特殊 token 解析：
+  - 支持真实模型 `fast_tokenizer_file.added_tokens` 结构；
+  - 同时兼容 plain `model.vocab` 中的 special token；
+  - 从 `tokenizer_config_file` 读取 token 名称，默认回退 `<s>`/`<pad>`/`</s>`/`<unk>`。
+- 新增真实模型 tokenizer fixture：
+  - `tests/fixtures/formula-tokenizer/fast_tokenizer.json`（真实 `character.fast_tokenizer_file`，1.4 MB）；
+  - `tests/fixtures/formula-tokenizer/cases.json`（30 个 Python `tokenizers==0.21.0` 参考序列）；
+  - fixture README。
+
+#### 22.2 验证结果
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --lib formula::tokenizer` | 9 passed；0 failed（含 30 个 golden 序列） |
+| `cargo test --lib formula::tokenizer_metadata` | 5 passed；0 failed |
+| `cargo test --all-targets` | 136 passed；0 failed |
+| `cargo fmt --all -- --check` | 通过 |
+| 已知 `[0,82,1769,2,1,1]` | 按 EOS 截断解码为 `\cdot`，padding 不进入 LaTeX |
+| 无 EOS 序列 | `truncated=true`，不静默当作完整结果 |
+| 空/PAD/UNK/out-of-vocab | 空和 PAD 可解码；out-of-vocab 返回明确 `Tokenizer` 错误 |
+
+#### 22.3 边界核验
+
+- tokenizer decode 不读取普通 OCR `character` 字典，也不依赖 CTC 输出。
+- `cases.json` 的 golden 与 Python `tokenizers==0.21.0` 一致。
+- `fast_tokenizer.json` 从真实 M 模型 metadata 提取，保证不是合成 BPE。
+
+#### 22.4 阶段提交
+
+| 阶段 | 提交 | 说明 |
+| --- | --- | --- |
+| 6 tokenizer | 待记录 | `feat(formula): implement phase 6 tokenizer decoding` |
 

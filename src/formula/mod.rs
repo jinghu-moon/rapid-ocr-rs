@@ -9,4 +9,5 @@
 pub mod model_info;
 pub mod preprocess;
 pub mod session;
+pub mod tokenizer;
 pub mod tokenizer_metadata;

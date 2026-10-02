@@ -48,34 +48,69 @@ impl FormulaTokenizerMetadata {
             RapidOcrError::Tokenizer(format!("`character` metadata is not valid JSON: {e}"))
         })?;
 
-        let vocab = metadata
-            .fast_tokenizer_file
-            .get("model")
-            .and_then(|model| model.get("vocab"))
-            .ok_or_else(|| {
-                RapidOcrError::Tokenizer(
-                    "`character`.fast_tokenizer_file.model.vocab is missing".to_string(),
-                )
-            })?;
-        let vocab_size = vocab.as_object().map(|o| o.len()).unwrap_or(0);
+        let model = metadata.fast_tokenizer_file.get("model").ok_or_else(|| {
+            RapidOcrError::Tokenizer("`character`.fast_tokenizer_file.model is missing".to_string())
+        })?;
+        let vocab = model.get("vocab").ok_or_else(|| {
+            RapidOcrError::Tokenizer(
+                "`character`.fast_tokenizer_file.model.vocab is missing".to_string(),
+            )
+        })?;
+        let vocab_size = vocab.as_object().map(|object| object.len()).unwrap_or(0);
         if vocab_size == 0 {
             return Err(RapidOcrError::Tokenizer(
                 "`character`.fast_tokenizer_file.model.vocab is empty".to_string(),
             ));
         }
+        let vocab = vocab.as_object().ok_or_else(|| {
+            RapidOcrError::Tokenizer(
+                "`character`.fast_tokenizer_file.model.vocab must be an object".to_string(),
+            )
+        })?;
 
-        let special = |token: &str| -> Result<i64> {
-            match vocab.get(token).and_then(|v| v.as_i64()) {
-                Some(id) => Ok(id),
-                None => Err(RapidOcrError::Tokenizer(format!(
-                    "tokenizer vocab is missing special token `{token}`"
-                ))),
-            }
+        let tokenizer_config = metadata.tokenizer_config_file.as_ref();
+        let config_token = |key: &str, fallback: &str| -> String {
+            tokenizer_config
+                .and_then(|value| value.get(key))
+                .and_then(|value| value.as_str())
+                .unwrap_or(fallback)
+                .to_string()
         };
-        let bos_id = special(BOS_TOKEN)?;
-        let pad_id = special(PAD_TOKEN)?;
-        let eos_id = special(EOS_TOKEN)?;
-        let unk_id = special(UNK_TOKEN)?;
+        let bos_token = config_token("bos_token", BOS_TOKEN);
+        let pad_token = config_token("pad_token", PAD_TOKEN);
+        let eos_token = config_token("eos_token", EOS_TOKEN);
+        let unk_token = config_token("unk_token", UNK_TOKEN);
+
+        let added_tokens = metadata
+            .fast_tokenizer_file
+            .get("added_tokens")
+            .and_then(|value| value.as_array());
+        let special = |token: &str| -> Result<i64> {
+            if let Some(id) = added_tokens.and_then(|tokens| {
+                tokens.iter().find_map(|entry| {
+                    let content = entry.get("content").and_then(|value| value.as_str())?;
+                    if content == token {
+                        entry.get("id").and_then(|value| value.as_i64())
+                    } else {
+                        None
+                    }
+                })
+            }) {
+                return Ok(id);
+            }
+            vocab
+                .get(token)
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| {
+                    RapidOcrError::Tokenizer(format!(
+                        "tokenizer metadata is missing special token `{token}`"
+                    ))
+                })
+        };
+        let bos_id = special(&bos_token)?;
+        let pad_id = special(&pad_token)?;
+        let eos_id = special(&eos_token)?;
+        let unk_id = special(&unk_token)?;
 
         if (bos_id, pad_id, eos_id, unk_id) != (BOS_ID, PAD_ID, EOS_ID, UNK_ID) {
             return Err(RapidOcrError::Tokenizer(format!(

@@ -1,0 +1,361 @@
+{
+  "source": "real PP-Formulanet_plus-M character.fast_tokenizer_file",
+  "sequences": [
+    {
+      "tokens": [
+        0,
+        82,
+        1769,
+        2
+      ],
+      "latex": "\\cdot",
+      "eos_index": 3,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        82,
+        1769,
+        2,
+        1,
+        1
+      ],
+      "latex": "\\cdot",
+      "eos_index": 3,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        82,
+        1769
+      ],
+      "latex": "\\cdot",
+      "eos_index": null,
+      "truncated": true
+    },
+    {
+      "tokens": [
+        0,
+        1,
+        1,
+        2
+      ],
+      "latex": "",
+      "eos_index": 3,
+      "truncated": false
+    },
+    {
+      "tokens": [],
+      "latex": "",
+      "eos_index": null,
+      "truncated": true
+    },
+    {
+      "tokens": [
+        1,
+        1
+      ],
+      "latex": "",
+      "eos_index": null,
+      "truncated": true
+    },
+    {
+      "tokens": [
+        0,
+        2
+      ],
+      "latex": "",
+      "eos_index": 1,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        0,
+        2
+      ],
+      "latex": "",
+      "eos_index": 2,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        3,
+        2
+      ],
+      "latex": "",
+      "eos_index": 2,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        49999,
+        2
+      ],
+      "latex": "ylethanolamine",
+      "eos_index": 2,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        44396,
+        9278,
+        35480,
+        2
+      ],
+      "latex": " RNF spot genre",
+      "eos_index": 4,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        26601,
+        45903,
+        23156,
+        6142,
+        42651,
+        32671,
+        2
+      ],
+      "latex": "coloneiculus Retrievalchoachlor hematoxylin",
+      "eos_index": 7,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        17834,
+        31265,
+        39905,
+        48149,
+        40074,
+        17488,
+        2
+      ],
+      "latex": " isother intubationmectin tokenizerHex modulo",
+      "eos_index": 7,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        44661,
+        2
+      ],
+      "latex": "rar",
+      "eos_index": 2,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        47234,
+        13641,
+        18752,
+        24807,
+        33869,
+        5464,
+        33578,
+        41569,
+        2
+      ],
+      "latex": " Yus transparentinski ji Minimization UV agreements lc",
+      "eos_index": 9,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        1055,
+        49838,
+        2
+      ],
+      "latex": " rem Cet",
+      "eos_index": 3,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        42095,
+        7178,
+        8411,
+        22107,
+        2
+      ],
+      "latex": " SSM fitting tro buf",
+      "eos_index": 5,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        45597,
+        3370,
+        2
+      ],
+      "latex": "ugoslavfficients",
+      "eos_index": 3,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        40840,
+        29763,
+        27840,
+        2
+      ],
+      "latex": "computingestimatekx",
+      "eos_index": 4,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        21371,
+        31680,
+        38829,
+        15687,
+        32187,
+        2
+      ],
+      "latex": " RNNςendanceAlso delivers",
+      "eos_index": 6,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        26013,
+        12283,
+        25127,
+        44974,
+        12792,
+        3415,
+        38463,
+        2
+      ],
+      "latex": " sculpt dictocorticalrhoeaeecess great imprinting",
+      "eos_index": 8,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        31072,
+        22841,
+        556,
+        43438,
+        2
+      ],
+      "latex": "playerIrach immunologic",
+      "eos_index": 5,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        9610,
+        46671,
+        26345,
+        3073,
+        22773,
+        2
+      ],
+      "latex": "ametric PONMer stabilityprefix",
+      "eos_index": 6,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        2186,
+        15497,
+        17496,
+        22153,
+        2
+      ],
+      "latex": "sqrt ASD narrplemented",
+      "eos_index": 5,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        26882,
+        29333,
+        46476,
+        12116,
+        42193,
+        2
+      ],
+      "latex": "arentsbil Sliding Upperarguments",
+      "eos_index": 6,
+      "truncated": false
+    },
+    {
+      "tokens": [
+        0,
+        31001,
+        4149,
+        8716,
+        41639
+      ],
+      "latex": "olerant enough saturation Conserv",
+      "eos_index": null,
+      "truncated": true
+    },
+    {
+      "tokens": [
+        0,
+        5453
+      ],
+      "latex": " rules",
+      "eos_index": null,
+      "truncated": true
+    },
+    {
+      "tokens": [
+        0,
+        2475,
+        45776
+      ],
+      "latex": "ols Extinction",
+      "eos_index": null,
+      "truncated": true
+    },
+    {
+      "tokens": [
+        0,
+        46901,
+        4006,
+        8359,
+        16385,
+        3818
+      ],
+      "latex": " spheroidal Bo dramophore chronic",
+      "eos_index": null,
+      "truncated": true
+    },
+    {
+      "tokens": [
+        0,
+        5407,
+        48913,
+        32628,
+        9583,
+        26623
+      ],
+      "latex": " parent TBA deferintegrellip",
+      "eos_index": null,
+      "truncated": true
+    }
+  ]
+}

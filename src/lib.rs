@@ -34,6 +34,7 @@ pub use formula::preprocess::{
     FORMULA_INPUT_SIZE, FORMULA_MEAN, FORMULA_STD, FormulaPreprocessor, FormulaTensor,
 };
 pub use formula::session::FormulaSession;
+pub use formula::tokenizer::{FormulaDecode, FormulaTokenizer};
 pub use formula::tokenizer_metadata::{
     BOS_ID, BOS_TOKEN, EOS_ID, EOS_TOKEN, FormulaTokenizerMetadata, PAD_ID, PAD_TOKEN, UNK_ID,
     UNK_TOKEN,
