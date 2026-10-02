@@ -3,7 +3,6 @@
 //! `FormulaRecognizer` 组合 typed formula session、公式预处理和 tokenizer，
 //! 不扩展普通 CTC `Recognizer`，也不依赖 `LineResult`。
 
-use std::io::{Cursor, Read};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -20,13 +19,26 @@ use crate::{
         tokenizer::{FormulaDecode, FormulaTokenizer},
         tokenizer_metadata::FormulaTokenizerMetadata,
     },
+    input::image_loader::{LoadImage, OcrInput},
     model_store::sha256_file,
     runtime::provider::ProviderResolution,
 };
 
 pub const DEFAULT_MAX_FORMULA_BATCH_SIZE: usize = 16;
 pub const DEFAULT_MAX_FORMULA_INPUT_PIXELS: u64 = 24_000_000;
-pub const DEFAULT_MAX_FORMULA_SEQUENCE_LENGTH: usize = 2560;
+/// 公式输出序列长度上限。
+///
+/// 模型图内 `Loop` 自己的 trip count 决定了输出张量的最大宽度：当 batch 中任一
+/// 样本在 Loop 预算内没有产生 EOS 时，ONNX Runtime 会把**整个 batch** 补齐到该宽度。
+/// 实测 `pp_formulanet_plus_m.onnx` 的该宽度为 2561（见
+/// `formula::recognizer::tests::default_sequence_limit_exceeds_model_loop_bound`）。
+///
+/// 因此上限必须**严格大于**模型的 Loop 宽度，否则一个不收敛的样本会导致整批被拒绝，
+/// 连带丢掉同批中识别正确的样本。4096 既覆盖实测宽度，又仍然是明确的内存/解码上界。
+pub const DEFAULT_MAX_FORMULA_SEQUENCE_LENGTH: usize = 4096;
+
+/// 实测的模型图内 `Loop` 输出宽度（`[N, 2561]`）。
+pub const FORMULA_MODEL_LOOP_BOUND: usize = 2561;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FormulaRecognition {
@@ -35,7 +47,15 @@ pub struct FormulaRecognition {
     pub eos_index: Option<usize>,
     pub truncated: bool,
     pub model_id: String,
+    /// 产生该结果的**调用**墙钟耗时（毫秒）。
+    ///
+    /// 同一次 [`FormulaRecognizer::recognize_batch`] 返回的所有结果共享同一个值，
+    /// 它是整个 batch 的端到端耗时，**不是**单样本耗时；需要单样本估计时除以
+    /// [`FormulaRecognition::batch_size`]。单图 [`FormulaRecognizer::recognize`]
+    /// 的调用耗时等于单样本耗时。
     pub elapsed_ms: f32,
+    /// 产生该结果的调用包含的图片数量（单图为 1）。
+    pub batch_size: usize,
 }
 
 impl FormulaRecognition {
@@ -176,25 +196,25 @@ impl FormulaRecognizer {
         self.ensure_sequence_limit(output.ncols())?;
         let token_ids = output.row(0).to_vec();
         let decoded = self.tokenizer.decode_ids(&token_ids)?;
-        Ok(self.recognition(decoded, start.elapsed().as_secs_f32() * 1000.0))
+        Ok(self.recognition(decoded, start.elapsed().as_secs_f32() * 1000.0, 1))
     }
 
+    /// Recognizes a formula from an in-memory encoded image.
+    ///
+    /// Encoded-byte, decoded-pixel and header-probe limits are enforced by the
+    /// shared input layer (`LoadImage`), so formula and ordinary OCR cannot
+    /// drift apart in their input semantics.
     pub fn recognize_encoded(
         &mut self,
         bytes: &[u8],
         max_decode_pixels: u64,
         max_encoded_bytes: u64,
     ) -> Result<FormulaRecognition> {
-        if bytes.len() as u64 > max_encoded_bytes {
-            return Err(RapidOcrError::InvalidImage(format!(
-                "encoded formula image has {} bytes, limit is {max_encoded_bytes}",
-                bytes.len()
-            )));
-        }
-        let dimensions = image_dimensions_from_bytes(bytes)?;
-        ensure_pixel_limit(dimensions.0, dimensions.1, max_decode_pixels)?;
-        let image = image::load_from_memory(bytes)
-            .map_err(|error| RapidOcrError::InvalidImage(error.to_string()))?;
+        let image = LoadImage::default().load_dynamic_with_limit(
+            OcrInput::Bytes(bytes.to_vec()),
+            max_decode_pixels,
+            max_encoded_bytes,
+        )?;
         self.recognize(&image)
     }
 
@@ -204,19 +224,11 @@ impl FormulaRecognizer {
         max_decode_pixels: u64,
         max_encoded_bytes: u64,
     ) -> Result<FormulaRecognition> {
-        if !path.is_file() {
-            return Err(RapidOcrError::FileNotFound(path.to_path_buf()));
-        }
-        let encoded_len = std::fs::metadata(path)?.len();
-        if encoded_len > max_encoded_bytes {
-            return Err(RapidOcrError::InvalidImage(format!(
-                "encoded formula image has {encoded_len} bytes, limit is {max_encoded_bytes}"
-            )));
-        }
-        let dimensions = image_dimensions_from_file(path)?;
-        ensure_pixel_limit(dimensions.0, dimensions.1, max_decode_pixels)?;
-        let image =
-            image::open(path).map_err(|error| RapidOcrError::InvalidImage(error.to_string()))?;
+        let image = LoadImage::default().load_dynamic_with_limit(
+            OcrInput::Path(path.to_path_buf()),
+            max_decode_pixels,
+            max_encoded_bytes,
+        )?;
         self.recognize(&image)
     }
 
@@ -227,25 +239,13 @@ impl FormulaRecognizer {
         max_encoded_bytes: u64,
         timeout: Duration,
     ) -> Result<FormulaRecognition> {
-        let client = reqwest::blocking::Client::builder()
-            .connect_timeout(timeout)
-            .timeout(timeout)
-            .build()?;
-        let response = client.get(url).send()?;
-        if !response.status().is_success() {
-            return Err(RapidOcrError::Download(format!(
-                "failed to fetch formula image from url {url}: HTTP {}",
-                response.status()
-            )));
-        }
-        if let Some(content_length) = response.content_length() {
-            ensure_encoded_limit(content_length, max_encoded_bytes)?;
-        }
-        let read_limit = max_encoded_bytes.saturating_add(1);
-        let mut bytes = Vec::new();
-        response.take(read_limit).read_to_end(&mut bytes)?;
-        ensure_encoded_limit(bytes.len() as u64, max_encoded_bytes)?;
-        self.recognize_encoded(&bytes, max_decode_pixels, max_encoded_bytes)
+        let loader = LoadImage::with_http_timeouts(timeout, timeout);
+        let image = loader.load_dynamic_with_limit(
+            OcrInput::Url(url.to_string()),
+            max_decode_pixels,
+            max_encoded_bytes,
+        )?;
+        self.recognize(&image)
     }
 
     pub fn recognize_batch(&mut self, images: &[DynamicImage]) -> Result<Vec<FormulaRecognition>> {
@@ -281,7 +281,13 @@ impl FormulaRecognizer {
         for row in output.axis_iter(Axis(0)) {
             let token_ids = row.to_vec();
             let decoded = self.tokenizer.decode_ids(&token_ids)?;
-            results.push(self.recognition(decoded, start.elapsed().as_secs_f32() * 1000.0));
+            results.push(self.recognition(decoded, 0.0, images.len()));
+        }
+        // 只有整个 batch（预处理 + 推理 + 全部 decode）结束后的墙钟时间才是这次调用的
+        // 耗时；把它统一写给所有结果，避免调用方误以为后一个样本更慢。
+        let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
+        for result in &mut results {
+            result.elapsed_ms = elapsed_ms;
         }
         Ok(results)
     }
@@ -289,14 +295,11 @@ impl FormulaRecognizer {
     fn ensure_image_limit(&self, image: &DynamicImage) -> Result<()> {
         use image::GenericImageView;
         let (width, height) = image.dimensions();
-        let pixels = u64::from(width) * u64::from(height);
-        if pixels > self.max_input_pixels {
-            return Err(RapidOcrError::InvalidImage(format!(
-                "formula image has {pixels} pixels, limit is {}",
-                self.max_input_pixels
-            )));
-        }
-        Ok(())
+        crate::input::image_loader::ensure_decode_pixels(
+            width as usize,
+            height as usize,
+            self.max_input_pixels,
+        )
     }
 
     fn ensure_sequence_limit(&self, sequence_length: usize) -> Result<()> {
@@ -308,8 +311,12 @@ impl FormulaRecognizer {
         }
         Ok(())
     }
-
-    fn recognition(&self, decoded: FormulaDecode, elapsed_ms: f32) -> FormulaRecognition {
+    fn recognition(
+        &self,
+        decoded: FormulaDecode,
+        elapsed_ms: f32,
+        batch_size: usize,
+    ) -> FormulaRecognition {
         FormulaRecognition {
             latex: crate::formula::postprocess::postprocess_latex(&decoded.latex),
             token_ids: decoded.token_ids,
@@ -317,44 +324,9 @@ impl FormulaRecognizer {
             truncated: decoded.truncated,
             model_id: self.model_id.clone(),
             elapsed_ms,
+            batch_size,
         }
     }
-}
-
-fn image_dimensions_from_bytes(bytes: &[u8]) -> Result<(u32, u32)> {
-    image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|error| RapidOcrError::InvalidImage(error.to_string()))?
-        .into_dimensions()
-        .map_err(|error| RapidOcrError::InvalidImage(error.to_string()))
-}
-
-fn image_dimensions_from_file(path: &Path) -> Result<(u32, u32)> {
-    image::ImageReader::open(path)
-        .map_err(|error| RapidOcrError::InvalidImage(error.to_string()))?
-        .with_guessed_format()
-        .map_err(|error| RapidOcrError::InvalidImage(error.to_string()))?
-        .into_dimensions()
-        .map_err(|error| RapidOcrError::InvalidImage(error.to_string()))
-}
-
-fn ensure_encoded_limit(actual: u64, max_encoded_bytes: u64) -> Result<()> {
-    if actual > max_encoded_bytes {
-        return Err(RapidOcrError::InvalidImage(format!(
-            "encoded formula image has {actual} bytes, limit is {max_encoded_bytes}"
-        )));
-    }
-    Ok(())
-}
-
-fn ensure_pixel_limit(width: u32, height: u32, max_decode_pixels: u64) -> Result<()> {
-    let pixels = u64::from(width) * u64::from(height);
-    if pixels > max_decode_pixels {
-        return Err(RapidOcrError::InvalidImage(format!(
-            "formula image has {pixels} pixels, limit is {max_decode_pixels}"
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -496,6 +468,35 @@ mod tests {
         );
     }
 
+    /// 默认序列上限必须严格大于模型图内 Loop 的输出宽度。
+    ///
+    /// 否则一个不收敛的样本会把整个 batch 的输出张量补齐到 Loop 宽度，从而让
+    /// `ensure_sequence_limit` 拒绝整批，连带丢掉同批中识别正确的样本。
+    /// 实测宽度来自真实模型在 501 张 val 上的输出（不收敛时的张量宽度为 2561）。
+    #[test]
+    fn default_sequence_limit_exceeds_model_loop_bound() {
+        const _: () = assert!(DEFAULT_MAX_FORMULA_SEQUENCE_LENGTH > FORMULA_MODEL_LOOP_BOUND);
+        let recognizer =
+            FormulaRecognizer::from_model(&fixture("formula_recognizer_ok.onnx"), &rt())
+                .expect("recognizer should load");
+        assert_eq!(
+            recognizer.max_sequence_length(),
+            DEFAULT_MAX_FORMULA_SEQUENCE_LENGTH
+        );
+        assert!(
+            recognizer
+                .ensure_sequence_limit(FORMULA_MODEL_LOOP_BOUND)
+                .is_ok(),
+            "a row at the model's own loop bound must be accepted"
+        );
+        assert!(
+            recognizer
+                .ensure_sequence_limit(DEFAULT_MAX_FORMULA_SEQUENCE_LENGTH + 1)
+                .is_err(),
+            "the limit must still bound memory for pathological outputs"
+        );
+    }
+
     #[test]
     fn pixel_and_sequence_limits_are_enforced() {
         let mut recognizer =
@@ -554,5 +555,99 @@ mod tests {
             .recognize_encoded(&encoded, 100, 10_000)
             .expect_err("pixel limit must fail");
         assert!(error.to_string().contains("limit is 100"), "error: {error}");
+    }
+
+    /// 文件输入必须与共享输入层使用同一套限制语义与错误类型。
+    #[test]
+    fn file_input_uses_shared_loader_limits() {
+        let mut recognizer =
+            FormulaRecognizer::from_model(&fixture("formula_recognizer_ok.onnx"), &rt())
+                .expect("recognizer should load");
+
+        let error = recognizer
+            .recognize_file(Path::new("does-not-exist.png"), 10_000, 10_000)
+            .expect_err("missing file must be reported as FileNotFound");
+        assert!(
+            matches!(error, RapidOcrError::FileNotFound(_)),
+            "error: {error}"
+        );
+
+        let directory = std::env::temp_dir().join(format!(
+            "rapid-ocr-rs-formula-loader-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("formula.png");
+        let image = gray(255).to_rgb8();
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode png");
+        std::fs::write(&path, &bytes).expect("write png");
+
+        let result = recognizer
+            .recognize_file(&path, 2000, 10_000)
+            .expect("file recognize");
+        assert_eq!(result.latex, "\\cdot");
+
+        let error = recognizer
+            .recognize_file(&path, 2000, 10)
+            .expect_err("encoded file limit must fail");
+        assert!(
+            error.to_string().contains("encoded image has")
+                && error.to_string().contains("limit is 10"),
+            "error: {error}"
+        );
+
+        let error = recognizer
+            .recognize_file(&path, 100, 10_000)
+            .expect_err("pixel file limit must fail");
+        assert!(error.to_string().contains("limit is 100"), "error: {error}");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// 公式域严格 provider 语义：请求不可用的加速器必须失败，不能静默用 CPU。
+    #[test]
+    #[cfg(not(feature = "cuda-provider"))]
+    fn unavailable_provider_is_rejected_not_silently_fallen_back() {
+        let runtime = RuntimeConfig {
+            provider_preference: crate::config::ProviderPreference::Cuda { device_id: 0 },
+            fail_if_provider_unavailable: false,
+            ..RuntimeConfig::default()
+        };
+        let error = FormulaRecognizer::from_model(&fixture("formula_recognizer_ok.onnx"), &runtime)
+            .expect_err("unavailable accelerator must fail");
+        assert!(
+            matches!(error, RapidOcrError::UnsupportedProvider(_)),
+            "error: {error}"
+        );
+    }
+
+    /// batch 结果的耗时语义必须明确：同一次调用的所有结果共享调用总耗时。
+    #[test]
+    fn batch_results_share_call_wall_time() {
+        let mut recognizer =
+            FormulaRecognizer::from_model(&fixture("formula_recognizer_ok.onnx"), &rt())
+                .expect("recognizer should load");
+        let images = vec![gray(0), gray(255), gray(128)];
+        let results = recognizer
+            .recognize_batch(&images)
+            .expect("batch recognize");
+        assert_eq!(results.len(), 3);
+        for result in &results {
+            assert_eq!(result.batch_size, 3);
+            assert!(
+                (result.elapsed_ms - results[0].elapsed_ms).abs() < f32::EPSILON,
+                "batch results must share the same call wall time"
+            );
+            assert!(result.elapsed_ms >= 0.0);
+        }
+
+        let single = recognizer.recognize(&gray(255)).expect("single recognize");
+        assert_eq!(single.batch_size, 1);
     }
 }

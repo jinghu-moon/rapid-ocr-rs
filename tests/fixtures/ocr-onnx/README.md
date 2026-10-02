@@ -1,6 +1,6 @@
 # ocr-onnx 测试 fixture
 
-本目录的 `*.onnx` 为普通 OCR session 契约测试件，被 `.gitignore` 排除（`*.onnx`），不随仓库提交。
+本目录的 `*.onnx` 为普通 OCR session 契约测试件；`tests/fixtures/**/*.onnx` 已从 `.gitignore` 中例外放行并随仓库提交，保证干净 clone/CI 可复现。
 
 ## 文件
 
@@ -19,4 +19,4 @@
 - 输出使用 `Constant` 节点，rank/dtype 分别满足或故意违反各领域 session 契约；
 - 每个模型通过 `onnx.checker.check_model` 后保存。
 
-缺失时 `src/ocr/session.rs` 的 fixture 测试会失败。
+这些 fixture 会随仓库提交，`src/ocr/session.rs` 的契约测试不依赖本机外部模型。

@@ -78,8 +78,8 @@ impl LoadImage {
         self.load_with_limit(input, u64::MAX, u64::MAX)
     }
 
-    #[cfg(test)]
-    fn with_http_timeouts(connect: Duration, request: Duration) -> Self {
+    /// Builds a loader with explicit HTTP connect/request timeouts.
+    pub fn with_http_timeouts(connect: Duration, request: Duration) -> Self {
         Self {
             http_connect_timeout: connect,
             http_request_timeout: request,
@@ -90,9 +90,9 @@ impl LoadImage {
     ///
     /// Encoded bytes, files, and URLs are dimension-probed before the actual
     /// pixel decode so oversized compressed images cannot force large
-    /// allocations just to be rejected afterwards. File and URL inputs are
-    /// also bounded by `max_encoded_bytes`; URL bodies are streamed with a
-    /// hard read cap even when `Content-Length` is absent.
+    /// allocations just to be rejected afterwards. All encoded inputs are also
+    /// bounded by `max_encoded_bytes`; URL bodies are streamed with a hard read
+    /// cap even when `Content-Length` is absent.
     pub fn load_with_limit(
         &self,
         input: OcrInput,
@@ -100,10 +100,58 @@ impl LoadImage {
         max_encoded_bytes: u64,
     ) -> Result<RecImage> {
         match input {
-            OcrInput::Path(path) => self.load_path(path, max_decode_pixels, max_encoded_bytes),
-            OcrInput::Url(url) => self.load_url(&url, max_decode_pixels, max_encoded_bytes),
-            OcrInput::Bytes(bytes) => self.decode_bytes_with_exif(&bytes, true, max_decode_pixels),
+            OcrInput::Path(_) | OcrInput::Url(_) | OcrInput::Bytes(_) => {
+                let bytes =
+                    self.read_encoded_with_limit(input, max_decode_pixels, max_encoded_bytes)?;
+                self.decode_bytes_with_exif(&bytes, true, max_decode_pixels)
+            }
             other => self.load_raw(other, max_decode_pixels),
+        }
+    }
+
+    /// Decodes an encoded or remote input into a [`DynamicImage`].
+    ///
+    /// Shares the same encoded-byte, decoded-pixel, streaming and timeout
+    /// enforcement as [`LoadImage::load_with_limit`], and applies EXIF
+    /// orientation normalization. Domain-specific conversion (for example
+    /// formula tensors) belongs to the caller.
+    pub fn load_dynamic_with_limit(
+        &self,
+        input: OcrInput,
+        max_decode_pixels: u64,
+        max_encoded_bytes: u64,
+    ) -> Result<DynamicImage> {
+        let bytes = self.read_encoded_with_limit(input, max_decode_pixels, max_encoded_bytes)?;
+        let mut image = image::load_from_memory(&bytes)
+            .map_err(|e| RapidOcrError::InvalidImage(e.to_string()))?;
+        image = apply_exif_orientation(image, exif_orientation_from_bytes(&bytes));
+        Ok(image)
+    }
+
+    /// Fetches and validates the encoded bytes of an input **before** decoding.
+    ///
+    /// This is the single place where encoded-size limits, header dimension
+    /// probes, URL `Content-Length` checks, streaming read caps and URL
+    /// timeouts are enforced. Raw pixel inputs are rejected because they carry
+    /// no encoded representation.
+    pub fn read_encoded_with_limit(
+        &self,
+        input: OcrInput,
+        max_decode_pixels: u64,
+        max_encoded_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        match input {
+            OcrInput::Bytes(bytes) => {
+                ensure_encoded_bytes(bytes.len() as u64, max_encoded_bytes)?;
+                let (width, height) = image_dimensions_from_bytes(&bytes)?;
+                ensure_decode_pixels(width as usize, height as usize, max_decode_pixels)?;
+                Ok(bytes)
+            }
+            OcrInput::Path(path) => self.read_path(path, max_decode_pixels, max_encoded_bytes),
+            OcrInput::Url(url) => self.read_url(&url, max_decode_pixels, max_encoded_bytes),
+            _ => Err(RapidOcrError::InvalidInput(
+                "raw pixel inputs carry no encoded bytes; use load_with_limit".to_string(),
+            )),
         }
     }
 
@@ -186,12 +234,12 @@ impl LoadImage {
         }
     }
 
-    fn load_path(
+    fn read_path(
         &self,
         path: PathBuf,
         max_decode_pixels: u64,
         max_encoded_bytes: u64,
-    ) -> Result<RecImage> {
+    ) -> Result<Vec<u8>> {
         if !path.exists() {
             return Err(RapidOcrError::FileNotFound(path));
         }
@@ -199,16 +247,15 @@ impl LoadImage {
         ensure_encoded_bytes(encoded_len, max_encoded_bytes)?;
         let (width, height) = image_dimensions_from_file(&path)?;
         ensure_decode_pixels(width as usize, height as usize, max_decode_pixels)?;
-        let bytes = fs::read(path)?;
-        self.decode_bytes_with_exif(&bytes, true, max_decode_pixels)
+        Ok(fs::read(path)?)
     }
 
-    fn load_url(
+    fn read_url(
         &self,
         url: &str,
         max_decode_pixels: u64,
         max_encoded_bytes: u64,
-    ) -> Result<RecImage> {
+    ) -> Result<Vec<u8>> {
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(self.http_connect_timeout)
             .timeout(self.http_request_timeout)
@@ -228,7 +275,9 @@ impl LoadImage {
         let mut bytes = Vec::new();
         response.take(read_limit).read_to_end(&mut bytes)?;
         ensure_encoded_bytes(bytes.len() as u64, max_encoded_bytes)?;
-        self.decode_bytes_with_exif(&bytes, true, max_decode_pixels)
+        let (width, height) = image_dimensions_from_bytes(&bytes)?;
+        ensure_decode_pixels(width as usize, height as usize, max_decode_pixels)?;
+        Ok(bytes)
     }
 
     fn decode_bytes_with_exif(
@@ -282,7 +331,11 @@ fn image_dimensions_from_file(path: &std::path::Path) -> Result<(u32, u32)> {
         .map_err(|e| RapidOcrError::InvalidImage(e.to_string()))
 }
 
-fn ensure_decode_pixels(width: usize, height: usize, max_decode_pixels: u64) -> Result<()> {
+pub(crate) fn ensure_decode_pixels(
+    width: usize,
+    height: usize,
+    max_decode_pixels: u64,
+) -> Result<()> {
     let pixels = (width as u64)
         .checked_mul(height as u64)
         .ok_or_else(|| RapidOcrError::InvalidInput("image dimensions overflow".to_string()))?;

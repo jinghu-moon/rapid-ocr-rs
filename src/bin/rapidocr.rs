@@ -3,14 +3,55 @@ use rapid_ocr_rs::evaluation::ocr::{
     EvaluationCase, EvaluationReport, EvaluationSummary, evaluate_case,
 };
 use rapid_ocr_rs::{
-    ClassifierPlan, ClassifierPolicy, DetectionPolicy, EngineConfig, ImageInput, OcrEngine,
-    OcrRequest, OutputPolicy, PreprocessPolicy, RapidOcrEngine, RecognitionPolicy, StagePlan,
-    TextOrder, WordOutputMode, render_output_report, to_output_items, to_output_json,
+    ClassifierPlan, ClassifierPolicy, DetectionPolicy, EngineConfig, FormulaPolicy, ImageInput,
+    OcrEngine, OcrRequest, OutputPolicy, PreprocessPolicy, RapidOcrEngine, RecognitionPolicy,
+    StagePlan, TextOrder, WordOutputMode, render_output_report, to_output_items, to_output_json,
 };
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+/// 页面级公式路由的 CLI 选项。
+#[derive(Debug, Clone, Default, clap::Args)]
+struct FormulaArgs {
+    /// 公式识别模型（`pp_formulanet_plus_m.onnx`）；给出即启用公式路由。
+    #[arg(long = "formula-model", value_name = "ONNX")]
+    model: Option<PathBuf>,
+    /// 页面公式检测模型（`pix2text-mfd-1.5.onnx`）；不给出时只处理显式区域。
+    #[arg(long = "formula-detector", value_name = "ONNX")]
+    detector: Option<PathBuf>,
+    /// 公式识别模型 SHA-256 校验。
+    #[arg(long = "formula-sha256")]
+    sha256: Option<String>,
+    /// 公式检测置信度阈值。
+    #[arg(long = "formula-confidence", default_value_t = 0.25)]
+    confidence: f32,
+    /// 每页最多保留的公式区域数。
+    #[arg(long = "formula-max-regions", default_value_t = 64)]
+    max_regions: usize,
+    /// 在 JSON 输出中保留公式原始 token IDs。
+    #[arg(long = "formula-token-ids")]
+    token_ids: bool,
+}
+
+impl FormulaArgs {
+    fn policy(&self) -> FormulaPolicy {
+        match &self.model {
+            Some(model) => FormulaPolicy {
+                enabled: true,
+                model_path: Some(model.clone()),
+                expected_model_sha256: self.sha256.clone(),
+                detector_path: self.detector.clone(),
+                confidence_threshold: self.confidence,
+                max_regions: self.max_regions,
+                include_token_ids: self.token_ids,
+                ..FormulaPolicy::default()
+            },
+            None => FormulaPolicy::default(),
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "rapidocr", about = "Run PaddleOCR ONNX models")]
@@ -31,6 +72,8 @@ enum Command {
         chars: bool,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        formula: FormulaArgs,
     },
     Report {
         #[arg(long = "input-dir")]
@@ -39,6 +82,8 @@ enum Command {
         output_dir: PathBuf,
         #[arg(long)]
         config: Option<PathBuf>,
+        #[command(flatten)]
+        formula: FormulaArgs,
     },
     Evaluate {
         #[arg(long)]
@@ -67,6 +112,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             words,
             chars,
             json,
+            formula,
         } => {
             let cfg = match config {
                 Some(path) => EngineConfig::from_yaml_file(path)?,
@@ -81,23 +127,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 WordOutputMode::Off
             };
-            let output = engine.recognize(OcrRequest {
-                input: ImageInput::Encoded(Arc::from(bytes)),
-                roi: None,
-                scale_hint: None,
-                stages: StagePlan {
-                    detect: true,
-                    classify: ClassifierPlan {
-                        policy: ClassifierPolicy::IfAvailable,
-                        apply_rotation: true,
-                    },
-                    recognize: true,
-                },
-                preprocess: PreprocessPolicy::default(),
-                detection: DetectionPolicy::default(),
-                recognition: RecognitionPolicy { words: word_mode },
-                output: OutputPolicy::default(),
-            })?;
+            let mut request = make_request(bytes, word_mode);
+            request.formula = formula.policy();
+            let output = engine.recognize(request)?;
             if json {
                 println!(
                     "{}",
@@ -105,9 +137,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             } else {
                 println!("{}", output.plain_text(TextOrder::Reading));
+                for (index, latex) in output.formula_latex(TextOrder::Reading) {
+                    println!("formula[{index}] = {latex}");
+                }
                 println!(
-                    "regions={} total_ms={:.1}",
+                    "regions={} formulas={} total_ms={:.1}",
                     output.regions.len(),
+                    output.formula_count(),
                     output.timings.total_ms
                 );
             }
@@ -117,7 +153,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             input_dir,
             output_dir,
             config,
-        } => report_cmd(input_dir, output_dir, config)?,
+            formula,
+        } => report_cmd(input_dir, output_dir, config, formula.policy())?,
         Command::Evaluate {
             manifest,
             config,
@@ -145,6 +182,7 @@ fn make_request(bytes: Vec<u8>, words: WordOutputMode) -> OcrRequest {
         detection: DetectionPolicy::default(),
         recognition: RecognitionPolicy { words },
         output: OutputPolicy::default(),
+        formula: FormulaPolicy::default(),
     }
 }
 
@@ -152,6 +190,7 @@ fn report_cmd(
     input_dir: PathBuf,
     output_dir: PathBuf,
     config: Option<PathBuf>,
+    formula: FormulaPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = match config {
         Some(path) => EngineConfig::from_yaml_file(path)?,
@@ -173,7 +212,9 @@ fn report_cmd(
         ) {
             continue;
         }
-        let output = engine.recognize(make_request(std::fs::read(&path)?, WordOutputMode::Off))?;
+        let mut request = make_request(std::fs::read(&path)?, WordOutputMode::Off);
+        request.formula = formula.clone();
+        let output = engine.recognize(request)?;
         let source_name = path
             .file_name()
             .and_then(|v| v.to_str())

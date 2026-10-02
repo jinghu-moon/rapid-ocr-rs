@@ -9,7 +9,8 @@ use std::path::Path;
 use crate::{
     config::RuntimeConfig,
     error::{RapidOcrError, Result},
-    runtime::{contracts::TensorSpec, session::OrtSession},
+    formula::contract::validate_formula_contract,
+    runtime::session::OrtSession,
 };
 
 /// 公式模型签名探针结果。
@@ -25,16 +26,11 @@ pub struct FormulaModelInfo {
     pub input_dims: Vec<i64>,
 }
 
-/// 输入契约：单输入 `FLOAT [N, 1, 384, 384]`。
-pub const FORMULA_INPUT_RANK: usize = 4;
-pub const FORMULA_INPUT_SPATIAL: i64 = 384;
-pub const FORMULA_INPUT_CHANNELS: i64 = 1;
-
-/// 输出契约：单输出 `INT64 [N, L]`。
-pub const FORMULA_OUTPUT_RANK: usize = 2;
-
 impl FormulaModelInfo {
     /// 探针入口：加载模型、校验签名与 metadata，不执行推理。
+    ///
+    /// IO 契约校验复用 [`validate_formula_contract`]，与 `FormulaSession::new`
+    /// 使用同一份实现，因此探针结论与运行时可接受性一致。
     pub fn probe(model_path: &Path, runtime_cfg: &RuntimeConfig) -> Result<Self> {
         if !model_path.is_file() {
             return Err(RapidOcrError::FileNotFound(model_path.to_path_buf()));
@@ -42,26 +38,9 @@ impl FormulaModelInfo {
 
         let session = OrtSession::open_unchecked(model_path, runtime_cfg)?;
         let io = session.probe_io()?;
-
-        if io.inputs.len() != 1 {
-            return Err(RapidOcrError::Config(format!(
-                "formula model must expose exactly one input, got {} (model={})",
-                io.inputs.len(),
-                model_path.display()
-            )));
-        }
-        if io.outputs.len() != 1 {
-            return Err(RapidOcrError::Config(format!(
-                "formula model must expose exactly one output, got {} (model={})",
-                io.outputs.len(),
-                model_path.display()
-            )));
-        }
-
+        validate_formula_contract(&io, model_path)?;
         let input = &io.inputs[0];
         let output = &io.outputs[0];
-        validate_input_spec(model_path, input)?;
-        validate_output_spec(model_path, output)?;
 
         let character_metadata = match session.metadata_custom("character")? {
             Some(raw) => raw,
@@ -101,80 +80,14 @@ impl FormulaModelInfo {
     }
 }
 
-fn validate_input_spec(model_path: &Path, input: &TensorSpec) -> Result<()> {
-    if input.rank != FORMULA_INPUT_RANK {
-        return Err(RapidOcrError::Config(format!(
-            "formula model input `{}` must be rank {FORMULA_INPUT_RANK}, got {} (model={})",
-            input.name,
-            input.rank,
-            model_path.display()
-        )));
-    }
-    if input.element_type != ort::value::TensorElementType::Float32 {
-        return Err(RapidOcrError::Config(format!(
-            "formula model input `{}` must be FLOAT32, got {:?} (model={})",
-            input.name,
-            input.element_type,
-            model_path.display()
-        )));
-    }
-    // 固定空间维：如果给出了具体值则必须为 384；动态维（<0）允许并记录。
-    let channels = input.dims.get(1).copied().unwrap_or(-1);
-    let height = input.dims.get(2).copied().unwrap_or(-1);
-    let width = input.dims.get(3).copied().unwrap_or(-1);
-    if channels >= 0 && channels != FORMULA_INPUT_CHANNELS {
-        return Err(RapidOcrError::Config(format!(
-            "formula model input `{}` must have {} channel, got {channels} (model={})",
-            input.name,
-            FORMULA_INPUT_CHANNELS,
-            model_path.display()
-        )));
-    }
-    if (height >= 0 && height != FORMULA_INPUT_SPATIAL)
-        || (width >= 0 && width != FORMULA_INPUT_SPATIAL)
-    {
-        return Err(RapidOcrError::Config(format!(
-            "formula model input `{}` must be {FORMULA_INPUT_SPATIAL}x{FORMULA_INPUT_SPATIAL}, \
-             got [_, {channels}, {height}, {width}] (model={})",
-            input.name,
-            model_path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn validate_output_spec(model_path: &Path, output: &TensorSpec) -> Result<()> {
-    if output.rank != FORMULA_OUTPUT_RANK {
-        return Err(RapidOcrError::Config(format!(
-            "formula model output `{}` must be rank {FORMULA_OUTPUT_RANK} (token sequence), \
-             got {} (model={})",
-            output.name,
-            output.rank,
-            model_path.display()
-        )));
-    }
-    if output.element_type != ort::value::TensorElementType::Int64 {
-        return Err(RapidOcrError::Config(format!(
-            "formula model output `{}` must be INT64, got {:?} (model={})",
-            output.name,
-            output.element_type,
-            model_path.display()
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::*;
 
-    const FIXTURES: &str =
-        r"D:\100_Projects\110_Daily\SnapClip\crates\rapid-ocr-rs\tests\fixtures\formula-onnx";
-
     fn fixture(name: &str) -> PathBuf {
-        PathBuf::from(FIXTURES).join(name)
+        crate::test_support::fixture_dir("formula-onnx").join(name)
     }
 
     fn rt() -> RuntimeConfig {
@@ -273,37 +186,20 @@ mod tests {
 
 #[cfg(test)]
 mod real_model_tests {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use crate::{config::RuntimeConfig, formula::model_info::FormulaModelInfo};
 
+    /// 真实 594 MB 模型不在仓库内；缺失时必须 skip，不允许 panic 或回落到开发机路径。
     fn real_model() -> Option<PathBuf> {
-        let env = std::env::var("RAPID_OCR_MODEL_ROOT")
-            .or_else(|_| std::env::var("RAPID_OCR_FORMULA_MODEL_PATH"));
-        if let Ok(p) = env {
-            let pb = PathBuf::from(p);
-            if pb.is_file() {
-                return Some(pb);
-            }
-            let candidate = pb.join("Formula-Recognition-Models/onnx/pp_formulanet_plus_m.onnx");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        // fallback: well-known absolute path
-        let fallback = Path::new(
-            r"D:\100_Projects\110_Daily\SnapClip\OCR-Model\Formula-Recognition-Models\onnx\pp_formulanet_plus_m.onnx",
-        );
-        if fallback.is_file() {
-            Some(fallback.to_path_buf())
-        } else {
-            None
-        }
+        crate::test_support::formula_model_path()
     }
 
     #[test]
     fn real_model_probe_smoke() {
-        let path = real_model().expect("real model not found; set RAPID_OCR_MODEL_ROOT");
+        let Some(path) = real_model() else {
+            return;
+        };
         let info =
             FormulaModelInfo::probe(&path, &RuntimeConfig::default()).expect("real model probe");
         assert_eq!(info.input_name, "x");
@@ -314,7 +210,9 @@ mod real_model_tests {
 
     #[test]
     fn real_model_metadata_contains_tokenizer() {
-        let path = real_model().expect("real model not found; set RAPID_OCR_MODEL_ROOT");
+        let Some(path) = real_model() else {
+            return;
+        };
         let info =
             FormulaModelInfo::probe(&path, &RuntimeConfig::default()).expect("real model probe");
         let json: serde_json::Value = serde_json::from_str(&info.character_metadata)
@@ -352,7 +250,9 @@ mod real_model_tests {
 
     #[test]
     fn real_model_zero_input_produces_int64_tokens() {
-        let path = real_model().expect("real model not found; set RAPID_OCR_MODEL_ROOT");
+        let Some(path) = real_model() else {
+            return;
+        };
         let rt = RuntimeConfig::default();
         let mut session =
             crate::runtime::session::OrtSession::open_unchecked(&path, &rt).expect("open session");

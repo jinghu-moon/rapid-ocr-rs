@@ -5,3 +5,4 @@
 
 pub mod formula;
 pub mod ocr;
+pub mod stats;

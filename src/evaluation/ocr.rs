@@ -272,6 +272,10 @@ mod tests {
             box_: Some(polygon.map(|p| [p[0] as f64, p[1] as f64])),
             txt: "ok".into(),
             score: 0.9,
+            kind: "text",
+            latex: None,
+            eos_index: None,
+            truncated: None,
         }];
         let metrics = evaluate_case("ok", &[polygon], &predicted, 0.5);
         assert_eq!(metrics.cer, 0.0);

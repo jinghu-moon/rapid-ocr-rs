@@ -617,12 +617,37 @@ FormulaRecognizer::recognize_batch(images)
 
 页面级集成任务：
 
-- [ ] 定义 `RegionKind::Formula` 或等价明确类型；
-- [ ] 明确公式 region 是否跳过普通 CTC 识别；
-- [ ] 明确 JSON/Markdown/HTML 的 LaTeX 表示；
-- [ ] 保留 crop 坐标和模型信息；
-- [ ] 增加公式检测误检、漏检和重叠区域测试；
-- [ ] 公式功能关闭时普通 OCR 行为必须与基线一致。
+- [x] 定义 `RegionKind::Formula` 或等价明确类型；
+- [x] 明确公式 region 是否跳过普通 CTC 识别；
+- [x] 明确 JSON/Markdown/HTML 的 LaTeX 表示；
+- [x] 保留 crop 坐标和模型信息；
+- [x] 增加公式检测误检、漏检和重叠区域测试；
+- [x] 公式功能关闭时普通 OCR 行为必须与基线一致。
+
+页面级集成实现要点（第二轮审核修复）：
+
+- `OcrRequest.formula: FormulaPolicy` 默认 `enabled = false`；关闭时 `recognize`
+  直接进入 `recognize_text`，不经过任何公式代码路径，因此“关闭时与基线一致”
+  是结构性保证，而不是靠分支判断。
+- 启用后：`FormulaDetector`（`pix2text-mfd-1.5.onnx`，可选）在整页上检测公式区域，
+  与 `FormulaPolicy::input_regions` 声明的区域合并，经 `formula::route`
+  过滤误检、消解重叠（IoU + 嵌套包含）、按分数排序并限制数量；
+- 公式像素在送入普通文本管线**之前**被抹白，因此 CTC 根本不会在公式上执行
+  （真正的“跳过 CTC”，不是事后丢弃结果）；
+- 公式区域从**未抹白**的原图裁剪，交给 `FormulaRecognizer`，作为独立的
+  `RegionKind::Formula` 区域追加，保留 polygon、检测分数与模型标识；
+  `OcrOutput::validate()` 强制“公式区域不得携带 CTC recognition”这一不变量；
+- 公式区域不伪造 per-character 置信度：`RecognitionOutcome` 对公式区域恒为 `None`；
+- `roi` 与 `tile` 与公式路由互斥，启用时返回结构化 `InvalidInput`（坐标语义会分叉）；
+- 输出：JSON 增加 `kind`/`latex`/`eos_index`/`truncated` 与顶层 `formulas`；
+  Markdown 按阅读顺序输出 `$$...$$`；HTML 单独渲染公式多边形与 LaTeX 列表。
+- 已知且被测试锁定的限制：
+  - 误检：检测器在非公式页面上（代码页、密集正文）默认阈值下会产生误检，
+    误检区域内的文本会被一并从文本通道移除；提高 `confidence_threshold`
+    可恢复到基线（集成测试用 0.95 验证）。
+  - 漏检：检测器未命中的公式仍留在文本通道，会被 CTC 识别成乱码，当前没有
+    跨模型仲裁机制。
+  - 公式裁剪使用四边形的最小外接矩形。
 
 ---
 
@@ -659,6 +684,22 @@ FormulaRecognizer::recognize_batch(images)
 - [x] 序列长度有上限；
 - [x] 图内 Loop 不应因异常输入导致无界内存增长；
 - [x] URL/文件输入不得在校验前完整缓冲超大数据。
+
+第二轮修复补充（根因）：
+
+- 公式输入加载不再自己实现限制逻辑，统一走共享 `input::image_loader`，
+  与普通 OCR 的编码字节、解码像素、header 探测、URL `Content-Length`、
+  流式读取上限与超时语义完全一致；
+- `max_encoded_bytes` 统一适用于所有编码输入（含调用方内存字节），
+  不再存在“文件/URL 受限、内存字节不受限”的语义分叉；
+- **序列长度上限根因修正**：模型图内 `Loop` 的输出宽度上限为 2561 列；
+  当 batch 中任一 样本在 Loop 预算内没有产生 EOS 时，ONNX Runtime 会把
+  **整个 batch** 补齐到 2561 列。原默认上限 2560 会让这一批整体被拒绝，
+  连带丢掉同批识别正确的样本（实测 501 张 val 中有 8 个 batch 触发）。
+  现在默认上限为 4096，并新增常量 `FORMULA_MODEL_LOOP_BOUND = 2561` 与
+  编译期断言 `DEFAULT_MAX_FORMULA_SEQUENCE_LENGTH > FORMULA_MODEL_LOOP_BOUND`；
+- `sha256_file` 的 1 MiB 栈缓冲区改为堆分配：Windows 主线程默认只有 1 MiB 栈，
+  原实现在 CLI/benchmark 中会直接 stack overflow。
 
 ---
 
@@ -701,12 +742,31 @@ im2latex_formulas.norm.lst
 
 任务：
 
-- [ ] 先跑 100 张固定 smoke subset；
-- [ ] 再跑完整 10,355 张测试集；
-- [ ] 记录吞吐、P50/P95、峰值内存和失败数；
-- [ ] 记录 exact token match、LaTeX exact match、normalized match、CER；
-- [ ] 将文本解码错误与模型识别错误分开统计；
-- [ ] 测试顺序稳定，可重复生成相同 manifest/hash。
+- [x] 先跑 100 张固定 smoke subset；
+- [x] 再跑完整 10,355 张测试集；
+- [x] 记录吞吐、P50/P95、峰值内存和失败数；
+- [x] 记录 exact token match、LaTeX exact match、normalized match、CER；
+- [x] 将文本解码错误与模型识别错误分开统计；
+- [x] 测试顺序稳定，可重复生成相同 manifest/hash。
+
+实现（第二轮审核修复）：
+
+- 新增 `src/bin/formula_eval.rs`（取代只支持一个数据集的 `formula_compare`），
+  支持 `im2latex` / `latexocr` / `unimer` 三个数据集；
+- 抽样使用**内容哈希排序**而不是“取前 N 张”：同一数据集/切分/子集/数量在任何
+  机器上得到同一子集，且顺序与文件系统无关；`--sample first` 仅用于复现历史结果；
+- `--manifest-output` 写出每个样本的相对路径与真值 SHA-256 及整体 manifest 哈希；
+  `--expect-manifest` 在哈希不一致时直接失败，避免“换了一批样本却照常出报告”；
+- `--python-reference` 内建 Rust/Python 对比：完整 token 行、EOS 前 token 序列、
+  EOS index、truncated、LaTeX 一致数，以及双方都错的样本数（模型识别错误）与
+  逐条列出的链路差异；
+- 失败分类：`image_decode` / `inference` / `tokenizer_decode` / `input_rejected`
+  （链路差异候选）与 `truncated_no_eos` / `model_mismatch`（模型识别质量）分开统计；
+- manifest 驱动的 Python 参考：`tools/formula_reference.py --manifest`，Python 不再
+  重复实现抽样，只在 Rust 选定的样本上运行；
+- 汇总与失败样本导出：`tools/summarize_formula_eval.py`；
+- 全流程驱动脚本：`tools/run_formula_evaluation.ps1`（顺序执行，避免 CPU 争用
+  扭曲吞吐）。
 
 ### 10.3 UniMER 评测
 
@@ -719,11 +779,15 @@ SCE 4742
 HWE 6332
 ```
 
-- [ ] SPE/CPE/SCE 作为 PP-FormulaNet-M 的主结果；
-- [ ] HWE 单独报告；
-- [ ] 不能把 HWE 结果混入印刷公式平均值掩盖领域差异；
-- [ ] 报告每组样本数、缺失数和失败数；
-- [ ] 保留固定抽样 manifest，避免只报告对模型有利的样本。
+- [x] SPE/CPE/SCE 作为 PP-FormulaNet-M 的主结果；
+- [x] HWE 单独报告；
+- [x] 不能把 HWE 结果混入印刷公式平均值掩盖领域差异；
+- [x] 报告每组样本数、缺失数和失败数；
+- [x] 保留固定抽样 manifest，避免只报告对模型有利的样本。
+
+实现：`formula_eval --dataset unimer --subset spe|cpe|sce|hwe` 每个子集单独运行、
+单独输出报告与 manifest；`summary.dataset` 记录为 `unimer_<subset>`，
+汇总表按子集分行，不做任何跨子集平均。
 
 ### 10.4 RapidDoc/Python/Rust 三方对比
 
@@ -764,6 +828,14 @@ HWE 6332
 - batch=1/2/4/8。
 
 不要只报告端到端平均值，避免预处理或初始化掩盖模型性能。
+
+第二轮修复：`formula_bench` 重写为分阶段**多轮采样统计**——
+每个指标记录 `samples` / `min` / `max` / `mean` / `P50` / `P95` / `stddev`，
+区分 `--warmup`（不计入统计）与 `--rounds`（计入统计），batch 表同时给出
+整批耗时与单图分摊耗时，并验证 batch 不改变 token 序列
+（`deterministic_tokens`）。峰值内存由共享 `runtime::memory` 采集
+（Windows `GetProcessMemoryInfo.PeakWorkingSetSize` / Linux `VmHWM`），
+分别记录启动、会话创建后与结束时的值。
 
 ### 11.2 性能验收
 
@@ -848,14 +920,36 @@ CPUExecutionProvider
 ```powershell
 cargo test --all-targets
 cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
 cargo check --features directml-provider,cuda-provider,cann-provider
 ```
 
 以及：
 
 ```powershell
-# 公式 smoke / benchmark 命令
-# 必须在实现后写成可复制执行的真实命令，不得保留伪命令。
+# 外部资产（模型/测试集）通过环境变量引用；缺失时相关测试显式 skip。
+$env:RAPID_OCR_MODEL_ROOT = "<workspace>/OCR-Model"
+$env:RAPID_OCR_FORMULA_TEST_ROOT = "<workspace>/Formula-TestSet"
+# 需要“缺资产即失败”的流水线：
+# $env:RAPID_OCR_REQUIRE_EXTERNAL_ASSETS = "1"
+
+# 公式 smoke / 主评测 / 性能（完整命令见 README 与 tools/run_formula_evaluation.ps1）
+cargo run --release --bin formula_eval -- --model <model.onnx> --dataset-root <Formula-TestSet> `
+  --dataset im2latex --split test --limit 100 --output target/formula-eval/im2latex-100.json
+cargo run --release --bin formula_eval -- --model <model.onnx> --dataset-root <Formula-TestSet> `
+  --dataset unimer --subset spe --output target/formula-eval/unimer-spe.json
+cargo run --release --bin formula_bench -- --model <model.onnx> --image <formula1.png> --image <formula2.png> `
+  --rounds 5 --warmup 1 --batch-sizes 1,2,4,8 --provider cpu
+
+# 页面级公式路由 CLI
+cargo run --release --bin rapidocr -- run --img-path <page.png> --config <config.yaml> `
+  --formula-model <model.onnx> --formula-detector <pix2text-mfd-1.5.onnx> --json
+
+# fixture / fixture 校验的重新生成
+python tools/build_formula_onnx_fixtures.py
+python tools/build_ftfy_tables.py --check
+python tools/formula_ftfy_reference.py
+python tools/formula_detect_reference.py
 ```
 
 ---
@@ -864,23 +958,27 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 
 只有以下条件全部满足，公式识别任务才算完成：
 
-- [ ] 模型和 tokenizer 来源、哈希、许可证已记录；
-- [ ] 阶段 0A/0B 已完成：普通 OCR 已归拢到 `src/ocr/`，公式实现位于 `src/formula/`，共享层没有反向领域依赖；
-- [ ] Rust `ort` 可加载 RapidDoc ONNX；
-- [ ] 预处理 tensor 有独立 golden 测试；
-- [ ] Formula session 使用独立的 `INT64` rank-2 契约；
-- [ ] Formula tokenizer 正确处理 BOS/PAD/EOS；
-- [ ] 单图和 batch 结果正确且顺序稳定；
-- [ ] 501 张 smoke 集的 Rust/Python token 和 LaTeX 差异已分类；
-- [ ] im2latex 100 张 smoke 和 10,355 张完整测试已完成；
-- [ ] UniMER SPE/CPE/SCE 已完成，HWE 单独报告；
-- [ ] exact match、normalized match、CER、EOS/truncated、失败数均已报告；
-- [ ] 性能、内存、线程和 provider 信息已记录；
-- [ ] 普通 OCR 修改前后测试和真实图片回归通过；
-- [ ] 默认、DirectML、CUDA、CANN 相关验证已执行或明确记录环境阻塞；
-- [ ] 没有保留公式专用兼容层、旧无效实现、重复 tokenizer 或未解释 TODO；
-- [ ] README、docs、第三方说明和 `.gitignore` 已同步；
-- [ ] 所有结论都有实际命令和可审查输出支撑。
+- [x] 模型和 tokenizer 来源、哈希、许可证已记录；
+- [x] 阶段 0A/0B 已完成：普通 OCR 已归拢到 `src/ocr/`，公式实现位于 `src/formula/`，共享层没有反向领域依赖；
+- [x] Rust `ort` 可加载 RapidDoc ONNX；
+- [x] 预处理 tensor 有独立 golden 测试；
+- [x] Formula session 使用独立的 `INT64` rank-2 契约；
+- [x] Formula tokenizer 正确处理 BOS/PAD/EOS；
+- [x] 单图和 batch 结果正确且顺序稳定；
+- [x] 501 张 smoke 集的 Rust/Python token 和 LaTeX 差异已分类；
+- [x] im2latex 100 张 smoke 和 10,355 张完整测试已完成；
+- [x] UniMER SPE/CPE/SCE 已完成，HWE 单独报告；
+- [x] exact match、normalized match、CER、EOS/truncated、失败数均已报告；
+- [x] 性能、内存、线程和 provider 信息已记录；
+- [x] 普通 OCR 修改前后测试和真实图片回归通过；
+- [x] 默认、DirectML、CUDA、CANN 相关验证已执行或明确记录环境阻塞；
+- [x] 没有保留公式专用兼容层、旧无效实现、重复 tokenizer 或未解释 TODO；
+- [x] README、docs、第三方说明和 `.gitignore` 已同步；
+- [x] 所有结论都有实际命令和可审查输出支撑；
+- [x] 页面级公式路由（`RegionKind::Formula`、公式检测与 crop、跳过 CTC、
+  JSON/Markdown/HTML 表示、误检/漏检/重叠测试）已实现；
+- [x] `cargo clippy --all-targets -- -D warnings` 通过；
+- [x] 干净 clone 中 `cargo test --all-targets` 不需要任何外部模型或数据集即可通过。
 
 ---
 

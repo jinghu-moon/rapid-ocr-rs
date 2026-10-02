@@ -272,11 +272,25 @@ fn decide_provider_resolution(
     })
 }
 
-#[cfg(any(
-    feature = "cuda-provider",
-    feature = "directml-provider",
-    feature = "cann-provider"
-))]
+/// Rejects a provider resolution that silently fell back to CPU.
+///
+/// `RuntimeConfig::fail_if_provider_unavailable` is a process-wide policy: by
+/// default an unavailable accelerator degrades to CPU. Domains whose contract
+/// requires the requested accelerator (the formula token session) must call
+/// this instead of trusting that flag, so a caller can never observe a
+/// different execution provider than the one it asked for.
+pub fn require_requested_provider(resolution: ProviderResolution) -> Result<ProviderResolution> {
+    if resolution.fallback_used {
+        return Err(RapidOcrError::UnsupportedProvider(format!(
+            "requested execution provider {} is unavailable and this domain rejects silent CPU \
+             fallback; enable the provider feature, install its runtime, or request \
+             `ProviderPreference::Cpu` explicitly",
+            format_provider_preference(resolution.requested)
+        )));
+    }
+    Ok(resolution)
+}
+
 fn format_provider_preference(preference: ProviderPreference) -> String {
     match preference {
         ProviderPreference::Cpu => "cpu".to_string(),
@@ -290,6 +304,7 @@ fn format_provider_preference(preference: ProviderPreference) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{ProviderResolution, require_requested_provider};
     #[cfg(any(
         feature = "cuda-provider",
         feature = "directml-provider",
@@ -304,6 +319,8 @@ mod tests {
         feature = "cann-provider"
     ))]
     use crate::config::ProviderPreference;
+    use crate::config::ProviderPreference as AnyProviderPreference;
+    use crate::runtime::provider::ResolvedExecutionProvider as AnyResolvedExecutionProvider;
 
     #[test]
     #[cfg(all(target_os = "windows", feature = "directml-provider"))]
@@ -380,5 +397,49 @@ mod tests {
         .expect("fallback should succeed");
         assert!(resolution.fallback_used);
         assert_eq!(resolution.resolved, ResolvedExecutionProvider::Cpu);
+    }
+
+    #[test]
+    fn require_requested_provider_rejects_silent_cpu_fallback() {
+        let resolution = ProviderResolution {
+            requested: AnyProviderPreference::Cuda { device_id: 0 },
+            resolved: AnyResolvedExecutionProvider::Cpu,
+            fallback_used: true,
+        };
+        let error = require_requested_provider(resolution)
+            .expect_err("fallback must be rejected regardless of process-wide policy");
+        assert!(
+            matches!(error, crate::error::RapidOcrError::UnsupportedProvider(_)),
+            "error: {error}"
+        );
+        assert!(
+            error.to_string().contains("cuda(device_id=0)"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn require_requested_provider_accepts_resolved_accelerator_and_cpu() {
+        let accelerated = ProviderResolution {
+            requested: AnyProviderPreference::DirectMl { device_id: 1 },
+            resolved: AnyResolvedExecutionProvider::DirectMl,
+            fallback_used: false,
+        };
+        assert_eq!(
+            require_requested_provider(accelerated)
+                .expect("resolved provider must pass")
+                .resolved,
+            AnyResolvedExecutionProvider::DirectMl
+        );
+
+        let cpu = ProviderResolution {
+            requested: AnyProviderPreference::Cpu,
+            resolved: AnyResolvedExecutionProvider::Cpu,
+            fallback_used: false,
+        };
+        assert!(
+            require_requested_provider(cpu).is_ok(),
+            "explicit CPU must always pass"
+        );
     }
 }

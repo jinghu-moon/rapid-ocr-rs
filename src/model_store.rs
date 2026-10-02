@@ -133,7 +133,9 @@ fn extract_file_name(url: &str) -> Result<String> {
 pub fn sha256_file(path: impl AsRef<Path>) -> Result<String> {
     let mut file = fs::File::open(path.as_ref())?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    // 缓冲区放在堆上：Windows 主线程默认只有 1 MiB 栈，1 MiB 的栈数组会在
+    // 调用方（CLI/benchmark）直接触发 stack overflow。
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {

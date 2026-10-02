@@ -1,0 +1,143 @@
+{
+  "ftfy_version": "6.3.1",
+  "generator": "tools/formula_ftfy_reference.py",
+  "implemented_steps": [
+    "remove_terminal_escapes",
+    "fix_c1_controls",
+    "fix_latin_ligatures",
+    "fix_character_width",
+    "uncurl_quotes",
+    "fix_line_breaks",
+    "normalization(NFC)",
+    "remove_control_chars"
+  ],
+  "unimplemented_steps": [
+    "unescape_html",
+    "fix_encoding",
+    "restore_byte_a0",
+    "replace_lossy_sequences",
+    "decode_inconsistent_utf8"
+  ],
+  "not_applicable_steps": [
+    "fix_surrogates"
+  ],
+  "equivalent": [
+    {
+      "input": "“here’s a test”",
+      "expected": "\"here's a test\""
+    },
+    {
+      "input": "ʼtestʼ",
+      "expected": "'test'"
+    },
+    {
+      "input": "fluffiest ﬂﬃﬆ",
+      "expected": "fluffiest flffist"
+    },
+    {
+      "input": "ＬＯＵＤ　ＮＯＩＳＥＳ",
+      "expected": "LOUD NOISES"
+    },
+    {
+      "input": "Ǆǅǆ Ĳĳ ŉ",
+      "expected": "DŽDždž IJij 'n"
+    },
+    {
+      "input": "a\r\nb\rc d ef",
+      "expected": "a\nb\nc\nd\ne…f"
+    },
+    {
+      "input": "é",
+      "expected": "é"
+    },
+    {
+      "input": "\u001b[36;44mblue\u001b[0m",
+      "expected": "blue"
+    },
+    {
+      "input": "a\u0000b\u000bc\u000ed",
+      "expected": "abcd"
+    },
+    {
+      "input": "﻿bom",
+      "expected": "bom"
+    },
+    {
+      "input": "\\mathrm { V o r g ä n g e “ }",
+      "expected": "\\mathrm { V o r g ä n g e \" }"
+    },
+    {
+      "input": "\\frac{a}{b}",
+      "expected": "\\frac{a}{b}"
+    },
+    {
+      "input": "\\begin{array}{cc}a&b\\\\c&d\\end{array}",
+      "expected": "\\begin{array}{cc}a&b\\\\c&d\\end{array}"
+    },
+    {
+      "input": "x^{2}+y^{2}=z^{2}",
+      "expected": "x^{2}+y^{2}=z^{2}"
+    },
+    {
+      "input": "\\left( \\frac{a}{b} \\right)",
+      "expected": "\\left( \\frac{a}{b} \\right)"
+    }
+  ],
+  "documented_divergence": [
+    {
+      "input": "&amp;",
+      "rust_expected": "&amp;",
+      "full_ftfy": "&",
+      "step": "unescape_html"
+    },
+    {
+      "input": "&lt;tag&gt;",
+      "rust_expected": "&lt;tag&gt;",
+      "full_ftfy": "<tag>",
+      "step": "unescape_html"
+    },
+    {
+      "input": "P&eacute;rez",
+      "rust_expected": "P&eacute;rez",
+      "full_ftfy": "Pérez",
+      "step": "unescape_html"
+    },
+    {
+      "input": "P&EACUTE;REZ",
+      "rust_expected": "P&EACUTE;REZ",
+      "full_ftfy": "PÉREZ",
+      "step": "unescape_html"
+    },
+    {
+      "input": "Ã©tÃ©",
+      "rust_expected": "Ã©tÃ©",
+      "full_ftfy": "été",
+      "step": "fix_encoding"
+    },
+    {
+      "input": "cafÃ©",
+      "rust_expected": "cafÃ©",
+      "full_ftfy": "café",
+      "step": "fix_encoding"
+    },
+    {
+      "input": "â",
+      "rust_expected": "â€™",
+      "full_ftfy": "'",
+      "step": "fix_encoding"
+    },
+    {
+      "input": "Ã©",
+      "rust_expected": "Ã©",
+      "full_ftfy": "é",
+      "step": "fix_encoding"
+    }
+  ],
+  "real_corpus_probe": {
+    "description": "真实标签语料上的 ftfy 生效次数（证明未实现步骤的实测影响）",
+    "lines": 357022,
+    "changed_by_full_ftfy": 1,
+    "changed_by_deterministic_only": 1,
+    "divergence_samples": []
+  }
+}

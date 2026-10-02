@@ -178,21 +178,6 @@ pub fn enhance_screen_adaptive(img: &RecImage) -> Result<RecImage> {
     RecImage::from_bgr_u8(img.width(), img.height(), out)
 }
 
-#[cfg(test)]
-mod enhancement_tests {
-    use super::enhance_screen_adaptive;
-    use crate::config::RecImage;
-
-    #[test]
-    fn screen_adaptive_stretches_contrast_without_changing_geometry() {
-        let image = RecImage::from_bgr_u8(2, 1, vec![20, 20, 20, 80, 80, 80]).unwrap();
-        let enhanced = enhance_screen_adaptive(&image).unwrap();
-        assert_eq!((enhanced.width(), enhanced.height()), (2, 1));
-        assert_eq!(enhanced.as_bytes()[0], 0);
-        assert_eq!(enhanced.as_bytes()[3], 255);
-    }
-}
-
 fn resize_with_bound(
     img: &RecImage,
     side_len: usize,
@@ -258,4 +243,19 @@ fn rotate_90(img: RecImage) -> Result<RecImage> {
         }
     }
     RecImage::from_bgr_u8(new_w, new_h, out)
+}
+
+#[cfg(test)]
+mod enhancement_tests {
+    use super::enhance_screen_adaptive;
+    use crate::config::RecImage;
+
+    #[test]
+    fn screen_adaptive_stretches_contrast_without_changing_geometry() {
+        let image = RecImage::from_bgr_u8(2, 1, vec![20, 20, 20, 80, 80, 80]).unwrap();
+        let enhanced = enhance_screen_adaptive(&image).unwrap();
+        assert_eq!((enhanced.width(), enhanced.height()), (2, 1));
+        assert_eq!(enhanced.as_bytes()[0], 0);
+        assert_eq!(enhanced.as_bytes()[3], 255);
+    }
 }

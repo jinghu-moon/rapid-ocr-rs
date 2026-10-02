@@ -426,18 +426,48 @@ mod tests {
 
     use super::*;
 
-    const TEST_ROOT: &str = r"D:\100_Projects\110_Daily\SnapClip\Formula-TestSet";
+    const TEST_ROOT_ENV: &str = "RAPID_OCR_FORMULA_TEST_ROOT";
 
-    fn test_root() -> PathBuf {
-        PathBuf::from(TEST_ROOT)
+    /// 公开测试集不随 crate 提交；缺失时必须 skip，不允许 panic 或回落到绝对路径。
+    fn launcher_root(relative: &str) -> Option<PathBuf> {
+        let root = crate::test_support::formula_dataset_root()?;
+        let path = root.join(relative);
+        if path.exists() {
+            Some(path)
+        } else {
+            crate::test_support::asset(
+                &format!(
+                    "formula dataset `{relative}` under {} (set {TEST_ROOT_ENV})",
+                    root.display()
+                ),
+                None,
+            )
+        }
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        let mut root = std::env::temp_dir();
+        root.push(format!("rapid-ocr-rs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp dir");
+        root
+    }
+
+    /// 取测试集子目录，缺失时直接跳过当前测试。
+    macro_rules! dataset_root {
+        ($relative:expr) => {
+            match launcher_root($relative) {
+                Some(root) => root,
+                None => return,
+            }
+        };
     }
 
     #[test]
     fn missing_root_returns_structured_error() {
-        let root = test_root().join("does-not-exist");
+        let root = temp_root("missing-root").join("does-not-exist");
         let result = load_im2latex(&root, FormulaSplit::Test);
-        assert!(result.is_err());
-        let err = result.err().unwrap();
+        let err = result.expect_err("missing root must fail");
         assert!(
             err.to_string().contains("does-not-exist")
                 || matches!(err, RapidOcrError::FileNotFound(_)),
@@ -447,40 +477,40 @@ mod tests {
 
     #[test]
     fn missing_label_file_returns_error() {
-        let root = test_root().join("im2latex-100k");
+        let root = dataset_root!("im2latex-100k");
         let result = load_im2latex(&root.join("nope"), FormulaSplit::Test);
         assert!(result.is_err());
     }
 
     #[test]
     fn im2latex_test_split_locates_all_images() {
-        let fixture = load_im2latex(&test_root().join("im2latex-100k"), FormulaSplit::Test)
-            .expect("im2latex test should load");
+        let root = dataset_root!("im2latex-100k");
+        let fixture = load_im2latex(&root, FormulaSplit::Test).expect("im2latex test should load");
         assert_eq!(fixture.len(), 10_355);
         assert!(fixture.samples.iter().all(|s| s.image_path.is_file()));
     }
 
     #[test]
     fn im2latex_validate_split_locates_all_images() {
-        let fixture = load_im2latex(&test_root().join("im2latex-100k"), FormulaSplit::Validate)
-            .expect("im2latex validate should load");
+        let root = dataset_root!("im2latex-100k");
+        let fixture =
+            load_im2latex(&root, FormulaSplit::Validate).expect("im2latex validate should load");
         assert_eq!(fixture.len(), 8_370);
         assert!(fixture.samples.iter().all(|s| s.image_path.is_file()));
     }
 
     #[test]
     fn im2latex_test_and_validate_have_no_overlap() {
-        let test = load_im2latex(&test_root().join("im2latex-100k"), FormulaSplit::Test)
-            .expect("test should load");
-        let validate = load_im2latex(&test_root().join("im2latex-100k"), FormulaSplit::Validate)
-            .expect("validate should load");
+        let root = dataset_root!("im2latex-100k");
+        let test = load_im2latex(&root, FormulaSplit::Test).expect("test should load");
+        let validate = load_im2latex(&root, FormulaSplit::Validate).expect("validate should load");
         assert_eq!(overlap_count(&test, &validate), 0);
     }
 
     #[test]
     fn im2latex_empty_ground_truth_are_flagged_not_dropped() {
-        let fixture = load_im2latex(&test_root().join("im2latex-100k"), FormulaSplit::Test)
-            .expect("test should load");
+        let root = dataset_root!("im2latex-100k");
+        let fixture = load_im2latex(&root, FormulaSplit::Test).expect("test should load");
         let empty = fixture.empty_ground_truth().collect::<Vec<_>>();
         assert_eq!(
             empty.len(),
@@ -493,9 +523,7 @@ mod tests {
 
     #[test]
     fn im2latex_out_of_bounds_index_fails() {
-        let mut root = std::env::temp_dir();
-        root.push("im2latex-oob-test");
-        std::fs::create_dir_all(&root).expect("temp dir");
+        let root = temp_root("im2latex-oob-test");
         std::fs::write(
             root.join("im2latex_test_filter.lst"),
             "no_such.png 999999\n",
@@ -509,45 +537,40 @@ mod tests {
 
     #[test]
     fn im2latex_missing_image_fails_with_name() {
-        let mut root = std::env::temp_dir();
-        root.push("im2latex-missing-img");
-        std::fs::create_dir_all(&root).expect("temp dir");
+        let root = temp_root("im2latex-missing-img");
         std::fs::write(root.join("im2latex_test_filter.lst"), "no_such.png 0\n")
             .expect("write filter");
         std::fs::write(root.join("im2latex_formulas.norm.lst"), "x\n").expect("write labels");
         let result = load_im2latex(&root, FormulaSplit::Test);
-        let err = result.err().expect("must fail");
+        let err = result.expect_err("must fail");
         assert!(err.to_string().contains("no_such.png"), "error: {err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn latex_ocr_example_val_has_501_and_valid_images() {
-        let fixture = load_latex_ocr_example(
-            &test_root().join("ocr_rec_latexocr_dataset_example"),
-            FormulaSplit::Validate,
-        )
-        .expect("val split should load");
+        let root = dataset_root!("ocr_rec_latexocr_dataset_example");
+        let fixture =
+            load_latex_ocr_example(&root, FormulaSplit::Validate).expect("val split should load");
         assert_eq!(fixture.len(), 501);
         assert!(fixture.samples.iter().all(|s| s.image_path.is_file()));
     }
 
     #[test]
     fn latex_ocr_example_missing_image_fails() {
-        let mut root = std::env::temp_dir();
-        root.push("latexocr-missing");
-        std::fs::create_dir_all(&root.join("images")).expect("temp dir");
+        let root = temp_root("latexocr-missing");
+        std::fs::create_dir_all(root.join("images")).expect("temp dir");
         std::fs::write(root.join("val.txt"), "images/nope.png\t\\int\n").expect("write val");
         let result = load_latex_ocr_example(&root, FormulaSplit::Validate);
-        let err = result.err().expect("must fail");
+        let err = result.expect_err("must fail");
         assert!(err.to_string().contains("nope.png"), "error: {err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn unimer_spe_maps_filenames_to_label_lines() {
-        let fixture = load_unimer(&test_root().join("UniMER-Test"), UniMerSubset::Spe)
-            .expect("spe should load");
+        let root = dataset_root!("UniMER-Test");
+        let fixture = load_unimer(&root, UniMerSubset::Spe).expect("spe should load");
         assert_eq!(fixture.len(), 6_762);
         let sample = &fixture.samples[0];
         let rendered = sample
@@ -563,35 +586,35 @@ mod tests {
 
     #[test]
     fn unimer_cpe_is_zip_mapped() {
-        let fixture = load_unimer(&test_root().join("UniMER-Test"), UniMerSubset::Cpe)
-            .expect("cpe should load");
+        let root = dataset_root!("UniMER-Test");
+        let fixture = load_unimer(&root, UniMerSubset::Cpe).expect("cpe should load");
         assert_eq!(fixture.len(), 5_921);
     }
 
     #[test]
     fn unimer_sce_maps_filenames_to_label_lines() {
-        let fixture = load_unimer(&test_root().join("UniMER-Test"), UniMerSubset::Sce)
-            .expect("sce should load");
+        let root = dataset_root!("UniMER-Test");
+        let fixture = load_unimer(&root, UniMerSubset::Sce).expect("sce should load");
         assert_eq!(fixture.len(), 4_742);
     }
 
     #[test]
     fn unimer_hwe_maps_filenames_to_label_lines() {
-        let fixture = load_unimer(&test_root().join("UniMER-Test"), UniMerSubset::Hwe)
-            .expect("hwe should load");
+        let root = dataset_root!("UniMER-Test");
+        let fixture = load_unimer(&root, UniMerSubset::Hwe).expect("hwe should load");
         assert_eq!(fixture.len(), 6_332);
     }
 
     #[test]
     fn unimer_each_subset_first_middle_last_mapping_and_decodable() {
+        let root = dataset_root!("UniMER-Test");
         for subset in [
             UniMerSubset::Spe,
             UniMerSubset::Cpe,
             UniMerSubset::Sce,
             UniMerSubset::Hwe,
         ] {
-            let fixture =
-                load_unimer(&test_root().join("UniMER-Test"), subset).expect("subset should load");
+            let fixture = load_unimer(&root, subset).expect("subset should load");
             assert!(!fixture.is_empty(), "{} empty", subset.as_str());
             let count = fixture.len();
             let pick = [0, count / 2, count - 1];
@@ -630,7 +653,10 @@ mod tests {
 
     #[test]
     fn unimer_out_of_bounds_index_fails() {
-        let result = load_unimer(&test_root().join("does-not-exist"), UniMerSubset::Spe);
+        let result = load_unimer(
+            &temp_root("unimer-missing").join("does-not-exist"),
+            UniMerSubset::Spe,
+        );
         assert!(result.is_err());
     }
 
@@ -638,20 +664,12 @@ mod tests {
     fn unicode_and_space_paths_are_readable() {
         // im2latex filenames are ASCII, but verify loader handles a Unicode-named tree
         // and an image name that contains a space (index is the final token).
-        let mut root = std::env::temp_dir();
-        root.push("公式 测试");
-        let _ = std::fs::remove_dir_all(&root);
+        let root = temp_root("unicode-space").join("公式 测试");
         std::fs::create_dir_all(&root).expect("temp dir");
         std::fs::write(root.join("im2latex_formulas.norm.lst"), "a+b\n").expect("labels");
         std::fs::write(root.join("im2latex_test_filter.lst"), "图像 1.png 0\n").expect("filter");
         std::fs::write(root.join("图像 1.png"), "not-really-png").expect("image file");
-        let result = load_im2latex(&root, FormulaSplit::Test);
-        assert!(
-            result.is_ok(),
-            "unicode path should load: {:?}",
-            result.err()
-        );
-        let fixture = result.unwrap();
+        let fixture = load_im2latex(&root, FormulaSplit::Test).expect("unicode path should load");
         assert_eq!(fixture.len(), 1);
         assert_eq!(fixture.samples[0].image_path, root.join("图像 1.png"));
         let _ = std::fs::remove_dir_all(&root);

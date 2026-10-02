@@ -6,20 +6,16 @@
 use std::path::{Path, PathBuf};
 
 use ndarray::{Array2, ArrayView4};
-use ort::value::TensorElementType;
 
 use crate::{
     config::RuntimeConfig,
     error::{RapidOcrError, Result},
+    formula::contract::validate_formula_contract,
     runtime::{
-        contracts::{
-            require_fixed_dim, require_single_input, require_single_output, require_tensor,
-        },
-        provider::ProviderResolution,
+        provider::{ProviderResolution, require_requested_provider},
         session::OrtSession,
     },
 };
-
 #[derive(Debug)]
 pub struct FormulaSession {
     inner: OrtSession,
@@ -34,20 +30,17 @@ impl FormulaSession {
             return Err(RapidOcrError::FileNotFound(model_path.to_path_buf()));
         }
         let inner = OrtSession::open_unchecked(model_path, runtime_cfg)?;
+        // 公式域契约：请求了加速器却只拿到 CPU 回退时必须失败，不能静默降级。
+        // 这里不依赖 `RuntimeConfig::fail_if_provider_unavailable`，因为那是进程级
+        // 默认策略，而调用方无法从 API 返回值观察到发生了回退。
+        require_requested_provider(inner.provider_resolution())?;
         let probe = inner.probe_io()?;
-        let input = require_single_input(&probe, model_path, "formula")?;
-        require_tensor(input, "input", 4, TensorElementType::Float32, model_path)?;
-        require_fixed_dim(input, "input", 1, 1, model_path)?;
-        require_fixed_dim(input, "input", 2, 384, model_path)?;
-        require_fixed_dim(input, "input", 3, 384, model_path)?;
-
-        let output = require_single_output(&probe, model_path, "formula")?;
-        require_tensor(output, "output", 2, TensorElementType::Int64, model_path)?;
+        let contract = validate_formula_contract(&probe, model_path)?;
 
         Ok(Self {
             inner,
-            input_name: input.name.clone(),
-            output_name: output.name.clone(),
+            input_name: contract.input_name,
+            output_name: contract.output_name,
             model_path: model_path.to_path_buf(),
         })
     }
@@ -175,6 +168,40 @@ mod tests {
         assert!(
             error.to_string().contains("[N,1,384,384]"),
             "error: {error}"
+        );
+    }
+
+    /// 公式域不接受静默回退：即使 `fail_if_provider_unavailable=false`，
+    /// 请求了当前构建未启用的 provider 也必须返回结构化错误。
+    #[test]
+    #[cfg(not(feature = "cuda-provider"))]
+    fn unavailable_provider_is_rejected_even_without_strict_flag() {
+        let runtime = RuntimeConfig {
+            provider_preference: crate::config::ProviderPreference::Cuda { device_id: 0 },
+            fail_if_provider_unavailable: false,
+            ..RuntimeConfig::default()
+        };
+        let error = FormulaSession::new(&fixture("formula_ok.onnx"), &runtime)
+            .expect_err("unavailable accelerator must not fall back to CPU");
+        assert!(
+            matches!(error, RapidOcrError::UnsupportedProvider(_)),
+            "error: {error}"
+        );
+    }
+
+    /// 显式请求 CPU 时必须正常构造，证明严格语义只拒绝“回退”，不拒绝 CPU。
+    #[test]
+    fn explicit_cpu_preference_is_accepted() {
+        let runtime = RuntimeConfig {
+            provider_preference: crate::config::ProviderPreference::Cpu,
+            fail_if_provider_unavailable: true,
+            ..RuntimeConfig::default()
+        };
+        let session = FormulaSession::new(&fixture("formula_ok.onnx"), &runtime)
+            .expect("explicit CPU must be accepted");
+        assert_eq!(
+            session.provider_resolution().resolved,
+            crate::runtime::provider::ResolvedExecutionProvider::Cpu
         );
     }
 }

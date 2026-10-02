@@ -169,12 +169,14 @@ pub enum EnhancementPolicy {
 pub struct PreprocessPolicy {
     /// Maximum number of decoded pixels accepted for any image input.
     pub max_decode_pixels: u64,
-    /// Maximum encoded byte length accepted for file and URL inputs.
+    /// Maximum encoded byte length accepted for any encoded image input.
     ///
-    /// Encoded bytes and decoded pixel buffers supplied by the caller are
-    /// already in memory and are covered by `max_decode_pixels`. This bound
-    /// prevents file/URL loading from buffering arbitrarily large compressed
-    /// payloads before the pixel limit can be checked.
+    /// This bound applies uniformly to file, URL and caller-supplied encoded
+    /// buffers so compressed payloads are rejected before any decode attempt.
+    /// URL bodies are additionally streamed with a hard read cap derived from
+    /// this value, so an absent or lying `Content-Length` cannot force an
+    /// unbounded buffer. Decoded pixel buffers are covered separately by
+    /// `max_decode_pixels`.
     pub max_encoded_bytes: u64,
     /// Maximum long side for engine preprocessing.
     ///
@@ -261,20 +263,11 @@ impl StagePlan {
         Ok(())
     }
 }
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct DetectionPolicy {
     pub box_thresh: Option<f32>,
     pub unclip_ratio: Option<f32>,
     pub text_score: Option<f32>,
-}
-impl Default for DetectionPolicy {
-    fn default() -> Self {
-        Self {
-            box_thresh: None,
-            unclip_ratio: None,
-            text_score: None,
-        }
-    }
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RecognitionPolicy {
@@ -313,10 +306,27 @@ pub struct OcrRequest {
     pub detection: DetectionPolicy,
     pub recognition: RecognitionPolicy,
     pub output: OutputPolicy,
+    /// 页面级公式路由；默认关闭，关闭时行为与不含公式功能时一致。
+    pub formula: FormulaPolicy,
 }
 impl OcrRequest {
     pub fn validate(&self) -> Result<()> {
         self.stages.validate(self.recognition.words)?;
+        self.formula.validate()?;
+        if self.formula.enabled {
+            if self.roi.is_some() {
+                return Err(RapidOcrError::InvalidInput(
+                    "formula routing does not support `roi`: formula regions are expressed in \
+                     original image coordinates"
+                        .into(),
+                ));
+            }
+            if self.preprocess.tile.is_some() {
+                return Err(RapidOcrError::InvalidInput(
+                    "formula routing does not support tiled preprocessing".into(),
+                ));
+            }
+        }
         if self.preprocess.max_decode_pixels == 0 {
             return Err(RapidOcrError::InvalidInput(
                 "max_decode_pixels must be greater than zero".into(),
@@ -332,50 +342,49 @@ impl OcrRequest {
                 "max_side must be greater than zero when set".into(),
             ));
         }
-        if let Some(v) = self.preprocess.min_text_scale {
-            if !v.is_finite() || v <= 0.0 {
-                return Err(RapidOcrError::InvalidInput(
-                    "min_text_scale must be finite and greater than zero".into(),
-                ));
-            }
+        if let Some(v) = self.preprocess.min_text_scale
+            && (!v.is_finite() || v <= 0.0)
+        {
+            return Err(RapidOcrError::InvalidInput(
+                "min_text_scale must be finite and greater than zero".into(),
+            ));
         }
-        if let Some(v) = self.scale_hint {
-            if !v.is_finite() || v <= 0.0 {
-                return Err(RapidOcrError::InvalidInput(
-                    "scale_hint must be finite and greater than zero".into(),
-                ));
-            }
+        if let Some(v) = self.scale_hint
+            && (!v.is_finite() || v <= 0.0)
+        {
+            return Err(RapidOcrError::InvalidInput(
+                "scale_hint must be finite and greater than zero".into(),
+            ));
         }
         for (name, value) in [
             ("box_thresh", self.detection.box_thresh),
             ("text_score", self.detection.text_score),
         ] {
-            if let Some(value) = value {
-                if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-                    return Err(RapidOcrError::InvalidInput(format!(
-                        "{name} must be finite and in [0,1]"
-                    )));
-                }
+            if let Some(value) = value
+                && (!value.is_finite() || !(0.0..=1.0).contains(&value))
+            {
+                return Err(RapidOcrError::InvalidInput(format!(
+                    "{name} must be finite and in [0,1]"
+                )));
             }
         }
-        if let Some(value) = self.detection.unclip_ratio {
-            if !value.is_finite() || value <= 0.0 {
-                return Err(RapidOcrError::InvalidInput(
-                    "unclip_ratio must be finite and greater than zero".into(),
-                ));
-            }
+        if let Some(value) = self.detection.unclip_ratio
+            && (!value.is_finite() || value <= 0.0)
+        {
+            return Err(RapidOcrError::InvalidInput(
+                "unclip_ratio must be finite and greater than zero".into(),
+            ));
         }
-        if let Some(t) = self.preprocess.tile {
-            if t.max_width == 0
+        if let Some(t) = self.preprocess.tile
+            && (t.max_width == 0
                 || t.max_height == 0
                 || t.overlap >= t.max_width
-                || t.overlap >= t.max_height
-            {
-                return Err(RapidOcrError::InvalidInput(
-                    "tile dimensions must be positive and overlap must be smaller than dimensions"
-                        .into(),
-                ));
-            }
+                || t.overlap >= t.max_height)
+        {
+            return Err(RapidOcrError::InvalidInput(
+                "tile dimensions must be positive and overlap must be smaller than dimensions"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -447,20 +456,162 @@ pub struct RecognitionOutcome {
     pub score: f32,
     pub words: Option<Vec<OcrWord>>,
 }
+
+/// 区域语义：普通文本区域，或由公式模型识别的公式区域。
+///
+/// 公式区域**不携带** CTC 文本识别结果：公式模型没有可与 CTC 平行解释的
+/// per-character 置信度，强行塞进 `RecognitionOutcome` 会伪造置信度语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionKind {
+    #[default]
+    Text,
+    Formula,
+}
+
+/// 公式区域识别结果（页面级输出）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormulaOutcome {
+    /// RapidDoc 兼容的 LaTeX（含 `fix_latex` 与已实现的 `ftfy` 步骤）。
+    pub latex: String,
+    pub eos_index: Option<usize>,
+    pub truncated: bool,
+    pub model_id: String,
+    /// 原始 token 序列；仅在 `FormulaPolicy::include_token_ids` 时输出。
+    pub token_ids: Option<Vec<i64>>,
+}
+
+/// 页面级公式路由策略。
+///
+/// `enabled = false` 时页面 OCR 行为与不含公式功能时完全一致；启用后：
+///
+/// 1. 用 `detector_path` 指定的公式检测模型（可选）在整页上检测公式区域，
+///    并合并调用方通过 `input_regions` 显式声明的区域；
+/// 2. 检测区域先做去重/包含消解，再按 `text_overlap_skip_ratio` 判断哪些
+///    **文本检测框**落在公式区域内，这些框在送入普通 CTC 之前从图像上抹白，
+///    因此不会产生 CTC 文本（真正“跳过 CTC”，而不是事后丢弃结果）；
+/// 3. 公式区域使用原图（未抹白）裁剪后交给 `FormulaRecognizer` 识别；
+/// 4. 结果是独立的 [`RegionKind::Formula`] 区域，保留 crop 坐标与模型信息。
+///
+/// 不支持 `roi` 与 `tile` 同时启用（坐标映射语义会分叉），此时返回结构化错误。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormulaPolicy {
+    pub enabled: bool,
+    /// 公式识别模型（`pp_formulanet_plus_m.onnx`）；`enabled` 时必填。
+    pub model_path: Option<PathBuf>,
+    /// 可选模型 SHA-256 校验。
+    pub expected_model_sha256: Option<String>,
+    /// 页面公式检测模型（`pix2text-mfd-1.5.onnx`）；为 `None` 时只处理 `input_regions`。
+    pub detector_path: Option<PathBuf>,
+    /// 公式检测置信度阈值。
+    pub confidence_threshold: f32,
+    /// 公式检测 NMS IoU 阈值。
+    pub iou_threshold: f32,
+    /// 每页最多保留的公式区域数。
+    pub max_regions: usize,
+    /// 候选区域面积占原图面积的最小比例，用于过滤明显误检。
+    pub min_area_ratio: f32,
+    /// 调用方显式声明的公式区域（原图像素坐标）。
+    pub input_regions: Vec<Polygon>,
+    /// 文本检测框被公式区域覆盖的比例达到该值时跳过其 CTC 识别。
+    pub text_overlap_skip_ratio: f32,
+    /// 是否在输出中保留原始 token IDs。
+    pub include_token_ids: bool,
+}
+
+impl Default for FormulaPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_path: None,
+            expected_model_sha256: None,
+            detector_path: None,
+            confidence_threshold: crate::formula::detect::DEFAULT_FORMULA_DETECT_CONFIDENCE,
+            iou_threshold: crate::formula::detect::DEFAULT_FORMULA_DETECT_IOU,
+            max_regions: 64,
+            min_area_ratio: 0.000_05,
+            input_regions: Vec::new(),
+            text_overlap_skip_ratio: 0.6,
+            include_token_ids: false,
+        }
+    }
+}
+
+impl FormulaPolicy {
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.model_path.is_none() {
+            return Err(RapidOcrError::InvalidInput(
+                "formula policy requires `model_path` when enabled".into(),
+            ));
+        }
+        for (name, value) in [
+            ("confidence_threshold", self.confidence_threshold),
+            ("iou_threshold", self.iou_threshold),
+            ("min_area_ratio", self.min_area_ratio),
+            ("text_overlap_skip_ratio", self.text_overlap_skip_ratio),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(RapidOcrError::InvalidInput(format!(
+                    "formula {name} must be finite and in [0,1]"
+                )));
+            }
+        }
+        if self.max_regions == 0 {
+            return Err(RapidOcrError::InvalidInput(
+                "formula max_regions must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OcrRegion {
     pub source: RegionSource,
+    /// 区域语义；默认为普通文本区域。
+    #[serde(default)]
+    pub kind: RegionKind,
     pub polygon: Option<Polygon>,
     pub detection: Option<DetectionOutcome>,
     pub classification: Option<ClassificationOutcome>,
     pub recognition: Option<RecognitionOutcome>,
+    /// 公式区域结果；仅当 `kind == RegionKind::Formula` 时为 `Some`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula: Option<FormulaOutcome>,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+
+impl OcrRegion {
+    /// 构造普通文本区域（公式字段为空）。
+    pub fn text(
+        source: RegionSource,
+        polygon: Option<Polygon>,
+        detection: Option<DetectionOutcome>,
+        classification: Option<ClassificationOutcome>,
+        recognition: Option<RecognitionOutcome>,
+    ) -> Self {
+        Self {
+            source,
+            kind: RegionKind::Text,
+            polygon,
+            detection,
+            classification,
+            recognition,
+            formula: None,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum StageState {
+    #[default]
     Disabled,
     SkippedNoInput,
     SkippedUnavailable,
-    Completed { items: usize },
+    Completed {
+        items: usize,
+    },
 }
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct StageTiming {
@@ -473,7 +624,7 @@ impl StageTiming {
         self.preprocess_ms + self.infer_ms + self.postprocess_ms
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct StageReport {
     pub state: StageState,
     pub timing: Option<StageTiming>,
@@ -484,12 +635,15 @@ pub struct InputTimings {
     pub resize_ms: Option<f32>,
     pub crop_ms: Option<f32>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StageReports {
     pub input: InputTimings,
     pub detector: StageReport,
     pub classifier: StageReport,
     pub recognizer: StageReport,
+    /// 页面级公式路由阶段；未启用时为 `Disabled`。
+    #[serde(default)]
+    pub formula: StageReport,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OcrTimings {
@@ -509,6 +663,9 @@ pub struct OcrTimings {
     pub recognizer_infer_ms: f32,
     pub recognizer_postprocess_ms: f32,
     pub recognize_ms: f32,
+    /// 页面级公式路由耗时（检测 + 裁剪 + 公式识别）；未启用时为 0。
+    #[serde(default)]
+    pub formula_ms: f32,
     pub postprocess_ms: f32,
     pub total_ms: f32,
 }
@@ -583,6 +740,29 @@ impl OcrOutput {
             .join("\n")
     }
 
+    /// 按阅读顺序返回公式区域 (region id, latex)。
+    pub fn formula_latex(&self, order: TextOrder) -> Vec<(usize, &str)> {
+        let ids = match order {
+            TextOrder::Reading => self.reading_order(),
+            TextOrder::Detection => (0..self.regions.len()).collect(),
+        };
+        ids.into_iter()
+            .filter_map(|id| {
+                let region = self.regions.get(id)?;
+                let formula = region.formula.as_ref()?;
+                Some((id, formula.latex.as_str()))
+            })
+            .collect()
+    }
+
+    /// 公式区域数量。
+    pub fn formula_count(&self) -> usize {
+        self.regions
+            .iter()
+            .filter(|region| region.kind == RegionKind::Formula)
+            .count()
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != 1 {
             return Err(RapidOcrError::InvalidInput(format!(
@@ -591,23 +771,44 @@ impl OcrOutput {
             )));
         }
         for region in &self.regions {
+            match region.kind {
+                RegionKind::Formula => {
+                    if region.formula.is_none() {
+                        return Err(RapidOcrError::InvalidInput(
+                            "formula region must carry a formula outcome".into(),
+                        ));
+                    }
+                    if region.recognition.is_some() {
+                        return Err(RapidOcrError::InvalidInput(
+                            "formula region must not carry a CTC recognition outcome".into(),
+                        ));
+                    }
+                }
+                RegionKind::Text => {
+                    if region.formula.is_some() {
+                        return Err(RapidOcrError::InvalidInput(
+                            "text region must not carry a formula outcome".into(),
+                        ));
+                    }
+                }
+            }
             if let Some(polygon) = region.polygon {
                 polygon.validate(self.image.original_size)?;
             }
-            if let Some(detection) = &region.detection {
-                if !detection.score.is_finite() || !(0.0..=1.0).contains(&detection.score) {
-                    return Err(RapidOcrError::InvalidInput(
-                        "detection score must be finite and in [0,1]".into(),
-                    ));
-                }
+            if let Some(detection) = &region.detection
+                && (!detection.score.is_finite() || !(0.0..=1.0).contains(&detection.score))
+            {
+                return Err(RapidOcrError::InvalidInput(
+                    "detection score must be finite and in [0,1]".into(),
+                ));
             }
-            if let Some(classification) = &region.classification {
-                if !classification.score.is_finite() || !(0.0..=1.0).contains(&classification.score)
-                {
-                    return Err(RapidOcrError::InvalidInput(
-                        "classification score must be finite and in [0,1]".into(),
-                    ));
-                }
+            if let Some(classification) = &region.classification
+                && (!classification.score.is_finite()
+                    || !(0.0..=1.0).contains(&classification.score))
+            {
+                return Err(RapidOcrError::InvalidInput(
+                    "classification score must be finite and in [0,1]".into(),
+                ));
             }
             if let Some(recognition) = &region.recognition {
                 if !recognition.score.is_finite() || !(0.0..=1.0).contains(&recognition.score) {
@@ -1053,6 +1254,7 @@ mod tests {
             },
             recognition: RecognitionPolicy::default(),
             output: OutputPolicy::default(),
+            formula: FormulaPolicy::default(),
         };
         assert!(request.validate().is_err());
     }

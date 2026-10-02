@@ -40,15 +40,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut images = Vec::new();
     for e in fs::read_dir(&cli.images_dir)? {
         let p = e?.path();
-        if p.is_file() {
-            if let Some(ext) = p.extension().and_then(|v| v.to_str()) {
-                if matches!(
-                    ext.to_ascii_lowercase().as_str(),
-                    "jpg" | "jpeg" | "png" | "bmp" | "webp" | "tif" | "tiff"
-                ) {
-                    images.push(p);
-                }
-            }
+        if p.is_file()
+            && let Some(ext) = p.extension().and_then(|v| v.to_str())
+            && matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg" | "png" | "bmp" | "webp" | "tif" | "tiff"
+            )
+        {
+            images.push(p);
         }
     }
     images.sort();
@@ -119,6 +118,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             words: WordOutputMode::Off,
         },
         output: OutputPolicy::default(),
+        formula: rapid_ocr_rs::FormulaPolicy::default(),
     };
     for _ in 0..cli.warmup_rounds {
         for p in &images {

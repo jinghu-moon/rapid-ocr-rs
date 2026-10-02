@@ -1,51 +1,77 @@
 //! RapidDoc PP-FormulaNet LaTeX 后处理。
 //!
-//! 只实现 RapidDoc `fix_latex` 中影响最终输出的确定性子步骤；`ftfy.fix_text`
-//! 的 mojibake 修复暂不引入，避免引入额外 Unicode 修正库。
+//! RapidDoc 的后处理顺序是：
+//!
+//! ```text
+//! remove_chinese_text_wrapping
+//!   -> fix_latex_left_right(fix_delimiter=False)
+//!   -> fix_latex_environments
+//!   -> remove_up_commands
+//!   -> remove_unsupported_commands
+//!   -> ftfy.fix_text
+//! ```
+//!
+//! 本模块实现前五步（与 `fix_latex` 一致，且 RapidDoc 只以
+//! `fix_delimiter=False` 调用，因此不再保留无用的 `fix_delimiter` 分支），
+//! 第六步由 [`crate::formula::ftfy::fix_text`] 承担。
+//!
+//! **等价性边界**：`ftfy.fix_text` 只有确定性步骤实现了等价语义，
+//! 启发式 mojibake 修复（`fix_encoding` 等）与 `unescape_html` 未实现，
+//! 详见 [`crate::formula::ftfy`] 的模块文档。因此本函数**不等于**完整
+//! RapidDoc 后处理等价，只在已评测语料上等价。
+//!
+//! 所有正则使用 `LazyLock` 只编译一次：`postprocess_latex` 在 10k 量级样本上
+//! 逐样本调用，重复编译是明确的浪费。
+
+use std::sync::LazyLock;
 
 use regex::Regex;
 
+static CHINESE_TEXT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\\text\s*\{\s*([^}]*?[\u{4e00}-\u{9fff}]+[^}]*?)\s*\}")
+        .expect("valid chinese text pattern")
+});
+static LEFT_COMMAND_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\left").expect("valid left pattern"));
+static RIGHT_COMMAND_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\right").expect("valid right pattern"));
+static UNBALANCED_LEFT_RIGHT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\left\.?|\\right\.?").expect("valid left/right remove pattern"));
+static UP_COMMAND_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\up([a-zA-Z]+)").expect("valid up pattern"));
+static UNSUPPORTED_COMMAND_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\\(?:lefteqn|boldmath|ensuremath|centering|textsubscript|sides|textsl|textcent|emph|protect|null)",
+    )
+    .expect("valid unsupported command pattern")
+});
+
 pub fn postprocess_latex(raw: &str) -> String {
     let text = remove_chinese_text_wrapping(raw);
-    let text = fix_latex_left_right(&text, false);
+    let text = fix_latex_left_right(&text);
     let text = fix_latex_environments(&text);
     let text = remove_up_commands(&text);
-    remove_unsupported_commands(&text)
+    let text = remove_unsupported_commands(&text);
+    crate::formula::ftfy::fix_text(&text)
 }
 
 fn remove_chinese_text_wrapping(input: &str) -> String {
-    let pattern = Regex::new(r"\\text\s*\{\s*([^}]*?[\u{4e00}-\u{9fff}]+[^}]*?)\s*\}")
-        .expect("valid chinese text pattern");
-    let replaced = pattern.replace_all(input, "$1");
+    let replaced = CHINESE_TEXT_RE.replace_all(input, "$1");
     replaced.replace('"', "")
 }
 
-fn fix_latex_left_right(input: &str, fix_delimiter: bool) -> String {
-    let mut text = input.to_string();
-    if fix_delimiter {
-        // RapidDoc's PP-FormulaNet post-process calls fix_delimiter=false.
-        // Keep the branch explicit but intentionally narrow.
-        let left = Regex::new(r"(\\left)(\S*)").expect("valid left pattern");
-        let right = Regex::new(r"(\\right)(\S*)").expect("valid right pattern");
-        text = left.replace_all(&text, "$1$2").to_string();
-        text = right.replace_all(&text, "$1$2").to_string();
-    }
-
-    let left_count = count_latex_command(&text, r"\\left");
-    let right_count = count_latex_command(&text, r"\\right");
+fn fix_latex_left_right(input: &str) -> String {
+    let left_count = count_latex_command(input, &LEFT_COMMAND_RE);
+    let right_count = count_latex_command(input, &RIGHT_COMMAND_RE);
 
     if left_count == right_count {
-        fix_left_right_pairs(&text)
+        fix_left_right_pairs(input)
     } else {
-        Regex::new(r"\\left\.?|\\right\.?")
-            .expect("valid left/right remove pattern")
-            .replace_all(&text, "")
-            .to_string()
+        UNBALANCED_LEFT_RIGHT_RE.replace_all(input, "").to_string()
     }
 }
 
-fn count_latex_command(text: &str, pattern: &str) -> usize {
-    let regex = Regex::new(pattern).expect("valid command pattern");
+fn count_latex_command(text: &str, regex: &Regex) -> usize {
     regex
         .find_iter(text)
         .filter(|match_| {
@@ -125,7 +151,7 @@ fn fix_left_right_pairs(input: &str) -> String {
     }
 
     let mut result = chars;
-    adjustments.sort_by(|a, b| b.0.cmp(&a.0));
+    adjustments.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
     for (start, end, target) in adjustments {
         if start >= result.len() || end > result.len() {
             continue;
@@ -210,8 +236,7 @@ fn environment_format(text: &str, environment: &str) -> String {
 }
 
 fn remove_up_commands(input: &str) -> String {
-    let pattern = Regex::new(r"\\up([a-zA-Z]+)").expect("valid up pattern");
-    pattern
+    UP_COMMAND_RE
         .replace_all(input, |captures: &regex::Captures<'_>| {
             let name = captures.get(1).map(|value| value.as_str()).unwrap_or("");
             if matches!(name, "arrow" | "downarrow" | "lus" | "silon") {
@@ -227,27 +252,24 @@ fn remove_up_commands(input: &str) -> String {
 }
 
 fn remove_unsupported_commands(input: &str) -> String {
-    Regex::new(
-        r"\\(?:lefteqn|boldmath|ensuremath|centering|textsubscript|sides|textsl|textcent|emph|protect|null)",
-    )
-    .expect("valid unsupported command pattern")
-    .replace_all(input, "")
-    .to_string()
+    UNSUPPORTED_COMMAND_RE.replace_all(input, "").to_string()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     #[test]
     fn removes_unbalanced_left_right() {
-        assert_eq!(fix_latex_left_right(r"\left( x", false), r"( x");
+        assert_eq!(fix_latex_left_right(r"\left( x"), r"( x");
     }
 
     #[test]
     fn keeps_balanced_left_right_pairs() {
         assert_eq!(
-            fix_latex_left_right(r"\left( x \right)", false),
+            fix_latex_left_right(r"\left( x \right)"),
             r"\left( x \right)"
         );
     }
@@ -271,6 +293,46 @@ mod tests {
         assert_eq!(
             remove_unsupported_commands(r"\lefteqn{x} \emph{y}"),
             r"{x} {y}"
+        );
+    }
+
+    #[test]
+    fn postprocess_applies_ftfy_after_fix_latex() {
+        // RapidDoc 的真实案例：弯引号来自 ftfy.uncurl_quotes，且出现在 fix_latex 之后。
+        assert_eq!(
+            postprocess_latex("\\mathrm { V o r g \u{e4} n g e \u{201c} }"),
+            "\\mathrm { V o r g \u{e4} n g e \" }"
+        );
+    }
+
+    #[test]
+    fn postprocess_removes_double_quotes_like_rapid_doc() {
+        // remove_chinese_text_wrapping 删除所有 `"`，随后 ftfy 又把弯引号变成 `"`。
+        assert_eq!(postprocess_latex("a\"b"), "ab");
+        assert_eq!(postprocess_latex("a\u{201c}b"), "a\"b");
+    }
+
+    #[test]
+    fn postprocess_is_idempotent_on_typical_latex() {
+        let input = r"\left( \frac{a}{b} \right) \begin{array}{cc}a&b\\c&d\end{array}";
+        let once = postprocess_latex(input);
+        assert_eq!(postprocess_latex(&once), once);
+    }
+
+    /// 正则只编译一次：10k 次调用必须远快于重新编译 regex 的实现。
+    #[test]
+    fn postprocess_reuses_compiled_regexes() {
+        let input = r"\left( \frac{\upalpha}{b} \right) \begin{array}";
+        // 预热，把 LazyLock 初始化排除在计时之外。
+        let _ = postprocess_latex(input);
+        let started = Instant::now();
+        for _ in 0..10_000 {
+            let _ = postprocess_latex(input);
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed.as_millis() < 2_000,
+            "10k postprocess calls took {elapsed:?}; regexes are probably recompiled"
         );
     }
 }

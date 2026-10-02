@@ -318,11 +318,11 @@ fn precompute_coefficients(
 
         let mut row = vec![0.0_f64; count];
         let mut sum = 0.0_f64;
-        for k in 0..count {
+        for (k, value) in row.iter_mut().enumerate() {
             let x = k as f64 + xmin as f64 - center + 0.5;
-            let value = filter.weight(x * ss);
-            row[k] = value;
-            sum += value;
+            let weight = filter.weight(x * ss);
+            *value = weight;
+            sum += weight;
         }
         if sum != 0.0 {
             for value in &mut row {
@@ -659,7 +659,9 @@ mod tests {
 
         let data_start = header_start + header_len;
         let values: Vec<f32> = bytes[data_start..]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
         assert_eq!(values.len(), shape.iter().product::<usize>());

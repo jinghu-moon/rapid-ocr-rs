@@ -23,6 +23,7 @@
 
 # Local model and binary artifacts. Keep manifests/configuration in Git.
 *.onnx
+!tests/fixtures/**/*.onnx
 *.pdmodel
 *.pdiparams
 *.nb

@@ -7,7 +7,7 @@ use std::{
 use crate::{
     api::OcrEngine as _,
     error::Result,
-    input::image_loader::{LoadImage, OcrInput},
+    input::image_loader::{LoadImage, OcrInput, ensure_decode_pixels},
     ocr::cls::classifier::{Classifier, ClassifierConfig},
     ocr::config::RecognizeOptions,
     ocr::det::detector::{Detector, DetectorConfig},
@@ -504,18 +504,6 @@ fn detector_cfg_from_pipeline(config: &EngineConfig) -> DetectorConfig {
     config.det.clone()
 }
 
-fn ensure_decode_pixels(width: u32, height: u32, max_decode_pixels: u64) -> Result<()> {
-    let pixels = (width as u64).checked_mul(height as u64).ok_or_else(|| {
-        crate::error::RapidOcrError::InvalidInput("image dimensions overflow".into())
-    })?;
-    if pixels > max_decode_pixels {
-        return Err(crate::error::RapidOcrError::InvalidImage(format!(
-            "image has {pixels} pixels, limit is {max_decode_pixels}"
-        )));
-    }
-    Ok(())
-}
-
 fn rec_image_input(
     image: crate::config::RecImage,
     roi: Option<crate::api::RectU32>,
@@ -525,7 +513,11 @@ fn rec_image_input(
         width: image.width() as u32,
         height: image.height() as u32,
     };
-    ensure_decode_pixels(original_size.width, original_size.height, max_decode_pixels)?;
+    ensure_decode_pixels(
+        original_size.width as usize,
+        original_size.height as usize,
+        max_decode_pixels,
+    )?;
     let Some(roi) = roi else {
         return Ok((OcrInput::Image(image), original_size, (0, 0)));
     };
@@ -572,6 +564,13 @@ pub struct RapidOcrEngine {
     model_id: String,
     base_min_side_len: usize,
     base_max_side_len: usize,
+    /// 懒加载的公式识别器（模型路径 -> 实例），避免每次请求重建 594 MB session。
+    formula_recognizer: Option<(
+        std::path::PathBuf,
+        crate::formula::recognizer::FormulaRecognizer,
+    )>,
+    /// 懒加载的页面公式检测器。
+    formula_detector: Option<(std::path::PathBuf, crate::formula::detect::FormulaDetector)>,
 }
 
 impl RapidOcrEngine {
@@ -589,6 +588,8 @@ impl RapidOcrEngine {
             model_id,
             base_min_side_len,
             base_max_side_len,
+            formula_recognizer: None,
+            formula_detector: None,
         })
     }
 
@@ -644,11 +645,25 @@ impl crate::api::OcrEngine for RapidOcrEngine {
     }
 
     fn recognize(&mut self, request: crate::api::OcrRequest) -> Result<crate::api::OcrOutput> {
+        request.validate()?;
+        if request.formula.enabled {
+            let policy = request.formula.clone();
+            return self.recognize_with_formula(request, policy);
+        }
+        self.recognize_text(request)
+    }
+}
+
+impl RapidOcrEngine {
+    /// 公式路由关闭时的普通文本识别路径。
+    ///
+    /// 提取为独立函数是为了让“公式关闭时行为与不含公式功能时一致”成为结构性保证：
+    /// 未启用公式时 `recognize` 直接走这里，不经过任何公式代码。
+    fn recognize_text(&mut self, request: crate::api::OcrRequest) -> Result<crate::api::OcrOutput> {
         use crate::api::{
             ClassifierPolicy, ImageInput, OcrRegion, RegionSource, StageReport, StageState,
             StageTiming, TextOrientation, WordKind,
         };
-        request.validate()?;
         if let Some(tile) = request.preprocess.tile {
             return self.recognize_tiled_request(request, tile);
         }
@@ -660,8 +675,8 @@ impl crate::api::OcrEngine for RapidOcrEngine {
         let (input, original_size, offset) = match request.input {
             ImageInput::Pixels(view) => {
                 ensure_decode_pixels(
-                    view.width,
-                    view.height,
+                    view.width as usize,
+                    view.height as usize,
                     request.preprocess.max_decode_pixels,
                 )?;
                 let (bgr, size, offset) = view.to_bgr(request.roi)?;
@@ -782,8 +797,8 @@ impl crate::api::OcrEngine for RapidOcrEngine {
         let cls_count = cls.len();
         let mut regions = Vec::new();
         if request.stages.detect {
-            for i in 0..boxes.len() {
-                let mut polygon = boxes[i];
+            for (i, det_box) in boxes.iter().enumerate() {
+                let mut polygon = *det_box;
                 for p in &mut polygon {
                     p[0] += offset.0 as f32;
                     p[1] += offset.1 as f32;
@@ -830,12 +845,14 @@ impl crate::api::OcrEngine for RapidOcrEngine {
                         });
                 regions.push(OcrRegion {
                     source: RegionSource::Detected { detector_index: i },
+                    kind: crate::api::RegionKind::Text,
                     polygon: Some(crate::api::Polygon { points: polygon }),
                     detection: Some(crate::api::DetectionOutcome {
                         score: det_scores.get(i).copied().unwrap_or_default(),
                     }),
                     classification,
                     recognition,
+                    formula: None,
                 });
             }
         } else if request.stages.recognize {
@@ -851,6 +868,7 @@ impl crate::api::OcrEngine for RapidOcrEngine {
                 });
                 regions.push(OcrRegion {
                     source: RegionSource::Input,
+                    kind: crate::api::RegionKind::Text,
                     polygon: None,
                     detection: None,
                     classification,
@@ -888,12 +906,14 @@ impl crate::api::OcrEngine for RapidOcrEngine {
                                 .collect()
                         }),
                     }),
+                    formula: None,
                 });
             }
         } else if use_cls {
             for (o, s) in &cls {
                 regions.push(OcrRegion {
                     source: RegionSource::Input,
+                    kind: crate::api::RegionKind::Text,
                     polygon: None,
                     detection: None,
                     classification: Some(crate::api::ClassificationOutcome {
@@ -906,6 +926,7 @@ impl crate::api::OcrEngine for RapidOcrEngine {
                         applied_rotation: request.stages.classify.apply_rotation && o == "180",
                     }),
                     recognition: None,
+                    formula: None,
                 });
             }
         }
@@ -935,6 +956,7 @@ impl crate::api::OcrEngine for RapidOcrEngine {
             recognizer_infer_ms: exec.rec_breakdown_ms.map(|v| v[1]).unwrap_or_default(),
             recognizer_postprocess_ms: exec.rec_breakdown_ms.map(|v| v[2]).unwrap_or_default(),
             recognize_ms: exec.elapsed_ms[2].unwrap_or_default(),
+            formula_ms: 0.0,
             postprocess_ms: exec.postprocess_ms.unwrap_or_default(),
             total_ms: exec.e2e_ms.unwrap_or_default() + preprocess_ms,
         };
@@ -967,12 +989,7 @@ impl crate::api::OcrEngine for RapidOcrEngine {
                 state: StageState::Disabled,
                 timing: None,
             }
-        } else if self.inner.classifier.is_none() {
-            StageReport {
-                state: StageState::SkippedUnavailable,
-                timing: None,
-            }
-        } else if !use_cls {
+        } else if self.inner.classifier.is_none() || !use_cls {
             StageReport {
                 state: StageState::SkippedUnavailable,
                 timing: None,
@@ -1030,6 +1047,7 @@ impl crate::api::OcrEngine for RapidOcrEngine {
                 detector,
                 classifier,
                 recognizer,
+                formula: crate::api::StageReport::default(),
             },
             regions,
             timings: timing,
@@ -1039,6 +1057,302 @@ impl crate::api::OcrEngine for RapidOcrEngine {
             },
         })
     }
+}
+
+impl RapidOcrEngine {
+    /// 页面级公式路由：检测/接收公式区域，抹白后跑普通文本管线，再单独识别公式。
+    ///
+    /// 顺序说明：
+    ///
+    /// 1. 用共享输入层解码**原图**（公式裁剪需要未抹白的像素）；
+    /// 2. 解析公式区域（检测模型 + 显式区域，见 `formula::route`）；
+    /// 3. 把公式区域抹白后交给普通文本管线：公式像素根本不进入检测/识别，
+    ///    因此“跳过普通 CTC”是执行层面的跳过，而不是事后丢弃结果；
+    /// 4. 从原图裁剪公式区域，批量送入 `FormulaRecognizer`；
+    /// 5. 公式区域作为独立 `RegionKind::Formula` 追加到输出，携带 polygon 与模型标识。
+    fn recognize_with_formula(
+        &mut self,
+        request: crate::api::OcrRequest,
+        policy: crate::api::FormulaPolicy,
+    ) -> Result<crate::api::OcrOutput> {
+        use crate::api::{FormulaOutcome, ImageSize, OcrRegion, Polygon, RegionKind, RegionSource};
+
+        let formula_start = Instant::now();
+        let original = self.decode_formula_source(&request)?;
+        let size = ImageSize {
+            width: original.width(),
+            height: original.height(),
+        };
+
+        let mut candidates = self.detect_formula_candidates(&original, &policy)?;
+        for polygon in &policy.input_regions {
+            polygon.validate(size)?;
+            candidates.push(crate::formula::route::FormulaCandidate {
+                polygon: *polygon,
+                score: 1.0,
+                detected: false,
+            });
+        }
+        let regions = crate::formula::route::resolve_formula_regions(
+            &candidates,
+            size,
+            policy.min_area_ratio,
+            policy.iou_threshold,
+            policy.max_regions,
+        );
+        let formula_ms = formula_start.elapsed().as_secs_f32() * 1000.0;
+
+        let mut text_request = request.clone();
+        text_request.formula = crate::api::FormulaPolicy::default();
+        if !regions.is_empty() {
+            // 抹白公式像素：普通文本管线看不到公式，也就不会对它们跑 CTC。
+            text_request.input = crate::api::ImageInput::Image(
+                crate::formula::route::whiten_regions(&original, &regions)?,
+            );
+            text_request.roi = None;
+        }
+        let mut output = self.recognize_text(text_request)?;
+
+        if regions.is_empty() {
+            output.stages.formula = crate::api::StageReport {
+                state: crate::api::StageState::SkippedNoInput,
+                timing: Some(crate::api::StageTiming {
+                    preprocess_ms: formula_ms,
+                    infer_ms: 0.0,
+                    postprocess_ms: 0.0,
+                }),
+            };
+            return Ok(output);
+        }
+
+        let crops: Vec<image::DynamicImage> = regions
+            .iter()
+            .map(|candidate| crop_polygon_bounds(&original, candidate.polygon))
+            .collect();
+        let recognize_start = Instant::now();
+        let recognitions = self.formula_recognizer(&policy)?.recognize_batch(&crops)?;
+        let recognize_ms = recognize_start.elapsed().as_secs_f32() * 1000.0;
+        output.timings.formula_ms = recognize_ms + formula_ms;
+        output.timings.total_ms += recognize_ms + formula_ms;
+
+        for (index, (candidate, recognition)) in regions.iter().zip(recognitions).enumerate() {
+            let detected = candidate.detected;
+            let source = if detected {
+                RegionSource::Detected {
+                    detector_index: index,
+                }
+            } else {
+                RegionSource::Input
+            };
+            let polygon = Some(Polygon {
+                points: canonical_polygon_points(candidate.polygon),
+            });
+            output.regions.push(OcrRegion {
+                source,
+                kind: RegionKind::Formula,
+                polygon,
+                detection: detected.then_some(crate::api::DetectionOutcome {
+                    score: candidate.score,
+                }),
+                classification: None,
+                recognition: None,
+                formula: Some(FormulaOutcome {
+                    latex: recognition.latex,
+                    eos_index: recognition.eos_index,
+                    truncated: recognition.truncated,
+                    model_id: recognition.model_id,
+                    token_ids: policy.include_token_ids.then_some(recognition.token_ids),
+                }),
+            });
+        }
+
+        output.stages.formula = crate::api::StageReport {
+            state: crate::api::StageState::Completed {
+                items: output.regions.len(),
+            },
+            timing: Some(crate::api::StageTiming {
+                preprocess_ms: formula_ms,
+                infer_ms: recognize_ms,
+                postprocess_ms: 0.0,
+            }),
+        };
+        output.validate()?;
+        Ok(output)
+    }
+
+    /// 解码请求输入为原图 `DynamicImage`，复用共享输入层的限制与错误语义。
+    fn decode_formula_source(
+        &self,
+        request: &crate::api::OcrRequest,
+    ) -> Result<image::DynamicImage> {
+        use crate::api::ImageInput;
+        let pixels = request.preprocess.max_decode_pixels;
+        let encoded = request.preprocess.max_encoded_bytes;
+        let image = match &request.input {
+            ImageInput::Encoded(bytes) => self.inner.loader.load_dynamic_with_limit(
+                OcrInput::Bytes(bytes.to_vec()),
+                pixels,
+                encoded,
+            )?,
+            ImageInput::File(path) => self.inner.loader.load_dynamic_with_limit(
+                OcrInput::Path(path.clone()),
+                pixels,
+                encoded,
+            )?,
+            ImageInput::Url(url) => self.inner.loader.load_dynamic_with_limit(
+                OcrInput::Url(url.clone()),
+                pixels,
+                encoded,
+            )?,
+            ImageInput::Pixels(view) => {
+                view.validate()?;
+                let (bgr, size, _) = view.to_bgr(None)?;
+                let rec = crate::config::RecImage::from_bgr_u8(
+                    size.width as usize,
+                    size.height as usize,
+                    bgr,
+                )?;
+                rec_image_to_dynamic(&rec)?
+            }
+            ImageInput::Image(rec) => rec_image_to_dynamic(rec)?,
+        };
+        Ok(image)
+    }
+
+    /// 运行公式检测模型；未配置检测模型时返回空候选（只处理显式区域）。
+    fn detect_formula_candidates(
+        &mut self,
+        image: &image::DynamicImage,
+        policy: &crate::api::FormulaPolicy,
+    ) -> Result<Vec<crate::formula::route::FormulaCandidate>> {
+        let Some(path) = policy.detector_path.clone() else {
+            return Ok(Vec::new());
+        };
+        let options = crate::formula::detect::FormulaDetectOptions {
+            confidence_threshold: policy.confidence_threshold,
+            iou_threshold: policy.iou_threshold,
+            max_detections: policy.max_regions,
+        };
+        let runtime = self.inner.config.rec.runtime.clone();
+        if self
+            .formula_detector
+            .as_ref()
+            .is_none_or(|(current, _)| *current != path)
+        {
+            self.formula_detector = Some((
+                path.clone(),
+                crate::formula::detect::FormulaDetector::from_model(&path, &runtime)?,
+            ));
+        }
+        let detector = self
+            .formula_detector
+            .as_mut()
+            .map(|(_, detector)| detector)
+            .ok_or_else(|| {
+                crate::error::RapidOcrError::Config("formula detector is not initialized".into())
+            })?;
+        Ok(detector
+            .detect(image, &options)?
+            .into_iter()
+            .map(|detected| crate::formula::route::FormulaCandidate {
+                polygon: crate::api::Polygon {
+                    points: detected.polygon,
+                },
+                score: detected.score,
+                detected: true,
+            })
+            .collect())
+    }
+
+    /// 懒加载公式识别器；模型路径变化时重建。
+    fn formula_recognizer(
+        &mut self,
+        policy: &crate::api::FormulaPolicy,
+    ) -> Result<&mut crate::formula::recognizer::FormulaRecognizer> {
+        let path = policy.model_path.clone().ok_or_else(|| {
+            crate::error::RapidOcrError::InvalidInput("formula policy requires `model_path`".into())
+        })?;
+        let runtime = self.inner.config.rec.runtime.clone();
+        let rebuild = self
+            .formula_recognizer
+            .as_ref()
+            .is_none_or(|(current, _)| *current != path);
+        if rebuild {
+            let recognizer = crate::formula::recognizer::FormulaRecognizer::from_model_with_hash(
+                &path,
+                &runtime,
+                policy.expected_model_sha256.as_deref(),
+            )?;
+            self.formula_recognizer = Some((path, recognizer));
+        }
+        self.formula_recognizer
+            .as_mut()
+            .map(|(_, recognizer)| recognizer)
+            .ok_or_else(|| {
+                crate::error::RapidOcrError::Config("formula recognizer is not initialized".into())
+            })
+    }
+}
+
+/// 以多边形包围盒裁剪原图；旋转四边形同样使用轴对齐包围盒。
+fn crop_polygon_bounds(
+    image: &image::DynamicImage,
+    polygon: crate::api::Polygon,
+) -> image::DynamicImage {
+    use image::GenericImageView;
+    let (width, height) = image.dimensions();
+    let (mut x0, mut y0) = (f32::INFINITY, f32::INFINITY);
+    let (mut x1, mut y1) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for [x, y] in polygon.points {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    let x0 = x0.floor().clamp(0.0, width as f32) as u32;
+    let y0 = y0.floor().clamp(0.0, height as f32) as u32;
+    let x1 = x1.ceil().clamp(0.0, width as f32) as u32;
+    let y1 = y1.ceil().clamp(0.0, height as f32) as u32;
+    let w = (x1.saturating_sub(x0))
+        .max(1)
+        .min(width.saturating_sub(x0).max(1));
+    let h = (y1.saturating_sub(y0))
+        .max(1)
+        .min(height.saturating_sub(y0).max(1));
+    image.crop_imm(x0, y0, w, h)
+}
+
+/// 输出的多边形统一为左上起顺时针四角，便于下游稳定消费。
+fn canonical_polygon_points(polygon: crate::api::Polygon) -> [[f32; 2]; 4] {
+    let (mut x0, mut y0) = (f32::INFINITY, f32::INFINITY);
+    let (mut x1, mut y1) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for [x, y] in polygon.points {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+}
+
+fn rec_image_to_dynamic(image: &crate::config::RecImage) -> Result<image::DynamicImage> {
+    use crate::config::ColorOrder;
+    let width = image.width() as u32;
+    let height = image.height() as u32;
+    let rgb: Vec<u8> = match image.color_order() {
+        ColorOrder::Rgb => image.as_bytes().to_vec(),
+        ColorOrder::Bgr => image
+            .as_bytes()
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|pixel| [pixel[2], pixel[1], pixel[0]])
+            .collect(),
+    };
+    let buffer = image::RgbImage::from_raw(width, height, rgb).ok_or_else(|| {
+        crate::error::RapidOcrError::InvalidImage("invalid RGB buffer for formula routing".into())
+    })?;
+    Ok(image::DynamicImage::ImageRgb8(buffer))
 }
 
 impl RapidOcrEngine {
@@ -1082,8 +1396,8 @@ impl RapidOcrEngine {
             crate::api::ImageInput::Pixels(view) => {
                 view.validate()?;
                 ensure_decode_pixels(
-                    view.width,
-                    view.height,
+                    view.width as usize,
+                    view.height as usize,
                     request.preprocess.max_decode_pixels,
                 )?;
                 let (bgr, size, _) = view.to_bgr(None)?;
@@ -1141,8 +1455,8 @@ impl RapidOcrEngine {
                     height: image.height() as u32,
                 };
                 ensure_decode_pixels(
-                    size.width,
-                    size.height,
+                    size.width as usize,
+                    size.height as usize,
                     request.preprocess.max_decode_pixels,
                 )?;
                 (rec_image_to_rgba(&image)?, size)
@@ -1187,6 +1501,8 @@ impl RapidOcrEngine {
                     detection: request.detection,
                     recognition: request.recognition,
                     output: request.output,
+                    // tiling 与公式路由互斥（`request.validate()` 已拒绝同时启用）。
+                    formula: crate::api::FormulaPolicy::default(),
                 };
                 let mut out = self.recognize(sub)?;
                 let region_offset = regions.len();
@@ -1214,13 +1530,13 @@ impl RapidOcrEngine {
                             p[1] += (roi.y + y) as f32;
                         }
                     }
-                    if let Some(rec) = &mut region.recognition {
-                        if let Some(words) = &mut rec.words {
-                            for word in words {
-                                for p in &mut word.polygon.points {
-                                    p[0] += (roi.x + x) as f32;
-                                    p[1] += (roi.y + y) as f32;
-                                }
+                    if let Some(rec) = &mut region.recognition
+                        && let Some(words) = &mut rec.words
+                    {
+                        for word in words {
+                            for p in &mut word.polygon.points {
+                                p[0] += (roi.x + x) as f32;
+                                p[1] += (roi.y + y) as f32;
                             }
                         }
                     }
@@ -1327,6 +1643,8 @@ impl RapidOcrEngine {
                         postprocess_ms: timings.recognizer_postprocess_ms,
                     }),
                 },
+                // 分块路径与公式路由互斥（`request.validate()` 已拒绝同时启用）。
+                formula: crate::api::StageReport::default(),
             },
             regions,
             timings,
@@ -1392,4 +1710,341 @@ fn deduplicate_regions(mut regions: Vec<crate::api::OcrRegion>) -> Vec<crate::ap
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     unique
+}
+
+#[cfg(test)]
+mod formula_integration_tests {
+    //! 页面级公式路由的集成测试。
+    //!
+    //! 这些测试需要真实模型（普通 OCR、公式识别、公式检测）与真实页面图片，
+    //! 因此全部通过环境变量定位：缺失时显式 skip，绝不 panic、绝不回落到
+    //! 开发机绝对路径。
+
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use crate::api::{
+        ClassifierPlan, ClassifierPolicy, DetectionPolicy, FormulaPolicy, ImageInput, OcrEngine,
+        OcrRequest, OutputPolicy, PreprocessPolicy, RecognitionPolicy, RegionKind, RegionSource,
+        StagePlan, StageState, TextOrder, WordOutputMode,
+    };
+    use crate::ocr::pipeline::config::EngineConfig;
+    use crate::ocr::pipeline::rapid_ocr::RapidOcrEngine;
+
+    fn engine_config(model_root: &std::path::Path) -> EngineConfig {
+        let yaml = format!(
+            r#"
+global:
+  use_det: true
+  use_cls: false
+  use_rec: true
+  max_side_len: 2000
+  min_side_len: 30
+det:
+  lang: multi
+  ocr_version: PP-OCRv6
+  model_type: small
+  model_path: {root}/small/PP-OCRv6_det_small.onnx
+  allow_download: false
+cls:
+  lang: ch
+rec:
+  model:
+    lang: ch
+    ocr_version: PP-OCRv6
+    model_type: small
+    model_path: {root}/small/PP-OCRv6_rec_small.onnx
+    rec_keys_path: {root}/small/ppocrv6_dict.txt
+    allow_download: false
+"#,
+            root = model_root.display().to_string().replace('\\', "/")
+        );
+        EngineConfig::from_yaml_str(&yaml).expect("engine config template must parse")
+    }
+
+    struct Assets {
+        engine: RapidOcrEngine,
+        formula_model: PathBuf,
+        detector: PathBuf,
+        page_with_formula: PathBuf,
+        /// 实测在该页面上检测器返回 0 个候选（无公式 / 漏检场景）。
+        page_without_detections: PathBuf,
+        /// 实测该页面没有公式，但默认阈值下检测器会误检（用于验证阈值可控性）。
+        page_with_false_positives: PathBuf,
+    }
+
+    fn assets() -> Option<Assets> {
+        let model_root = crate::test_support::ocr_model_root()?;
+        let formula_model = crate::test_support::formula_model_path()?;
+        let detector = crate::test_support::formula_detector_path()?;
+        let page_with_formula = crate::test_support::page_fixture("08数字公式与符号.png")?;
+        let page_without_detections = crate::test_support::page_fixture("09竖排文本.png")?;
+        let page_with_false_positives = crate::test_support::page_fixture("05代码与等宽字体.png")?;
+        let engine = RapidOcrEngine::new(engine_config(&model_root)).expect("engine should load");
+        Some(Assets {
+            engine,
+            formula_model,
+            detector,
+            page_with_formula,
+            page_without_detections,
+            page_with_false_positives,
+        })
+    }
+
+    fn request(bytes: Vec<u8>, formula: FormulaPolicy) -> OcrRequest {
+        OcrRequest {
+            input: ImageInput::Encoded(Arc::from(bytes)),
+            roi: None,
+            scale_hint: None,
+            stages: StagePlan {
+                detect: true,
+                classify: ClassifierPlan {
+                    policy: ClassifierPolicy::Off,
+                    apply_rotation: false,
+                },
+                recognize: true,
+            },
+            preprocess: PreprocessPolicy::default(),
+            detection: DetectionPolicy::default(),
+            recognition: RecognitionPolicy {
+                words: WordOutputMode::Off,
+            },
+            output: OutputPolicy::default(),
+            formula,
+        }
+    }
+
+    fn formula_policy(assets: &Assets) -> FormulaPolicy {
+        FormulaPolicy {
+            enabled: true,
+            model_path: Some(assets.formula_model.clone()),
+            detector_path: Some(assets.detector.clone()),
+            ..FormulaPolicy::default()
+        }
+    }
+
+    /// 公式路由与 `roi`/`tile` 互斥，必须在进入管线前结构化拒绝。
+    #[test]
+    fn formula_routing_rejects_roi_and_tile() {
+        let base = FormulaPolicy {
+            enabled: true,
+            model_path: Some(PathBuf::from("model.onnx")),
+            ..FormulaPolicy::default()
+        };
+        let mut with_roi = request(Vec::new(), base.clone());
+        with_roi.roi = Some(crate::api::RectU32 {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        });
+        let error = with_roi.validate().expect_err("roi must be rejected");
+        assert!(error.to_string().contains("roi"), "error: {error}");
+
+        let mut with_tile = request(Vec::new(), base);
+        with_tile.preprocess.tile = Some(crate::api::TilePolicy {
+            max_width: 100,
+            max_height: 100,
+            overlap: 10,
+        });
+        let error = with_tile.validate().expect_err("tile must be rejected");
+        assert!(error.to_string().contains("tiled"), "error: {error}");
+    }
+
+    #[test]
+    fn formula_policy_requires_a_model_path() {
+        let policy = FormulaPolicy {
+            enabled: true,
+            ..FormulaPolicy::default()
+        };
+        assert!(policy.validate().is_err());
+    }
+
+    /// 公式功能关闭时：输出中不能出现公式区域，公式阶段必须是 `Disabled`。
+    #[test]
+    fn disabled_formula_policy_produces_no_formula_regions() {
+        let Some(mut assets) = assets() else {
+            return;
+        };
+        let bytes = std::fs::read(&assets.page_with_formula).expect("page readable");
+        let output = assets
+            .engine
+            .recognize(request(bytes, FormulaPolicy::default()))
+            .expect("baseline recognize");
+        assert!(output.validate().is_ok());
+        assert_eq!(output.formula_count(), 0);
+        assert!(output.formula_latex(TextOrder::Reading).is_empty());
+        assert_eq!(output.stages.formula.state, StageState::Disabled);
+        assert!(
+            output
+                .regions
+                .iter()
+                .all(|region| region.kind == RegionKind::Text),
+            "disabled formula policy must not produce formula regions"
+        );
+    }
+
+    /// 漏检场景：页面上没有公式（检测器返回 0 候选）时，公式路由不得改变文本输出。
+    #[test]
+    fn formula_routing_without_detections_matches_the_baseline() {
+        let Some(mut assets) = assets() else {
+            return;
+        };
+        let bytes = std::fs::read(&assets.page_without_detections).expect("page readable");
+        let baseline = assets
+            .engine
+            .recognize(request(bytes.clone(), FormulaPolicy::default()))
+            .expect("baseline recognize");
+        let routed = assets
+            .engine
+            .recognize(request(bytes, formula_policy(&assets)))
+            .expect("routed recognize");
+        assert_eq!(routed.formula_count(), 0, "no formula on this page");
+        assert_eq!(routed.stages.formula.state, StageState::SkippedNoInput);
+        assert_eq!(
+            routed.plain_text(TextOrder::Reading),
+            baseline.plain_text(TextOrder::Reading),
+            "formula routing must not change text output when nothing is detected"
+        );
+        assert_eq!(
+            routed.regions.len(),
+            baseline.regions.len(),
+            "region count must not change when nothing is detected"
+        );
+    }
+
+    /// 误检可控性：在实测会误检的页面上，提高置信度阈值必须能恢复到完全基线行为。
+    ///
+    /// 这条测试同时把“检测器在非公式页面上会有误检”这一事实固定下来：
+    /// 调用方必须通过阈值/面积下限在召回与精度之间取舍，而不是假设检测器永远正确。
+    #[test]
+    fn strict_confidence_threshold_restores_baseline_on_a_noisy_page() {
+        let Some(mut assets) = assets() else {
+            return;
+        };
+        let bytes = std::fs::read(&assets.page_with_false_positives).expect("page readable");
+        let baseline = assets
+            .engine
+            .recognize(request(bytes.clone(), FormulaPolicy::default()))
+            .expect("baseline recognize");
+
+        let default_threshold = assets
+            .engine
+            .recognize(request(bytes.clone(), formula_policy(&assets)))
+            .expect("routed recognize");
+        assert!(
+            default_threshold.formula_count() > 0,
+            "this page is known to produce false positives at the default threshold; \
+             if that changed, update this test and the documented limitation"
+        );
+
+        let strict = FormulaPolicy {
+            confidence_threshold: 0.95,
+            ..formula_policy(&assets)
+        };
+        let strict_output = assets
+            .engine
+            .recognize(request(bytes, strict))
+            .expect("strict recognize");
+        assert_eq!(strict_output.formula_count(), 0);
+        assert_eq!(
+            strict_output.stages.formula.state,
+            StageState::SkippedNoInput
+        );
+        assert_eq!(
+            strict_output.plain_text(TextOrder::Reading),
+            baseline.plain_text(TextOrder::Reading),
+            "with a strict threshold the output must equal the formula-disabled baseline"
+        );
+    }
+
+    /// 主路径：检测到公式后，公式区域是独立 typed region，且文本区域不含公式文本。
+    #[test]
+    fn detected_formula_regions_are_typed_and_carry_latex() {
+        let Some(mut assets) = assets() else {
+            return;
+        };
+        let bytes = std::fs::read(&assets.page_with_formula).expect("page readable");
+        let output = assets
+            .engine
+            .recognize(request(bytes, formula_policy(&assets)))
+            .expect("routed recognize");
+        output.validate().expect("routed output must validate");
+        assert!(
+            output.formula_count() > 0,
+            "the formula page must produce at least one formula region"
+        );
+        assert_eq!(
+            output.stages.formula.state,
+            StageState::Completed {
+                items: output.regions.len()
+            }
+        );
+        for region in output
+            .regions
+            .iter()
+            .filter(|region| region.kind == RegionKind::Formula)
+        {
+            let formula = region.formula.as_ref().expect("formula outcome");
+            assert!(
+                region.recognition.is_none(),
+                "formula regions must not carry CTC text: {:?}",
+                region.recognition
+            );
+            assert!(!formula.model_id.is_empty());
+            assert!(
+                region.polygon.is_some(),
+                "formula regions must keep their crop polygon"
+            );
+            assert!(
+                formula.token_ids.is_none(),
+                "token ids must stay opt-in outside debug mode"
+            );
+        }
+    }
+
+    /// 显式声明的公式区域无需检测模型即可工作，并带上 `RegionSource::Input`。
+    #[test]
+    fn explicit_input_regions_are_recognized_without_a_detector() {
+        let Some(mut assets) = assets() else {
+            return;
+        };
+        let bytes = std::fs::read(&assets.page_with_formula).expect("page readable");
+        let policy = FormulaPolicy {
+            enabled: true,
+            model_path: Some(assets.formula_model.clone()),
+            detector_path: None,
+            input_regions: vec![crate::api::Polygon {
+                points: [
+                    [120.0, 420.0],
+                    [900.0, 420.0],
+                    [900.0, 560.0],
+                    [120.0, 560.0],
+                ],
+            }],
+            include_token_ids: true,
+            ..FormulaPolicy::default()
+        };
+        let output = assets
+            .engine
+            .recognize(request(bytes, policy))
+            .expect("explicit region recognize");
+        output.validate().expect("output must validate");
+        assert_eq!(output.formula_count(), 1);
+        let region = output
+            .regions
+            .iter()
+            .find(|region| region.kind == RegionKind::Formula)
+            .expect("formula region");
+        assert_eq!(region.source, RegionSource::Input);
+        assert!(
+            region.detection.is_none(),
+            "explicit regions have no detector score"
+        );
+        let formula = region.formula.as_ref().expect("formula outcome");
+        assert!(
+            formula.token_ids.is_some(),
+            "include_token_ids must keep the raw token sequence"
+        );
+    }
 }

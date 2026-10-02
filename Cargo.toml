@@ -32,6 +32,7 @@ turbojpeg = { version = "1.4.0", default-features = false, features = ["cmake"] 
 rayon = "1.10"
 regex = "1"
 clap = { version = "4.5", features = ["derive"] }
+unicode-normalization = { version = "0.1.25", default-features = false }
 
 [features]
 default = ["ort-runtime"]
@@ -43,3 +44,10 @@ opencv-backend = ["dep:opencv"]
 directml-provider = ["ort/directml"]
 cuda-provider = ["ort/cuda"]
 cann-provider = ["ort/cann"]
+
+[lints.rust]
+# `ort` / `turbojpeg` 链接的预编译原生库在 MSVC 下会偶发报告
+# `LNK4098: defaultlib 'LIBCMT'/'LIBCMTD' conflicts with use of other libs`。
+# 该诊断来自第三方预编译二进制而不是本 crate 的代码，却会让
+# `cargo clippy --all-targets -- -D warnings` 随机失败，因此显式允许该 lint。
+linker_messages = "allow"

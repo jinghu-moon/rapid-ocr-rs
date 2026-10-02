@@ -34,7 +34,7 @@ before redistributing a complete application or model bundle.
 
 ```rust,no_run
 use rapid_ocr_rs::{
-    ClassifierPlan, ClassifierPolicy, DetectionPolicy, EngineConfig, ImageInput,
+    ClassifierPlan, ClassifierPolicy, DetectionPolicy, EngineConfig, FormulaPolicy, ImageInput,
     OcrEngine, OcrRequest, OutputPolicy, PreprocessPolicy, RapidOcrEngine,
     RecognitionPolicy, StagePlan, WordOutputMode,
 };
@@ -60,6 +60,9 @@ let output = engine.recognize(OcrRequest {
     detection: DetectionPolicy::default(),
     recognition: RecognitionPolicy { words: WordOutputMode::Off },
     output: OutputPolicy::default(),
+    // Formula routing is off by default, so the text path is byte-identical to a
+    // build without the formula feature.
+    formula: FormulaPolicy::default(),
 })?;
 println!("{} regions", output.regions.len());
 # Ok::<(), rapid_ocr_rs::RapidOcrError>(())
@@ -79,8 +82,11 @@ part of the public crate contract.
 
 ## Formula recognition
 
-`rapid-ocr-rs` also exposes an independent PP-FormulaNet_plus-M ONNX formula
-API. It does not reuse the CTC `Recognizer` path.
+`rapid-ocr-rs` exposes two formula capabilities: an independent
+PP-FormulaNet_plus-M ONNX recognizer, and optional page-level formula routing
+that reuses the ordinary OCR pipeline without touching its CTC contract.
+
+### Independent formula API
 
 ```rust,no_run
 use rapid_ocr_rs::{FormulaRecognizer, RuntimeConfig};
@@ -97,21 +103,141 @@ println!("{}", result.latex);
 - `FormulaRecognizer::recognize_batch` preserves input order and defaults to a
   maximum batch size of 16.
 - `FormulaRecognition` contains `latex`, raw `token_ids`, `eos_index`,
-  `truncated`, model id, and elapsed time.
-- `recognize_encoded`, `recognize_file`, and `recognize_url` apply encoded-byte,
-  decoded-pixel, streaming-read, and sequence-length limits.
-- CPU `CPUExecutionProvider` is the first supported provider. DirectML/CUDA
-  support is model/provider dependent and must not be assumed.
+  `truncated`, `model_id`, `elapsed_ms`, and `batch_size`.
+  `elapsed_ms` is the wall time of the **call** that produced the result: every
+  result of one `recognize_batch` shares the same value (the whole batch), so
+  divide by `batch_size` for a per-image estimate. It is never a per-sample
+  measurement that grows with position in the batch.
+- `recognize_encoded`, `recognize_file`, and `recognize_url` delegate to the
+  shared input loader (`input::image_loader`), so encoded-byte, decoded-pixel,
+  streaming-read, header-probe, timeout, and error semantics are identical to
+  ordinary OCR.
+- The default sequence limit is 4096. The model's in-graph `Loop` pads the whole
+  batch to 2561 columns when any sample fails to emit EOS, so a limit at or
+  below that value would reject an entire batch and lose the samples that did
+  recognize correctly. Set a larger limit only if a different model needs it.
+- **Provider strictness**: the formula session rejects a silent CPU fallback.
+  Requesting an accelerator that is unavailable returns
+  `RapidOcrError::UnsupportedProvider` even when
+  `RuntimeConfig::fail_if_provider_unavailable` is `false`. Request
+  `ProviderPreference::Cpu` explicitly if CPU is intended.
 
-Model asset:
+### Page-level formula routing
 
-```text
-https://www.modelscope.cn/models/RapidAI/RapidDoc/resolve/v1.0.0/formula/PP-FormulaNet_plus-M/pp_formulanet_plus_m.onnx
-SHA-256 71b6d389cf7b857e45252a4b98cfced1a3ffca7bf24d9497d02d052a41d9493b
+`OcrRequest::formula` (`FormulaPolicy`) turns a whole page into text regions plus
+typed formula regions:
+
+```rust,no_run
+use rapid_ocr_rs::{
+    FormulaPolicy, ImageInput, OcrEngine, OcrRegion, OcrRequest, RapidOcrEngine, RegionKind,
+};
+
+# fn example(engine: &mut RapidOcrEngine) -> Result<(), rapid_ocr_rs::RapidOcrError> {
+let request = OcrRequest {
+    // ... stages / preprocess / detection / recognition / output as usual ...
+    # input: ImageInput::File("page.png".into()),
+    # roi: None,
+    # scale_hint: None,
+    # stages: Default::default(),
+    # preprocess: Default::default(),
+    # detection: Default::default(),
+    # recognition: Default::default(),
+    # output: Default::default(),
+    formula: FormulaPolicy {
+        enabled: true,
+        model_path: Some("pp_formulanet_plus_m.onnx".into()),
+        detector_path: Some("pix2text-mfd-1.5.onnx".into()),
+        ..FormulaPolicy::default()
+    },
+};
+let output = engine.recognize(request)?;
+for region in output.regions.iter().filter(|r| r.kind == RegionKind::Formula) {
+    println!("{:?}", region.formula.as_ref().map(|f| &f.latex));
+}
+# Ok(())
+# }
 ```
 
-The model and tokenizer metadata are not bundled. Download them separately,
-verify SHA-256, and review upstream licenses before redistribution.
+How routing works:
+
+1. Formula regions come from the optional page detector
+   (`pix2text-mfd-1.5.onnx`, a YOLO11 detect model) **and** from
+   `FormulaPolicy::input_regions`, which lets a caller declare regions without a
+   detector.
+2. Candidates are filtered by `min_area_ratio` and deduplicated by
+   `iou_threshold` / containment. The result is capped by `max_regions` and is
+   independent of candidate order.
+3. Formula pixels are painted white **before** the ordinary text pipeline runs,
+   so CTC never executes on them. "Formula regions skip CTC" is an execution
+   guarantee, not post-hoc filtering.
+4. Each formula region is cropped from the untouched original image, recognized
+   by `FormulaRecognizer`, and appended as a `RegionKind::Formula` region that
+   keeps its polygon, detector score, and model id. Formula regions never carry
+   a CTC `recognition` outcome (they have no meaningful per-character
+   confidence), and `OcrOutput::validate()` enforces that invariant.
+5. `roi` and tiled preprocessing are rejected with a structured error while
+   formula routing is enabled, because their coordinate mapping would diverge
+   from original-image formula coordinates.
+
+Output formats:
+
+- JSON adds `kind: "text" | "formula"`, `latex`/`eos_index`/`truncated` on
+  formula items, and a top-level `formulas` array in reading order.
+- Markdown renders formula regions as `$$...$$` display math in reading order.
+  Inner `$$` is escaped, blank lines are dropped, and a truncated result gets an
+  invisible `<!-- formula truncated: no EOS token -->` marker.
+- HTML renders formula polygons separately, lists the LaTeX with a copy button,
+  and reports `data-truncated` / `data-eos` per formula.
+- Raw token ids are only emitted when `FormulaPolicy::include_token_ids` is set.
+
+Known limitations (explicit, and pinned by tests):
+
+- Detector precision is not perfect. On the repository's 12 smoke pages the
+  detector reports false positives on non-formula pages (code listings, dense
+  prose) at the default `confidence_threshold = 0.25`. A false-positive region
+  removes the text underneath it from the text channel. Raise
+  `confidence_threshold`/`min_area_ratio` to trade recall for precision; at
+  `0.95` the integration test shows the output returns to the
+  formula-disabled baseline.
+- A **missed** formula (below threshold, or a detector that returned nothing)
+  stays in the text channel, so ordinary CTC will emit garbage for it. There is
+  no cross-model arbitration.
+- Formula crops use the axis-aligned bounding box of the region quadrilateral.
+
+Model assets:
+
+```text
+formula recognizer:
+https://www.modelscope.cn/models/RapidAI/RapidDoc/resolve/v1.0.0/formula/PP-FormulaNet_plus-M/pp_formulanet_plus_m.onnx
+SHA-256 71b6d389cf7b857e45252a4b98cfced1a3ffca7bf24d9497d02d052a41d9493b
+
+page formula detector:
+OCR-Model/Formula-Detection-Model/pix2text-mfd-1.5.onnx (Pix2Text-MFD-1.5, YOLO11m detect)
+```
+
+The models and tokenizer metadata are not bundled. Download them separately,
+verify SHA-256, and review upstream licenses before redistribution
+(`THIRD_PARTY_NOTES.md` records the conflicting license metadata on the detector).
+
+### RapidDoc post-processing equivalence
+
+`FormulaRecognizer` post-processing is `remove_chinese_text_wrapping` ->
+`fix_latex` -> `ftfy.fix_text`, matching RapidDoc's order. The deterministic
+`ftfy` steps are ported exactly (tables generated from the real `ftfy` by
+`tools/build_ftfy_tables.py`, verified byte-for-byte against Python):
+`remove_terminal_escapes`, `fix_c1_controls`, `fix_latin_ligatures`,
+`fix_character_width`, `uncurl_quotes`, `fix_line_breaks`, NFC normalization, and
+`remove_control_characters`.
+
+The heuristic mojibake repairs (`fix_encoding`, `restore_byte_a0`,
+`replace_lossy_sequences`, `decode_inconsistent_utf8`) and `unescape_html` are
+**not** implemented; `fix_surrogates` cannot apply to a Rust `String`. This is
+not a silent gap: `tests/fixtures/formula-postprocess/cases.json` enumerates the
+divergence cases and asserts them, and the same fixture records that across all
+357,022 labels in `Formula-TestSet` the deterministic subset explains every
+observed `ftfy` change (1 of 357,022 lines, a curly-quote uncurl).
+`postprocess_latex` must therefore not be described as fully equivalent to
+RapidDoc's post-processing.
 
 ## Model integrity
 
@@ -246,23 +372,107 @@ functional regression check with explicit tolerances on the repository fixture
 Exact-image text match is reported for information only and is not required.
 The current small/medium comparison is inside these thresholds.
 
-## Formula benchmark and smoke evaluation
+## Formula benchmark and evaluation
+
+`formula_eval` is the phase-9 evaluation tool for all three datasets. It writes a
+stable sampling manifest (content-hash sampling, not "first N"), per-sample
+records, failure classification, exact/normalized match, CER, EOS/truncated
+counts, throughput with P50/P95, peak working set, and provider/thread settings.
 
 ```powershell
-# CPU warm timings and batch timing; add --features directml-provider/cuda-provider
-# and --provider directml/cuda for provider checks.
-cargo run --bin formula_bench -- --model <pp_formulanet_plus_m.onnx> --image <formula.png> --rounds 3 --provider cpu
+$Model = "<pp_formulanet_plus_m.onnx>"
+$TestSet = "../../Formula-TestSet"   # collection root
 
-# Rust token/LaTeX output over a fixture subset.
-cargo run --bin formula_compare -- --model <pp_formulanet_plus_m.onnx> --dataset-root ../../Formula-TestSet/ocr_rec_latexocr_dataset_example --split val --limit 100 --output target/formula-rust.json
+# PaddleX example set, 501 val images, with a reproducible manifest.
+cargo run --release --bin formula_eval -- --model $Model --dataset-root $TestSet `
+  --dataset latexocr --split validate --batch-size 8 `
+  --manifest-output target/formula-eval/manifest-val-501.json `
+  --output target/formula-eval/val-501.json
 
-# Python RapidDoc/ONNX reference for the same subset.
-python tools/formula_reference.py --model <pp_formulanet_plus_m.onnx> --dataset-root ../../Formula-TestSet/ocr_rec_latexocr_dataset_example --split val --limit 100 --output target/formula-python.json
-python tools/formula_compare_results.py --rust target/formula-rust.json --python target/formula-python.json --output target/formula-compare.json
+# Rust/Python link comparison over exactly the same samples.
+python tools/formula_reference.py --model $Model --dataset-root $TestSet `
+  --dataset latexocr --manifest target/formula-eval/manifest-val-501.json `
+  --output target/formula-eval/python-val-501.json
+cargo run --release --bin formula_eval -- --model $Model --dataset-root $TestSet `
+  --dataset latexocr --split validate `
+  --expect-manifest target/formula-eval/manifest-val-501.json `
+  --python-reference target/formula-eval/python-val-501.json `
+  --output target/formula-eval/val-501-compared.json
+
+# im2latex smoke and full test set (10,355 references, 71 empty labels).
+cargo run --release --bin formula_eval -- --model $Model --dataset-root $TestSet `
+  --dataset im2latex --split test --limit 100 --output target/formula-eval/im2latex-100.json
+cargo run --release --bin formula_eval -- --model $Model --dataset-root $TestSet `
+  --dataset im2latex --split test --output target/formula-eval/im2latex-full.json
+
+# UniMER: one sub-run per subset; HWE is reported separately, never averaged in.
+foreach ($subset in 'spe','cpe','sce','hwe') {
+  cargo run --release --bin formula_eval -- --model $Model --dataset-root $TestSet `
+    --dataset unimer --subset $subset --output "target/formula-eval/unimer-$subset.json"
+}
+
+# The whole sequence above, including the CPU benchmark, in one run.
+pwsh -NoProfile -File tools/run_formula_evaluation.ps1
 ```
 
-The formula model file is not bundled. Use the RapidDoc `v1.0.0` URL and
-SHA-256 recorded in `THIRD_PARTY_NOTES.md`.
+`formula_eval --expect-manifest` fails if the current selection does not hash to
+the recorded manifest, so a re-run either reproduces the same sample set or
+reports the difference instead of silently evaluating a different subset.
+
+Benchmark:
+
+```powershell
+cargo run --release --bin formula_bench -- --model $Model `
+  --image <formula1.png> --image <formula2.png> `
+  --rounds 5 --warmup 1 --batch-sizes 1,2,4,8 --provider cpu `
+  --output target/formula-eval/bench-cpu.json
+```
+
+`formula_bench` reports per-stage min/max/mean/P50/P95/stddev over the measured
+rounds, per-image and per-batch end-to-end latency, whether batch size changed
+the token sequence, the resolved provider and whether a CPU fallback occurred,
+and the process peak working set
+(`windows:GetProcessMemoryInfo.PeakWorkingSetSize` or
+`linux:/proc/self/status:VmHWM`). Formula throughput is always reported
+separately from ordinary OCR; `--ocr-baseline <bench.json>` only adds the
+ordinary OCR benchmark side by side and never merges the two into one number.
+
+## Tests and external assets
+
+`cargo test --all-targets` passes in a clean clone without any model or dataset:
+the contract fixtures under `tests/fixtures/**` are committed, and every test
+that needs the real 594 MB model or the public datasets skips with a message
+when the assets are absent. There is no development-machine absolute path
+fallback anywhere in the crate.
+
+```powershell
+# Force external-asset tests to fail instead of skipping (CI with staged assets).
+$env:RAPID_OCR_REQUIRE_EXTERNAL_ASSETS = "1"
+$env:RAPID_OCR_MODEL_ROOT = "<workspace>/OCR-Model"
+$env:RAPID_OCR_FORMULA_TEST_ROOT = "<workspace>/Formula-TestSet"
+cargo test --all-targets
+```
+
+| variable | purpose |
+| --- | --- |
+| `RAPID_OCR_MODEL_ROOT` | OCR model root (`<workspace>/OCR-Model`); also locates the formula model, the formula detector, and (via its parent) `OCR-test-image` |
+| `RAPID_OCR_FORMULA_MODEL` | direct path to `pp_formulanet_plus_m.onnx` |
+| `RAPID_OCR_FORMULA_DETECT_MODEL` | direct path to `pix2text-mfd-1.5.onnx` |
+| `RAPID_OCR_FORMULA_TEST_ROOT` | formula test-set root (`<workspace>/Formula-TestSet`) |
+| `RAPID_OCR_TEST_IMAGES` | page images used by the page-level formula integration tests |
+| `RAPID_OCR_REQUIRE_EXTERNAL_ASSETS` | `1` turns a missing asset into a test failure |
+
+### Quality gates
+
+```text
+cargo test --all-targets
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo check --features directml-provider,cuda-provider,cann-provider
+```
+
+`--all-features` additionally enables `opencv-backend`; that build requires an
+OpenCV installation and is not part of the checks above.
 
 ## Provider feature verification
 

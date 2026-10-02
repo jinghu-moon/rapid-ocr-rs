@@ -1,11 +1,26 @@
+//! PP-FormulaNet_plus 性能与 provider 验收工具。
+//!
+//! 设计要点（对应任务文档阶段 10）：
+//!
+//! - 分阶段测量 session 创建、首次推理、warm 预处理 / `session.run` / tokenizer
+//!   decode / 端到端，避免初始化或预处理掩盖模型真实性能；
+//! - 每个指标记录 **多轮采样** 的 min / max / mean / P50 / P95 / 标准差，而不是只报平均值；
+//! - batch=1/2/4/8 分别统计，并给出每张图的分摊耗时；
+//! - 记录请求 / 实际 provider 与是否发生 CPU 回退；
+//! - 记录进程 **峰值工作集**（Windows PSAPI `PeakWorkingSetSize`，Linux `/proc/self/status`
+//!   `VmHWM`）；
+//! - 公式模型与普通 OCR 的性能**分开报告**，不混成一个吞吐指标；需要对比时通过
+//!   `--ocr-baseline` 指向普通 OCR 的 benchmark JSON，只做并列展示，不做加权合并。
+
+use std::path::PathBuf;
+use std::time::Instant;
+
 use clap::{Parser, ValueEnum};
 use rapid_ocr_rs::{
     FormulaPreprocessor, FormulaSession, FormulaTokenizer, FormulaTokenizerMetadata,
-    ProviderPreference, RuntimeConfig,
+    ProviderPreference, RuntimeConfig, sha256_file,
 };
 use serde::Serialize;
-use std::path::PathBuf;
-use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ProviderArg {
@@ -15,21 +30,65 @@ enum ProviderArg {
 }
 
 #[derive(Debug, Parser)]
+#[command(
+    name = "formula_bench",
+    about = "Benchmark PP-FormulaNet_plus with per-stage latency statistics, providers and peak memory"
+)]
 struct Cli {
     #[arg(long)]
     model: PathBuf,
-    #[arg(long)]
-    image: PathBuf,
+    /// 一张或多张真实公式图片；多张图片时 batch 统计会按顺序循环取样。
+    #[arg(long = "image", required = true, num_args = 1..)]
+    images: Vec<PathBuf>,
+    /// 计入统计的测量轮数。
     #[arg(long, default_value_t = 5)]
     rounds: usize,
+    /// 不计入统计的预热轮数。
+    #[arg(long, default_value_t = 1)]
+    warmup: usize,
+    /// batch 大小列表。
+    #[arg(long = "batch-sizes", value_delimiter = ',', default_value = "1,2,4,8")]
+    batch_sizes: Vec<usize>,
     #[arg(long, value_enum, default_value_t = ProviderArg::Cpu)]
     provider: ProviderArg,
+    /// 覆盖 ONNX Runtime intra-op 线程数；默认沿用 `RuntimeConfig` 的自动调优。
+    #[arg(long)]
+    threads: Option<usize>,
+    /// 需要校验模型 SHA-256 时传入。
+    #[arg(long)]
+    expected_sha256: Option<String>,
+    /// 普通 OCR benchmark JSON；仅用于并列展示，不参与任何合并计算。
+    #[arg(long = "ocr-baseline")]
+    ocr_baseline: Option<PathBuf>,
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
-#[derive(Debug, Default, Serialize)]
-struct Timing {
-    session_create_ms: f64,
-    first_inference_ms: f64,
+use rapid_ocr_rs::evaluation::stats::Stats;
+use rapid_ocr_rs::{peak_memory_source, peak_working_set_bytes};
+
+/// 分阶段耗时统计；统计口径来自共享层，避免 benchmark 与评测工具各写一套。
+#[derive(Debug, Serialize)]
+struct StageStats {
+    preprocess: Stats,
+    session_run: Stats,
+    tokenizer_decode: Stats,
+    end_to_end: Stats,
+}
+
+impl StageStats {
+    fn from_rounds(rounds: &[RoundSample]) -> Self {
+        Self {
+            preprocess: Stats::from_samples(rounds.iter().map(|r| r.preprocess_ms).collect()),
+            session_run: Stats::from_samples(rounds.iter().map(|r| r.run_ms).collect()),
+            tokenizer_decode: Stats::from_samples(rounds.iter().map(|r| r.decode_ms).collect()),
+            end_to_end: Stats::from_samples(rounds.iter().map(|r| r.e2e_ms).collect()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RoundSample {
     preprocess_ms: f64,
     run_ms: f64,
     decode_ms: f64,
@@ -37,22 +96,64 @@ struct Timing {
 }
 
 #[derive(Debug, Serialize)]
-struct BatchTiming {
+struct BatchReport {
     batch: usize,
-    preprocess_ms: f64,
-    run_ms: f64,
-    decode_ms: f64,
-    e2e_ms: f64,
+    /// 每张图的分摊端到端耗时（e2e / batch）。
+    per_image_e2e_ms: Stats,
+    /// 整个 batch 的端到端耗时。
+    batch_e2e_ms: Stats,
+    stages: StageStats,
+    /// 相同 batch 的 token/LaTeX 是否稳定（batch 不应改变结果）。
+    deterministic_tokens: bool,
+    latex: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryReport {
+    peak_working_set_start_bytes: Option<u64>,
+    peak_working_set_after_session_bytes: Option<u64>,
+    peak_working_set_end_bytes: Option<u64>,
+    peak_working_set_delta_bytes: Option<u64>,
+    source: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelReport {
+    path: String,
+    file_name: String,
+    size_bytes: u64,
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ThreadReport {
+    intra_threads: Option<usize>,
+    inter_threads: Option<usize>,
+    auto_tune_threads: bool,
+    logical_cpus: Option<usize>,
+    physical_cpus: usize,
 }
 
 #[derive(Debug, Serialize)]
 struct Report {
-    provider: String,
-    provider_resolution: String,
+    tool: &'static str,
+    provider_requested: String,
+    provider_resolved: String,
+    provider_fallback_used: bool,
     rounds: usize,
-    single: Timing,
-    batches: Vec<BatchTiming>,
-    error: Option<String>,
+    warmup: usize,
+    model: ModelReport,
+    images: Vec<String>,
+    image_size: Option<[u32; 2]>,
+    threads: ThreadReport,
+    session_create_ms: f64,
+    first_inference_ms: f64,
+    warm_single: StageStats,
+    batches: Vec<BatchReport>,
+    memory: MemoryReport,
+    /// 与普通 OCR benchmark 的并列信息；不做任何吞吐合并。
+    ocr_baseline: Option<serde_json::Value>,
+    notes: Vec<String>,
 }
 
 fn main() {
@@ -62,109 +163,250 @@ fn main() {
     }
 }
 
-fn runtime_config(provider: ProviderArg) -> RuntimeConfig {
-    let mut config = RuntimeConfig::default();
-    config.provider_preference = match provider {
-        ProviderArg::Cpu => ProviderPreference::Cpu,
-        ProviderArg::Directml => ProviderPreference::DirectMl { device_id: 0 },
-        ProviderArg::Cuda => ProviderPreference::Cuda { device_id: 0 },
-    };
-    config.fail_if_provider_unavailable = true;
-    config
-}
-
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-    let runtime = runtime_config(cli.provider);
-    let image = image::open(&cli.image)?;
-
-    let session_start = Instant::now();
-    let mut session = FormulaSession::new(&cli.model, &runtime)?;
-    let session_create_ms = ms(session_start);
-    let provider_resolution = format!("{:?}", session.provider_resolution());
-    let character_metadata = session
-        .character_metadata()?
-        .ok_or("model has no character metadata")?;
-    let metadata = FormulaTokenizerMetadata::from_character_metadata(&character_metadata)?;
-    let tokenizer = FormulaTokenizer::from_metadata(&metadata)?;
-    let preprocessor = FormulaPreprocessor::new();
-
-    let input = preprocessor.preprocess(&image)?;
-    let first_start = Instant::now();
-    let first_output = session.run(input.view())?;
-    let first_inference_ms = ms(first_start);
-    let _ = tokenizer.decode_ids(&first_output.row(0).to_vec())?;
-
-    let mut single = Timing {
-        session_create_ms,
-        first_inference_ms,
-        ..Timing::default()
-    };
-    for _ in 0..cli.rounds {
-        let preprocess_start = Instant::now();
-        let tensor = preprocessor.preprocess(&image)?;
-        let preprocess_ms = ms(preprocess_start);
-
-        let run_start = Instant::now();
-        let output = session.run(tensor.view())?;
-        let run_ms = ms(run_start);
-
-        let decode_start = Instant::now();
-        let decoded = tokenizer.decode_ids(&output.row(0).to_vec())?;
-        let decode_ms = ms(decode_start);
-        let e2e_ms = preprocess_ms + run_ms + decode_ms;
-        let _ = decoded;
-
-        single.preprocess_ms += preprocess_ms;
-        single.run_ms += run_ms;
-        single.decode_ms += decode_ms;
-        single.e2e_ms += e2e_ms;
+fn runtime_config(cli: &Cli) -> RuntimeConfig {
+    RuntimeConfig {
+        provider_preference: match cli.provider {
+            ProviderArg::Cpu => ProviderPreference::Cpu,
+            ProviderArg::Directml => ProviderPreference::DirectMl { device_id: 0 },
+            ProviderArg::Cuda => ProviderPreference::Cuda { device_id: 0 },
+        },
+        // benchmark 必须显式失败而不是静默回退，否则数据没有意义。
+        fail_if_provider_unavailable: true,
+        intra_threads: cli.threads,
+        auto_tune_threads: cli.threads.is_none(),
+        ..RuntimeConfig::default()
     }
-    if cli.rounds > 0 {
-        let divisor = cli.rounds as f64;
-        single.preprocess_ms /= divisor;
-        single.run_ms /= divisor;
-        single.decode_ms /= divisor;
-        single.e2e_ms /= divisor;
-    }
-
-    let mut batches = Vec::new();
-    for batch in [1usize, 2, 4, 8] {
-        let images: Vec<_> = std::iter::repeat_with(|| image.clone())
-            .take(batch)
-            .collect();
-        let preprocess_start = Instant::now();
-        let tensor = preprocessor.preprocess_batch(&images)?;
-        let preprocess_ms = ms(preprocess_start);
-        let run_start = Instant::now();
-        let output = session.run(tensor.view())?;
-        let run_ms = ms(run_start);
-        let decode_start = Instant::now();
-        for row in output.axis_iter(ndarray::Axis(0)) {
-            let _ = tokenizer.decode_ids(&row.to_vec())?;
-        }
-        let decode_ms = ms(decode_start);
-        batches.push(BatchTiming {
-            batch,
-            preprocess_ms,
-            run_ms,
-            decode_ms,
-            e2e_ms: preprocess_ms + run_ms + decode_ms,
-        });
-    }
-
-    let report = Report {
-        provider: format!("{:?}", cli.provider),
-        provider_resolution,
-        rounds: cli.rounds,
-        single,
-        batches,
-        error: None,
-    };
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
 }
 
 fn ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
+}
+
+fn measure(
+    preprocessor: &FormulaPreprocessor,
+    session: &mut FormulaSession,
+    tokenizer: &FormulaTokenizer,
+    images: &[image::DynamicImage],
+) -> Result<RoundSample, Box<dyn std::error::Error>> {
+    let preprocess_start = Instant::now();
+    let tensor = preprocessor.preprocess_batch(images)?;
+    let preprocess_ms = ms(preprocess_start);
+
+    let run_start = Instant::now();
+    let output = session.run(tensor.view())?;
+    let run_ms = ms(run_start);
+
+    let decode_start = Instant::now();
+    for row in output.axis_iter(ndarray::Axis(0)) {
+        let _ = tokenizer.decode_ids(&row.to_vec())?;
+    }
+    let decode_ms = ms(decode_start);
+
+    Ok(RoundSample {
+        preprocess_ms,
+        run_ms,
+        decode_ms,
+        e2e_ms: preprocess_ms + run_ms + decode_ms,
+    })
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    if cli.rounds == 0 {
+        return Err("--rounds must be greater than zero".into());
+    }
+    if cli.batch_sizes.contains(&0) {
+        return Err("--batch-sizes entries must be greater than zero".into());
+    }
+
+    let memory_start = peak_working_set_bytes();
+    let runtime = runtime_config(&cli);
+    let images = cli
+        .images
+        .iter()
+        .map(image::open)
+        .collect::<Result<Vec<_>, _>>()?;
+    if images.is_empty() {
+        return Err("--image requires at least one readable image".into());
+    }
+    let max_batch = images
+        .len()
+        .max(*cli.batch_sizes.iter().max().unwrap_or(&1));
+
+    let session_start = Instant::now();
+    let mut session = FormulaSession::new(&cli.model, &runtime)?;
+    let session_create_ms = ms(session_start);
+    let memory_after_session = peak_working_set_bytes();
+    let resolution = session.provider_resolution();
+
+    let character_metadata = session
+        .character_metadata()?
+        .ok_or("model has no `character` metadata")?;
+    let metadata = FormulaTokenizerMetadata::from_character_metadata(&character_metadata)?;
+    let tokenizer = FormulaTokenizer::from_metadata(&metadata)?;
+    let preprocessor = FormulaPreprocessor::new();
+
+    // 首次推理单独测量，不进入 warm 统计。
+    let first_input = preprocessor.preprocess(&images[0])?;
+    let first_start = Instant::now();
+    let first_output = session.run(first_input.view())?;
+    let first_inference_ms = ms(first_start);
+    let baseline_tokens = first_output.row(0).to_vec();
+    let baseline_latex = tokenizer.decode_ids(&baseline_tokens)?.latex;
+
+    // 预热。
+    for _ in 0..cli.warmup {
+        let _ = measure(&preprocessor, &mut session, &tokenizer, &images[..1])?;
+    }
+
+    // 单图 warm 轮次轮转所有图片，避免只测一张。
+    let mut single_rounds = Vec::with_capacity(cli.rounds);
+    for round in 0..cli.rounds {
+        let image = &images[round % images.len()];
+        single_rounds.push(measure(
+            &preprocessor,
+            &mut session,
+            &tokenizer,
+            std::slice::from_ref(image),
+        )?);
+    }
+
+    let mut batches = Vec::new();
+    for &batch in &cli.batch_sizes {
+        if batch > max_batch {
+            continue;
+        }
+        let selected: Vec<image::DynamicImage> = (0..batch)
+            .map(|index| images[index % images.len()].clone())
+            .collect();
+
+        for _ in 0..cli.warmup {
+            let _ = measure(&preprocessor, &mut session, &tokenizer, &selected)?;
+        }
+
+        let mut rounds = Vec::with_capacity(cli.rounds);
+        let mut deterministic = true;
+        for _ in 0..cli.rounds {
+            let sample = measure(&preprocessor, &mut session, &tokenizer, &selected)?;
+            rounds.push(sample);
+
+            let tensor = preprocessor.preprocess_batch(&selected)?;
+            let output = session.run(tensor.view())?;
+            for row in output.axis_iter(ndarray::Axis(0)) {
+                if row.to_vec() != baseline_tokens {
+                    deterministic = false;
+                }
+            }
+        }
+
+        batches.push(BatchReport {
+            batch,
+            per_image_e2e_ms: Stats::from_samples(
+                rounds.iter().map(|r| r.e2e_ms / batch as f64).collect(),
+            ),
+            batch_e2e_ms: Stats::from_samples(rounds.iter().map(|r| r.e2e_ms).collect()),
+            stages: StageStats::from_rounds(&rounds),
+            deterministic_tokens: deterministic,
+            latex: baseline_latex.clone(),
+        });
+    }
+
+    let ocr_baseline = match &cli.ocr_baseline {
+        Some(path) => Some(serde_json::from_str(&std::fs::read_to_string(path)?)?),
+        None => None,
+    };
+
+    let memory_end = peak_working_set_bytes();
+    let image_size = {
+        use image::GenericImageView;
+        let (width, height) = images[0].dimensions();
+        Some([width, height])
+    };
+
+    let mut notes = vec![
+        "公式模型的吞吐与普通 OCR 分开报告；`ocr_baseline` 仅作并列展示，不做加权合并。"
+            .to_string(),
+        "`deterministic_tokens` 验证 batch 是否改变 token 序列；batch 不应改变结果。".to_string(),
+    ];
+    if resolution.fallback_used {
+        notes.push(
+            "provider 发生 CPU 回退；benchmark 已用 fail_if_provider_unavailable=true，\
+                    出现该状态说明环境与配置不一致。"
+                .to_string(),
+        );
+    }
+    if memory_end.is_none() {
+        notes.push(
+            "当前平台未实现峰值工作集采集（仅支持 Windows PSAPI 与 Linux /proc）。".to_string(),
+        );
+    }
+
+    let report = Report {
+        tool: "formula_bench",
+        provider_requested: format!("{:?}", cli.provider),
+        provider_resolved: format!("{:?}", resolution.resolved),
+        provider_fallback_used: resolution.fallback_used,
+        rounds: cli.rounds,
+        warmup: cli.warmup,
+        model: ModelReport {
+            path: cli.model.display().to_string(),
+            file_name: cli
+                .model
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            size_bytes: std::fs::metadata(&cli.model)?.len(),
+            sha256: Some(sha256_file(&cli.model)?),
+        },
+        images: cli
+            .images
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        image_size,
+        threads: ThreadReport {
+            intra_threads: runtime.intra_threads,
+            inter_threads: runtime.inter_threads,
+            auto_tune_threads: runtime.auto_tune_threads,
+            logical_cpus: std::thread::available_parallelism().ok().map(|v| v.get()),
+            physical_cpus: num_cpus::get_physical(),
+        },
+        session_create_ms,
+        first_inference_ms,
+        warm_single: StageStats::from_rounds(&single_rounds),
+        batches,
+        memory: MemoryReport {
+            peak_working_set_start_bytes: memory_start,
+            peak_working_set_after_session_bytes: memory_after_session,
+            peak_working_set_end_bytes: memory_end,
+            peak_working_set_delta_bytes: match (memory_start, memory_end) {
+                (Some(start), Some(end)) => Some(end.saturating_sub(start)),
+                _ => None,
+            },
+            source: peak_memory_source(),
+        },
+        ocr_baseline,
+        notes,
+    };
+
+    let text = serde_json::to_string_pretty(&report)?;
+    if let Some(path) = &cli.output {
+        std::fs::write(path, &text)?;
+    }
+    println!("{text}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Stats;
+
+    #[test]
+    fn stats_are_wired_to_the_shared_implementation() {
+        let stats = Stats::from_samples(vec![4.0, 1.0, 3.0, 2.0]);
+        assert_eq!(stats.samples, 4);
+        assert!((stats.mean_ms - 2.5).abs() < 1e-12);
+        assert!((stats.p50_ms - 2.5).abs() < 1e-12);
+        assert!(Stats::from_samples(Vec::new()).samples == 0);
+    }
 }

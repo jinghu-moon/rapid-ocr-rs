@@ -5,3 +5,5 @@
 
 pub mod fixture;
 pub mod metrics;
+pub mod report;
+pub mod sampling;

@@ -97,10 +97,29 @@ pub fn to_markdown_texts(txts: &[String]) -> String {
 }
 
 pub fn to_output_markdown(output: &OcrOutput) -> String {
-    for region in &output.regions {
-        if region.recognition.is_some() && region.polygon.is_none() {
-            return output.plain_text(TextOrder::Reading);
+    // 整图文本输入没有多边形，无法参与阅读顺序分组；此时退回“纯文本 + 公式块”，
+    // 仍保证公式 LaTeX 不丢失。
+    let polygonless_text = output
+        .regions
+        .iter()
+        .any(|region| region.recognition.is_some() && region.polygon.is_none());
+    if polygonless_text {
+        let mut sections: Vec<String> = Vec::new();
+        let text = output.plain_text(TextOrder::Reading);
+        if !text.is_empty() {
+            sections.push(text);
         }
+        for (_, latex) in output.formula_latex(TextOrder::Reading) {
+            let block = crate::formula::output::to_markdown_block(latex, false);
+            if !block.is_empty() {
+                sections.push(block);
+            }
+        }
+        return if sections.is_empty() {
+            "No text detected.".to_string()
+        } else {
+            sections.join("\n\n")
+        };
     }
 
     let mut blocks: Vec<String> = Vec::new();
@@ -109,25 +128,36 @@ pub fn to_output_markdown(output: &OcrOutput) -> String {
     for group in output.reading_order_groups() {
         let mut parts = Vec::new();
         let mut group_props: Option<BoxProps> = None;
+        let mut group_has_formula = false;
 
         for id in group {
             let Some(region) = output.regions.get(id) else {
                 continue;
             };
-            let Some(recognition) = &region.recognition else {
-                continue;
-            };
             let Some(polygon) = region.polygon else {
                 continue;
             };
-            parts.push(recognition.text.clone());
             let props = get_box_properties(&polygon.points);
             group_props = Some(match group_props {
                 Some(current) => current.merge(props),
                 None => props,
             });
+
+            if let Some(formula) = &region.formula {
+                // 公式区域使用 display math，不当作普通文本转义。
+                let block =
+                    crate::formula::output::to_markdown_block(&formula.latex, formula.truncated);
+                group_has_formula = true;
+                parts.push(block);
+                continue;
+            }
+            let Some(recognition) = &region.recognition else {
+                continue;
+            };
+            parts.push(recognition.text.clone());
         }
 
+        parts.retain(|part| !part.is_empty());
         if parts.is_empty() {
             continue;
         }
@@ -138,7 +168,12 @@ pub fn to_output_markdown(output: &OcrOutput) -> String {
                 blocks.push(String::new());
             }
         }
-        blocks.push(parts.join("   "));
+        // 含公式的分组按行分隔，避免 display math 与正文挤在同一行。
+        blocks.push(if group_has_formula {
+            parts.join("\n")
+        } else {
+            parts.join("   ")
+        });
         previous_props = group_props;
     }
 
@@ -172,10 +207,11 @@ fn get_box_properties(box_: &Quad) -> BoxProps {
 mod tests {
     use super::to_markdown;
     use crate::{
-        CoordinateSpace, EngineInfo, GenericProviderPreference as ProviderPreference, ImageInfo,
-        ImageSize, InputTimings, OcrOutput, OcrRegion, OcrTimings, Polygon, ProviderInfo,
-        ProviderResolutionInfo, RecognitionOutcome, RegionSource, ResolvedProvider, StageReport,
-        StageReports, StageState,
+        CoordinateSpace, EngineInfo, FormulaOutcome,
+        GenericProviderPreference as ProviderPreference, ImageInfo, ImageSize, InputTimings,
+        OcrOutput, OcrRegion, OcrTimings, Polygon, ProviderInfo, ProviderResolutionInfo,
+        RecognitionOutcome, RegionKind, RegionSource, ResolvedProvider, StageReport, StageReports,
+        StageState,
     };
 
     #[test]
@@ -186,18 +222,86 @@ mod tests {
         );
     }
 
-    fn text_region(id: usize, points: [[f32; 2]; 4], text: &str) -> OcrRegion {
+    fn formula_region(id: usize, points: [[f32; 2]; 4], latex: &str, truncated: bool) -> OcrRegion {
         OcrRegion {
             source: RegionSource::Detected { detector_index: id },
+            kind: RegionKind::Formula,
             polygon: Some(Polygon { points }),
-            detection: None,
+            detection: Some(crate::DetectionOutcome { score: 0.8 }),
             classification: None,
-            recognition: Some(RecognitionOutcome {
+            recognition: None,
+            formula: Some(FormulaOutcome {
+                latex: latex.to_string(),
+                eos_index: if truncated { None } else { Some(1) },
+                truncated,
+                model_id: "pp_formulanet_plus_m".to_string(),
+                token_ids: None,
+            }),
+        }
+    }
+
+    fn text_region(id: usize, points: [[f32; 2]; 4], text: &str) -> OcrRegion {
+        OcrRegion::text(
+            RegionSource::Detected { detector_index: id },
+            Some(Polygon { points }),
+            None,
+            None,
+            Some(RecognitionOutcome {
                 text: text.to_string(),
                 score: 0.99,
                 words: None,
             }),
-        }
+        )
+    }
+
+    #[test]
+    fn formula_regions_render_as_display_math_in_reading_order() {
+        let output = output_with_regions(vec![
+            text_region(
+                0,
+                [[10.0, 10.0], [90.0, 10.0], [90.0, 30.0], [10.0, 30.0]],
+                "above",
+            ),
+            formula_region(
+                1,
+                [[10.0, 40.0], [90.0, 40.0], [90.0, 70.0], [10.0, 70.0]],
+                "\\frac{a}{b}",
+                false,
+            ),
+            text_region(
+                2,
+                [[10.0, 80.0], [90.0, 80.0], [90.0, 95.0], [10.0, 95.0]],
+                "below",
+            ),
+        ]);
+        let markdown = super::to_output_markdown(&output);
+        assert!(markdown.contains("above"), "markdown: {markdown}");
+        assert!(markdown.contains("$$"), "markdown: {markdown}");
+        assert!(markdown.contains("\\frac{a}{b}"), "markdown: {markdown}");
+        assert!(markdown.contains("below"), "markdown: {markdown}");
+        assert!(
+            markdown.find("$$").unwrap() > markdown.find("above").unwrap(),
+            "formula must keep reading order: {markdown}"
+        );
+        assert!(
+            markdown.find("below").unwrap() > markdown.find("$$").unwrap(),
+            "formula must keep reading order: {markdown}"
+        );
+    }
+
+    #[test]
+    fn truncated_formula_markdown_carries_the_invisible_marker() {
+        let output = output_with_regions(vec![formula_region(
+            0,
+            [[10.0, 10.0], [90.0, 10.0], [90.0, 40.0], [10.0, 40.0]],
+            "\\frac{1}{",
+            true,
+        )]);
+        let markdown = super::to_output_markdown(&output);
+        assert!(
+            markdown.contains(crate::formula::output::TRUNCATED_MARKER),
+            "markdown: {markdown}"
+        );
     }
 
     fn output_with_regions(regions: Vec<OcrRegion>) -> OcrOutput {
@@ -237,6 +341,7 @@ mod tests {
                     },
                     timing: None,
                 },
+                formula: StageReport::default(),
             },
             regions,
             timings: OcrTimings::default(),

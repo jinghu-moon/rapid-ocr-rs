@@ -5,12 +5,18 @@
 //!
 //! 阶段 0B 只建立空领域模块；阶段 3 增加模型契约探针 `model_info`。
 //! `preprocess`/`tokenizer`/`session` 在阶段 4/5/6 实现。
+//! 页面级公式检测在 `detect`，RapidDoc 后处理等价性在 `postprocess` + `ftfy`。
 
+pub mod contract;
+pub mod detect;
+pub mod ftfy;
+pub(crate) mod ftfy_tables;
 pub mod model_info;
 pub mod output;
 pub mod postprocess;
 pub mod preprocess;
 pub mod recognizer;
+pub mod route;
 pub mod session;
 pub mod tokenizer;
 pub mod tokenizer_metadata;
