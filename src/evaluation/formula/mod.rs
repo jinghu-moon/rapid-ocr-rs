@@ -4,3 +4,4 @@
 //! `HWE`（手写公式）作为附加测试单独报告，不并入印刷体平均值。
 
 pub mod fixture;
+pub mod metrics;

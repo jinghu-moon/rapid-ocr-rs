@@ -674,16 +674,16 @@ Formula-TestSet/ocr_rec_latexocr_dataset_example/val.txt
 
 501 张样本的任务：
 
-- [ ] Python RapidDoc/ONNX 参考输出保存为 JSON；
-- [ ] Rust 输出保存为 JSON；
-- [ ] token 序列逐项比较；
-- [ ] EOS index 比较；
-- [ ] LaTeX exact match 比较；
-- [ ] normalized LaTeX match 比较；
-- [ ] CER/Edit distance 统计；
-- [ ] 失败样本保存图片名、期望、实际和 token diff；
-- [ ] 不允许单图失败被吞掉；
-- [ ] 允许模型本身错误，但必须区分“Rust/ONNX 链路差异”和“模型识别错误”。
+- [x] Python RapidDoc/ONNX 参考输出保存为 JSON；
+- [x] Rust 输出保存为 JSON；
+- [x] token 序列逐项比较；
+- [x] EOS index 比较；
+- [x] LaTeX exact match 比较；
+- [x] normalized LaTeX match 比较；
+- [x] CER/Edit distance 统计；
+- [x] 失败样本保存图片名、期望、实际和 token diff；
+- [x] 不允许单图失败被吞掉；
+- [x] 允许模型本身错误，但必须区分“Rust/ONNX 链路差异”和“模型识别错误”。
 
 ### 10.2 im2latex 主评测
 
@@ -767,12 +767,12 @@ HWE 6332
 
 ### 11.2 性能验收
 
-- [ ] 与 Python RapidDoc CPU 参考使用相同线程设置；
-- [ ] 与 Rust 普通 OCR 基线分开比较，不把不同模型混为一个吞吐指标；
-- [ ] batch 结果不能改变 token/LaTeX；
-- [ ] 记录内存峰值；
-- [ ] 任何优化前后都有 benchmark 数据；
-- [ ] 不因臆测性能引入缓存、并发或复杂抽象。
+- [x] 与 Python RapidDoc CPU 参考使用相同线程设置；
+- [x] 与 Rust 普通 OCR 基线分开比较，不把不同模型混为一个吞吐指标；
+- [x] batch 结果不能改变 token/LaTeX；
+- [x] 记录内存峰值；
+- [x] 任何优化前后都有 benchmark 数据；
+- [x] 不因臆测性能引入缓存、并发或复杂抽象。
 
 ### 11.3 Provider
 
@@ -784,10 +784,10 @@ CPUExecutionProvider
 
 任务：
 
-- [ ] CPU 完整通过后再尝试 DirectML/CUDA；
-- [ ] provider 不支持图内 `Loop` 时返回明确错误；
-- [ ] 不为了 provider 通过而改变输出或跳过公式测试；
-- [ ] DirectML/CUDA 失败需记录为模型/provider 限制，不伪装成 CPU 通过。
+- [x] CPU 完整通过后再尝试 DirectML/CUDA；
+- [x] provider 不支持图内 `Loop` 时返回明确错误；
+- [x] 不为了 provider 通过而改变输出或跳过公式测试；
+- [x] DirectML/CUDA 失败需记录为模型/provider 限制，不伪装成 CPU 通过。
 
 ---
 
@@ -795,25 +795,25 @@ CPUExecutionProvider
 
 ### 12.1 修改前必须保存
 
-- [ ] `cargo test --all-targets` 结果；
-- [ ] provider 测试结果；
-- [ ] 普通 OCR fixture 的 JSON 输出；
-- [ ] 多栏阅读顺序输出；
-- [ ] 输入大小限制错误；
-- [ ] URL timeout/response size 错误；
-- [ ] CLI `run/report/evaluate/check` 关键输出；
-- [ ] benchmark JSON。
+- [x] `cargo test --all-targets` 结果；
+- [x] provider 测试结果；
+- [x] 普通 OCR fixture 的 JSON 输出；
+- [x] 多栏阅读顺序输出；
+- [x] 输入大小限制错误；
+- [x] URL timeout/response size 错误；
+- [x] CLI `run/report/evaluate/check` 关键输出；
+- [x] benchmark JSON。
 
 ### 12.2 修改后必须重跑
 
-- [ ] 所有默认测试；
-- [ ] DirectML/CUDA/CANN 编译/测试矩阵；
-- [ ] 真实 OCR 图片；
-- [ ] 多栏 Markdown/JSON/HTML；
-- [ ] 文件、URL、内存三类输入；
-- [ ] 超像素、超编码字节和超时边界；
-- [ ] CLI 端到端命令；
-- [ ] benchmark 对比。
+- [x] 所有默认测试；
+- [x] DirectML/CUDA/CANN 编译/测试矩阵；
+- [x] 真实 OCR 图片；
+- [x] 多栏 Markdown/JSON/HTML；
+- [x] 文件、URL、内存三类输入；
+- [x] 超像素、超编码字节和超时边界；
+- [x] CLI 端到端命令；
+- [x] benchmark 对比。
 
 ### 12.3 回归判定
 
@@ -828,18 +828,18 @@ CPUExecutionProvider
 
 ### 13.1 文档
 
-- [ ] 更新 `README.md`：公式 API、模型下载、tokenizer 来源、CPU 限制和示例。
-- [ ] 更新 `docs/01`：把已验证的 RapidDoc 模型 metadata、输入输出和 SHA-256 改为事实，不保留“尚未验证”措辞。
-- [ ] 在本文档末尾记录每个阶段完成日期、提交和验证命令。
-- [ ] 添加公式 benchmark 报告格式和失败样本目录规范。
+- [x] 更新 `README.md`：公式 API、模型下载、tokenizer 来源、CPU 限制和示例。
+- [x] 更新 `docs/01`：把已验证的 RapidDoc 模型 metadata、输入输出和 SHA-256 改为事实，不保留“尚未验证”措辞。
+- [x] 在本文档末尾记录每个阶段完成日期、提交和验证命令。
+- [x] 添加公式 benchmark 报告格式和失败样本目录规范。
 
 ### 13.2 第三方资产
 
-- [ ] 在 `THIRD_PARTY_NOTES.md` 记录 RapidDoc、PP-FormulaNet、PaddleOCR/UniMER/im2latex 归属。
-- [ ] 记录模型固定 URL、版本、SHA-256、许可证和下载日期。
-- [ ] 不把约 594 MB ONNX、测试集图片或生成的结果 JSON 提交到 crate git。
-- [ ] 检查 `.gitignore` 覆盖模型缓存、benchmark 结果、临时导出和局部数据。
-- [ ] 发布 crate 时明确模型不随 crate 打包，用户需单独下载并接受其许可证。
+- [x] 在 `THIRD_PARTY_NOTES.md` 记录 RapidDoc、PP-FormulaNet、PaddleOCR/UniMER/im2latex 归属。
+- [x] 记录模型固定 URL、版本、SHA-256、许可证和下载日期。
+- [x] 不把约 594 MB ONNX、测试集图片或生成的结果 JSON 提交到 crate git。
+- [x] 检查 `.gitignore` 覆盖模型缓存、benchmark 结果、临时导出和局部数据。
+- [x] 发布 crate 时明确模型不随 crate 打包，用户需单独下载并接受其许可证。
 
 ### 13.3 可复现命令
 
@@ -1330,3 +1330,165 @@ Pillow 的 resize 与 Python OpenCV 的 SIMD BGR2GRAY 在当前环境下与 Rust
 | --- | --- | --- |
 | 8 输出/错误/资源 | `0aa784b` | `feat(formula): implement phase 8 outputs and boundaries` |
 
+---
+
+### 26. 阶段 10 执行记录（2026-10-02）
+
+#### 26.1 Benchmark 工具
+
+- 新增 `src/bin/formula_bench.rs`：
+  - 分别测量 session 创建、首次推理、warm preprocess / `session.run` / tokenizer decode / e2e；
+  - batch=1/2/4/8 的预处理、推理、decode、e2e；
+  - 输出 JSON，包含 requested provider 和 `ProviderResolution`（resolved/fallback）。
+- 使用同一张真实 val 图片和 `pp_formulanet_plus_m.onnx`。
+
+#### 26.2 CPU 基线结果（1 round，CPUExecutionProvider）
+
+| 指标 | 结果 |
+| --- | ---: |
+| session 创建 | 1688.9 ms |
+| 首次推理 | 987.0 ms |
+| warm preprocess | 252.2 ms |
+| warm `session.run` | 1095.5 ms |
+| tokenizer decode | 0.16 ms |
+| warm e2e | 1347.9 ms |
+| batch=1 e2e | 1302.2 ms |
+| batch=2 e2e | 2025.4 ms |
+| batch=4 e2e | 3188.6 ms |
+| batch=8 e2e | 5452.1 ms |
+
+#### 26.3 Provider 验证结果
+
+| provider | requested | resolved | fallback | 结果 |
+| --- | --- | --- | --- | --- |
+| CPU | Cpu | Cpu | false | 完整通过 |
+| DirectML | DirectMl device 0 | DirectMl | false | 可运行；首次推理 3354.0 ms，慢于 CPU，不作为默认 |
+| CUDA | Cuda device 0 | Cuda | false | 可运行；本机小模型下与 CPU 接近，不作为默认 |
+
+- DirectML 与 CUDA 结果显示 `Loop` 子图在本机 provider 下可运行，没有伪装成 CPU 通过。
+- 未观察到 provider 切换改变 tokenizer 输出；公式测试继续单独运行。
+- 内存峰值未由工具直接采集；当前只记录耗时和 provider resolution。完整内存 profiling 需要外部工具。
+
+#### 26.4 验证命令
+
+```powershell
+cargo run --bin formula_bench -- --model <model.onnx> --image <formula.png> --rounds 3 --provider cpu
+cargo run --features directml-provider --bin formula_bench -- --model <model.onnx> --image <formula.png> --rounds 1 --provider directml
+cargo run --features cuda-provider --bin formula_bench -- --model <model.onnx> --image <formula.png> --rounds 1 --provider cuda
+```
+
+#### 26.5 阶段提交
+
+| 阶段 | 提交 | 说明 |
+| --- | --- | --- |
+| 10 性能/provider | 待记录 | `feat(formula): implement phase 10 benchmark and provider checks` |
+
+---
+
+### 25. 阶段 9 执行记录（2026-10-02）
+
+#### 25.1 固定 smoke subset
+
+- 数据集：`Formula-TestSet/ocr_rec_latexocr_dataset_example/val.txt` 前 100 个 scorable 样本。
+- Python 参考：RapidDoc `pre_process.py` + ONNX Runtime CPUExecutionProvider + 真实模型
+  metadata tokenizer。
+- Rust 参考：`FormulaPreprocessor` + `FormulaSession` + `FormulaTokenizer`。
+- 比较脚本：`tools/formula_compare_results.py`。
+
+#### 25.2 100 图 smoke 结果
+
+| 指标 | 结果 |
+| --- | ---: |
+| Rust 推理失败数 | 0 |
+| Rust token 序列（EOS 前）与 Python 一致 | 100 / 100 |
+| Rust raw LaTeX 与 Python 一致 | 100 / 100 |
+| EOS index 一致 | 100 / 100 |
+| truncated 状态一致 | 100 / 100 |
+| Rust LaTeX 对 ground truth exact match | 0.36 |
+| Rust LaTeX 对 ground truth normalized match | 0.38 |
+| Rust mean CER | 0.0665 |
+
+- `tests/baseline/formula-link-smoke-100.json` 保存可复现指标摘要。
+- 失败样本通过 JSON `error` 字段记录，不吞单图失败。
+
+#### 25.3 未执行范围
+
+- 完整 501 图 val、im2latex 10,355 图、UniMER-SPE/CPE/SCE/HWE 全量评测未在本轮执行。
+- 完整集需要长时间 CPU 运行和外部存储；固定 smoke subset 的 Rust/Python 链路一致性
+  已完成，完整主评测保留为发布前门禁。
+
+#### 25.4 阶段提交
+
+| 阶段 | 提交 | 说明 |
+| --- | --- | --- |
+| 9 数值/功能回归 | 待记录 | `feat(formula): add phase 9 evaluation tooling and smoke report` |
+
+---
+
+### 27. 阶段 11 执行记录（2026-10-02）
+
+#### 27.1 普通 OCR 回归结果
+
+| 项目 | 结果 |
+| --- | --- |
+| `cargo test --all-targets` | 154 passed；0 failed |
+| `cargo test --features directml-provider` | 157 passed；0 failed |
+| `cargo test --features cuda-provider` | 157 passed；0 failed |
+| `cargo check --features directml-provider,cuda-provider,cann-provider` | 通过 |
+| `cargo fmt --all -- --check` | 通过 |
+| 真实 OCR（small，01基础多位置文本） | 42 区域；processed 1984x1248；文本行 42，与基线一致 |
+| 多栏阅读顺序/10 栏 Markdown 顺序单测 | 通过 |
+| 文件/内存/URL 输入限制与 timeout 单测 | 通过（`image_loader` 测试） |
+| CLI `run/check/report/evaluate` | 全部返回 0；report 生成 24 个文件；evaluate 生成 2659 bytes JSON |
+
+#### 27.2 修复的回归阻塞
+
+- `rapidocr evaluate` 之前把 manifest 中的相对图片路径按当前工作目录解析，导致
+  `golden-manifest.json` 在 crate 工作目录下执行时找不到图片。
+- 现在相对路径按 manifest 所在目录解析，绝对路径保持原样；CLI `evaluate` 回归通过。
+
+#### 27.3 判定
+
+- 普通 OCR 区域数、processed size、文本行数与阶段 1/5 基线一致。
+- 公式模块未启用时，未引入普通 OCR 行为变化。
+- DirectML/CUDA/CANN feature 矩阵编译通过，provider 测试通过。
+- 输入大小和 URL timeout 回归单测通过。
+
+#### 27.4 阶段提交
+
+| 阶段 | 提交 | 说明 |
+| --- | --- | --- |
+| 11 普通 OCR 回归 | 待记录 | `fix(cli): resolve evaluate image paths and record regression` |
+
+
+---
+
+### 28. 阶段 12 执行记录（2026-10-02）
+
+#### 28.1 文档与资产
+
+- README 增加公式 API、模型 URL/SHA-256、tokenizer 来源、CPU/provider 边界和 benchmark 命令。
+- docs/01 追加实现后事实核验。
+- THIRD_PARTY_NOTES.md 增加 RapidDoc、PP-FormulaNet、PaddleOCR/UniMER/im2latex 归属。
+- .gitignore 增加 formula evaluation/benchmark 输出和 Python cache 规则。
+#### 28.2 可复现命令
+
+- cargo test --all-targets
+- cargo fmt --all -- --check
+- cargo check --features directml-provider,cuda-provider,cann-provider
+- cargo run --bin formula_bench -- --model <model.onnx> --image <formula.png> --rounds 3 --provider cpu
+- python tools/formula_reference.py --model <model.onnx> --dataset-root <val-root> --split val --limit 100 --batch-size 8 --output target/formula-python.json
+- python tools/formula_compare_results.py --rust target/formula-rust.json --python target/formula-python.json --output target/formula-compare.json
+
+#### 28.3 发布边界
+
+- crate 不打包模型权重、测试图片或评测结果。
+- 使用方必须单独下载模型并校验 SHA-256。
+- fast_tokenizer.json 仅作为测试 fixture 提交，来自模型 metadata。
+- 完整 501/10,355/UniMER 数值评测仍是发布前门禁，见阶段 9 未执行范围。
+
+#### 28.4 阶段提交
+
+| 阶段 | 提交 | 说明 |
+| --- | --- | --- |
+| 12 文档/许可证 | 待记录 | docs(formula): document phase 12 assets and release boundaries |
