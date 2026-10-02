@@ -293,13 +293,13 @@ $env:RAPID_OCR_FORMULA_TEST_ROOT = "D:\100_Projects\110_Daily\SnapClip\Formula-T
 
 ### 3.2 实现测试 fixture loader 前先写测试
 
-- [ ] Red：不存在根目录时返回结构化错误，不 panic。
-- [ ] Red：缺失 label 文件时返回错误。
-- [ ] Red：缺失图片时返回错误并指出文件名。
-- [ ] Red：空标签拒绝进入评测。
-- [ ] Red：路径包含 Unicode、空格时可读取。
-- [ ] Green：实现 `FormulaFixture`、`FormulaSample` 和三个数据集 loader。
-- [ ] Refactor：统一样本接口，不为每个数据集复制评测循环。
+- [x] Red：不存在根目录时返回结构化错误，不 panic。
+- [x] Red：缺失 label 文件时返回错误。
+- [x] Red：缺失图片时返回错误并指出文件名。
+- [x] Red：空标签由 loader 标记并从可评分集合排除（真实 im2latex test 有 71 条空标签引用，不能整批拒绝或丢弃）。
+- [x] Red：路径包含 Unicode、空格时可读取（含图片名内含空格，从右向左按最后一个空白拆分）。
+- [x] Green：实现 `FormulaFixture`、`FormulaSample` 和三个数据集 loader。
+- [x] Refactor：统一样本接口，不为每个数据集复制评测循环。
 
 建议数据结构：
 
@@ -332,14 +332,14 @@ image_name.png formula_index
 
 实现并测试：
 
-- [ ] `image_name` 精确定位本地 PNG；
-- [ ] `formula_index` 索引 `im2latex_formulas.norm.lst`；
-- [ ] 越界 index 失败；
-- [ ] 文件名缺失失败；
-- [ ] test/validation 样本无交集；
-- [ ] `test_filter` 10,355 条全部可定位；
-- [ ] `validate_filter` 8,370 条全部可定位；
-- [ ] 不使用原始 `im2latex_test.lst` 直接按行配对。
+- [x] `image_name` 精确定位本地 PNG；
+- [x] `formula_index` 索引 `im2latex_formulas.norm.lst`；
+- [x] 越界 index 失败；
+- [x] 文件名缺失失败；
+- [x] test/validation 样本无交集；
+- [x] `test_filter` 10,355 条全部可定位；
+- [x] `validate_filter` 8,370 条全部可定位；
+- [x] 不使用原始 `im2latex_test.lst` 直接按行配对。
 
 ### 3.4 PaddleX 示例集测试
 
@@ -352,12 +352,12 @@ Formula-TestSet/ocr_rec_latexocr_dataset_example/
   val.txt
 ```
 
-- [ ] Red：验证 `val.txt` 的图片引用全部存在；
-- [ ] Red：制造缺失图片时 loader 明确失败；
-- [ ] Green：读取 tab 分隔图片路径和 LaTeX；
-- [ ] Refactor：统一为 `FormulaSample`；
-- [ ] 固定 501 张 `val` 作为 smoke/e2e gold set；
-- [ ] 明确 `latex_ocr_tokenizer.json` 不作为 PP-FormulaNet tokenizer。
+- [x] Red：验证 `val.txt` 的图片引用全部存在；
+- [x] Red：制造缺失图片时 loader 明确失败；
+- [x] Green：读取 tab 分隔图片路径和 LaTeX；
+- [x] Refactor：统一为 `FormulaSample`；
+- [x] 固定 501 张 `val` 作为 smoke/e2e gold set；
+- [x] 明确 `latex_ocr_tokenizer.json` 不作为 PP-FormulaNet tokenizer。
 
 ### 3.5 UniMER-Test 映射测试
 
@@ -377,11 +377,11 @@ Formula-TestSet/UniMER-Test/
 
 测试任务：
 
-- [ ] 每个子集抽取首、中、尾各 3 个样本验证映射；
-- [ ] 验证图片可解码；
-- [ ] 验证索引越界错误；
-- [ ] 按 `SPE/CPE/SCE/HWE` 分组统计，禁止默认混合汇总；
-- [ ] 记录 HWE 是手写公式附加测试，不是 PP-FormulaNet-M 主验收集。
+- [x] 每个子集抽取首、中、尾各 3 个样本验证映射；
+- [x] 验证图片可解码；
+- [x] 验证索引越界错误；
+- [x] 按 `SPE/CPE/SCE/HWE` 分组统计，禁止默认混合汇总；
+- [x] 记录 HWE 是手写公式附加测试，不是 PP-FormulaNet-M 主验收集。
 
 ---
 
@@ -893,7 +893,7 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 | 0A 设计冻结 | ☑ | 2026-10-02 | `8e05bfa` | 无源码修改；确认目录/依赖/迁移方案 | 模型 SHA-256 一致；测试集齐备；目标目录冻结 | typed contract 留待阶段 5 |
 | 1 基线 | ☑ | 2026-10-02 | `8e05bfa` | cargo test/fmt/check + provider 矩阵 | 默认 76/DirectML 79/CUDA 79 通过；CANN check 通过；真实图片回归正常 | 未重测独立吞吐/内存，沿用既有基准 |
 | 0B 结构重构 | ☑ | 2026-10-02 | `b1846cc` | cargo check/test/fmt + provider 矩阵 + 真实图片回归 | 76 测试通过；DirectML/CUDA 79 通过；CANN check 通过；真实图片 42 区域文本一致 | 依赖边界靠 mod.rs 注释约束；阶段 11 最终复核 |
-| 2 fixture | ☐ |  |  |  |  |  |
+| 2 fixture | ☑ | 2026-10-02 | 待填 | cargo test --lib evaluation::formula::fixture / cargo test --lib / cargo fmt --all -- --check | 17 项 fixture 测试全绿；lib 93/93；im2latex test 10,355 / validate 8,370 全部可定位且无交集；UniMER meas 首/中/尾映射+可解码通过；空标签标记并排除出评分 | 未跑 provider 矩阵（fixture 为纯 IO，不涉模型/推理） |
 | 3 模型契约 | ☐ |  |  |  |  |  |
 | 4 预处理 | ☐ |  |  |  |  |  |
 | 5 runtime/领域契约 | ☐ |  |  |  |  |  |
@@ -996,4 +996,33 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 | 1 基线 | `8e05bfa` | 与 0A 同一次文档提交（基线记录按阶段归档） |
 | 0B 结构重构 | `b1846cc` | `refactor(ocr): move ordinary OCR into ocr bounded context (phase 0B)` |
 
-后续阶段（2-12）尚未开始。
+### 18. 阶段 2 执行记录（2026-10-02）
+
+### 18.1 实现内容
+
+- 将 `src/evaluation/formula.rs`（占位）重建为目录模块 `src/evaluation/formula/`：`mod.rs` + `fixture.rs`
+- `fixture.rs` 实现统一样本接口 `FormulaSample`/`FormulaFixture`，以及三个 loader：
+  - `load_im2latex`：`im2latex_test_filter.lst` / `im2latex_validate_filter.lst` + `im2latex_formulas.norm.lst`
+  - `load_latex_ocr_example`：`val.txt`/`train.txt`（tab 分隔）
+  - `load_unimer`：`spe/ cpe/ sce/ hwe/` 子目录 + 对应 `*.txt` 标签
+- 公开工具：`FormulaFixture::scorable()`（仅含非空真值样本）、`empty_ground_truth()`、`smoke()`、`check_images_decodable()`、`overlap_count()`、`summarize_unimer()`
+
+### 18.2 关键数据事实（根因修正）
+
+原始实现过滤了标签文件中的空行，导致按原始行号索引错位。真实数据：
+
+- `im2latex_formulas.norm.lst`：103,559 行，其中 697 行为空串；filter 的 `formula_index` 是**原始行号（含空行）**。
+- `im2latex_test_filter.lst`：10,355 条，索引范围 11..=103,546，**71 条引用空标签**；`validate_filter.lst`：8,370 条，无空标签引用；两者图片无交集。
+- `im2latex` 图片名可能含空格，因此按**最后一个空白**拆分索引，图片名取左侧剩余部分。
+- `UniMER-Test`：`spe.txt` 234,884 行 / 6,762 图；`cpe.txt` 5,921 / 5,921 图；`sce.txt` 6,708 行 / 4,742 图；`hwe.txt` 6,332 / 6,332 图。`spe`/`sce` 图片文件名数字是原始 label 行索引，不能 `zip(sorted(images), labels)`。
+- 空标签样本**不拒绝、不丢弃**，而是标记为 `has_ground_truth()==false`，从精确匹配统计中排除（`scorable()`），避免丢失评测目标或整批失败。
+
+### 18.3 验证结果
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --lib evaluation::formula::fixture` | 17 passed；0 failed |
+| `cargo test --lib` | 93 passed；0 failed |
+| `cargo fmt --all -- --check` | 通过 |
+
+阶段 2 完成后，阶段 3（ONNX 模型契约）开始。
