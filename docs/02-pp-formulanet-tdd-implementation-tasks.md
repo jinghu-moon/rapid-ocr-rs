@@ -893,7 +893,7 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 | 0A 设计冻结 | ☑ | 2026-10-02 | `8e05bfa` | 无源码修改；确认目录/依赖/迁移方案 | 模型 SHA-256 一致；测试集齐备；目标目录冻结 | typed contract 留待阶段 5 |
 | 1 基线 | ☑ | 2026-10-02 | `8e05bfa` | cargo test/fmt/check + provider 矩阵 | 默认 76/DirectML 79/CUDA 79 通过；CANN check 通过；真实图片回归正常 | 未重测独立吞吐/内存，沿用既有基准 |
 | 0B 结构重构 | ☑ | 2026-10-02 | `b1846cc` | cargo check/test/fmt + provider 矩阵 + 真实图片回归 | 76 测试通过；DirectML/CUDA 79 通过；CANN check 通过；真实图片 42 区域文本一致 | 依赖边界靠 mod.rs 注释约束；阶段 11 最终复核 |
-| 2 fixture | ☑ | 2026-10-02 | 待填 | cargo test --lib evaluation::formula::fixture / cargo test --lib / cargo fmt --all -- --check | 17 项 fixture 测试全绿；lib 93/93；im2latex test 10,355 / validate 8,370 全部可定位且无交集；UniMER meas 首/中/尾映射+可解码通过；空标签标记并排除出评分 | 未跑 provider 矩阵（fixture 为纯 IO，不涉模型/推理） |
+| 2 fixture | ☑ | 2026-10-02 | `5f05bf5` | cargo test --lib evaluation::formula::fixture / cargo test --lib / cargo fmt --all -- --check | 17 项 fixture 测试全绿；lib 93/93；im2latex test 10,355 / validate 8,370 全部可定位且无交集；UniMER meas 首/中/尾映射+可解码通过；空标签标记并排除出评分 | 未跑 provider 矩阵（fixture 为纯 IO，不涉模型/推理） |
 | 3 模型契约 | ☐ |  |  |  |  |  |
 | 4 预处理 | ☐ |  |  |  |  |  |
 | 5 runtime/领域契约 | ☐ |  |  |  |  |  |
