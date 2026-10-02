@@ -1,0 +1,518 @@
+{
+  "tool": "tools/summarize_formula_eval.py",
+  "regenerate": "python tools/summarize_formula_eval.py --dir target/formula-eval --baseline-json tests\\baseline\\formula-evaluation-2026-10-03.json",
+  "note": "由 formula_eval / formula_bench 的报告精简而来；原始报告不随仓库提交。分片运行的吞吐是并发下界，权威性能数据来自串行无争用的 bench-*.json。",
+  "evaluations": [
+    {
+      "dataset": "im2latex",
+      "split": "test",
+      "subset": null,
+      "batch_size": 8,
+      "manifest_sha256": "31747b4d8cc0c3e71ac528cde038052ababa4817392b3c19a2a567bdbe1dfe97",
+      "limit": 100,
+      "strategy": "hash",
+      "samples": 100,
+      "scored": 100,
+      "exact_match_rate": 0.26,
+      "normalized_match_rate": 0.26,
+      "mean_cer": 0.0851973536439876,
+      "pipeline_failures": 0,
+      "model_mismatches": 74,
+      "truncated": 0,
+      "failure_counts": {
+        "model_mismatch": 74,
+        "none": 26
+      },
+      "images_per_second": 1.9491321418969443,
+      "per_image_p50_ms": 474.47845458984375,
+      "per_image_p95_ms": 855.576416015625,
+      "peak_working_set_bytes": 2200858624,
+      "provider": {
+        "requested": "Cpu",
+        "resolved": "Cpu",
+        "fallback_used": false,
+        "intra_threads": null,
+        "inter_threads": null,
+        "auto_tune_threads": true,
+        "physical_cpus": 14
+      },
+      "merged_from": null
+    },
+    {
+      "dataset": "im2latex",
+      "split": "test",
+      "subset": null,
+      "batch_size": 8,
+      "manifest_sha256": "7813ded3c22f9ec35e2a6a3edf52989bab0ab85d3ed5101e3ddc475f3d2dae67",
+      "limit": 0,
+      "strategy": "hash",
+      "samples": 10355,
+      "scored": 10284,
+      "exact_match_rate": 0.26380785686503305,
+      "normalized_match_rate": 0.2675029171528588,
+      "mean_cer": 0.11834735361898523,
+      "pipeline_failures": 0,
+      "model_mismatches": 7560,
+      "truncated": 11,
+      "failure_counts": {
+        "empty_ground_truth": 71,
+        "model_mismatch": 7560,
+        "none": 2713,
+        "truncated_no_eos": 11
+      },
+      "images_per_second": 1.2364103082147415,
+      "per_image_p50_ms": 612.6823120117188,
+      "per_image_p95_ms": 1354.1929931640625,
+      "peak_working_set_bytes": 4071374848,
+      "provider": {
+        "requested": "Cpu",
+        "resolved": "Cpu",
+        "fallback_used": false,
+        "intra_threads": null,
+        "inter_threads": null,
+        "auto_tune_threads": true,
+        "physical_cpus": 14
+      },
+      "merged_from": null
+    },
+    {
+      "dataset": "unimer_cpe",
+      "split": "test",
+      "subset": "cpe",
+      "batch_size": 8,
+      "manifest_sha256": "9c95492c9a7776bb994371f220ff17a4bb9ff359a3d15bd5f706aa7f673800c0",
+      "limit": 0,
+      "strategy": "hash",
+      "samples": 5921,
+      "scored": 5921,
+      "exact_match_rate": 0.1818949501773349,
+      "normalized_match_rate": 0.18493497719979732,
+      "mean_cer": 0.10085682329675363,
+      "pipeline_failures": 0,
+      "model_mismatches": 4819,
+      "truncated": 25,
+      "failure_counts": {
+        "model_mismatch": 4819,
+        "none": 1077,
+        "truncated_no_eos": 25
+      },
+      "images_per_second": 0.5056862840374012,
+      "per_image_p50_ms": 6920.515625,
+      "per_image_p95_ms": 23793.935546875,
+      "peak_working_set_bytes": 3765940224,
+      "provider": {
+        "requested": "Cpu",
+        "resolved": "Cpu",
+        "fallback_used": false,
+        "intra_threads": 3,
+        "inter_threads": null,
+        "auto_tune_threads": false,
+        "physical_cpus": 14
+      },
+      "merged_from": [
+        "D:\\100_Projects\\110_Daily\\SnapClip\\crates\\rapid-ocr-rs\\target\\formula-eval\\unimer-cpe.shard0.json",
+        "D:\\100_Projects\\110_Daily\\SnapClip\\crates\\rapid-ocr-rs\\target\\formula-eval\\unimer-cpe.shard1.json",
+        "D:\\100_Projects\\110_Daily\\SnapClip\\crates\\rapid-ocr-rs\\target\\formula-eval\\unimer-cpe.shard2.json",
+        "D:\\100_Projects\\110_Daily\\SnapClip\\crates\\rapid-ocr-rs\\target\\formula-eval\\unimer-cpe.shard3.json",
+        "D:\\100_Projects\\110_Daily\\SnapClip\\crates\\rapid-ocr-rs\\target\\formula-eval\\unimer-cpe.shard4.json"
+      ]
+    },
+    {
+      "dataset": "unimer_hwe",
+      "split": "test",
+      "subset": "hwe",
+      "batch_size": 8,
+      "manifest_sha256": "302422a93ae9127ff3a55f01b2143a57486d7d6c2cda61b196da0dee5c8f323e",
+      "limit": 0,
+      "strategy": "hash",
+      "samples": 6332,
+      "scored": 6332,
+      "exact_match_rate": 0.48878711307643713,
+      "normalized_match_rate": 0.48878711307643713,
+      "mean_cer": 0.15445354922842613,
+      "pipeline_failures": 0,
+      "model_mismatches": 3234,
+      "truncated": 3,
+      "failure_counts": {
+        "model_mismatch": 3234,
+        "none": 3095,
+        "truncated_no_eos": 3
+      },
+      "images_per_second": 1.2906836491921878,
+      "per_image_p50_ms": 652.3704833984375,
+      "per_image_p95_ms": 963.8724365234375,
+      "peak_working_set_bytes": 3409068032,
+      "provider": {
+        "requested": "Cpu",
+        "resolved": "Cpu",
+        "fallback_used": false,
+        "intra_threads": 4,
+        "inter_threads": null,
+        "auto_tune_threads": false,
+        "physical_cpus": 14
+      },
+      "merged_from": null
+    },
+    {
+      "dataset": "unimer_sce",
+      "split": "test",
+      "subset": "sce",
+      "batch_size": 8,
+      "manifest_sha256": "2ae51500e0bebc95c40ae9348f4db0a21061db43d8e092628904a11654955116",
+      "limit": 0,
+      "strategy": "hash",
+      "samples": 4742,
+      "scored": 4742,
+      "exact_match_rate": 0.33677773091522567,
+      "normalized_match_rate": 0.39814424293547024,
+      "mean_cer": 0.3882867812903806,
+      "pipeline_failures": 0,
+      "model_mismatches": 3144,
+      "truncated": 1,
+      "failure_counts": {
+        "model_mismatch": 3144,
+        "none": 1597,
+        "truncated_no_eos": 1
+      },
+      "images_per_second": 1.2576378143601588,
+      "per_image_p50_ms": 615.5873413085938,
+      "per_image_p95_ms": 1588.3389892578125,
+      "peak_working_set_bytes": 3309334528,
+      "provider": {
+        "requested": "Cpu",
+        "resolved": "Cpu",
+        "fallback_used": false,
+        "intra_threads": 4,
+        "inter_threads": null,
+        "auto_tune_threads": false,
+        "physical_cpus": 14
+      },
+      "merged_from": null
+    },
+    {
+      "dataset": "unimer_spe",
+      "split": "test",
+      "subset": "spe",
+      "batch_size": 8,
+      "manifest_sha256": "06fa2bc417bafc6efadb5013eab63376870045eb38d5a40bcdb96b61fcd12033",
+      "limit": 0,
+      "strategy": "hash",
+      "samples": 6762,
+      "scored": 6762,
+      "exact_match_rate": 0.3711919550428867,
+      "normalized_match_rate": 0.37533274179236914,
+      "mean_cer": 0.08467600439671011,
+      "pipeline_failures": 0,
+      "model_mismatches": 4241,
+      "truncated": 11,
+      "failure_counts": {
+        "model_mismatch": 4241,
+        "none": 2510,
+        "truncated_no_eos": 11
+      },
+      "images_per_second": 0.8525140280219473,
+      "per_image_p50_ms": 816.5042724609375,
+      "per_image_p95_ms": 2142.347900390625,
+      "peak_working_set_bytes": 4333060096,
+      "provider": {
+        "requested": "Cpu",
+        "resolved": "Cpu",
+        "fallback_used": false,
+        "intra_threads": 8,
+        "inter_threads": null,
+        "auto_tune_threads": false,
+        "physical_cpus": 14
+      },
+      "merged_from": null
+    },
+    {
+      "dataset": "latexocr_example",
+      "split": "validate",
+      "subset": null,
+      "batch_size": 8,
+      "manifest_sha256": "c2a4ec16088774f7694e75aa125968da8420202d624254230c647f68ba75a2d8",
+      "limit": 0,
+      "strategy": "hash",
+      "samples": 501,
+      "scored": 501,
+      "exact_match_rate": 0.37924151696606784,
+      "normalized_match_rate": 0.3872255489021956,
+      "mean_cer": 0.07966784063213257,
+      "pipeline_failures": 0,
+      "model_mismatches": 310,
+      "truncated": 1,
+      "failure_counts": {
+        "model_mismatch": 310,
+        "none": 190,
+        "truncated_no_eos": 1
+      },
+      "images_per_second": 1.103610831896347,
+      "per_image_p50_ms": 686.2857666015625,
+      "per_image_p95_ms": 1183.3785400390625,
+      "peak_working_set_bytes": 3859251200,
+      "provider": {
+        "requested": "Cpu",
+        "resolved": "Cpu",
+        "fallback_used": false,
+        "intra_threads": null,
+        "inter_threads": null,
+        "auto_tune_threads": true,
+        "physical_cpus": 14
+      },
+      "merged_from": null
+    }
+  ],
+  "reference_comparison": [
+    {
+      "dataset": "latexocr_example",
+      "manifest_sha256": "c2a4ec16088774f7694e75aa125968da8420202d624254230c647f68ba75a2d8",
+      "reference_path": "D:\\100_Projects\\110_Daily\\SnapClip\\crates\\rapid-ocr-rs\\target\\formula-eval\\python-val-501.json",
+      "compared": 501,
+      "missing_in_reference": 0,
+      "missing_in_rust": 0,
+      "full_token_sequence_matches": 501,
+      "eos_prefix_token_matches": 501,
+      "eos_index_matches": 501,
+      "truncated_matches": 501,
+      "latex_matches": 501,
+      "both_wrong": 311,
+      "link_differences": 0
+    }
+  ],
+  "benchmarks": [
+    {
+      "provider_requested": "Cpu",
+      "provider_resolved": "Cpu",
+      "provider_fallback_used": false,
+      "rounds": 5,
+      "warmup": 1,
+      "session_create_ms": 1171.2747000000002,
+      "first_inference_ms": 842.9592,
+      "warm_single": {
+        "preprocess": {
+          "samples": 5,
+          "min_ms": 8.6784,
+          "max_ms": 22.2449,
+          "mean_ms": 14.04896,
+          "p50_ms": 13.6104,
+          "p95_ms": 20.6041,
+          "stddev_ms": 5.046465252332568
+        },
+        "session_run": {
+          "samples": 5,
+          "min_ms": 1207.9085,
+          "max_ms": 5657.8014,
+          "mean_ms": 2324.2282999999998,
+          "p50_ms": 1405.362,
+          "p95_ms": 4935.577879999999,
+          "stddev_ms": 1892.243717487116
+        },
+        "tokenizer_decode": {
+          "samples": 5,
+          "min_ms": 0.0438,
+          "max_ms": 0.1168,
+          "mean_ms": 0.06224,
+          "p50_ms": 0.0481,
+          "p95_ms": 0.1049,
+          "stddev_ms": 0.030949684974164116
+        },
+        "end_to_end": {
+          "samples": 5,
+          "min_ms": 1221.5641,
+          "max_ms": 5669.5884,
+          "mean_ms": 2338.3394999999996,
+          "p50_ms": 1414.0885,
+          "p95_ms": 4949.467919999998,
+          "stddev_ms": 1891.6508175348204
+        }
+      },
+      "batches": [
+        {
+          "batch": 1,
+          "per_image_e2e_mean_ms": 1233.53448,
+          "batch_e2e_mean_ms": 1233.53448,
+          "deterministic_tokens": true
+        },
+        {
+          "batch": 2,
+          "per_image_e2e_mean_ms": 1373.1427600000002,
+          "batch_e2e_mean_ms": 2746.2855200000004,
+          "deterministic_tokens": true
+        },
+        {
+          "batch": 4,
+          "per_image_e2e_mean_ms": 2484.882905,
+          "batch_e2e_mean_ms": 9939.53162,
+          "deterministic_tokens": true
+        },
+        {
+          "batch": 8,
+          "per_image_e2e_mean_ms": 1830.0769325,
+          "batch_e2e_mean_ms": 14640.61546,
+          "deterministic_tokens": true
+        }
+      ],
+      "peak_working_set_bytes": 2085588992,
+      "threads": {
+        "intra_threads": null,
+        "inter_threads": null,
+        "auto_tune_threads": true,
+        "logical_cpus": 20,
+        "physical_cpus": 14
+      },
+      "source": "bench-cpu.json"
+    },
+    {
+      "provider_requested": "Cuda",
+      "provider_resolved": "Cuda",
+      "provider_fallback_used": false,
+      "rounds": 2,
+      "warmup": 1,
+      "session_create_ms": 1644.5483,
+      "first_inference_ms": 836.0229999999999,
+      "warm_single": {
+        "preprocess": {
+          "samples": 2,
+          "min_ms": 13.4686,
+          "max_ms": 22.351599999999998,
+          "mean_ms": 17.9101,
+          "p50_ms": 17.9101,
+          "p95_ms": 21.907449999999997,
+          "stddev_ms": 6.281229537280099
+        },
+        "session_run": {
+          "samples": 2,
+          "min_ms": 1208.2461,
+          "max_ms": 2040.007,
+          "mean_ms": 1624.12655,
+          "p50_ms": 1624.12655,
+          "p95_ms": 1998.418955,
+          "stddev_ms": 588.1437727158258
+        },
+        "tokenizer_decode": {
+          "samples": 2,
+          "min_ms": 0.0458,
+          "max_ms": 0.0707,
+          "mean_ms": 0.058249999999999996,
+          "p50_ms": 0.058249999999999996,
+          "p95_ms": 0.069455,
+          "stddev_ms": 0.01760695885154503
+        },
+        "end_to_end": {
+          "samples": 2,
+          "min_ms": 1221.7605,
+          "max_ms": 2062.4293000000002,
+          "mean_ms": 1642.0949,
+          "p50_ms": 1642.0949,
+          "p95_ms": 2020.39586,
+          "stddev_ms": 594.4426092119576
+        }
+      },
+      "batches": [
+        {
+          "batch": 1,
+          "per_image_e2e_mean_ms": 1227.0949500000002,
+          "batch_e2e_mean_ms": 1227.0949500000002,
+          "deterministic_tokens": true
+        },
+        {
+          "batch": 2,
+          "per_image_e2e_mean_ms": 1379.2541999999999,
+          "batch_e2e_mean_ms": 2758.5083999999997,
+          "deterministic_tokens": true
+        },
+        {
+          "batch": 4,
+          "per_image_e2e_mean_ms": 2483.7218000000003,
+          "batch_e2e_mean_ms": 9934.887200000001,
+          "deterministic_tokens": true
+        }
+      ],
+      "peak_working_set_bytes": 1550528512,
+      "threads": {
+        "intra_threads": null,
+        "inter_threads": null,
+        "auto_tune_threads": true,
+        "logical_cpus": 20,
+        "physical_cpus": 14
+      },
+      "source": "bench-cuda.json"
+    },
+    {
+      "provider_requested": "Directml",
+      "provider_resolved": "DirectMl",
+      "provider_fallback_used": false,
+      "rounds": 2,
+      "warmup": 1,
+      "session_create_ms": 1449.2975000000001,
+      "first_inference_ms": 6468.6866,
+      "warm_single": {
+        "preprocess": {
+          "samples": 2,
+          "min_ms": 11.1685,
+          "max_ms": 16.030800000000003,
+          "mean_ms": 13.59965,
+          "p50_ms": 13.59965,
+          "p95_ms": 15.787685000000002,
+          "stddev_ms": 3.4381653021633523
+        },
+        "session_run": {
+          "samples": 2,
+          "min_ms": 2484.1199,
+          "max_ms": 4028.8413,
+          "mean_ms": 3256.4806,
+          "p50_ms": 3256.4806,
+          "p95_ms": 3951.60523,
+          "stddev_ms": 1092.2829769839773
+        },
+        "tokenizer_decode": {
+          "samples": 2,
+          "min_ms": 0.030000000000000002,
+          "max_ms": 0.0422,
+          "mean_ms": 0.0361,
+          "p50_ms": 0.0361,
+          "p95_ms": 0.04159,
+          "stddev_ms": 0.00862670273047588
+        },
+        "end_to_end": {
+          "samples": 2,
+          "min_ms": 2500.1807000000003,
+          "max_ms": 4040.052,
+          "mean_ms": 3270.1163500000002,
+          "p50_ms": 3270.1163500000002,
+          "p95_ms": 3963.058435,
+          "stddev_ms": 1088.8534383845442
+        }
+      },
+      "batches": [
+        {
+          "batch": 1,
+          "per_image_e2e_mean_ms": 3562.89095,
+          "batch_e2e_mean_ms": 3562.89095,
+          "deterministic_tokens": true
+        },
+        {
+          "batch": 2,
+          "per_image_e2e_mean_ms": 7467.599975000001,
+          "batch_e2e_mean_ms": 14935.199950000002,
+          "deterministic_tokens": true
+        },
+        {
+          "batch": 4,
+          "per_image_e2e_mean_ms": 16583.933825,
+          "batch_e2e_mean_ms": 66335.7353,
+          "deterministic_tokens": true
+        }
+      ],
+      "peak_working_set_bytes": 1575264256,
+      "threads": {
+        "intra_threads": null,
+        "inter_threads": null,
+        "auto_tune_threads": true,
+        "logical_cpus": 20,
+        "physical_cpus": 14
+      },
+      "source": "bench-directml.json"
+    }
+  ]
+}

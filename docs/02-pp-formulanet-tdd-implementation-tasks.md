@@ -1498,7 +1498,9 @@ cargo run --features cuda-provider --bin formula_bench -- --model <model.onnx> -
   metadata tokenizer。
 - Rust 参考：`FormulaPreprocessor` + `FormulaSession` + `FormulaTokenizer` +
   RapidDoc-compatible `fix_latex` 后处理。
-- 比较脚本：`tools/formula_compare_results.py`。
+- 比较脚本：`tools/formula_compare_results.py`（第二轮修复后已删除：对比能力内建到
+  `formula_eval --python-reference`，汇总由 `tools/summarize_formula_eval.py` 承担，
+  避免同一份对比逻辑存在两套实现）。
 
 #### 25.2 100 图 smoke 结果
 
@@ -1514,6 +1516,10 @@ cargo run --features cuda-provider --bin formula_bench -- --model <model.onnx> -
 | Rust mean CER | 0.0665 |
 
 - `tests/baseline/formula-link-smoke-100.json` 保存可复现指标摘要。
+  （第二轮修复后由 `tests/baseline/formula-evaluation-2026-10-03.json` 取代：
+  原文件记录的 100 张 first-N smoke 依赖已删除的 `formula_compare` 命令，
+  且其数字早于序列长度上限修正与 ftfy 子集实现，无法再复现；
+  新文件覆盖 501 / 10,355 / UniMER 四个子集的完整结果与 3 个 provider benchmark。）
 - 失败样本通过 JSON `error` 字段记录，不吞单图失败。
 
 #### 25.3 未执行范围
@@ -1581,9 +1587,14 @@ cargo run --features cuda-provider --bin formula_bench -- --model <model.onnx> -
 - cargo test --all-targets
 - cargo fmt --all -- --check
 - cargo check --features directml-provider,cuda-provider,cann-provider
-- cargo run --bin formula_bench -- --model <model.onnx> --image <formula.png> --rounds 3 --provider cpu
-- python tools/formula_reference.py --model <model.onnx> --dataset-root <val-root> --split val --limit 100 --batch-size 8 --output target/formula-python.json
-- python tools/formula_compare_results.py --rust target/formula-rust.json --python target/formula-python.json --output target/formula-compare.json
+- cargo run --bin formula_bench -- --model <model.onnx> --image <formula1.png> --image <formula2.png> --rounds 5 --warmup 1 --batch-sizes 1,2,4,8 --provider cpu
+- cargo run --release --bin formula_eval -- --model <model.onnx> --dataset-root <Formula-TestSet> --dataset latexocr --split validate --manifest-output target/formula-eval/manifest-val-501.json --output target/formula-eval/val-501.json
+- python tools/formula_reference.py --model <model.onnx> --dataset-root <Formula-TestSet> --dataset latexocr --manifest target/formula-eval/manifest-val-501.json --output target/formula-eval/python-val-501.json
+- python tools/summarize_formula_eval.py --dir target/formula-eval --markdown target/formula-eval/summary.md --baseline-json tests/baseline/formula-evaluation-2026-10-03.json
+- pwsh -NoProfile -File tools/run_formula_evaluation.ps1
+
+（第二轮修复前的旧命令 `formula_compare` / `formula_compare_results.py` 已删除，
+原因见 §29.4；本节命令为当前可执行版本。）
 
 #### 28.3 发布边界
 
@@ -1746,9 +1757,10 @@ provider 矩阵改为按特性分别验证（上表）。这与阶段 1 基线�
 
 ### 29.8 阶段 9/10 执行结果
 
-环境：CPU provider（`auto_tune_threads`，14 物理核），batch=8，模型 SHA-256
-`71b6d389…d9493b`；命令为 `tools/run_formula_evaluation.ps1`。
-报告、抽样 manifest 与失败样本均在 `target/formula-eval/`（不随仓库提交），
+环境：CPU provider（`auto_tune_threads`，14 物理核 / 20 逻辑核），batch=8，模型 SHA-256
+`71b6d389…d9493b`；命令为 `tools/run_formula_evaluation.ps1`（CPE 见下）。
+报告、抽样 manifest 与失败样本均在 `target/formula-eval/`（不随仓库提交）；
+精简后的可复查记录提交在 `tests/baseline/formula-evaluation-2026-10-03.json`，
 本表由 `tools/summarize_formula_eval.py` 生成。
 
 | 数据集 | 切分 | 样本 | 评分 | exact | normalized | mean CER | 链路失败 | 模型错误 | truncated | 吞吐(img/s) | P95 单图(ms) | 峰值内存(MB) | manifest |
@@ -1756,6 +1768,39 @@ provider 矩阵改为按特性分别验证（上表）。这与阶段 1 基线�
 | im2latex | test | 100 | 100 | 26.00% | 26.00% | 0.0852 | 0 | 74 | 0 | 1.949 | 855.6 | 2099 | `31747b4d8cc0c3e7` |
 | latexocr_example | validate | 501 | 501 | 37.92% | 38.72% | 0.0797 | 0 | 310 | 1 | 1.104 | 1183.4 | 3680 | `c2a4ec16088774f7` |
 | im2latex | test | 10,355 | 10,284 | 26.38% | 26.75% | 0.1183 | 0 | 7,560 | 11 | 1.236 | 1354.2 | 3883 | `7813ded3c22f9ec3` |
+| UniMER-SPE | test | 6,762 | 6,762 | 37.12% | 37.53% | 0.0847 | 0 | 4,241 | 11 | 0.853 | 2142.3 | 4132 | `06fa2bc417bafc6e` |
+| UniMER-CPE | test | 5,921 | 5,921 | 18.19% | 18.49% | 0.1009 | 0 | 4,819 | 25 | 0.506 | 23793.9 | 3591 | `9c95492c9a7776bb` |
+| UniMER-SCE | test | 4,742 | 4,742 | 33.68% | 39.81% | 0.3883 | 0 | 3,144 | 1 | 1.258 | 1588.3 | 3156 | `2ae51500e0bebc95` |
+| UniMER-HWE（手写，单独报告） | test | 6,332 | 6,332 | 48.88% | 48.88% | 0.1545 | 0 | 3,234 | 3 | 1.291 | 963.9 | 3251 | `302422a93ae9127f` |
+
+合计 40,374 个样本全部执行完毕，**链路失败 0**（无图片解码 / ONNX / tokenizer 错误）。
+
+### 29.9 阶段 10 性能与 provider
+
+`formula_bench` 在**无争用**条件下运行（串行、单进程），是权威性能数据；
+上表中评测运行的吞吐是并发/分片下的下界。
+
+| provider | 解析结果 | 回退 | session 创建(ms) | 首次推理(ms) | 单图 p50(ms) | 单图 p95(ms) | batch=1 单图(ms) | batch=4 单图(ms) | batch 改变 token | 峰值内存(MB) |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| CPU | Cpu | 否 | 1171.3 | 843.0 | 1414.1 | 4949.5 | 1233.5 | 2484.9 | 否 | 1989 |
+| CUDA | Cuda | 否 | 1644.5 | 836.0 | 1624.1 | 2020.4 | 1227.1 | 2483.7 | 否 | 1479 |
+| DirectML | DirectMl | 否 | 1449.3 | 6468.7 | 3256.5 | 3963.1 | 3562.9 | 16583.9 | 否 | 1502 |
+
+- 三个 provider 都能加载并运行该图（含图内 `Loop`），且 **batch 不改变 token 序列**
+  （`deterministic_tokens = true`，口径为 EOS 前 token 序列）。
+- DirectML 明显慢于 CPU（与阶段 10 首次记录一致），不作为默认；
+  CUDA 在本机与 CPU 接近，其 batch=4 数值与 CPU 几乎相同，**不能据此推断
+  `Loop` 子图被加速**，只能说明本机小模型下二者没有可观测差异。
+- 分阶段耗时（CPU，单图）：预处理 14.0 ms，`session.run` 均值 2324.2 ms
+  （p50 1405.4 / p95 4935.6 / max 5657.8），tokenizer decode 0.1 ms。
+  单图耗时方差大是数据决定的：本次 8 张 val 图标签长度差异很大，
+  而图内 `Loop` 的步数正比于序列长度。
+- 峰值内存由共享 `runtime::memory` 采集
+  （`windows:GetProcessMemoryInfo.PeakWorkingSetSize`）。
+
+### 29.10 执行口径与数据根因
+
+#### im2latex 完整测试集
 
 im2latex 完整测试集说明：
 
@@ -1776,7 +1821,7 @@ im2latex 完整测试集说明：
 | 子集 | 样本 | 评分 | exact | normalized | mean CER | 链路失败 | 模型错误 | truncated | 吞吐(img/s) | P95 单图(ms) | 峰值内存(MB) | manifest |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | SPE | 6,762 | 6,762 | 37.12% | 37.53% | 0.0847 | 0 | 4,241 | 11 | 0.853 | 2142.3 | 4132 | `06fa2bc417bafc6e` |
-| CPE | 5,921 | 5,921 | 待补 | 待补 | 待补 | 待补 | 待补 | 待补 | 待补 | 待补 | 待补 | 待补 |
+| CPE | 5,921 | 5,921 | 18.19% | 18.49% | 0.1009 | 0 | 4,819 | 25 | 0.506 | 23793.9 | 3591 | `9c95492c9a7776bb` |
 | SCE | 4,742 | 4,742 | 33.68% | 39.81% | 0.3883 | 0 | 3,144 | 1 | 1.258 | 1588.3 | 3156 | `2ae51500e0bebc95` |
 | HWE（手写，单独报告） | 6,332 | 6,332 | 48.88% | 48.88% | 0.1545 | 0 | 3,234 | 3 | 1.291 | 963.9 | 3251 | `302422a93ae9127f` |
 
@@ -1805,6 +1850,8 @@ SPE 154、SCE 37、HWE 43、**CPE 658（p95 1375，最大 5744）**。模型图�
   比较；权威性能数据来自串行、无争用的 `formula_bench`（`bench-cpu.json`）。
   **精度指标（exact/normalized/CER/失败分类）与并发无关**，仍是完整数据集的精确结果。
 
+#### Rust/Python 链路对比
+
 Rust/Python 三方对比（同一 manifest、同一批样本；Python 使用 RapidDoc
 `PPPreProcess` + ONNX Runtime + 真实 metadata tokenizer + RapidDoc `PPPostProcess`）：
 
@@ -1821,9 +1868,7 @@ Rust/Python 三方对比（同一 manifest、同一批样本；Python 使用 Rap
 （`model_mismatch` / `truncated_no_eos`）分开记录，每条包含图片、期望、实际、
 token 序列、EOS 与 CER。
 
-（完整 10,355 张 im2latex 与 UniMER 四个子集的结果在本次运行结束后追加到本表。）
-
-### 29.9 提交
+### 29.11 提交
 
 | 内容 | 提交 | 说明 |
 | --- | --- | --- |
@@ -1832,3 +1877,6 @@ token 序列、EOS 与 CER。
 | benchmark batch 判定口径 | `c1aa94b` | `fix(bench): compare EOS prefixes for batch determinism and reuse measured runs` |
 | 阶段 9 smoke 结果记录 | `e41f965` | `docs(formula): record phase 9 smoke results and the 501-image Rust/Python comparison` |
 | 二进制 fixture checkout 修复 | `b666390` | `fix(repo): mark binary fixtures so checkout cannot corrupt them` |
+| 分片/合并评测能力 | `bf734d8` | `feat(eval): add --shard/--merge-shards for parallel long-dataset evaluation` |
+| CPE 分片执行与文档 | `5322a53` | `docs(formula): record the CPE sharding approach and its verified equivalence` |
+| 阶段 9/10 全部结果 | 见本节表格 | 提交在 `tests/baseline/formula-evaluation-2026-10-03.json` |
