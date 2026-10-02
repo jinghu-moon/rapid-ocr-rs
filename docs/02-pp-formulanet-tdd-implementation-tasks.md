@@ -1328,5 +1328,5 @@ Pillow 的 resize 与 Python OpenCV 的 SIMD BGR2GRAY 在当前环境下与 Rust
 
 | 阶段 | 提交 | 说明 |
 | --- | --- | --- |
-| 8 输出/错误/资源 | 待记录 | `feat(formula): implement phase 8 outputs and boundaries` |
+| 8 输出/错误/资源 | `0aa784b` | `feat(formula): implement phase 8 outputs and boundaries` |
 
