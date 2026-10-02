@@ -1701,7 +1701,7 @@ Python 参考改为 manifest 驱动（`tools/formula_reference.py --manifest`）
 **执行**（`tools/run_formula_evaluation.ps1`，CPU provider，batch=8，模型
 SHA-256 `71b6d389…d9493b`）：
 
-（完整表格见 §29.7；下方为逐阶段提交记录。）
+完整结果表见 §29.8（阶段 9/10 执行结果）与 §29.9（性能与 provider）。
 
 ### 29.5 P2 重复实现与语义问题
 
@@ -1720,11 +1720,11 @@ SHA-256 `71b6d389…d9493b`）：
 
 | 命令 | 结果 |
 | --- | --- |
-| `cargo test --all-targets` | 246 passed / 0 failed（无外部资产） |
-| `cargo test --all-targets`（带模型与测试集） | 246 passed / 0 failed |
-| `cargo test --all-targets`（干净 clone，无外部资产） | 246 passed / 0 failed |
-| `cargo test --features directml-provider` | 248 passed / 0 failed |
-| `cargo test --features cuda-provider` | 246 passed / 0 failed |
+| `cargo test --all-targets` | lib 246 + bin 9 passed / 0 failed（无外部资产） |
+| `cargo test --all-targets`（带模型与测试集） | lib 246 + bin 9 passed / 0 failed |
+| `cargo test --all-targets`（干净 clone，无外部资产） | lib 246 + bin 9 passed / 0 failed |
+| `cargo test --features directml-provider` | lib 249 passed / 0 failed |
+| `cargo test --features cuda-provider` | lib 247 passed / 0 failed |
 | `cargo check --features directml-provider,cuda-provider,cann-provider` | 通过 |
 | `cargo fmt --all -- --check` | 通过 |
 | `cargo clippy --all-targets -- -D warnings` | 通过（0 warning） |
