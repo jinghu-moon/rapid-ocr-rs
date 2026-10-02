@@ -1281,5 +1281,5 @@ Pillow 的 resize 与 Python OpenCV 的 SIMD BGR2GRAY 在当前环境下与 Rust
 
 | 阶段 | 提交 | 说明 |
 | --- | --- | --- |
-| 7 Formula API | 待记录 | `feat(formula): implement phase 7 recognizer API` |
+| 7 Formula API | `f77ecfd` | `feat(formula): implement phase 7 recognizer API` |
 
