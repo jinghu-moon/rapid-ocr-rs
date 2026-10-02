@@ -1788,12 +1788,21 @@ SPE 154、SCE 37、HWE 43、**CPE 658（p95 1375，最大 5744）**。模型图�
 由此产生的执行方式与口径：
 
 - SCE、HWE 以 4 路并行（每进程 `--threads 4`）完成；
-- SPE、CPE 序列更长、单进程吞吐存在上限，改为 2 路并行（每进程 `--threads 8`）；
+- **CPE 分片并行完成**：单进程吞吐存在硬上限（实测 4 线程 5995 ms/图、
+  14 线程 3876 ms/图，即约 0.25 img/s 的上限，与线程数关系不大，原因是长序列下
+  自注意力成本随序列长度二次增长），串行需要 6 小时以上。因此新增
+  `formula_eval --shard INDEX/COUNT` 与 `--merge-shards`：
+  - 分片只裁剪“评测哪些下标”，**manifest 仍然覆盖完整集合**，所有分片写出同一个
+    `manifest_sha256`，并用 `--expect-manifest` 校验样本集合与之前的完整集合一致；
+  - `--merge-shards` 按 manifest 顺序重排记录，并用**同一套 Rust 汇总实现**
+    （`evaluation::formula::report::summarize`）重新计算指标；
+  - 等价性已实测：`--limit 8` 时串行与 4 分片合并的
+    exact/normalized/CER/失败计数完全一致（0.3750 / 0.3750 / 0.0619 / 0 / 5 / 0）；
+  - CPE 使用 5 个分片 × 3 线程（≈15 线程）执行；
 - 实测调优依据：CPE batch=8 单图 4277 ms、batch=16 单图 5264 ms（**batch 越大越被最长
-  样本拖住**，因此保持 batch=8）；CPE `--threads 4` 单图 5995 ms、`--threads 14`
-  单图 3876 ms（线程数有效）；batch=1 单图 6405 ms、batch=4 单图 4353 ms；
-- **时序口径**：并行争用下测得的吞吐/P50/P95 只能作为下界，不能与串行结果直接比较；
-  权威性能数据来自串行、无争用的 `formula_bench`（`bench-cpu.json`）。
+  样本拖住**，因此保持 batch=8）；batch=1 单图 6405 ms、batch=4 单图 4353 ms；
+- **时序口径**：并行/分片争用下测得的吞吐/P50/P95 只能作为下界，不能与串行结果直接
+  比较；权威性能数据来自串行、无争用的 `formula_bench`（`bench-cpu.json`）。
   **精度指标（exact/normalized/CER/失败分类）与并发无关**，仍是完整数据集的精确结果。
 
 Rust/Python 三方对比（同一 manifest、同一批样本；Python 使用 RapidDoc
