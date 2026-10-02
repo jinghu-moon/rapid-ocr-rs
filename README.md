@@ -437,6 +437,12 @@ and the process peak working set
 separately from ordinary OCR; `--ocr-baseline <bench.json>` only adds the
 ordinary OCR benchmark side by side and never merges the two into one number.
 
+`deterministic_tokens` compares each batch row against the same image decoded
+alone. The comparison uses the tokens **up to and including EOS**, because the
+in-graph `Loop` pads every row of a batch to the same width: comparing whole
+rows would report a difference that is only padding. Measured batch=1/2/4 over
+real val images are identical by that definition.
+
 ## Tests and external assets
 
 `cargo test --all-targets` passes in a clean clone without any model or dataset:

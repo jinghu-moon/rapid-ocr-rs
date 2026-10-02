@@ -21,8 +21,9 @@
 /bench-*.json
 *.summary.txt
 
-# Local model and binary artifacts. Keep manifests/configuration in Git.
+# 本地模型与二进制产物。清单/配置保留在 Git 中。
 *.onnx
+# 例外：KB 级契约 fixture 必须随仓库提交，否则干净 clone / CI 无法复现测试。
 !tests/fixtures/**/*.onnx
 *.pdmodel
 *.pdiparams
@@ -41,4 +42,8 @@ desktop.ini
 /formula-bench/
 __pycache__/
 *.pyc
+
+# 阶段 9/10 的评测与 benchmark 输出统一写在 target/formula-eval/ 下，
+# 已由 /target/ 覆盖：报告、抽样 manifest、失败样本与 bench JSON 都不入库。
+# 需要长期保留的结论请写入 docs/，而不是提交原始 JSON。
 

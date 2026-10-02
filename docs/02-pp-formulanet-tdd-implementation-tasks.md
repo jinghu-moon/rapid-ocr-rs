@@ -846,6 +846,12 @@ HWE 6332
 - [x] 任何优化前后都有 benchmark 数据；
 - [x] 不因臆测性能引入缓存、并发或复杂抽象。
 
+**batch 不变性判定口径（实测发现）**：模型图内 `Loop` 会把整个 batch 补齐到同一宽度
+（不收敛样本出现时为 2561 列），因此**完整 token 行**的尾部 padding 会随 batch 组成
+变化。判定“batch 是否改变结果”必须比较 **EOS 之前（含 EOS）** 的 token 序列。
+`formula_bench` 的 `deterministic_tokens` 采用该口径；实测 batch=1/2/4 在 4 张真实 val
+图片上完全一致（若比较完整行会得到错误的 False）。
+
 ### 11.3 Provider
 
 第一版验收范围：
@@ -1691,13 +1697,36 @@ SHA-256 `71b6d389…d9493b`）：
 原生库在 MSVC 下会偶发 `LNK4098`，该诊断来自第三方二进制而非本 crate 代码，但会让
 `-D warnings` 随机失败。
 
-### 29.7 阶段 9/10 执行结果
+环境阻塞（明确记录，非代码问题）：
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo check --features opencv-backend`（`--all-features` 的前提） | `opencv v0.94.4` 构建脚本失败：本机 `OPENCV_CMAKE_NAME` / `CMAKE_PREFIX_PATH` 为空，未安装/未配置 OpenCV |
+
+因此 `--all-features`（等于 provider 矩阵 + `opencv-backend`）在本机无法验证，
+provider 矩阵改为按特性分别验证（上表）。这与阶段 1 基线记录的环境限制一致。
+
+### 29.7 普通 OCR 回归（公式关闭）
+
+| 项目 | 修改前基线 | 本次实测 | 判定 |
+| --- | --- | --- | --- |
+| `cargo test --all-targets` | 159 passed（阶段 11） | 245/246 passed（新增公式测试） | 无新增失败 |
+| 真实图片区域数（01基础多位置文本，small 配置） | 42 | 42 | 保持 |
+| processed size | 1984×1248 | 1984×1248 | 保持 |
+| 公式区域数（未传 `--formula-model`） | 不存在 | 0（`formulas: 0`，`items: 42`） | 公式关闭时无公式区域 |
+| 公式阶段状态 | 不存在 | `Disabled` | 结构性保证 |
+
+`recognize` 在 `formula.enabled == false` 时直接进入 `recognize_text`，不经过任何公式
+代码路径，因此“公式功能关闭时普通 OCR 行为与基线一致”不依赖分支判断的正确性。
+
+### 29.8 阶段 9/10 执行结果
 
 （本节由 `tools/summarize_formula_eval.py` 从 `target/formula-eval/*.json` 生成，
 报告与失败样本均在 `target/formula-eval/`，不随仓库提交。）
 
-### 29.8 提交
+### 29.9 提交
 
 | 内容 | 提交 | 说明 |
 | --- | --- | --- |
 | 第二轮审核修复 | `9db5dda` | `fix(formula): close the review gaps in the PP-FormulaNet integration` |
+| `OcrOutput::len` 语义修正 | `e08df20` | `fix(api): count formula regions in OcrOutput::len and document text_len` |

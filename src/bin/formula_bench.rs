@@ -182,12 +182,23 @@ fn ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
 }
 
+/// 一次测量的结果：耗时样本 + 本次输出张量解码出的 token 序列。
+#[derive(Debug, Clone)]
+struct Measurement {
+    sample: RoundSample,
+    /// 每个 batch 行在 **EOS 之前**（含 EOS）的 token 序列。
+    ///
+    /// 模型图内 `Loop` 会把整个 batch 补齐到同一宽度，因此完整 token 行会随 batch
+    /// 组成变化；判定“batch 是否改变结果”必须比较 EOS 前的内容。
+    tokens: Vec<Vec<i64>>,
+}
+
 fn measure(
     preprocessor: &FormulaPreprocessor,
     session: &mut FormulaSession,
     tokenizer: &FormulaTokenizer,
     images: &[image::DynamicImage],
-) -> Result<RoundSample, Box<dyn std::error::Error>> {
+) -> Result<Measurement, Box<dyn std::error::Error>> {
     let preprocess_start = Instant::now();
     let tensor = preprocessor.preprocess_batch(images)?;
     let preprocess_ms = ms(preprocess_start);
@@ -197,16 +208,26 @@ fn measure(
     let run_ms = ms(run_start);
 
     let decode_start = Instant::now();
+    let mut tokens = Vec::with_capacity(images.len());
     for row in output.axis_iter(ndarray::Axis(0)) {
-        let _ = tokenizer.decode_ids(&row.to_vec())?;
+        let row = row.to_vec();
+        let decoded = tokenizer.decode_ids(&row)?;
+        let mut prefix = decoded.token_ids;
+        if let Some(eos_index) = decoded.eos_index {
+            prefix.truncate(eos_index + 1);
+        }
+        tokens.push(prefix);
     }
     let decode_ms = ms(decode_start);
 
-    Ok(RoundSample {
-        preprocess_ms,
-        run_ms,
-        decode_ms,
-        e2e_ms: preprocess_ms + run_ms + decode_ms,
+    Ok(Measurement {
+        sample: RoundSample {
+            preprocess_ms,
+            run_ms,
+            decode_ms,
+            e2e_ms: preprocess_ms + run_ms + decode_ms,
+        },
+        tokens,
     })
 }
 
@@ -246,13 +267,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let tokenizer = FormulaTokenizer::from_metadata(&metadata)?;
     let preprocessor = FormulaPreprocessor::new();
 
-    // 首次推理单独测量，不进入 warm 统计。
+    // 首次推理单独测量，不进入 warm 统计；同时为每张图建立“单图 token 基线”，
+    // 用于判定 batch 是否改变结果（不能拿第一张的基线去比对其它图片的行）。
     let first_input = preprocessor.preprocess(&images[0])?;
     let first_start = Instant::now();
     let first_output = session.run(first_input.view())?;
     let first_inference_ms = ms(first_start);
-    let baseline_tokens = first_output.row(0).to_vec();
-    let baseline_latex = tokenizer.decode_ids(&baseline_tokens)?.latex;
+    let mut baselines: Vec<Vec<i64>> = Vec::with_capacity(images.len());
+    baselines.push(first_output.row(0).to_vec());
+    for image in images.iter().skip(1) {
+        let input = preprocessor.preprocess(image)?;
+        let output = session.run(input.view())?;
+        baselines.push(output.row(0).to_vec());
+    }
+    let baseline_latex = tokenizer.decode_ids(&baselines[0])?.latex;
 
     // 预热。
     for _ in 0..cli.warmup {
@@ -263,12 +291,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut single_rounds = Vec::with_capacity(cli.rounds);
     for round in 0..cli.rounds {
         let image = &images[round % images.len()];
-        single_rounds.push(measure(
+        let measurement = measure(
             &preprocessor,
             &mut session,
             &tokenizer,
             std::slice::from_ref(image),
-        )?);
+        )?;
+        single_rounds.push(measurement.sample);
     }
 
     let mut batches = Vec::new();
@@ -287,13 +316,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut rounds = Vec::with_capacity(cli.rounds);
         let mut deterministic = true;
         for _ in 0..cli.rounds {
-            let sample = measure(&preprocessor, &mut session, &tokenizer, &selected)?;
-            rounds.push(sample);
-
-            let tensor = preprocessor.preprocess_batch(&selected)?;
-            let output = session.run(tensor.view())?;
-            for row in output.axis_iter(ndarray::Axis(0)) {
-                if row.to_vec() != baseline_tokens {
+            // 复用本次测量解码出的 token 行做稳定性判定，避免额外推理扭曲耗时。
+            let measurement = measure(&preprocessor, &mut session, &tokenizer, &selected)?;
+            rounds.push(measurement.sample);
+            for (row, tokens) in measurement.tokens.iter().enumerate() {
+                if *tokens != baselines[row % baselines.len()] {
                     deterministic = false;
                 }
             }
@@ -326,7 +353,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut notes = vec![
         "公式模型的吞吐与普通 OCR 分开报告；`ocr_baseline` 仅作并列展示，不做加权合并。"
             .to_string(),
-        "`deterministic_tokens` 验证 batch 是否改变 token 序列；batch 不应改变结果。".to_string(),
+        "`deterministic_tokens` 逐行比较 batch 输出与同图单图推理的 token 序列；batch 不应改变结果。"
+            .to_string(),
     ];
     if resolution.fallback_used {
         notes.push(
