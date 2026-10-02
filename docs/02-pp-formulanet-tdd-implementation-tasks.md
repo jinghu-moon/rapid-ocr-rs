@@ -1173,5 +1173,5 @@ Pillow 的 resize 与 Python OpenCV 的 SIMD BGR2GRAY 在当前环境下与 Rust
 
 | 阶段 | 提交 | 说明 |
 | --- | --- | --- |
-| 5 runtime 契约 | 待记录 | `refactor(runtime): implement typed OCR and formula sessions (phase 5)` |
+| 5 runtime 契约 | `0288762` | `refactor(runtime): implement typed OCR and formula sessions (phase 5)` |
 
