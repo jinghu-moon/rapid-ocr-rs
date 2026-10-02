@@ -8,6 +8,7 @@
 
 pub mod model_info;
 pub mod output;
+pub mod postprocess;
 pub mod preprocess;
 pub mod recognizer;
 pub mod session;

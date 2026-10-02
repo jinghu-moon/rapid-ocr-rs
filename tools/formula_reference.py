@@ -2,6 +2,7 @@ import argparse
 import importlib.util
 import json
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,27 @@ def load_module(path: Path, name: str):
 def load_preprocessor(rapid_doc_root: Path):
     path = rapid_doc_root / "rapid_doc/model/formula/rapid_formula_self/model_handler/pp_formulanet_plus/pre_process.py"
     return load_module(path, "rd_formula_pre_process")
+
+
+def load_postprocessor(rapid_doc_root: Path, character_metadata):
+    base = "rapid_doc.model.formula.rapid_formula_self.model_handler.pp_formulanet_plus"
+    utils_path = rapid_doc_root / "rapid_doc/model/formula/rapid_formula_self/model_handler/pp_formulanet_plus/utils.py"
+    post_path = rapid_doc_root / "rapid_doc/model/formula/rapid_formula_self/model_handler/pp_formulanet_plus/post_process.py"
+    utils_module = load_module(utils_path, "rd_formula_utils")
+    parent_names = [
+        "rapid_doc",
+        "rapid_doc.model",
+        "rapid_doc.model.formula",
+        "rapid_doc.model.formula.rapid_formula_self",
+        "rapid_doc.model.formula.rapid_formula_self.model_handler",
+        "rapid_doc.model.formula.rapid_formula_self.model_handler.pp_formulanet_plus",
+    ]
+    for name in parent_names:
+        if name not in sys.modules:
+            sys.modules[name] = types.ModuleType(name)
+    sys.modules[f"{base}.utils"] = utils_module
+    post_module = load_module(post_path, "rd_formula_post_process")
+    return post_module.PPPostProcess(character_metadata)
 
 
 def decode_tokens(tokenizer: Tokenizer, tokens):
@@ -59,6 +81,7 @@ def main():
 
     pre_module = load_preprocessor(Path(args.rapid_doc_root))
     preprocess = pre_module.PPPreProcess(img_size=(384, 384))
+    postprocess = load_postprocessor(Path(args.rapid_doc_root), character_metadata)
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
 
@@ -85,7 +108,8 @@ def main():
         output = session.run([output_name], {input_name: batch})[0]
         for row, (image_path, expected) in zip(output, chunk):
             tokens = [int(value) for value in row.tolist()]
-            latex, eos_index, truncated = decode_tokens(tokenizer, tokens)
+            _, eos_index, truncated = decode_tokens(tokenizer, tokens)
+            latex = postprocess([tokens])[0]
             records.append(
                 {
                     "image": str(image_path),

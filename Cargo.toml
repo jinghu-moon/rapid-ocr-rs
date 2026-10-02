@@ -30,6 +30,7 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 unicode-bidi = "0.3"
 turbojpeg = { version = "1.4.0", default-features = false, features = ["cmake"] }
 rayon = "1.10"
+regex = "1"
 clap = { version = "4.5", features = ["derive"] }
 
 [features]

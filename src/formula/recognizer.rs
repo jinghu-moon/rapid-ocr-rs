@@ -311,7 +311,7 @@ impl FormulaRecognizer {
 
     fn recognition(&self, decoded: FormulaDecode, elapsed_ms: f32) -> FormulaRecognition {
         FormulaRecognition {
-            latex: decoded.latex,
+            latex: crate::formula::postprocess::postprocess_latex(&decoded.latex),
             token_ids: decoded.token_ids,
             eos_index: decoded.eos_index,
             truncated: decoded.truncated,

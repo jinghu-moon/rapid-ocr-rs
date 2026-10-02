@@ -900,9 +900,9 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 | 6 tokenizer | ☑ | 2026-10-02 | `22b4cf6` | cargo test --lib formula::tokenizer / cargo test --all-targets / cargo fmt | 9 passed；30 个 Python tokenizers golden 序列通过；真实 fast_tokenizer.json 使用 | 未跑全量 LaTeX postprocess |
 | 7 Formula API | ☑ | 2026-10-02 | `f77ecfd` | cargo test --lib formula::recognizer / cargo test --all-targets | 9 passed；145 passed；单图/batch/空 batch/超 batch/路径/hash/metadata/out-of-vocab 通过 | 真实 594MB 模型不在单测内，阶段 9 补充 |
 | 8 输出/错误/资源 | ☑ | 2026-10-02 | `0aa784b` | cargo test --lib formula::output formula::recognizer / cargo test --all-targets | 4+11 passed；151 passed；JSON/Markdown/HTML、受限输入、stream URL cap 通过 | 图内 Loop 的内存上限依赖模型结构；无外部 profiling |
-| 9 数值回归 | ☑ | 2026-10-02 | `a94eadc` | formula_compare + formula_reference + compare_results (100 val subset) | 100/100 tokens(EOS 前)、raw LaTeX、EOS、truncated 一致；Rust exact 0.36，CER 0.0665 | 完整 501/im2latex/UniMER 未运行，保留发布前门禁 |
+| 9 数值回归 | ☑ | 2026-10-02 | `a94eadc` | formula_compare + formula_reference + compare_results (100 val subset) | 100/100 tokens(EOS 前)、final LaTeX、EOS、truncated 一致；Rust exact 0.36，CER 0.0665 | 完整 501/im2latex/UniMER 未运行，保留发布前门禁 |
 | 10 性能/provider | ☑ | 2026-10-02 | `76a5e6f` | formula_bench CPU/DirectML/CUDA 1-3 rounds | CPU e2e ~1348ms；DirectML 可运行但较慢；CUDA 可运行；batch 1/2/4/8 有数据 | 内存峰值未用外部 profiler 采集 |
-| 11 普通 OCR 回归 | ☑ | 2026-10-02 | `9649aa4` | cargo test --all-targets / provider tests / real OCR / CLI run/report/evaluate/check | 154 passed；DirectML/CUDA 157 passed；真实 OCR 42 区域；CLI 全通过 | benchmark 未与阶段 1 全量逐项重跑 |
+| 11 普通 OCR 回归 | ☑ | 2026-10-02 | `9649aa4` | cargo test --all-targets / provider tests / real OCR / CLI run/report/evaluate/check | 159 passed；DirectML/CUDA 162 passed；真实 OCR 42 区域；CLI 全通过 | benchmark 未与阶段 1 全量逐项重跑 |
 | 12 文档/发布边界 | ☑ | 2026-10-02 | `310d2ed` | README/THIRD_PARTY/docs/01/.gitignore 检查 | 模型 URL/SHA-256/license 记录；模型不入 crate；可复现命令齐全 | 发布前仍需完整主评测与 license inventory |
 
 ---
@@ -1392,7 +1392,8 @@ cargo run --features cuda-provider --bin formula_bench -- --model <model.onnx> -
 - 数据集：`Formula-TestSet/ocr_rec_latexocr_dataset_example/val.txt` 前 100 个 scorable 样本。
 - Python 参考：RapidDoc `pre_process.py` + ONNX Runtime CPUExecutionProvider + 真实模型
   metadata tokenizer。
-- Rust 参考：`FormulaPreprocessor` + `FormulaSession` + `FormulaTokenizer`。
+- Rust 参考：`FormulaPreprocessor` + `FormulaSession` + `FormulaTokenizer` +
+  RapidDoc-compatible `fix_latex` 后处理。
 - 比较脚本：`tools/formula_compare_results.py`。
 
 #### 25.2 100 图 smoke 结果
@@ -1401,7 +1402,7 @@ cargo run --features cuda-provider --bin formula_bench -- --model <model.onnx> -
 | --- | ---: |
 | Rust 推理失败数 | 0 |
 | Rust token 序列（EOS 前）与 Python 一致 | 100 / 100 |
-| Rust raw LaTeX 与 Python 一致 | 100 / 100 |
+| Rust final LaTeX（RapidDoc fix_latex 后处理）与 Python 一致 | 100 / 100 |
 | EOS index 一致 | 100 / 100 |
 | truncated 状态一致 | 100 / 100 |
 | Rust LaTeX 对 ground truth exact match | 0.36 |
@@ -1431,9 +1432,9 @@ cargo run --features cuda-provider --bin formula_bench -- --model <model.onnx> -
 
 | 项目 | 结果 |
 | --- | --- |
-| `cargo test --all-targets` | 154 passed；0 failed |
-| `cargo test --features directml-provider` | 157 passed；0 failed |
-| `cargo test --features cuda-provider` | 157 passed；0 failed |
+| `cargo test --all-targets` | 159 passed；0 failed |
+| `cargo test --features directml-provider` | 162 passed；0 failed |
+| `cargo test --features cuda-provider` | 162 passed；0 failed |
 | `cargo check --features directml-provider,cuda-provider,cann-provider` | 通过 |
 | `cargo fmt --all -- --check` | 通过 |
 | 真实 OCR（small，01基础多位置文本） | 42 区域；processed 1984x1248；文本行 42，与基线一致 |

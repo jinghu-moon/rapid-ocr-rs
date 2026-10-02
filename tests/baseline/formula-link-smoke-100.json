@@ -1,8 +1,9 @@
 {
   "date": "2026-10-02",
   "dataset": "Formula-TestSet/ocr_rec_latexocr_dataset_example val first 100 scorable samples",
-  "rust_command": "target/debug/formula_compare.exe --model <M> --dataset-root <val-root> --split val --limit 100 --batch-size 8 --output target/formula-smoke-rust-100.json",
-  "python_command": "python tools/formula_reference.py --model <M> --dataset-root <val-root> --split val --limit 100 --batch-size 8 --output target/formula-smoke-python-100.json",
+  "comparison": "final LaTeX after RapidDoc-compatible fix_latex postprocess",
+  "rust_command": "target/debug/formula_compare.exe --model <M> --dataset-root <val-root> --split val --limit 100 --batch-size 16 --output target/formula-smoke-rust-100.json",
+  "python_command": "python tools/formula_reference.py --model <M> --dataset-root <val-root> --split val --limit 100 --batch-size 16 --output target/formula-smoke-python-100.json",
   "compare_command": "python tools/formula_compare_results.py --rust target/formula-smoke-rust-100.json --python target/formula-smoke-python-100.json --output target/formula-smoke-report-100.json",
   "rust_expected": {
     "count": 100,
