@@ -7,7 +7,10 @@ use rapid_ocr_rs::{
     OcrRequest, OutputPolicy, PreprocessPolicy, RapidOcrEngine, RecognitionPolicy, StagePlan,
     TextOrder, WordOutputMode, render_output_report, to_output_items, to_output_json,
 };
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "rapidocr", about = "Run PaddleOCR ONNX models")]
@@ -199,7 +202,8 @@ fn evaluate_cmd(
     iou_threshold: f32,
     output: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cases: Vec<EvaluationCase> = serde_json::from_str(&std::fs::read_to_string(manifest)?)?;
+    let cases: Vec<EvaluationCase> = serde_json::from_str(&std::fs::read_to_string(&manifest)?)?;
+    let manifest_dir = manifest.parent().unwrap_or_else(|| Path::new("."));
     let cfg = match config {
         Some(path) => EngineConfig::from_yaml_file(path)?,
         None => EngineConfig::default(),
@@ -207,8 +211,14 @@ fn evaluate_cmd(
     let mut engine = RapidOcrEngine::new(cfg)?;
     let mut reports = Vec::with_capacity(cases.len());
     for case in cases {
+        let image_path = Path::new(&case.image);
+        let resolved_image = if image_path.is_absolute() {
+            image_path.to_path_buf()
+        } else {
+            manifest_dir.join(image_path)
+        };
         let result = engine.recognize(make_request(
-            std::fs::read(&case.image)?,
+            std::fs::read(&resolved_image)?,
             WordOutputMode::Off,
         ))?;
         let metrics = evaluate_case(
