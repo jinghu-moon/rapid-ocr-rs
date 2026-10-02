@@ -1721,8 +1721,33 @@ provider 矩阵改为按特性分别验证（上表）。这与阶段 1 基线�
 
 ### 29.8 阶段 9/10 执行结果
 
-（本节由 `tools/summarize_formula_eval.py` 从 `target/formula-eval/*.json` 生成，
-报告与失败样本均在 `target/formula-eval/`，不随仓库提交。）
+环境：CPU provider（`auto_tune_threads`，14 物理核），batch=8，模型 SHA-256
+`71b6d389…d9493b`；命令为 `tools/run_formula_evaluation.ps1`。
+报告、抽样 manifest 与失败样本均在 `target/formula-eval/`（不随仓库提交），
+本表由 `tools/summarize_formula_eval.py` 生成。
+
+| 数据集 | 切分 | 样本 | 评分 | exact | normalized | mean CER | 链路失败 | 模型错误 | truncated | 吞吐(img/s) | P95 单图(ms) | 峰值内存(MB) | manifest |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| im2latex | test | 100 | 100 | 26.00% | 26.00% | 0.0852 | 0 | 74 | 0 | 1.949 | 855.6 | 2099 | `31747b4d8cc0c3e7` |
+| latexocr_example | validate | 501 | 501 | 37.92% | 38.72% | 0.0797 | 0 | 310 | 1 | 1.104 | 1183.4 | 3680 | `c2a4ec16088774f7` |
+
+Rust/Python 三方对比（同一 manifest、同一批样本；Python 使用 RapidDoc
+`PPPreProcess` + ONNX Runtime + 真实 metadata tokenizer + RapidDoc `PPPostProcess`）：
+
+| 数据集 | 对比样本 | 完整 token 行一致 | token(EOS 前)一致 | LaTeX 一致 | EOS index 一致 | truncated 一致 | 双方都错（模型错误） | 链路差异 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| latexocr_example | 501 | 501 | 501 | 501 | 501 | 501 | 311 | **0** |
+
+结论：501 张 smoke 集上 Rust 与 Python/RapidDoc 链路**逐项完全一致**（含完整 token 行），
+全部 311 个不匹配样本都是模型识别错误，没有任何一个属于 Rust 链路差异
+（`link_differences: []`）。
+
+失败样本（`failures-<dataset>.json`）按失败种类分类：链路失败
+（`image_decode` / `inference` / `tokenizer_decode` / `input_rejected`）与模型错误
+（`model_mismatch` / `truncated_no_eos`）分开记录，每条包含图片、期望、实际、
+token 序列、EOS 与 CER。
+
+（完整 10,355 张 im2latex 与 UniMER 四个子集的结果在本次运行结束后追加到本表。）
 
 ### 29.9 提交
 
