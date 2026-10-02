@@ -595,13 +595,13 @@ FormulaRecognizer::recognize_batch(images)
 
 ### 8.2 TDD 任务
 
-- [ ] Red：单图 API 的 happy path。
-- [ ] Red：batch=1/2/8 顺序和结果独立性。
-- [ ] Red：空 batch、超大 batch、空图和解码失败。
-- [ ] Red：模型路径不存在、模型 hash 不匹配、metadata 损坏。
-- [ ] Green：实现 session、preprocessor、tokenizer 的组合。
-- [ ] Green：实现 batch 输入 tensor 构建和输出拆分。
-- [ ] Refactor：将 API 参数与普通 OCR 的 `RecognizeOptions` 解耦；共享真正通用的图片加载和 provider 配置。
+- [x] Red：单图 API 的 happy path。
+- [x] Red：batch=1/2/8 顺序和结果独立性。
+- [x] Red：空 batch、超大 batch、空图和解码失败。
+- [x] Red：模型路径不存在、模型 hash 不匹配、metadata 损坏。
+- [x] Green：实现 session、preprocessor、tokenizer 的组合。
+- [x] Green：实现 batch 输入 tensor 构建和输出拆分。
+- [x] Refactor：将 API 参数与普通 OCR 的 `RecognizeOptions` 解耦；共享真正通用的图片加载和 provider 配置。
 
 ### 8.3 与页面 OCR 的集成策略
 
@@ -1225,4 +1225,61 @@ Pillow 的 resize 与 Python OpenCV 的 SIMD BGR2GRAY 在当前环境下与 Rust
 | 阶段 | 提交 | 说明 |
 | --- | --- | --- |
 | 6 tokenizer | `22b4cf6` | `feat(formula): implement phase 6 tokenizer decoding` |
+
+---
+
+### 23. 阶段 7 执行记录（2026-10-02）
+
+#### 23.1 实现内容
+
+- 新增 `src/formula/recognizer.rs`：
+  - `FormulaRecognizer::from_model(path, runtime_config)`；
+  - `FormulaRecognizer::from_model_with_hash(..., expected_sha256)`；
+  - `recognize(&DynamicImage) -> FormulaRecognition`；
+  - `recognize_batch(&[DynamicImage]) -> Vec<FormulaRecognition>`，保持输入顺序；
+  - `max_batch_size` 默认 16，可配置并在超限时返回 `InvalidInput`；
+  - `provider_resolution`。
+- `FormulaRecognition` 为独立结果类型，不复用普通 OCR `LineResult`：
+  - `latex`、`token_ids`、`eos_index`、`truncated`、`model_id`、`elapsed_ms`。
+- `FormulaSession` 增加：
+  - 模型路径存在性检查，返回 `FileNotFound`；
+  - `character_metadata()` 读取模型 `character` JSON。
+- `FormulaRecognizer::from_model*` 串联：
+  - `FormulaSession` typed contract；
+  - `FormulaTokenizerMetadata::from_character_metadata`；
+  - `FormulaTokenizer::from_metadata`；
+  - `FormulaPreprocessor`；
+  - `FormulaSession::run` 输出按 batch 拆分并解码。
+- 新增本地 ONNX fixture：
+  - `formula_recognizer_ok.onnx`：动态 batch Expand graph，输出 `[0,82,1769,2]`，metadata 使用真实 tokenizer；
+  - `formula_recognizer_bad_token.onnx`：输出 `[0,999999,2]`，用于解码失败。
+- 增加 batch/超大 batch/空 batch/空图/路径/hash/metadata/out-of-vocab 测试。
+
+#### 23.2 验证结果
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --lib formula::recognizer` | 9 passed；0 failed |
+| `cargo test --all-targets` | 145 passed；0 failed |
+| `cargo fmt --all -- --check` | 通过 |
+| 单图 happy path | `latex="\cdot"`，tokens `[0,82,1769,2]`，EOS index=3 |
+| batch=4 | 4 个结果顺序稳定、彼此独立 |
+| empty batch | 返回空 Vec |
+| max_batch_size=1 + batch=2 | 返回 batch 超限错误 |
+| missing model | `FileNotFound` |
+| hash mismatch | `HashMismatch` |
+| corrupted tokenizer metadata | 结构化 `Tokenizer` 错误 |
+| out-of-vocab token output | `out of vocabulary` 错误 |
+
+#### 23.3 边界核验
+
+- 公式 API 不依赖普通 `RecognizeOptions`、`Recognizer` 或 CTC decoder。
+- 输入 tensor 构建复用公式预处理；输出拆分按 batch 行顺序。
+- 本阶段未运行 594 MB 真实模型；真实模型数值回归在阶段 9 单独执行。
+
+#### 23.4 阶段提交
+
+| 阶段 | 提交 | 说明 |
+| --- | --- | --- |
+| 7 Formula API | 待记录 | `feat(formula): implement phase 7 recognizer API` |
 

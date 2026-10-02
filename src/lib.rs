@@ -33,6 +33,9 @@ pub use formula::model_info::{
 pub use formula::preprocess::{
     FORMULA_INPUT_SIZE, FORMULA_MEAN, FORMULA_STD, FormulaPreprocessor, FormulaTensor,
 };
+pub use formula::recognizer::{
+    DEFAULT_MAX_FORMULA_BATCH_SIZE, FormulaRecognition, FormulaRecognizer,
+};
 pub use formula::session::FormulaSession;
 pub use formula::tokenizer::{FormulaDecode, FormulaTokenizer};
 pub use formula::tokenizer_metadata::{

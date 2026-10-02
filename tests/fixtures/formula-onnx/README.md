@@ -24,6 +24,8 @@ PY
 要点：
 
 - `formula_ok.onnx`：`x float[Dyn,1,384,384]` -> `Cast int64` -> `Flatten(axis=1)` -> `fetch_name_0 int64[Dyn,Dyn]`，附规范 `character` metadata（vocab 50,000）
+- `formula_recognizer_ok.onnx`：动态 batch graph，输出每行 `[0,82,1769,2]`；附真实 `fast_tokenizer_file` metadata，用于 `FormulaRecognizer` happy path / batch 顺序测试
+- `formula_recognizer_bad_token.onnx`：输出每行 `[0,999999,2]`，用于 out-of-vocab 解码失败测试
 - 负向 fixture 逐一违反：输入 rank/dtype/空间维、输出 rank/dtype、多输入/多输出、缺少或损坏 `character` metadata
 - `formula_bad_metadata.onnx` 的 metadata 必须是**非 JSON 字符串**（如 `{"fast_tokenizer_file": broken`），不能是 `json.dumps(str)`
 

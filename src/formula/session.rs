@@ -30,6 +30,9 @@ pub struct FormulaSession {
 
 impl FormulaSession {
     pub fn new(model_path: &Path, runtime_cfg: &RuntimeConfig) -> Result<Self> {
+        if !model_path.is_file() {
+            return Err(RapidOcrError::FileNotFound(model_path.to_path_buf()));
+        }
         let inner = OrtSession::open_unchecked(model_path, runtime_cfg)?;
         let probe = inner.probe_io()?;
         let input = require_single_input(&probe, model_path, "formula")?;
@@ -59,6 +62,10 @@ impl FormulaSession {
 
     pub fn provider_resolution(&self) -> ProviderResolution {
         self.inner.provider_resolution()
+    }
+
+    pub fn character_metadata(&self) -> Result<Option<String>> {
+        self.inner.metadata_custom("character")
     }
 
     pub fn run(&mut self, input: ArrayView4<'_, f32>) -> Result<Array2<i64>> {
