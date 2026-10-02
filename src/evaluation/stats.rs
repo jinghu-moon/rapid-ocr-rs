@@ -3,10 +3,10 @@
 //! benchmark 与评测工具都要报告“不只看平均值”的延迟分布，因此把统计口径放在
 //! 共享层，避免每个 bin 各写一套 percentile。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// 一个指标的采样统计（毫秒）。
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Stats {
     pub samples: usize,
     pub min_ms: f64,

@@ -33,8 +33,8 @@ use rapid_ocr_rs::{
     evaluation::{
         formula::{
             fixture::{
-                FormulaFixture, FormulaSplit, UniMerSubset, load_im2latex, load_latex_ocr_example,
-                load_unimer,
+                FormulaFixture, FormulaSample, FormulaSplit, UniMerSubset, load_im2latex,
+                load_latex_ocr_example, load_unimer,
             },
             report::{EvaluationSummary, FailureKind, SampleRecord, summarize},
             sampling::{Manifest, SampleStrategy, build_manifest, select_samples},
@@ -72,13 +72,15 @@ enum SampleArg {
     about = "Evaluate PP-FormulaNet_plus over im2latex / latexocr / UniMER with stable manifests"
 )]
 struct Cli {
-    #[arg(long)]
-    model: PathBuf,
-    /// 公式测试集根目录，例如 `<workspace>/Formula-TestSet`。
+    /// 公式识别模型；合并分片报告时不需要。
+    #[arg(long, required_unless_present = "merge_shards")]
+    model: Option<PathBuf>,
+    /// 公式测试集根目录，例如 `<workspace>/Formula-TestSet`；合并分片报告时不需要。
     #[arg(long = "dataset-root")]
-    dataset_root: PathBuf,
+    dataset_root: Option<PathBuf>,
+    /// 合并分片报告时不需要（数据集信息从分片报告读取）。
     #[arg(long, value_enum)]
-    dataset: DatasetArg,
+    dataset: Option<DatasetArg>,
     #[arg(long, default_value = "test")]
     split: String,
     /// `--dataset unimer` 必填。
@@ -112,9 +114,50 @@ struct Cli {
     /// 不在报告中写入逐样本记录（仅保留汇总）；失败样本将无法逐个审查。
     #[arg(long = "no-records")]
     no_records: bool,
+    /// 只评测 `INDEX/COUNT` 这一片（按 manifest 顺序取模分片）。
+    ///
+    /// manifest 与抽样仍然覆盖**完整**集合，因此所有分片写出同一个
+    /// `manifest_sha256`，可用 `--merge-shards` 合并成与串行运行等价的报告。
+    /// 分片只影响执行方式，不影响样本集合、指标口径或精度。
+    #[arg(long, value_name = "INDEX/COUNT")]
+    shard: Option<String>,
+    /// 合并若干分片报告：按 manifest 顺序重排记录并用同一套代码重新汇总。
+    #[arg(long = "merge-shards", num_args = 1.., value_name = "REPORT")]
+    merge_shards: Vec<PathBuf>,
 }
 
-#[derive(Debug, Serialize)]
+/// 分片信息。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct ShardInfo {
+    index: usize,
+    count: usize,
+}
+
+/// 解析 `INDEX/COUNT`。
+fn parse_shard(raw: &str) -> Result<ShardInfo, String> {
+    let (index, count) = raw
+        .split_once('/')
+        .ok_or_else(|| format!("--shard expects INDEX/COUNT, got `{raw}`"))?;
+    let index: usize = index
+        .trim()
+        .parse()
+        .map_err(|_| format!("--shard index is not a number: `{index}`"))?;
+    let count: usize = count
+        .trim()
+        .parse()
+        .map_err(|_| format!("--shard count is not a number: `{count}`"))?;
+    if count == 0 {
+        return Err("--shard count must be greater than zero".into());
+    }
+    if index >= count {
+        return Err(format!(
+            "--shard index {index} must be smaller than count {count}"
+        ));
+    }
+    Ok(ShardInfo { index, count })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct ModelInfo {
     path: String,
     size_bytes: u64,
@@ -122,7 +165,7 @@ struct ModelInfo {
     load_ms: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ProviderInfo {
     requested: String,
     resolved: String,
@@ -133,7 +176,7 @@ struct ProviderInfo {
     physical_cpus: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ThroughputInfo {
     images_per_second: f64,
     total_wall_ms: f64,
@@ -144,17 +187,19 @@ struct ThroughputInfo {
     batch_size: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct MemoryInfo {
+    // source 用 String 以便分片报告可以被反序列化后合并。
     peak_working_set_start_bytes: Option<u64>,
     peak_working_set_end_bytes: Option<u64>,
     delta_bytes: Option<u64>,
-    source: &'static str,
+    source: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct EvaluationReport {
-    tool: &'static str,
+    /// 工具标识；用 `String` 而不是 `&'static str`，否则报告无法反序列化（合并分片需要）。
+    tool: String,
     model: ModelInfo,
     provider: ProviderInfo,
     dataset: String,
@@ -166,11 +211,17 @@ struct EvaluationReport {
     memory: MemoryInfo,
     summary: EvaluationSummary,
     reference_comparison: Option<ReferenceComparison>,
+    /// 本报告是分片运行时记录的分片编号；串行运行或合并后为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shard: Option<ShardInfo>,
+    /// 合并来源的报告文件（合并报告才有的溯源信息）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    merged_from: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     records: Option<Vec<SampleRecord>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReferenceComparison {
     reference_path: String,
     compared: usize,
@@ -189,7 +240,7 @@ struct ReferenceComparison {
     link_differences: Vec<LinkDifference>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LinkDifference {
     relative_path: String,
     rust_tokens: Vec<i64>,
@@ -275,18 +326,20 @@ fn dataset_name(dataset: DatasetArg, subset: Option<SubsetArg>) -> String {
     }
 }
 
-fn load_fixture(cli: &Cli) -> Result<FormulaFixture, Box<dyn std::error::Error>> {
-    let split = parse_split(&cli.split)?;
-    let root = cli.dataset_root.join(dataset_subdir(cli.dataset));
-    let fixture = match cli.dataset {
+fn load_fixture(
+    dataset_root: &Path,
+    dataset: DatasetArg,
+    split: FormulaSplit,
+    subset: Option<SubsetArg>,
+) -> Result<FormulaFixture, Box<dyn std::error::Error>> {
+    let root = dataset_root.join(dataset_subdir(dataset));
+    let fixture = match dataset {
         DatasetArg::Im2latex => load_im2latex(&root, split)?,
         DatasetArg::Latexocr => load_latex_ocr_example(&root, split)?,
         DatasetArg::Unimer => {
-            let subset = cli
-                .subset
-                .ok_or("--dataset unimer requires --subset spe|cpe|sce|hwe")?;
+            let subset = subset.ok_or("--dataset unimer requires --subset spe|cpe|sce|hwe")?;
             // `load_unimer` 的 root 是 UniMER-Test 目录本身。
-            load_unimer(&cli.dataset_root.join("UniMER-Test"), unimer_subset(subset))?
+            load_unimer(&dataset_root.join("UniMER-Test"), unimer_subset(subset))?
         }
     };
     Ok(fixture)
@@ -311,15 +364,218 @@ fn error_record(path: &Path, expected: &str, error: &RapidOcrError) -> SampleRec
     )
 }
 
+/// 合并分片报告：按 manifest 顺序重排记录，并用同一套汇总实现重新计算指标。
+///
+/// 这是分片运行保持“单一实现”的关键：分片只改变执行方式，汇总口径仍然只有
+/// `evaluation::formula::report::summarize` 一份。合并会校验：
+///
+/// - 所有分片的 `manifest_sha256` 一致；
+/// - 每个分片都带有 `records`（`--no-records` 的报告无法合并）；
+/// - 分片集合恰好覆盖 manifest 的每个条目且无重复、无缺失。
+fn merge_shard_reports(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let mut reports = Vec::with_capacity(cli.merge_shards.len());
+    for path in &cli.merge_shards {
+        let raw = std::fs::read_to_string(path)?;
+        let report: EvaluationReport = serde_json::from_str(&raw)?;
+        reports.push((path.clone(), report));
+    }
+    let (first_path, first) = reports
+        .first()
+        .ok_or("--merge-shards requires at least one report")?;
+    if first.records.is_none() {
+        return Err(format!(
+            "{} has no per-sample records; shards must be produced without --no-records",
+            first_path.display()
+        )
+        .into());
+    }
+    let manifest_hash = first.manifest.manifest_sha256.clone();
+    for (path, report) in &reports {
+        if report.manifest.manifest_sha256 != manifest_hash {
+            return Err(format!(
+                "{} belongs to a different manifest ({} vs {})",
+                path.display(),
+                report.manifest.manifest_sha256,
+                manifest_hash
+            )
+            .into());
+        }
+        if report.records.is_none() {
+            return Err(format!("{} has no per-sample records", path.display()).into());
+        }
+        if report.dataset != first.dataset || report.split != first.split {
+            return Err(format!(
+                "{} covers {}/{} but the first report covers {}/{}",
+                path.display(),
+                report.dataset,
+                report.split,
+                first.dataset,
+                first.split
+            )
+            .into());
+        }
+    }
+
+    // 按 manifest 顺序落位，同时检测重复与缺失。
+    let mut positioned: Vec<Option<(SampleRecord, usize)>> =
+        (0..first.manifest.entries.len()).map(|_| None).collect();
+    let mut position_by_path: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (position, entry) in first.manifest.entries.iter().enumerate() {
+        position_by_path.insert(entry.relative_path.clone(), position);
+    }
+    let mut merged_elapsed: Vec<f64> = Vec::new();
+    for (path, report) in &reports {
+        for record in report.records.clone().unwrap_or_default() {
+            let Some(position) = position_by_path.get(&record.relative_path).copied() else {
+                return Err(format!(
+                    "{} contains `{}` which is not in the manifest",
+                    path.display(),
+                    record.relative_path
+                )
+                .into());
+            };
+            if positioned[position].is_some() {
+                return Err(
+                    format!("`{}` appears in more than one shard", record.relative_path).into(),
+                );
+            }
+            if !record.failure.is_pipeline_error() {
+                merged_elapsed.push(f64::from(record.elapsed_ms) / record.batch_size.max(1) as f64);
+            }
+            positioned[position] = Some((record, position));
+        }
+    }
+    let missing: Vec<&str> = positioned
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.is_none())
+        .map(|(position, _)| first.manifest.entries[position].relative_path.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "merged shards are missing {} manifest entries (first: {})",
+            missing.len(),
+            missing[0]
+        )
+        .into());
+    }
+
+    let records: Vec<SampleRecord> = positioned
+        .into_iter()
+        .map(|slot| slot.map(|(record, _)| record).expect("checked above"))
+        .collect();
+    let summary = summarize(records.iter());
+    let wall_ms = reports
+        .iter()
+        .map(|(_, report)| report.throughput.total_wall_ms)
+        .fold(0.0_f64, f64::max);
+
+    let merged = EvaluationReport {
+        tool: "formula_eval".to_string(),
+        model: ModelInfo {
+            path: first.model.path.clone(),
+            size_bytes: first.model.size_bytes,
+            sha256: first.model.sha256.clone(),
+            load_ms: first.model.load_ms,
+        },
+        provider: ProviderInfo {
+            requested: first.provider.requested.clone(),
+            resolved: first.provider.resolved.clone(),
+            fallback_used: first.provider.fallback_used,
+            intra_threads: first.provider.intra_threads,
+            inter_threads: first.provider.inter_threads,
+            auto_tune_threads: first.provider.auto_tune_threads,
+            physical_cpus: first.provider.physical_cpus,
+        },
+        dataset: first.dataset.clone(),
+        split: first.split.clone(),
+        subset: first.subset.clone(),
+        batch_size: first.batch_size,
+        manifest: first.manifest.clone(),
+        throughput: ThroughputInfo {
+            images_per_second: if wall_ms > 0.0 {
+                records.len() as f64 / (wall_ms / 1000.0)
+            } else {
+                0.0
+            },
+            total_wall_ms: wall_ms,
+            per_image_ms: Stats::from_samples(merged_elapsed),
+            per_batch_ms: Stats::from_samples(Vec::new()),
+            batch_size: first.batch_size,
+        },
+        memory: MemoryInfo {
+            peak_working_set_start_bytes: reports
+                .iter()
+                .filter_map(|(_, report)| report.memory.peak_working_set_start_bytes)
+                .min(),
+            peak_working_set_end_bytes: reports
+                .iter()
+                .filter_map(|(_, report)| report.memory.peak_working_set_end_bytes)
+                .max(),
+            delta_bytes: None,
+            source: peak_memory_source().to_string(),
+        },
+        summary,
+        reference_comparison: first.reference_comparison.clone(),
+        shard: None,
+        merged_from: Some(
+            reports
+                .iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect(),
+        ),
+        records: Some(records),
+    };
+
+    println!(
+        "merged: shards={} total={} scored={} exact={:.4} normalized={:.4} mean_cer={:.4} \
+         pipeline_failures={} model_mismatches={} truncated={} wall_ms={:.1}",
+        reports.len(),
+        merged.summary.total,
+        merged.summary.scored,
+        merged.summary.exact_match_rate,
+        merged.summary.normalized_match_rate,
+        merged.summary.mean_cer,
+        merged.summary.pipeline_failures,
+        merged.summary.model_mismatches,
+        merged.summary.truncated,
+        merged.throughput.total_wall_ms
+    );
+    match &cli.output {
+        Some(path) => {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, serde_json::to_string_pretty(&merged)?)?;
+        }
+        None => println!("{}", serde_json::to_string(&merged)?),
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if !cli.merge_shards.is_empty() {
+        return merge_shard_reports(&cli);
+    }
     if cli.batch_size == 0 {
         return Err("--batch-size must be greater than zero".into());
     }
-    if !cli.dataset_root.is_dir() {
+    let split = parse_split(&cli.split)?;
+    let model = cli.model.clone().ok_or("--model is required")?;
+    let dataset_root = cli
+        .dataset_root
+        .clone()
+        .ok_or("--dataset-root is required")?;
+    let dataset = cli.dataset.ok_or("--dataset is required")?;
+    if !dataset_root.is_dir() {
         return Err(format!(
             "--dataset-root {} is not a directory ({} is also checked)",
-            cli.dataset_root.display(),
+            dataset_root.display(),
             DATASET_SUBDIRS
                 .iter()
                 .map(|(name, _)| *name)
@@ -330,7 +586,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let memory_start = peak_working_set_bytes();
 
-    let fixture = load_fixture(&cli)?;
+    let fixture = load_fixture(&dataset_root, dataset, split, cli.subset)?;
     let strategy = match cli.sample {
         SampleArg::Hash => SampleStrategy::Hash,
         SampleArg::First => SampleStrategy::First,
@@ -341,7 +597,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let subset = subset_name(cli.subset);
     let manifest = build_manifest(
-        &dataset_name(cli.dataset, cli.subset),
+        &dataset_name(dataset, cli.subset),
         fixture.split.as_str(),
         subset.as_deref(),
         strategy,
@@ -372,37 +628,62 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::write(path, serde_json::to_string_pretty(&manifest)?)?;
     }
 
+    let shard = match cli.shard.as_deref() {
+        Some(raw) => Some(parse_shard(raw)?),
+        None => None,
+    };
     let runtime = runtime_config(&cli);
     let loaded_start = Instant::now();
-    let mut recognizer = FormulaRecognizer::from_model_with_hash(
-        &cli.model,
-        &runtime,
-        cli.expected_sha256.as_deref(),
-    )?;
+    let mut recognizer =
+        FormulaRecognizer::from_model_with_hash(&model, &runtime, cli.expected_sha256.as_deref())?;
     let load_ms = loaded_start.elapsed().as_secs_f64() * 1000.0;
     let resolution = recognizer.provider_resolution();
 
+    // 分片只裁剪“要评测哪些下标”，manifest 始终覆盖完整集合，
+    // 因此所有分片的 manifest_sha256 相同，合并结果与串行运行等价。
+    let order: Vec<usize> = match shard {
+        Some(info) => (0..selected.len())
+            .filter(|index| index % info.count == info.index)
+            .collect(),
+        None => (0..selected.len()).collect(),
+    };
+    if order.is_empty() {
+        return Err("this shard has no samples".into());
+    }
+
     println!(
-        "formula_eval: dataset={} split={} samples={} scored={} batch={} manifest={}",
+        "formula_eval: dataset={} split={} samples={} scored={} batch={} manifest={}{}",
         manifest.dataset,
         fixture.split.as_str(),
         manifest.entry_count,
         manifest.scored_count,
         cli.batch_size,
-        &manifest.manifest_sha256[..16]
+        &manifest.manifest_sha256[..16],
+        match shard {
+            Some(info) => format!(
+                " shard={}/{} evaluating={}",
+                info.index,
+                info.count,
+                order.len()
+            ),
+            None => String::new(),
+        }
     );
 
     let total_start = Instant::now();
-    let mut records: Vec<SampleRecord> = Vec::with_capacity(selected.len());
+    let mut records: Vec<SampleRecord> = Vec::with_capacity(order.len());
     let mut per_batch_ms: Vec<f64> = Vec::new();
     let mut per_image_ms: Vec<f64> = Vec::new();
     let batch_size = cli.batch_size;
     let progress_every = cli.progress_every.max(1);
 
     let mut index = 0usize;
-    while index < selected.len() {
-        let end = (index + batch_size).min(selected.len());
-        let chunk = &selected[index..end];
+    while index < order.len() {
+        let end = (index + batch_size).min(order.len());
+        let chunk: Vec<&FormulaSample> = order[index..end]
+            .iter()
+            .map(|position| selected[*position])
+            .collect();
         let mut pending: Vec<Option<SampleRecord>> = (0..chunk.len()).map(|_| None).collect();
         let mut valid_images = Vec::new();
         let mut valid_indices = Vec::new();
@@ -470,11 +751,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         records.extend(pending.into_iter().flatten());
         index = end;
-        if index.is_multiple_of(progress_every) || index == selected.len() {
+        if index.is_multiple_of(progress_every) || index == order.len() {
             eprintln!(
                 "  progress {index}/{} ({:.1}%)",
-                selected.len(),
-                index as f64 * 100.0 / selected.len() as f64
+                order.len(),
+                index as f64 * 100.0 / order.len() as f64
             );
         }
     }
@@ -482,18 +763,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let total_wall_ms = total_start.elapsed().as_secs_f64() * 1000.0;
     let memory_end = peak_working_set_bytes();
 
-    // 记录顺序与 manifest 条目顺序一致（都是 `selected` 的顺序），
-    // 因此这里可以逐项补齐相对路径，作为跨语言的稳定比较键。
-    if records.len() != manifest.entries.len() {
+    // 逐样本记录必须能对应到 manifest 条目：串行时顺序一致，分片时是 manifest
+    // 顺序的子序列，因此都按相对路径反查下标，保证合并后顺序稳定。
+    for record in records.iter_mut() {
+        let key = record.image.replace('\\', "/");
+        let Some(position) = manifest
+            .entries
+            .iter()
+            .position(|entry| key.ends_with(entry.relative_path.as_str()))
+        else {
+            return Err(format!(
+                "record `{}` does not match any manifest entry",
+                record.image
+            )
+            .into());
+        };
+        record.relative_path = manifest.entries[position].relative_path.clone();
+    }
+    if records.len() != order.len() {
         return Err(format!(
-            "internal error: {} records for {} manifest entries",
+            "internal error: {} records for {} evaluated samples",
             records.len(),
-            manifest.entries.len()
+            order.len()
         )
         .into());
-    }
-    for (record, entry) in records.iter_mut().zip(manifest.entries.iter()) {
-        record.relative_path = entry.relative_path.clone();
     }
 
     let reference_comparison = match &cli.python_reference {
@@ -503,11 +796,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let summary = summarize(records.iter());
     let report = EvaluationReport {
-        tool: "formula_eval",
+        tool: "formula_eval".to_string(),
         model: ModelInfo {
-            path: cli.model.display().to_string(),
-            size_bytes: std::fs::metadata(&cli.model)?.len(),
-            sha256: sha256_file(&cli.model)?,
+            path: model.display().to_string(),
+            size_bytes: std::fs::metadata(&model)?.len(),
+            sha256: sha256_file(&model)?,
             load_ms,
         },
         provider: ProviderInfo {
@@ -542,10 +835,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 (Some(start), Some(end)) => Some(end.saturating_sub(start)),
                 _ => None,
             },
-            source: peak_memory_source(),
+            source: peak_memory_source().to_string(),
         },
         summary,
         reference_comparison,
+        shard,
+        merged_from: None,
         records: (!cli.no_records).then_some(records),
     };
 
@@ -676,8 +971,8 @@ mod tests {
     use rapid_ocr_rs::evaluation::formula::fixture::{FormulaSplit, UniMerSubset};
 
     use super::{
-        Cli, DatasetArg, SubsetArg, dataset_name, dataset_subdir, load_fixture, parse_split,
-        subset_name, unimer_subset,
+        DatasetArg, SubsetArg, dataset_name, dataset_subdir, load_fixture, parse_shard,
+        parse_split, subset_name, unimer_subset,
     };
 
     #[test]
@@ -720,24 +1015,42 @@ mod tests {
     #[test]
     fn fixture_loading_uses_the_collection_root() {
         // 不存在的根目录必须返回可定位错误，而不是 panic。
-        let cli = Cli {
-            model: "model.onnx".into(),
-            dataset_root: std::env::temp_dir().join("rapid-ocr-rs-does-not-exist"),
-            dataset: DatasetArg::Im2latex,
-            split: "test".to_string(),
-            subset: None,
-            limit: 0,
-            batch_size: 8,
-            sample: super::SampleArg::Hash,
-            expect_manifest: None,
-            output: None,
-            manifest_output: None,
-            python_reference: None,
-            expected_sha256: None,
-            threads: None,
-            progress_every: 500,
-            no_records: false,
-        };
-        assert!(load_fixture(&cli).is_err());
+        let root = std::env::temp_dir().join("rapid-ocr-rs-does-not-exist");
+        assert!(load_fixture(&root, DatasetArg::Im2latex, FormulaSplit::Test, None).is_err());
+    }
+
+    /// 缺少必填参数时必须给出可定位错误，而不是 panic。
+    #[test]
+    fn load_fixture_rejects_missing_unimer_subset() {
+        let root = std::env::temp_dir();
+        assert!(load_fixture(&root, DatasetArg::Unimer, FormulaSplit::Test, None).is_err());
+    }
+
+    #[test]
+    fn shard_parsing_validates_index_and_count() {
+        let shard = parse_shard("1/4").expect("1/4 is valid");
+        assert_eq!((shard.index, shard.count), (1, 4));
+        assert!(parse_shard("4/4").is_err(), "index must be < count");
+        assert!(parse_shard("0/0").is_err(), "count must be > 0");
+        assert!(parse_shard("1").is_err(), "INDEX/COUNT is required");
+        assert!(parse_shard("a/2").is_err(), "index must be numeric");
+    }
+
+    /// 分片划分必须是 manifest 顺序上互不重叠、并集完整的划分。
+    #[test]
+    fn shard_partition_is_disjoint_and_complete() {
+        let total = 37usize;
+        let count = 4usize;
+        let mut seen = vec![0usize; total];
+        for index in 0..count {
+            let shard = parse_shard(&format!("{index}/{count}")).expect("valid shard");
+            for position in (0..total).filter(|p| p % shard.count == shard.index) {
+                seen[position] += 1;
+            }
+        }
+        assert!(
+            seen.iter().all(|hits| *hits == 1),
+            "every manifest position must belong to exactly one shard: {seen:?}"
+        );
     }
 }
