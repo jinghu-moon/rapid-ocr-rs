@@ -895,15 +895,15 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 | 0B 结构重构 | ☑ | 2026-10-02 | `b1846cc` | cargo check/test/fmt + provider 矩阵 + 真实图片回归 | 76 测试通过；DirectML/CUDA 79 通过；CANN check 通过；真实图片 42 区域文本一致 | 依赖边界靠 mod.rs 注释约束；阶段 11 最终复核 |
 | 2 fixture | ☑ | 2026-10-02 | `5f05bf5` | cargo test --lib evaluation::formula::fixture / cargo test --lib / cargo fmt --all -- --check | 17 项 fixture 测试全绿；lib 93/93；im2latex test 10,355 / validate 8,370 全部可定位且无交集；UniMER meas 首/中/尾映射+可解码通过；空标签标记并排除出评分 | 未跑 provider 矩阵（fixture 为纯 IO，不涉模型/推理） |
 | 3 模型契约 | ☑ | 2026-10-02 | `635b216` | cargo test --lib formula::model_info / cargo test --all-targets / cargo fmt --all -- --check | 14 项模型契约测试全绿；lib/全部 target 112 passed；真实模型签名/零输入 batch 冒烟通过；tokenizer metadata 契约（vocab 50000、BOS/PAD/EOS/UNK=0/1/2/3）验证通过 | 未跑 provider 矩阵（阶段 10 补充）；fixture 模型仅覆盖契约失败路径，真实模型单测覆盖正路径 |
-| 4 预处理 | ☐ |  |  |  |  |  |
-| 5 runtime/领域契约 | ☐ |  |  |  |  |  |
-| 6 tokenizer | ☐ |  |  |  |  |  |
-| 7 Formula API | ☐ |  |  |  |  |  |
-| 8 输出/错误 | ☐ |  |  |  |  |  |
-| 9 数值回归 | ☐ |  |  |  |  |  |
-| 10 性能/provider | ☐ |  |  |  |  |  |
-| 11 普通 OCR 回归 | ☐ |  |  |  |  |  |
-| 12 文档/发布边界 | ☐ |  |  |  |  |  |
+| 4 预处理 | ☑ | 2026-10-02 | `a79be8c` | cargo test --lib formula::preprocess / cargo test --all-targets / cargo fmt | 6 passed；118 passed；Python/Rust tensor max_abs <= 4.77e-7；5 本地样本 + 宽/透明/常量边界 fixture 通过 | SHA 采用 Python golden 字节哈希；Rust 不声明 bit-exact |
+| 5 runtime/领域契约 | ☑ | 2026-10-02 | `0288762` | cargo test --lib session::tests / cargo test --all-targets / directml | 14 passed；132 passed；公式模型误载 Rec session 失败；CTC/fixture 通过；真实 OCR 42 区域 | 单图真实公式未跑；阶段 7 起验证 |
+| 6 tokenizer | ☑ | 2026-10-02 | `22b4cf6` | cargo test --lib formula::tokenizer / cargo test --all-targets / cargo fmt | 9 passed；30 个 Python tokenizers golden 序列通过；真实 fast_tokenizer.json 使用 | 未跑全量 LaTeX postprocess |
+| 7 Formula API | ☑ | 2026-10-02 | `f77ecfd` | cargo test --lib formula::recognizer / cargo test --all-targets | 9 passed；145 passed；单图/batch/空 batch/超 batch/路径/hash/metadata/out-of-vocab 通过 | 真实 594MB 模型不在单测内，阶段 9 补充 |
+| 8 输出/错误/资源 | ☑ | 2026-10-02 | `0aa784b` | cargo test --lib formula::output formula::recognizer / cargo test --all-targets | 4+11 passed；151 passed；JSON/Markdown/HTML、受限输入、stream URL cap 通过 | 图内 Loop 的内存上限依赖模型结构；无外部 profiling |
+| 9 数值回归 | ☑ | 2026-10-02 | `a94eadc` | formula_compare + formula_reference + compare_results (100 val subset) | 100/100 tokens(EOS 前)、raw LaTeX、EOS、truncated 一致；Rust exact 0.36，CER 0.0665 | 完整 501/im2latex/UniMER 未运行，保留发布前门禁 |
+| 10 性能/provider | ☑ | 2026-10-02 | `76a5e6f` | formula_bench CPU/DirectML/CUDA 1-3 rounds | CPU e2e ~1348ms；DirectML 可运行但较慢；CUDA 可运行；batch 1/2/4/8 有数据 | 内存峰值未用外部 profiler 采集 |
+| 11 普通 OCR 回归 | ☑ | 2026-10-02 | `9649aa4` | cargo test --all-targets / provider tests / real OCR / CLI run/report/evaluate/check | 154 passed；DirectML/CUDA 157 passed；真实 OCR 42 区域；CLI 全通过 | benchmark 未与阶段 1 全量逐项重跑 |
+| 12 文档/发布边界 | ☑ | 2026-10-02 | `310d2ed` | README/THIRD_PARTY/docs/01/.gitignore 检查 | 模型 URL/SHA-256/license 记录；模型不入 crate；可复现命令齐全 | 发布前仍需完整主评测与 license inventory |
 
 ---
 
@@ -1381,7 +1381,7 @@ cargo run --features cuda-provider --bin formula_bench -- --model <model.onnx> -
 
 | 阶段 | 提交 | 说明 |
 | --- | --- | --- |
-| 10 性能/provider | 待记录 | `feat(formula): implement phase 10 benchmark and provider checks` |
+| 10 性能/provider | `76a5e6f` | `feat(formula): implement phase 10 benchmark and provider checks` |
 
 ---
 
@@ -1421,7 +1421,7 @@ cargo run --features cuda-provider --bin formula_bench -- --model <model.onnx> -
 
 | 阶段 | 提交 | 说明 |
 | --- | --- | --- |
-| 9 数值/功能回归 | 待记录 | `feat(formula): add phase 9 evaluation tooling and smoke report` |
+| 9 数值/功能回归 | `a94eadc` | `feat(formula): add phase 9 evaluation tooling and smoke report` |
 
 ---
 
@@ -1458,7 +1458,7 @@ cargo run --features cuda-provider --bin formula_bench -- --model <model.onnx> -
 
 | 阶段 | 提交 | 说明 |
 | --- | --- | --- |
-| 11 普通 OCR 回归 | 待记录 | `fix(cli): resolve evaluate image paths and record regression` |
+| 11 普通 OCR 回归 | `9649aa4` | `fix(cli): resolve evaluate image paths and record regression` |
 
 
 ---
@@ -1491,4 +1491,4 @@ cargo run --features cuda-provider --bin formula_bench -- --model <model.onnx> -
 
 | 阶段 | 提交 | 说明 |
 | --- | --- | --- |
-| 12 文档/许可证 | 待记录 | docs(formula): document phase 12 assets and release boundaries |
+| 12 文档/许可证 | `310d2ed` | `docs(formula): document phase 12 assets and release boundaries` |
