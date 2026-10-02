@@ -30,6 +30,9 @@ pub use formula::model_info::{
     FORMULA_INPUT_CHANNELS, FORMULA_INPUT_RANK, FORMULA_INPUT_SPATIAL, FORMULA_OUTPUT_RANK,
     FormulaModelInfo,
 };
+pub use formula::output::{
+    order_formula_results, to_formula_html, to_formula_json, to_formula_markdown,
+};
 pub use formula::preprocess::{
     FORMULA_INPUT_SIZE, FORMULA_MEAN, FORMULA_STD, FormulaPreprocessor, FormulaTensor,
 };

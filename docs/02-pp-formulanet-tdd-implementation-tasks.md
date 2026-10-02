@@ -630,35 +630,35 @@ FormulaRecognizer::recognize_batch(images)
 
 ### 9.1 输出格式
 
-- [ ] JSON 输出包含 `latex`、`token_ids`、`eos_index`、`truncated`、模型标识和耗时。
-- [ ] Markdown 使用明确的 display math 表示，例如 `$$...$$`，避免把 LaTeX 当普通文本转义。
-- [ ] HTML 对 LaTeX 文本和 HTML 属性分别转义。
-- [ ] 原始 token ID 默认可选输出，调试模式打开，不在普通 Markdown 中泄露。
-- [ ] 公式输出顺序与检测 region/reading order 一致。
+- [x] JSON 输出包含 `latex`、`token_ids`、`eos_index`、`truncated`、模型标识和耗时。
+- [x] Markdown 使用明确的 display math 表示，例如 `$$...$$`，避免把 LaTeX 当普通文本转义。
+- [x] HTML 对 LaTeX 文本和 HTML 属性分别转义。
+- [x] 原始 token ID 默认可选输出，调试模式打开，不在普通 Markdown 中泄露。
+- [x] 公式输出顺序与检测 region/reading order 一致。
 
 ### 9.2 错误语义
 
-- [ ] 模型不存在；
-- [ ] hash 不匹配；
-- [ ] ONNX 契约不匹配；
-- [ ] tokenizer metadata 缺失/损坏；
-- [ ] 图片解码失败；
-- [ ] 像素/编码大小超限；
-- [ ] batch 超限；
-- [ ] EOS 缺失导致截断；
-- [ ] provider 不可用；
-- [ ] ORT 执行失败。
+- [x] 模型不存在；
+- [x] hash 不匹配；
+- [x] ONNX 契约不匹配；
+- [x] tokenizer metadata 缺失/损坏；
+- [x] 图片解码失败；
+- [x] 像素/编码大小超限；
+- [x] batch 超限；
+- [x] EOS 缺失导致截断；
+- [x] provider 不可用；
+- [x] ORT 执行失败。
 
 所有错误都应使用现有错误体系或重构后的结构化错误，不返回只包含底层 ORT 字符串的不可判断错误。
 
 ### 9.3 资源约束
 
-- [ ] 延续普通输入的解码像素和编码字节限制；
-- [ ] 对公式 crop 也执行尺寸限制；
-- [ ] batch 大小有显式上限；
-- [ ] 序列长度有上限；
-- [ ] 图内 Loop 不应因异常输入导致无界内存增长；
-- [ ] URL/文件输入不得在校验前完整缓冲超大数据。
+- [x] 延续普通输入的解码像素和编码字节限制；
+- [x] 对公式 crop 也执行尺寸限制；
+- [x] batch 大小有显式上限；
+- [x] 序列长度有上限；
+- [x] 图内 Loop 不应因异常输入导致无界内存增长；
+- [x] URL/文件输入不得在校验前完整缓冲超大数据。
 
 ---
 
@@ -1282,4 +1282,51 @@ Pillow 的 resize 与 Python OpenCV 的 SIMD BGR2GRAY 在当前环境下与 Rust
 | 阶段 | 提交 | 说明 |
 | --- | --- | --- |
 | 7 Formula API | `f77ecfd` | `feat(formula): implement phase 7 recognizer API` |
+
+---
+
+### 24. 阶段 8 执行记录（2026-10-02）
+
+#### 24.1 输出格式
+
+- 新增 `src/formula/output.rs`：
+  - `to_formula_json(result, include_token_ids)`：
+    - 始终包含 `latex`、`eos_index`、`truncated`、`model_id`、`elapsed_ms`；
+    - 仅 debug 模式包含 `token_ids`；
+  - `to_formula_markdown`：输出 `$$...$$` display math，不泄露 token IDs；
+  - `to_formula_html`：LaTeX 文本和 `data-latex` 属性分别使用 `escape_html` / `escape_attr`；
+  - `order_formula_results(results, order)`：按显式 region/reading order 重排并拒绝重复/越界/长度不一致。
+- `output/html.rs` 的 HTML escape 函数改为 `pub(crate)` 供公式输出复用。
+
+#### 24.2 错误与资源边界
+
+- `FormulaRecognizer` 增加：
+  - `max_input_pixels` 默认 24,000,000；
+  - `max_sequence_length` 默认 2560；
+  - `max_batch_size` 默认 16；
+  - `recognize_encoded`：编码 bytes 长度检查 -> header 维度检查 -> 解码 -> 识别；
+  - `recognize_file`：文件 metadata 编码长度检查 -> header 维度检查 -> 解码 -> 识别；
+  - `recognize_url`：Content-Length 检查 + streaming read cap + header/pixel 限制。
+- 错误路径覆盖：
+  - 模型不存在、hash mismatch、ONNX contract、tokenizer metadata、图片解码、像素/编码超限、batch 超限、out-of-vocab、ORT/provider 错误。
+- EOS 缺失通过 `truncated=true` 结构化返回，不静默当作完整结果。
+
+#### 24.3 验证结果
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --lib formula::output` | 4 passed；0 failed |
+| `cargo test --lib formula::recognizer` | 11 passed；0 failed |
+| `cargo test --all-targets` | 151 passed；0 failed |
+| `cargo fmt --all -- --check` | 通过 |
+| JSON token IDs 开关 | 普通模式无 `token_ids`；debug 模式保留 |
+| Markdown display math | `$$...$$`，不包含 token IDs |
+| HTML escaping | `<`/`&` 在文本和属性中均被转义 |
+| encoded/file/url limits | 编码长度、像素、流式读取 cap 均生效 |
+
+#### 24.4 阶段提交
+
+| 阶段 | 提交 | 说明 |
+| --- | --- | --- |
+| 8 输出/错误/资源 | 待记录 | `feat(formula): implement phase 8 outputs and boundaries` |
 

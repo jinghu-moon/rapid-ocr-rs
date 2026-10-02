@@ -152,7 +152,7 @@ pub fn render_output_report(
     )
 }
 
-fn escape_html(value: &str) -> String {
+pub(crate) fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -161,7 +161,7 @@ fn escape_html(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn escape_attr(value: &str) -> String {
+pub(crate) fn escape_attr(value: &str) -> String {
     escape_html(value)
 }
 
