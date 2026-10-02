@@ -30,6 +30,9 @@ pub use formula::model_info::{
     FORMULA_INPUT_CHANNELS, FORMULA_INPUT_RANK, FORMULA_INPUT_SPATIAL, FORMULA_OUTPUT_RANK,
     FormulaModelInfo,
 };
+pub use formula::preprocess::{
+    FORMULA_INPUT_SIZE, FORMULA_MEAN, FORMULA_STD, FormulaPreprocessor, FormulaTensor,
+};
 pub use formula::tokenizer_metadata::{
     BOS_ID, BOS_TOKEN, EOS_ID, EOS_TOKEN, FormulaTokenizerMetadata, PAD_ID, PAD_TOKEN, UNK_ID,
     UNK_TOKEN,

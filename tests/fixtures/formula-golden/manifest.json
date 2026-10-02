@@ -1,0 +1,68 @@
+{
+  "source": "RapidDoc PP-Formulanet_plus pre_process.py at img_size=(384,384), Python Pillow 11.1.0/OpenCV 5.0.0/Numpy 2.5.3",
+  "shape": [
+    1,
+    1,
+    384,
+    384
+  ],
+  "dtype": "float32",
+  "images": [
+    {
+      "image": "formula_text.png",
+      "golden": "formula_text_golden.npy",
+      "sha256_raw_f32le": "e658ca6455d4def6ab2949895de84f2bd0c3ad38489b8e28dd8c8f668bb3ad25",
+      "min": -4.563291072845459,
+      "max": 1.1904487609863281,
+      "mean": -3.116105079650879
+    },
+    {
+      "image": "narrow_tall.png",
+      "golden": "narrow_tall_golden.npy",
+      "sha256_raw_f32le": "bbd6de3a31b5fedb6a2b4ad4fb5c3c0795fc4f8de9d43200edef51ee95b6d3fa",
+      "min": -4.563291072845459,
+      "max": 1.1904487609863281,
+      "mean": -4.56007194519043
+    },
+    {
+      "image": "pure_black.png",
+      "golden": "pure_black_golden.npy",
+      "sha256_raw_f32le": "ca217a896749c2c3a76f3cbca37d48de839f1d3a74c3f551fdd890a1afa6d3bf",
+      "min": -4.563291072845459,
+      "max": -4.563291072845459,
+      "mean": -4.563291072845459
+    },
+    {
+      "image": "pure_white.png",
+      "golden": "pure_white_golden.npy",
+      "sha256_raw_f32le": "53281b0fe16604a46c61e73a3f54810612f9fb730674df2f740fc35d3b4aac6a",
+      "min": -4.563291072845459,
+      "max": 1.1904487609863281,
+      "mean": -0.5776274800300598
+    },
+    {
+      "image": "single_pixel.png",
+      "golden": "single_pixel_golden.npy",
+      "sha256_raw_f32le": "ca217a896749c2c3a76f3cbca37d48de839f1d3a74c3f551fdd890a1afa6d3bf",
+      "min": -4.563291072845459,
+      "max": -4.563291072845459,
+      "mean": -4.563291072845459
+    },
+    {
+      "image": "transparent.png",
+      "golden": "transparent_golden.npy",
+      "sha256_raw_f32le": "ca217a896749c2c3a76f3cbca37d48de839f1d3a74c3f551fdd890a1afa6d3bf",
+      "min": -4.563291072845459,
+      "max": -4.563291072845459,
+      "mean": -4.563291072845459
+    },
+    {
+      "image": "wide_short.png",
+      "golden": "wide_short_golden.npy",
+      "sha256_raw_f32le": "ca217a896749c2c3a76f3cbca37d48de839f1d3a74c3f551fdd890a1afa6d3bf",
+      "min": -4.563291072845459,
+      "max": -4.563291072845459,
+      "mean": -4.563291072845459
+    }
+  ]
+}

@@ -275,9 +275,7 @@ mod tests {
 mod real_model_tests {
     use std::path::{Path, PathBuf};
 
-    use crate::{
-        config::RuntimeConfig, error::RapidOcrError, formula::model_info::FormulaModelInfo,
-    };
+    use crate::{config::RuntimeConfig, formula::model_info::FormulaModelInfo};
 
     fn real_model() -> Option<PathBuf> {
         let env = std::env::var("RAPID_OCR_MODEL_ROOT")

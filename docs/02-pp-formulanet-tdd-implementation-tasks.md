@@ -458,13 +458,13 @@ FLOAT32 [N, 1, 384, 384]
 
 ### 5.2 Red/Green/Refactor 任务
 
-- [ ] Red：固定 5 张本地样本的输出 shape、dtype、min、max、均值和 SHA-256。
-- [ ] Red：纯白图、全黑图、单像素图、窄图、宽图、透明图各有测试。
-- [ ] Red：RGB 与 BGR 顺序错误的探针必须失败，防止通道语义回归。
-- [ ] Green：实现独立 `FormulaPreprocessor`。
-- [ ] Green：实现批量预处理，样本顺序保持稳定。
-- [ ] Refactor：删除与普通 OCR 预处理重复但语义不同的隐式转换。
-- [ ] 通过 Python 参考实现导出 golden tensor，与 Rust `allclose` 比较。
+- [x] Red：固定 5 张本地样本的输出 shape、dtype、min、max、均值和 SHA-256。
+- [x] Red：纯白图、全黑图、单像素图、窄图、宽图、透明图各有测试。
+- [x] Red：RGB 与 BGR 顺序错误的探针必须失败，防止通道语义回归。
+- [x] Green：实现独立 `FormulaPreprocessor`。
+- [x] Green：实现批量预处理，样本顺序保持稳定。
+- [x] Refactor：删除与普通 OCR 预处理重复但语义不同的隐式转换。
+- [x] 通过 Python 参考实现导出 golden tensor，与 Rust `allclose` 比较。
 
 ### 5.3 预处理验收阈值
 
@@ -1027,7 +1027,7 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 
 ### 19. 阶段 3 执行记录（2026-10-02）
 
-### 19.1 实现内容
+#### 20.1 实现内容
 
 - 在共享 `runtime::session` 增加通用能力（不触碰普通 OCR 契约）：
   - `OrtSession::open_unchecked`：加载 ONNX 而不做领域契约校验（公式探针专用）
@@ -1066,3 +1066,60 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 | `cargo build --lib` | 通过，无警告 |
 
 阶段 3 完成后，阶段 4（预处理 TDD）开始。
+
+---
+
+### 20. 阶段 4 执行记录（2026-10-02）
+
+#### 20.1 实现内容
+
+- 新增独立 `src/formula/preprocess.rs`，不依赖 `ocr/pipeline` 预处理：
+  - `FormulaPreprocessor::preprocess(&DynamicImage)`
+  - `preprocess_rgb8` / `preprocess_rgba8` / `preprocess_gray8`
+  - `preprocess_batch(&[DynamicImage])`，保持输入顺序
+  - 输出 `FormulaTensor = ndarray::Array4<f32>`，形状 `[N,1,384,384]`
+- 复现 RapidDoc `PPPreProcess` 契约：
+  - PIL `convert("L")` 对应的整数 luma 裁剪边界；
+  - 裁剪非白区域，右/下边界按 PIL crop 的 exclusive 语义处理；
+  - 短边先缩放到 384，再用 Pillow thumbnail 语义限制长边；
+  - 黑色画布居中填充；
+  - 归一化 `mean=0.7931`、`std=0.1738`；
+  - OpenCV `COLOR_BGR2GRAY` 的通道权重与其 SIMD FMA 运算顺序；
+  - 最终单通道 NCHW，多 16 对齐时使用归一化后的 `1.0` 填充。
+- 为 bit-level 接近复现 Pillow，实现了：
+  - Pillow `precompute_coeffs` 的 Bilinear/Bicubic 系数；
+  - 8bpc 固定点 `PRECISION_BITS=22` 的两个 pass resize；
+  - `thumbnail(..., reducing_gap=2.0)` 的 reduce 优化和 fractional box；
+  - Pillow `ImagingReduce` 的 box average/fixed-point 语义。
+- 新增 golden fixture：
+  - `tests/fixtures/formula-golden/*.png`
+  - `tests/fixtures/formula-golden/*_golden.npy`
+  - `tests/fixtures/formula-golden/manifest.json`
+  - manifest 记录每个 Python 参考 tensor 的 shape、dtype、min/max/mean 和 raw f32 little-endian SHA-256。
+
+#### 20.2 预处理验收结果
+
+| 项目 | 结果 |
+| --- | --- |
+| `cargo test --lib formula::preprocess` | 6 passed；0 failed |
+| `cargo test --all-targets` | 118 passed；0 failed |
+| `cargo fmt --all -- --check` | 通过 |
+| Python/Rust tensor 最大绝对误差 | `formula_text` 4.77e-7；`narrow_tall` 3.58e-7；其余常量/边界样本 0 |
+| 纯度白/黑/单像素/窄图/宽图/透明图 | 均有 golden 或等价断言 |
+| RGB/BGR 通道探针 | 锁定 red/blue normalized luma 差异，顺序反转会使测试失败 |
+| batch 顺序 | 2 样本 batch 与单图完全一致 |
+
+#### 20.3 已知差异与处理
+
+Pillow 的 resize 与 Python OpenCV 的 SIMD BGR2GRAY 在当前环境下与 Rust 实现存在最多 1 ULP 的差异：
+- 阶段 4 验收按任务文档采用 `max_abs <= 1e-5`；
+- manifest 中固定的 SHA-256 是 Python 参考 tensor 的字节哈希，用于锁定 golden 资产；
+- 不声称 Rust 输出与 Python 参考 bit-level SHA 完全相同；
+- 该差异远低于归一化张量验收阈值，且常量/无 resize 样本已达到 bit-exact。
+
+#### 20.4 阶段提交
+
+| 阶段 | 提交 | 说明 |
+| --- | --- | --- |
+| 4 预处理 | 待记录 | `feat(formula): implement phase 4 preprocessing TDD` |
+

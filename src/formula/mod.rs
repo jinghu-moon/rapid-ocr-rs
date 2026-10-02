@@ -7,4 +7,5 @@
 //! `preprocess`/`tokenizer`/`session` 在阶段 4/5/6 实现。
 
 pub mod model_info;
+pub mod preprocess;
 pub mod tokenizer_metadata;
