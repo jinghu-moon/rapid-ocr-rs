@@ -25,6 +25,9 @@ pub enum RapidOcrError {
     #[error("decoding failed: {0}")]
     Decode(String),
 
+    #[error("tokenizer error: {0}")]
+    Tokenizer(String),
+
     #[error("unsupported provider for v1: {0}")]
     UnsupportedProvider(String),
 

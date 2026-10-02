@@ -26,6 +26,14 @@ pub use config::{
     RuntimeBackend, RuntimeConfig, VisionBackend,
 };
 pub use error::{RapidOcrError, Result};
+pub use formula::model_info::{
+    FORMULA_INPUT_CHANNELS, FORMULA_INPUT_RANK, FORMULA_INPUT_SPATIAL, FORMULA_OUTPUT_RANK,
+    FormulaModelInfo,
+};
+pub use formula::tokenizer_metadata::{
+    BOS_ID, BOS_TOKEN, EOS_ID, EOS_TOKEN, FormulaTokenizerMetadata, PAD_ID, PAD_TOKEN, UNK_ID,
+    UNK_TOKEN,
+};
 pub use model_store::{
     default_model_store_dir, ensure_downloaded, sha256_file, verify_existing_file,
 };
@@ -40,5 +48,6 @@ pub use output::json::{OcrJsonItem, to_output_items, to_output_json};
 pub use output::markdown::to_output_markdown;
 pub use output::visualize::draw_output;
 pub use runtime::provider::{ProviderResolution, ResolvedExecutionProvider};
+pub use runtime::session::{ModelIoProbe, OrtSession, TensorSpec};
 
 pub type Quad = [[f32; 2]; 4];

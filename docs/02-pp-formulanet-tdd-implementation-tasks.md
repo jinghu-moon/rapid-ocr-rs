@@ -389,34 +389,34 @@ Formula-TestSet/UniMER-Test/
 
 ### 4.1 先写模型探针测试
 
-- [ ] Red：模型不存在时返回可定位错误。
-- [ ] Red：输入不是单输入、类型不是 `FLOAT`、rank 不是 4 时拒绝。
-- [ ] Red：输出不是 `INT64` rank 2 时拒绝。
-- [ ] Red：固定空间维不是 `384x384` 时拒绝或明确支持动态契约。
-- [ ] Red：缺失 `character` metadata 时按显式策略失败，不静默使用普通 OCR 字典。
-- [ ] Green：实现模型签名探针并输出结构化 `FormulaModelInfo`。
-- [ ] Refactor：模型验证逻辑与推理执行逻辑分离。
+- [x] Red：模型不存在时返回可定位错误。
+- [x] Red：输入不是单输入、类型不是 `FLOAT`、rank 不是 4 时拒绝。
+- [x] Red：输出不是 `INT64` rank 2 时拒绝。
+- [x] Red：固定空间维不是 `384x384` 时拒绝或明确支持动态契约。
+- [x] Red：缺失 `character` metadata 时按显式策略失败，不静默使用普通 OCR 字典。
+- [x] Green：实现模型签名探针并输出结构化 `FormulaModelInfo`。
+- [x] Refactor：模型验证逻辑与推理执行逻辑分离。
 
 ### 4.2 Rust `ort` 兼容性验证
 
-- [ ] 使用项目锁定的 `ort = 2.0.0-rc.13` 加载模型；
-- [ ] 使用 CPU provider 创建 session；
-- [ ] 验证 opset 18/IR 10 在项目 runtime 下可加载；
-- [ ] 用一个 `[1,1,384,384]` 输入运行；
-- [ ] 用两个样本运行动态 batch；
-- [ ] 检查输出 dtype、rank、batch 维；
-- [ ] 记录 session 创建时间、首次运行时间和错误信息；
-- [ ] 若项目 ort/ORT 不支持该图，先解决 runtime 版本/构建根因，不修改模型图规避错误。
+- [x] 使用项目锁定的 `ort = 2.0.0-rc.13` 加载模型；
+- [x] 使用 CPU provider 创建 session；
+- [x] 验证 opset 18/IR 10 在项目 runtime 下可加载；
+- [x] 用一个 `[1,1,384,384]` 输入运行；
+- [x] 用两个样本运行动态 batch；
+- [x] 检查输出 dtype、rank、batch 维；
+- [x] 记录 session 创建时间、首次运行时间和错误信息；
+- [x] 若项目 ort/ORT 不支持该图，先解决 runtime 版本/构建根因，不修改模型图规避错误。
 
 ### 4.3 metadata tokenizer 测试
 
-- [ ] 读取 `character` metadata JSON；
-- [ ] 验证存在 `fast_tokenizer_file`；
-- [ ] 验证 vocab 中包含 `<s>`, `<pad>`, `</s>`, `<unk>`；
-- [ ] 验证 ID 分别为 `0,1,2,3`；
-- [ ] 验证 tokenizer vocab 规模为 50,000；
-- [ ] metadata JSON 损坏时返回 tokenizer 错误；
-- [ ] 不把完整 tokenizer JSON 写入源码或复制成第二份真值。
+- [x] 读取 `character` metadata JSON；
+- [x] 验证存在 `fast_tokenizer_file`；
+- [x] 验证 vocab 中包含 `<s>`, `<pad>`, `</s>`, `<unk>`；
+- [x] 验证 ID 分别为 `0,1,2,3`；
+- [x] 验证 tokenizer vocab 规模为 50,000；
+- [x] metadata JSON 损坏时返回 tokenizer 错误；
+- [x] 不把完整 tokenizer JSON 写入源码或复制成第二份真值。
 
 ---
 
@@ -894,7 +894,7 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 | 1 基线 | ☑ | 2026-10-02 | `8e05bfa` | cargo test/fmt/check + provider 矩阵 | 默认 76/DirectML 79/CUDA 79 通过；CANN check 通过；真实图片回归正常 | 未重测独立吞吐/内存，沿用既有基准 |
 | 0B 结构重构 | ☑ | 2026-10-02 | `b1846cc` | cargo check/test/fmt + provider 矩阵 + 真实图片回归 | 76 测试通过；DirectML/CUDA 79 通过；CANN check 通过；真实图片 42 区域文本一致 | 依赖边界靠 mod.rs 注释约束；阶段 11 最终复核 |
 | 2 fixture | ☑ | 2026-10-02 | `5f05bf5` | cargo test --lib evaluation::formula::fixture / cargo test --lib / cargo fmt --all -- --check | 17 项 fixture 测试全绿；lib 93/93；im2latex test 10,355 / validate 8,370 全部可定位且无交集；UniMER meas 首/中/尾映射+可解码通过；空标签标记并排除出评分 | 未跑 provider 矩阵（fixture 为纯 IO，不涉模型/推理） |
-| 3 模型契约 | ☐ |  |  |  |  |  |
+| 3 模型契约 | ☑ | 2026-10-02 | 待填 | cargo test --lib formula::model_info / cargo test --all-targets / cargo fmt --all -- --check | 14 项模型契约测试全绿；lib/全部 target 112 passed；真实模型签名/零输入 batch 冒烟通过；tokenizer metadata 契约（vocab 50000、BOS/PAD/EOS/UNK=0/1/2/3）验证通过 | 未跑 provider 矩阵（阶段 10 补充）；fixture 模型仅覆盖契约失败路径，真实模型单测覆盖正路径 |
 | 4 预处理 | ☐ |  |  |  |  |  |
 | 5 runtime/领域契约 | ☐ |  |  |  |  |  |
 | 6 tokenizer | ☐ |  |  |  |  |  |
@@ -1025,4 +1025,44 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 | `cargo test --lib` | 93 passed；0 failed |
 | `cargo fmt --all -- --check` | 通过 |
 
-阶段 2 完成后，阶段 3（ONNX 模型契约）开始。
+### 19. 阶段 3 执行记录（2026-10-02）
+
+### 19.1 实现内容
+
+- 在共享 `runtime::session` 增加通用能力（不触碰普通 OCR 契约）：
+  - `OrtSession::open_unchecked`：加载 ONNX 而不做领域契约校验（公式探针专用）
+  - `OrtSession::probe_io`：输出结构化 `ModelIoProbe`（输入/输出名称、rank、维度、元素类型）
+  - `OrtSession::metadata_custom`：读取自定义 metadata（如 `character`）
+  - `OrtSession::run_i64_2d`：以命名输入运行，第一个输出按 `INT64` rank-2 提取
+- 新增 `formula::model_info`：`FormulaModelInfo::probe` 解析并校验公式模型契约
+  - 单输入 `FLOAT` rank-4、空间维固定 384（动态维允许并记录）
+  - 单输出 `INT64` rank-2
+  - 缺失 `character` metadata 或 JSON 损坏时显式失败，绝不回退普通 OCR 字典
+- 新增 `formula::tokenizer_metadata`：解析 `character` metadata，校验 vocab 规模与
+  `<s>`/`<pad>`/`</s>`/`<unk>` = 0/1/2/3；不复制 HF tokenizer 实现，JSON 不写入源码
+- 测试资产：`tests/fixtures/formula-onnx/*.onnx`（10 个 KB 级 ONNX fixture，覆盖正/负契约路径；
+  `*.onnx` 已由 `.gitignore` 排除，不随仓库提交）
+
+### 19.2 模型契约事实（实算确认）
+
+| 项目 | 值 |
+| --- | --- |
+| 模型 | `pp_formulanet_plus_m.onnx`，SHA-256 `71b6d389…d9493b`（594 MB） |
+| IR / opset | IR 10 / opset 18 |
+| 输入 | `x` FLOAT32 `[N, 1, 384, 384]` |
+| 输出 | `fetch_name_0` INT64 `[N, L]` |
+| 零输入 batch=1 输出 | `(1, 4)`，tokens `[0, 82, 1769, 2]`（BOS 起始、EOS 结尾） |
+| batch=2 输出 | `(2, 4)`，每行首 token 均为 BOS=0 |
+| metadata | `character` 内含 `fast_tokenizer_file`（vocab 50,000）与 `tokenizer_config_file`（model_max_length=768） |
+
+### 19.3 验证结果
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --lib formula::model_info` | 14 passed；0 failed |
+| `cargo test --lib` | 112 passed；0 failed |
+| `cargo test --all-targets` | 112 passed（lib）+ 0（bins） |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo build --lib` | 通过，无警告 |
+
+阶段 3 完成后，阶段 4（预处理 TDD）开始。
