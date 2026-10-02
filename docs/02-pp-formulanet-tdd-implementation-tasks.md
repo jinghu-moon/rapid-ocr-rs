@@ -1,0 +1,959 @@
+# PP-FormulaNet_plus-M 接入 rapid-ocr-rs：TDD 分阶段任务清单
+
+> 文档状态：实施计划
+>
+> 目标：在 `rapid-ocr-rs` 中以独立、可验证的公式识别链路接入 RapidDoc 的 `PP-FormulaNet_plus-M` ONNX 模型，并用公开公式测试集完成数值、功能、性能和回归验收。
+>
+> 适用阶段：项目仍处于开发期，尚未正式发布。
+
+---
+
+## 0. 工程原则与不可变验收规则
+
+### 0.1 开发期决策
+
+- 不考虑历史版本兼容性。
+- 允许删除、重命名和重构现有公共 API。
+- 不增加仅用于兼容旧调用方的 adapter、wrapper、legacy branch 或重复实现。
+- 发现接口、数据结构或模块边界错误时，优先重构根因。
+- 不为了让测试通过而弱化断言、跳过测试、修改错误真值或降低指标。
+- 任何完成声明都必须附带实际命令、结果和未覆盖风险。
+
+### 0.2 必须保持的现有行为
+
+公式功能可以破坏不合理的内部抽象，但不能无意破坏普通 OCR：
+
+- 普通检测、方向分类、CTC 识别仍可运行；
+- 文件、内存、URL 输入限制仍有效；
+- JSON、Markdown、HTML、可视化输出仍有效；
+- 现有 provider 选择和 CPU/DirectML/CUDA/CANN 编译路径不应被公式模块静默改变；
+- 既有阅读顺序、多栏、边界和异常行为必须有前后回归证据。
+
+### 0.3 当前已确认的模型事实
+
+模型路径：
+
+```text
+OCR-Model/Formula-Recognition-Models/onnx/pp_formulanet_plus_m.onnx
+```
+
+RapidDoc ModelScope 来源：
+
+```text
+https://www.modelscope.cn/models/RapidAI/RapidDoc/resolve/v1.0.0/formula/PP-FormulaNet_plus-M/pp_formulanet_plus_m.onnx
+```
+
+已验证 SHA-256：
+
+```text
+71b6d389cf7b857e45252a4b98cfced1a3ffca7bf24d9497d02d052a41d9493b
+```
+
+已验证 ONNX 契约：
+
+| 项目 | 实际值 |
+| --- | --- |
+| 输入名 | `x` |
+| 输入类型 | `FLOAT` |
+| 输入形状 | `[N, 1, 384, 384]` |
+| 输出名 | `fetch_name_0` |
+| 输出类型 | `INT64` |
+| 输出形状 | `[N, sequence_length]` |
+| ONNX IR | 10 |
+| opset | 18 |
+| 控制流 | 图内 `Loop` |
+| tokenizer | `character` metadata 内嵌 `fast_tokenizer_file` 和 `tokenizer_config_file` |
+| 特殊 token | `BOS=0`、`PAD=1`、`EOS=2` |
+| 词表 | 50,000 项 |
+
+已完成的人工/脚本探针：
+
+- CPU ONNX Runtime 可加载模型；
+- 单图真实推理成功；
+- `val_0053264.png` 的输出 LaTeX 与 `val.txt` 标注完全一致；
+- batch=2 推理成功，输出序列按样本独立结束；
+- 预处理错误地使用 RGB/BGR 顺序会改变结果，必须由测试锁定通道语义。
+
+这些事实是实施前置条件，不替代 Rust 端测试。
+
+### 0.4 结构重构决策：普通 OCR、公式识别与共享能力分域
+
+在实现公式识别之前，先把现有普通 OCR 代码归拢到明确的 `ocr` bounded context。这个重构允许破坏内部模块路径和公共 API；不增加兼容适配层。目标是让公式识别成为独立领域，而不是继续堆叠在普通 CTC OCR 的 `rec` 或 `pipeline` 中。
+
+目标目录：
+
+```text
+src/
+├── ocr/                         # 普通 OCR 专属
+│   ├── mod.rs
+│   ├── det/
+│   ├── cls/
+│   ├── rec/
+│   ├── pipeline/
+│   │   ├── rapid_ocr.rs
+│   │   ├── config.rs
+│   │   ├── types.rs
+│   │   └── image_ops.rs
+│   ├── config.rs
+│   └── types.rs
+│
+├── formula/                     # 公式识别专属
+│   ├── mod.rs
+│   ├── session.rs
+│   ├── recognizer.rs
+│   ├── preprocess.rs
+│   ├── tokenizer.rs
+│   └── types.rs
+│
+├── runtime/                     # 共享 session 创建、provider、线程和错误映射
+├── input/                       # 共享图片/文件/URL 输入和限制
+├── vision/                      # 共享图像基础能力；领域算法不得放在这里
+├── output/                      # 共享输出入口，内部按 OCR/公式拆 serializer
+├── model_store.rs               # 共享模型资产管理
+├── model_registry.rs            # 共享模型注册
+├── error.rs                     # 共享错误体系
+├── evaluation/                  # 共享评测框架，拆分 ocr.rs/formula.rs
+├── api.rs                       # 公共 API 门面
+├── config.rs                    # 仅保留真正共享配置
+└── types.rs                     # 仅保留真正共享类型
+```
+
+边界规则：
+
+- `cls/`、`det/`、`rec/` 和当前普通 OCR 编排器 `pipeline/rapid_ocr.rs` 必须归入 `src/ocr/`。
+- `pipeline/config.rs`、`pipeline/types.rs` 中只服务普通 OCR 的内容归入 `src/ocr/pipeline/`；不能把通用 runtime 或公式配置混入其中。
+- `config.rs` 不能整体机械移动：检测、分类、CTC 识别配置进入 `ocr/config.rs`，provider/runtime/图像基础配置保留在共享模块。
+- `types.rs` 不能整体机械移动：`LineResult`、`WordBox` 等普通 OCR 类型进入 `ocr/types.rs`，通用几何、图片和跨领域结果类型保留共享。
+- `evaluation.rs` 拆为 `evaluation/ocr.rs` 与 `evaluation/formula.rs`（即 `evaluation::ocr` / `evaluation::formula`），两类指标不得混合成一个默认汇总。公式评测模块后续可扩展为 `evaluation/formula/` 目录模块，但不得移入 `ocr/` 或依赖生产识别器。
+- `runtime/`、`input/`、模型存储、错误体系和基础 `vision` 能力属于共享层；共享层不能依赖 `ocr` 或 `formula`。
+- `output/` 保留公共输出入口，但 OCR 文本和公式 LaTeX 的序列化逻辑必须分域；公式不能伪装成 CTC 文本。
+- `api.rs` 和 `lib.rs` 可以作为公共 facade，但 facade 不是 legacy adapter；如果当前公共类型边界错误，开发期允许直接重设计。
+- 普通 OCR 与公式识别不能通过“如果是公式就跳过 CTC 契约”的特殊分支耦合；两者必须拥有独立的 typed session contract。
+
+结构重构的 TDD 顺序：
+
+1. 在移动文件前记录普通 OCR 基线，并为模块路径/公共导出建立编译测试。
+2. 创建 `ocr/mod.rs`，移动 `det`、`cls`、`rec`，更新引用。
+3. 将普通 OCR pipeline 移到 `ocr/pipeline/`，拆出真正共享的图像基础函数。
+4. 拆分 `config.rs`、`types.rs`、`evaluation.rs`，每次拆分后运行普通 OCR 全量回归。
+5. 建立空的 `formula/mod.rs` 和公式专属测试入口；不得提前复用普通 `Recognizer`。
+6. 结构重构完成并通过普通 OCR 回归后，才实现 `formula/session.rs`、`preprocess.rs` 和 `tokenizer.rs`。
+
+阶段 0 必须拆成两个执行门：
+
+- **0A 设计冻结**：只确认目录、依赖方向、公共边界和迁移方案，不修改源代码。0A 在阶段 1 基线前完成。
+- **0B 结构重构实施**：必须在阶段 1 基线完成后执行，按上面的 Red -> Green -> Refactor 顺序移动和拆分代码。0B 完成后，阶段 2 及后续阶段才允许开始。
+
+这样既保留阶段 0 对架构的控制权，又满足“修改前建立基线”的工程规则。阶段 0 不是简单的目录移动任务；0B 的完成必须以普通 OCR 前后回归通过为门槛。
+
+### 0.5 阶段 0B 对后续阶段的影响
+
+阶段 0B 改变的是内部模块边界，不改变公式识别的功能验收目标。后续阶段必须按以下新边界执行：
+
+| 后续阶段 | 受影响的任务 | 更新后的约束 |
+| --- | --- | --- |
+| 2 fixture | fixture loader 位置和依赖 | 放在 `evaluation::formula`，只依赖共享输入/评测类型，不依赖 `ocr` 生产识别器 |
+| 3 模型契约 | ONNX 探针入口 | 不再从普通 `rec` 或 CTC `Recognizer` 进入；可使用当前 runtime 的通用加载能力，typed formula contract 留给阶段 5 |
+| 4 预处理 | 预处理实现位置 | 只实现 `formula/preprocess.rs`，不得复用普通 OCR 的预处理策略或把公式逻辑放入 `ocr/pipeline` |
+| 5 runtime 契约 | session 文件和契约 | 共享生命周期/provider 留在 `runtime`；普通 CTC session 在 `ocr/session.rs`，公式 token session 在 `formula/session.rs` |
+| 6 tokenizer | 解码输入 | 消费公式 session 的 `INT64` token 序列，不读取普通 OCR 字符字典或 CTC 输出 |
+| 7 Formula API | 公共 API | 组合 `formula/session.rs`、`formula/preprocess.rs` 和 `formula/tokenizer.rs`；不扩展普通 `Recognizer` 作为兼容入口 |
+| 8 输出/错误 | 序列化和错误分类 | 公式 LaTeX、token、EOS/truncated 使用独立结果类型；共享错误只提供通用基础，不伪装成普通 OCR 行结果 |
+| 9-10 评测/性能 | 评测对象和基线 | 公式指标、模型吞吐和 provider 结果单独记录，不与普通 OCR 汇总或比较 |
+| 11 普通 OCR 回归 | 重构验收 | 这是阶段 0B 后以及最终阶段 11 的双重门槛；任何未解释的普通 OCR 变化都阻止后续发布边界验收 |
+
+因此，阶段 0B 完成后不得再出现以下旧设计：在 `src/rec/` 增加公式逻辑、在共享 `runtime` 放置公式专属 session、通过模式分支跳过 CTC 合约，或以普通 OCR 类型承载公式 LaTeX。
+
+结构重构验收：
+
+- [ ] 普通 OCR 专属实现全部位于 `src/ocr/`；
+- [ ] 公式实现全部位于 `src/formula/`，不混入 `src/ocr/`；
+- [ ] 共享模块不反向依赖任何领域模块；
+- [ ] 没有新增兼容 wrapper、旧路径转发或重复实现；
+- [ ] `cargo check`、普通 OCR 单元/集成测试和真实图片回归均通过；
+- [ ] 重构前后普通 OCR 的输出、错误语义和性能差异都有记录；
+- [ ] 目录边界和依赖方向写入模块 `mod.rs`，不依赖开发者记忆。
+- [x] 0A 设计冻结记录已完成；
+- [ ] 0B 结构重构实施已在阶段 1 基线之后完成；
+- [ ] 0B 完成后普通 OCR 全量回归通过，且阶段 1 基线仍可追溯。
+
+---
+
+## 1. 总体阶段、依赖和完成门槛
+
+阶段必须按顺序推进。除非前一阶段的完成门槛满足，否则不得进入下一阶段。
+
+| 阶段 | 目标 | 主要产物 | 进入条件 |
+| --- | --- | --- | --- |
+| 0A | 冻结范围、资产和模块边界，不改源代码 | 本文档、模型哈希、`ocr/formula/shared` 目录设计和迁移方案 | 开始阶段 1 前完成 |
+| 1 | 建立修改前基线 | 测试/编译/性能基线报告 | 0A 已冻结，源代码尚未移动 |
+| 0B | 实施普通 OCR 结构重构并建立公式领域空模块 | `src/ocr/`、`src/formula/mod.rs`、依赖边界和普通 OCR 前后回归报告 | 阶段 1 基线已保存；完成后普通 OCR 全量回归通过 |
+| 2 | 建立数据集与真值读取层 | `evaluation::formula` fixture manifest、标注解析测试 | 0B 已完成且普通 OCR 回归通过 |
+| 3 | 固定 ONNX 模型契约 | 模型探针、Rust `ort` smoke test | 0B 和阶段 2 已完成；使用当前通用 runtime 做探针，typed domain contract 在阶段 5 固化 |
+| 4 | 固定预处理契约 | `formula/preprocess.rs`、预处理 golden tensor | Python/Rust tensor 一致 |
+| 5 | 重构运行时契约 | 共享 typed session/runtime contract | 普通 OCR session 回归通过，公式 session 仍位于 `src/formula/` |
+| 6 | 实现 tokenizer 与公式解码 | `formula/tokenizer.rs`、EOS、LaTeX 输出 | 单图 golden 通过 |
+| 7 | 实现公式识别 API | 完整的 `formula/session.rs` 执行流程、`formula/recognizer.rs` 和独立结果类型 | API 单测和集成测试通过 |
+| 8 | 接入批量、错误和输出 | batch、限制、错误语义 | 边界测试通过 |
+| 9 | Paddle/ONNX/旧新结果对比 | 数值回归报告 | 指标达到阈值 |
+| 10 | 性能与 provider 验证 | benchmark 报告 | 无不可接受退化 |
+| 11 | 普通 OCR 前后回归 | 前后基线对比报告 | 无未解释的行为变化 |
+| 12 | 文档、资产和发布前检查 | README、第三方说明、清单 | 全部验收门满足 |
+
+每一阶段均遵循：
+
+```text
+先写失败测试（Red）
+  -> 写最少正确实现（Green）
+  -> 删除重复/错误抽象并重构（Refactor）
+  -> 跑本阶段测试和受影响的全量回归
+```
+
+---
+
+## 2. 阶段 1：修改前基线（必须先做）
+
+### 2.1 基线记录任务
+
+- [x] 记录工作树状态：`git status --short`。
+- [x] 记录 Rust、Cargo、OS、CPU、ORT provider、模型目录和测试集路径。
+- [x] 运行默认测试：
+
+  ```powershell
+  cargo test --all-targets
+  ```
+
+- [x] 运行格式检查：
+
+  ```powershell
+  cargo fmt --all -- --check
+  ```
+
+- [x] 运行默认编译：
+
+  ```powershell
+  cargo check
+  ```
+
+- [x] 运行已有 provider 编译/测试：
+
+  ```powershell
+  cargo test --features directml-provider
+  cargo test --features cuda-provider
+  cargo check --features directml-provider,cuda-provider,cann-provider
+  ```
+
+- [x] 保存普通 OCR 的真实图片回归结果：区域数、文本、耗时和失败数。
+- [x] 保存现有 benchmark 的吞吐、P50/P95、内存和 provider 信息。
+- [x] 保存 baseline JSON，不覆盖 `tests/baseline` 中已有真值；新结果使用带日期或阶段名的文件。
+
+### 2.2 基线验收
+
+必须形成表格：
+
+| 项目 | 修改前实际值 | 修改后实际值 | 预期 |
+| --- | --- | --- | --- |
+| 默认测试 |  |  | 不得有新增失败 |
+| DirectML 测试 |  |  | 不得有新增失败 |
+| CUDA 测试 |  |  | 不得有新增失败 |
+| CANN 编译 |  |  | 编译通过或记录环境阻塞 |
+| 普通 OCR 区域数 |  |  | 保持 |
+| 普通 OCR 文本 |  |  | 保持 |
+| 普通 OCR 吞吐 |  |  | 记录差异并解释 |
+| 峰值内存 |  |  | 无不可接受增长 |
+
+未完成基线不得开始执行阶段 0B，也不得开始将普通 OCR 源码迁入 `src/ocr/`、创建公式实现模块或修改共享 runtime 契约。
+
+阶段 1 完成后，必须回到阶段 0 执行 0B 结构重构。阶段 0B 完成并通过普通 OCR 回归后，才进入下面的阶段 2。
+
+---
+
+## 3. 阶段 2：测试数据和真值读取层
+
+本阶段的 fixture loader 属于 `src/evaluation/formula.rs`（即 `evaluation::formula`；规模增大时可改为 `src/evaluation/formula/` 目录模块），不属于 `src/ocr/`，也不应依赖生产识别器。进入本阶段前必须确认阶段 0B 已完成。
+
+### 3.1 固定本地资产
+
+不把大模型和完整数据集提交到 crate 仓库。模型与数据放在仓库外的工作目录，通过环境变量或测试参数引用。
+
+推荐环境变量：
+
+```powershell
+$env:RAPID_OCR_MODEL_ROOT = "D:\100_Projects\110_Daily\SnapClip\OCR-Model"
+$env:RAPID_OCR_FORMULA_TEST_ROOT = "D:\100_Projects\110_Daily\SnapClip\Formula-TestSet"
+```
+
+必须记录：
+
+- 模型 SHA-256；
+- tokenizer 来源（本模型 metadata）；
+- 测试集来源、版本/下载日期；
+- 图片数量、标签数量、缺失/重复数量；
+- 测试数据许可证和上游引用。
+
+### 3.2 实现测试 fixture loader 前先写测试
+
+- [ ] Red：不存在根目录时返回结构化错误，不 panic。
+- [ ] Red：缺失 label 文件时返回错误。
+- [ ] Red：缺失图片时返回错误并指出文件名。
+- [ ] Red：空标签拒绝进入评测。
+- [ ] Red：路径包含 Unicode、空格时可读取。
+- [ ] Green：实现 `FormulaFixture`、`FormulaSample` 和三个数据集 loader。
+- [ ] Refactor：统一样本接口，不为每个数据集复制评测循环。
+
+建议数据结构：
+
+```text
+FormulaSample {
+    image_path: PathBuf,
+    ground_truth: String,
+    split: FormulaSplit,
+    source_index: Option<usize>,
+}
+```
+
+### 3.3 im2latex 映射规则测试
+
+测试集目录：
+
+```text
+Formula-TestSet/im2latex-100k/
+  *.png
+  im2latex_formulas.norm.lst
+  im2latex_test_filter.lst
+  im2latex_validate_filter.lst
+```
+
+列表格式：
+
+```text
+image_name.png formula_index
+```
+
+实现并测试：
+
+- [ ] `image_name` 精确定位本地 PNG；
+- [ ] `formula_index` 索引 `im2latex_formulas.norm.lst`；
+- [ ] 越界 index 失败；
+- [ ] 文件名缺失失败；
+- [ ] test/validation 样本无交集；
+- [ ] `test_filter` 10,355 条全部可定位；
+- [ ] `validate_filter` 8,370 条全部可定位；
+- [ ] 不使用原始 `im2latex_test.lst` 直接按行配对。
+
+### 3.4 PaddleX 示例集测试
+
+目录：
+
+```text
+Formula-TestSet/ocr_rec_latexocr_dataset_example/
+  images/
+  train.txt
+  val.txt
+```
+
+- [ ] Red：验证 `val.txt` 的图片引用全部存在；
+- [ ] Red：制造缺失图片时 loader 明确失败；
+- [ ] Green：读取 tab 分隔图片路径和 LaTeX；
+- [ ] Refactor：统一为 `FormulaSample`；
+- [ ] 固定 501 张 `val` 作为 smoke/e2e gold set；
+- [ ] 明确 `latex_ocr_tokenizer.json` 不作为 PP-FormulaNet tokenizer。
+
+### 3.5 UniMER-Test 映射测试
+
+目录：
+
+```text
+Formula-TestSet/UniMER-Test/
+  spe/ cpe/ sce/ hwe/
+  spe.txt cpe.txt sce.txt hwe.txt
+```
+
+规则：
+
+- `cpe`/`hwe` 图片编号通常可直接对应 label 行；
+- `spe`/`sce` 图片文件名数字是原始 label 行索引，不能 `zip(sorted(images), labels)`；
+- 标签、图片数量和缺失索引必须在 manifest 中显式记录。
+
+测试任务：
+
+- [ ] 每个子集抽取首、中、尾各 3 个样本验证映射；
+- [ ] 验证图片可解码；
+- [ ] 验证索引越界错误；
+- [ ] 按 `SPE/CPE/SCE/HWE` 分组统计，禁止默认混合汇总；
+- [ ] 记录 HWE 是手写公式附加测试，不是 PP-FormulaNet-M 主验收集。
+
+---
+
+## 4. 阶段 3：ONNX 模型契约与 Rust smoke test
+
+### 4.1 先写模型探针测试
+
+- [ ] Red：模型不存在时返回可定位错误。
+- [ ] Red：输入不是单输入、类型不是 `FLOAT`、rank 不是 4 时拒绝。
+- [ ] Red：输出不是 `INT64` rank 2 时拒绝。
+- [ ] Red：固定空间维不是 `384x384` 时拒绝或明确支持动态契约。
+- [ ] Red：缺失 `character` metadata 时按显式策略失败，不静默使用普通 OCR 字典。
+- [ ] Green：实现模型签名探针并输出结构化 `FormulaModelInfo`。
+- [ ] Refactor：模型验证逻辑与推理执行逻辑分离。
+
+### 4.2 Rust `ort` 兼容性验证
+
+- [ ] 使用项目锁定的 `ort = 2.0.0-rc.13` 加载模型；
+- [ ] 使用 CPU provider 创建 session；
+- [ ] 验证 opset 18/IR 10 在项目 runtime 下可加载；
+- [ ] 用一个 `[1,1,384,384]` 输入运行；
+- [ ] 用两个样本运行动态 batch；
+- [ ] 检查输出 dtype、rank、batch 维；
+- [ ] 记录 session 创建时间、首次运行时间和错误信息；
+- [ ] 若项目 ort/ORT 不支持该图，先解决 runtime 版本/构建根因，不修改模型图规避错误。
+
+### 4.3 metadata tokenizer 测试
+
+- [ ] 读取 `character` metadata JSON；
+- [ ] 验证存在 `fast_tokenizer_file`；
+- [ ] 验证 vocab 中包含 `<s>`, `<pad>`, `</s>`, `<unk>`；
+- [ ] 验证 ID 分别为 `0,1,2,3`；
+- [ ] 验证 tokenizer vocab 规模为 50,000；
+- [ ] metadata JSON 损坏时返回 tokenizer 错误；
+- [ ] 不把完整 tokenizer JSON 写入源码或复制成第二份真值。
+
+---
+
+## 5. 阶段 4：预处理 TDD
+
+预处理是当前最容易造成“模型能运行但结果全错”的根因，必须独立测试，不允许只用端到端结果间接证明。
+
+### 5.1 预处理契约
+
+输入为 RGB/RGBA/灰度图片，输出：
+
+```text
+FLOAT32 [N, 1, 384, 384]
+```
+
+流程：
+
+```text
+解码
+  -> 灰度阈值找非白区域
+  -> 裁剪边界
+  -> 短边缩放到 384
+  -> 长边限制为 384
+  -> 白色画布居中填充
+  -> /255
+  -> mean=0.7931, std=0.1738
+  -> 灰度单通道
+  -> NCHW
+```
+
+必须明确并固定：
+
+- resize 插值算法；
+- crop 的边界是否包含右/下边界；
+- 空白图行为；
+- 灰度图和 alpha 图行为；
+- RGB/BGR 通道语义；
+- 填充值是归一化前白色还是归一化后的常数 `1`。
+
+### 5.2 Red/Green/Refactor 任务
+
+- [ ] Red：固定 5 张本地样本的输出 shape、dtype、min、max、均值和 SHA-256。
+- [ ] Red：纯白图、全黑图、单像素图、窄图、宽图、透明图各有测试。
+- [ ] Red：RGB 与 BGR 顺序错误的探针必须失败，防止通道语义回归。
+- [ ] Green：实现独立 `FormulaPreprocessor`。
+- [ ] Green：实现批量预处理，样本顺序保持稳定。
+- [ ] Refactor：删除与普通 OCR 预处理重复但语义不同的隐式转换。
+- [ ] 通过 Python 参考实现导出 golden tensor，与 Rust `allclose` 比较。
+
+### 5.3 预处理验收阈值
+
+对于相同输入和相同环境：
+
+- shape、dtype 必须完全一致；
+- 归一化 tensor 的最大绝对误差 `<= 1e-5`；
+- 允许平台 resize 浮点差异时，必须单独记录放宽原因和新阈值；
+- 不能只比较最终 LaTeX 来掩盖预处理差异。
+
+---
+
+## 6. 阶段 5：运行时契约根因重构
+
+### 6.1 当前问题
+
+当前 `runtime::session::OrtSession` 的 `SessionContract::Rec` 将：
+
+- 输入必须是 rank-4 `FLOAT`；
+- 输出必须是 rank-3 `FLOAT`；
+- metadata `character` 直接按普通字符行读取；
+
+写死在普通 OCR session 中。公式模型是 rank-2 `INT64`，并且 metadata 是 JSON tokenizer，不应被强行解释为 CTC 字符表。
+
+### 6.2 目标设计
+
+允许破坏现有内部接口，重构为按模型语义划分的 typed session。共享 runtime 只负责 session 生命周期、provider、线程和通用 tensor 访问；领域模块拥有自己的模型契约：
+
+```text
+runtime/
+  session.rs              通用 session 创建、provider、线程和错误
+  contracts.rs            通用输入/输出契约验证工具
+
+ocr/
+  session.rs              普通 CTC FLOAT rank-3 session
+
+formula/
+  session.rs              公式 token INT64 rank-2 session
+```
+
+阶段 5 只负责 runtime/contract 根因重构和领域 session 的契约边界；公式 session 的完整识别 API 在阶段 7 实现。不能把 `formula_session.rs` 放回共享 `runtime/`，也不能通过“公式模式”绕过普通 OCR 契约。
+
+允许采用等价的文件名，但必须满足：
+
+- 普通 OCR 和公式识别没有共享错误的输出契约；
+- provider/线程/生命周期逻辑可复用；
+- tensor 类型和 rank 在类型化入口验证；
+- 不引入“如果是公式就跳过 Rec 检查”的特殊分支。
+
+### 6.3 TDD 任务
+
+- [ ] Red：普通 CTC session 合约测试保持原行为。
+- [ ] Red：公式模型加载普通 CTC session 必须失败，错误明确指出契约不匹配。
+- [ ] Red：公式 session 可接受 `FLOAT [N,1,384,384]` -> `INT64 [N,L]`。
+- [ ] Red：错误 dtype、rank、缺失 output 均有测试。
+- [ ] Green：提取通用 session 创建和 provider 配置。
+- [ ] Green：实现 `runtime::contracts` 的通用契约验证，并分别实现 `ocr::session` 与 `formula::session` 的领域契约。
+- [ ] Refactor：删除旧 session 中的公式特判、重复 metadata 解析和临时 adapter。
+- [ ] 运行普通 OCR 全量回归后才进入公式 API 阶段。
+
+---
+
+## 7. 阶段 6：FormulaTokenizer 与序列解码
+
+### 7.1 设计要求
+
+公式 tokenizer 必须处理模型输出的 token ID 序列，而不是 CTC argmax：
+
+```text
+token_ids
+  -> 去掉 BOS
+  -> 在首个 EOS 截断
+  -> 丢弃 PAD/EOS 等特殊 token
+  -> tokenizer decode
+  -> LaTeX String
+```
+
+必须保留原始 token 序列用于调试和回归，不得只保留最终字符串。
+
+### 7.2 TDD 任务
+
+- [ ] Red：`[0, 82, ..., 2, 1, 1]` 只解码 EOS 前内容。
+- [ ] Red：无 EOS 的序列按明确策略失败或标记 truncated，不能静默当作完整结果。
+- [ ] Red：全 PAD、空序列、未知 token、超出 vocab 均有测试。
+- [ ] Red：BOS/PAD/EOS ID 与 metadata 不一致时拒绝启动。
+- [ ] Green：实现 `FormulaTokenizer::from_metadata`。
+- [ ] Green：实现 `decode_ids`，返回 token IDs、EOS 状态、LaTeX。
+- [ ] Refactor：不复制 Hugging Face tokenizer 实现；仅实现模型所需 tokenizer JSON 语义，必要时引入成熟 Rust tokenizer crate。
+- [ ] 用 Python `tokenizers` 参考输出建立至少 20 个 token 序列 golden。
+
+### 7.3 输出数据结构建议
+
+```text
+FormulaResult {
+    latex: String,
+    token_ids: Vec<i64>,
+    eos_index: Option<usize>,
+    truncated: bool,
+    model: String,
+    elapsed: Duration,
+}
+```
+
+不要把公式结果强行塞进 `LineResult` 的置信度字段；公式模型当前没有可与 CTC 平行解释的 per-character confidence。
+
+---
+
+## 8. 阶段 7：FormulaRecognizer / FormulaSession API
+
+### 8.1 第一版 API 边界
+
+第一版先提供独立公式识别 API：
+
+```text
+FormulaRecognizer::from_model(path, runtime_config)
+FormulaRecognizer::recognize(image)
+FormulaRecognizer::recognize_batch(images)
+```
+
+可根据现有项目命名调整，但必须满足：
+
+- 公式 API 不复用普通 `Recognizer` 的输出类型；
+- 支持单图和 batch；
+- 保持输入顺序；
+- 返回 token、LaTeX、EOS/truncated 和耗时；
+- CPU 为第一版明确支持范围；
+- provider 不支持时返回结构化错误，不静默回退到 CPU。
+
+### 8.2 TDD 任务
+
+- [ ] Red：单图 API 的 happy path。
+- [ ] Red：batch=1/2/8 顺序和结果独立性。
+- [ ] Red：空 batch、超大 batch、空图和解码失败。
+- [ ] Red：模型路径不存在、模型 hash 不匹配、metadata 损坏。
+- [ ] Green：实现 session、preprocessor、tokenizer 的组合。
+- [ ] Green：实现 batch 输入 tensor 构建和输出拆分。
+- [ ] Refactor：将 API 参数与普通 OCR 的 `RecognizeOptions` 解耦；共享真正通用的图片加载和 provider 配置。
+
+### 8.3 与页面 OCR 的集成策略
+
+不得在第一步把公式识别硬塞进普通文本识别链。先完成独立 API 和完整回归，再设计页面级路由：
+
+```text
+页面/图片
+  -> 公式检测（已有 Formula-Detection-Model 或未来路由）
+  -> 公式 crop
+  -> FormulaRecognizer
+  -> OcrOutput 中的 Formula region
+```
+
+页面级集成任务：
+
+- [ ] 定义 `RegionKind::Formula` 或等价明确类型；
+- [ ] 明确公式 region 是否跳过普通 CTC 识别；
+- [ ] 明确 JSON/Markdown/HTML 的 LaTeX 表示；
+- [ ] 保留 crop 坐标和模型信息；
+- [ ] 增加公式检测误检、漏检和重叠区域测试；
+- [ ] 公式功能关闭时普通 OCR 行为必须与基线一致。
+
+---
+
+## 9. 阶段 8：输出、错误、资源和安全边界
+
+### 9.1 输出格式
+
+- [ ] JSON 输出包含 `latex`、`token_ids`、`eos_index`、`truncated`、模型标识和耗时。
+- [ ] Markdown 使用明确的 display math 表示，例如 `$$...$$`，避免把 LaTeX 当普通文本转义。
+- [ ] HTML 对 LaTeX 文本和 HTML 属性分别转义。
+- [ ] 原始 token ID 默认可选输出，调试模式打开，不在普通 Markdown 中泄露。
+- [ ] 公式输出顺序与检测 region/reading order 一致。
+
+### 9.2 错误语义
+
+- [ ] 模型不存在；
+- [ ] hash 不匹配；
+- [ ] ONNX 契约不匹配；
+- [ ] tokenizer metadata 缺失/损坏；
+- [ ] 图片解码失败；
+- [ ] 像素/编码大小超限；
+- [ ] batch 超限；
+- [ ] EOS 缺失导致截断；
+- [ ] provider 不可用；
+- [ ] ORT 执行失败。
+
+所有错误都应使用现有错误体系或重构后的结构化错误，不返回只包含底层 ORT 字符串的不可判断错误。
+
+### 9.3 资源约束
+
+- [ ] 延续普通输入的解码像素和编码字节限制；
+- [ ] 对公式 crop 也执行尺寸限制；
+- [ ] batch 大小有显式上限；
+- [ ] 序列长度有上限；
+- [ ] 图内 Loop 不应因异常输入导致无界内存增长；
+- [ ] URL/文件输入不得在校验前完整缓冲超大数据。
+
+---
+
+## 10. 阶段 9：数值和功能回归
+
+### 10.1 Smoke gold set
+
+先使用：
+
+```text
+Formula-TestSet/ocr_rec_latexocr_dataset_example/val.txt
+```
+
+501 张样本的任务：
+
+- [ ] Python RapidDoc/ONNX 参考输出保存为 JSON；
+- [ ] Rust 输出保存为 JSON；
+- [ ] token 序列逐项比较；
+- [ ] EOS index 比较；
+- [ ] LaTeX exact match 比较；
+- [ ] normalized LaTeX match 比较；
+- [ ] CER/Edit distance 统计；
+- [ ] 失败样本保存图片名、期望、实际和 token diff；
+- [ ] 不允许单图失败被吞掉；
+- [ ] 允许模型本身错误，但必须区分“Rust/ONNX 链路差异”和“模型识别错误”。
+
+### 10.2 im2latex 主评测
+
+测试列表：
+
+```text
+im2latex_test_filter.lst
+```
+
+标签索引：
+
+```text
+im2latex_formulas.norm.lst
+```
+
+任务：
+
+- [ ] 先跑 100 张固定 smoke subset；
+- [ ] 再跑完整 10,355 张测试集；
+- [ ] 记录吞吐、P50/P95、峰值内存和失败数；
+- [ ] 记录 exact token match、LaTeX exact match、normalized match、CER；
+- [ ] 将文本解码错误与模型识别错误分开统计；
+- [ ] 测试顺序稳定，可重复生成相同 manifest/hash。
+
+### 10.3 UniMER 评测
+
+分组执行：
+
+```text
+SPE 6762
+CPE 5921
+SCE 4742
+HWE 6332
+```
+
+- [ ] SPE/CPE/SCE 作为 PP-FormulaNet-M 的主结果；
+- [ ] HWE 单独报告；
+- [ ] 不能把 HWE 结果混入印刷公式平均值掩盖领域差异；
+- [ ] 报告每组样本数、缺失数和失败数；
+- [ ] 保留固定抽样 manifest，避免只报告对模型有利的样本。
+
+### 10.4 RapidDoc/Python/Rust 三方对比
+
+固定相同：
+
+- 图片字节；
+- 裁剪和 resize；
+- 输入 tensor；
+- 模型文件 SHA-256；
+- tokenizer metadata；
+- batch size；
+- CPU provider 和线程数。
+
+对比层次：
+
+1. input tensor `max_abs`；
+2. output token IDs；
+3. EOS index；
+4. decoded LaTeX；
+5. batch 与单图结果；
+6. 重复运行确定性。
+
+---
+
+## 11. 阶段 10：性能与 provider 验证
+
+### 11.1 性能基线
+
+必须分别测量：
+
+- session 创建；
+- 首次推理；
+- warm inference；
+- 预处理；
+- ONNX `session.run`；
+- tokenizer decode；
+- 端到端单图；
+- batch=1/2/4/8。
+
+不要只报告端到端平均值，避免预处理或初始化掩盖模型性能。
+
+### 11.2 性能验收
+
+- [ ] 与 Python RapidDoc CPU 参考使用相同线程设置；
+- [ ] 与 Rust 普通 OCR 基线分开比较，不把不同模型混为一个吞吐指标；
+- [ ] batch 结果不能改变 token/LaTeX；
+- [ ] 记录内存峰值；
+- [ ] 任何优化前后都有 benchmark 数据；
+- [ ] 不因臆测性能引入缓存、并发或复杂抽象。
+
+### 11.3 Provider
+
+第一版验收范围：
+
+```text
+CPUExecutionProvider
+```
+
+任务：
+
+- [ ] CPU 完整通过后再尝试 DirectML/CUDA；
+- [ ] provider 不支持图内 `Loop` 时返回明确错误；
+- [ ] 不为了 provider 通过而改变输出或跳过公式测试；
+- [ ] DirectML/CUDA 失败需记录为模型/provider 限制，不伪装成 CPU 通过。
+
+---
+
+## 12. 阶段 11：普通 OCR 前后回归
+
+### 12.1 修改前必须保存
+
+- [ ] `cargo test --all-targets` 结果；
+- [ ] provider 测试结果；
+- [ ] 普通 OCR fixture 的 JSON 输出；
+- [ ] 多栏阅读顺序输出；
+- [ ] 输入大小限制错误；
+- [ ] URL timeout/response size 错误；
+- [ ] CLI `run/report/evaluate/check` 关键输出；
+- [ ] benchmark JSON。
+
+### 12.2 修改后必须重跑
+
+- [ ] 所有默认测试；
+- [ ] DirectML/CUDA/CANN 编译/测试矩阵；
+- [ ] 真实 OCR 图片；
+- [ ] 多栏 Markdown/JSON/HTML；
+- [ ] 文件、URL、内存三类输入；
+- [ ] 超像素、超编码字节和超时边界；
+- [ ] CLI 端到端命令；
+- [ ] benchmark 对比。
+
+### 12.3 回归判定
+
+- 新增公式测试失败不能通过删除普通 OCR 测试解决；
+- 普通 OCR 行为变化必须有明确设计原因和更新后的真值；
+- 只要普通 OCR 出现未解释的区域数、文本或错误语义变化，阶段 11 不通过；
+- 公式模块未启用时，普通 OCR 输出应与基线逐项一致或达到已记录的容差。
+
+---
+
+## 13. 阶段 12：文档、许可证和仓库边界
+
+### 13.1 文档
+
+- [ ] 更新 `README.md`：公式 API、模型下载、tokenizer 来源、CPU 限制和示例。
+- [ ] 更新 `docs/01`：把已验证的 RapidDoc 模型 metadata、输入输出和 SHA-256 改为事实，不保留“尚未验证”措辞。
+- [ ] 在本文档末尾记录每个阶段完成日期、提交和验证命令。
+- [ ] 添加公式 benchmark 报告格式和失败样本目录规范。
+
+### 13.2 第三方资产
+
+- [ ] 在 `THIRD_PARTY_NOTES.md` 记录 RapidDoc、PP-FormulaNet、PaddleOCR/UniMER/im2latex 归属。
+- [ ] 记录模型固定 URL、版本、SHA-256、许可证和下载日期。
+- [ ] 不把约 594 MB ONNX、测试集图片或生成的结果 JSON 提交到 crate git。
+- [ ] 检查 `.gitignore` 覆盖模型缓存、benchmark 结果、临时导出和局部数据。
+- [ ] 发布 crate 时明确模型不随 crate 打包，用户需单独下载并接受其许可证。
+
+### 13.3 可复现命令
+
+至少提供：
+
+```powershell
+cargo test --all-targets
+cargo fmt --all -- --check
+cargo check --features directml-provider,cuda-provider,cann-provider
+```
+
+以及：
+
+```powershell
+# 公式 smoke / benchmark 命令
+# 必须在实现后写成可复制执行的真实命令，不得保留伪命令。
+```
+
+---
+
+## 14. 最终 Definition of Done
+
+只有以下条件全部满足，公式识别任务才算完成：
+
+- [ ] 模型和 tokenizer 来源、哈希、许可证已记录；
+- [ ] 阶段 0A/0B 已完成：普通 OCR 已归拢到 `src/ocr/`，公式实现位于 `src/formula/`，共享层没有反向领域依赖；
+- [ ] Rust `ort` 可加载 RapidDoc ONNX；
+- [ ] 预处理 tensor 有独立 golden 测试；
+- [ ] Formula session 使用独立的 `INT64` rank-2 契约；
+- [ ] Formula tokenizer 正确处理 BOS/PAD/EOS；
+- [ ] 单图和 batch 结果正确且顺序稳定；
+- [ ] 501 张 smoke 集的 Rust/Python token 和 LaTeX 差异已分类；
+- [ ] im2latex 100 张 smoke 和 10,355 张完整测试已完成；
+- [ ] UniMER SPE/CPE/SCE 已完成，HWE 单独报告；
+- [ ] exact match、normalized match、CER、EOS/truncated、失败数均已报告；
+- [ ] 性能、内存、线程和 provider 信息已记录；
+- [ ] 普通 OCR 修改前后测试和真实图片回归通过；
+- [ ] 默认、DirectML、CUDA、CANN 相关验证已执行或明确记录环境阻塞；
+- [ ] 没有保留公式专用兼容层、旧无效实现、重复 tokenizer 或未解释 TODO；
+- [ ] README、docs、第三方说明和 `.gitignore` 已同步；
+- [ ] 所有结论都有实际命令和可审查输出支撑。
+
+---
+
+## 15. 阶段执行记录模板
+
+每完成一个阶段，在下表补充实际证据：
+
+| 阶段 | 状态 | 日期 | 提交 | 执行命令 | 关键结果 | 未覆盖风险 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0A 设计冻结 | ☑ | 2026-10-02 | 见 §16 | 无源码修改；确认目录/依赖/迁移方案 | 模型 SHA-256 一致；测试集齐备；目标目录冻结 | typed contract 留待阶段 5 |
+| 1 基线 | ☑ | 2026-10-02 | 见 §16 | cargo test/fmt/check + provider 矩阵 | 默认 76/DirectML 79/CUDA 79 通过；CANN check 通过；真实图片回归正常 | 未重测独立吞吐/内存，沿用既有基准 |
+| 0B 结构重构 | ☐ |  |  |  |  |  |
+| 2 fixture | ☐ |  |  |  |  |  |
+| 3 模型契约 | ☐ |  |  |  |  |  |
+| 4 预处理 | ☐ |  |  |  |  |  |
+| 5 runtime/领域契约 | ☐ |  |  |  |  |  |
+| 6 tokenizer | ☐ |  |  |  |  |  |
+| 7 Formula API | ☐ |  |  |  |  |  |
+| 8 输出/错误 | ☐ |  |  |  |  |  |
+| 9 数值回归 | ☐ |  |  |  |  |  |
+| 10 性能/provider | ☐ |  |  |  |  |  |
+| 11 普通 OCR 回归 | ☐ |  |  |  |  |  |
+| 12 文档/发布边界 | ☐ |  |  |  |  |  |
+
+---
+
+## 16. 阶段 0A / 1 执行记录
+
+### 16.1 阶段 0A 设计冻结（2026-10-02）
+
+设计冻结只确认目录、依赖方向、公共边界和迁移方案，不修改源代码；同时确认资产事实：
+
+- 模型文件：`D:\100_Projects\110_Daily\SnapClip\OCR-Model\Formula-Recognition-Models\onnx\pp_formulanet_plus_m.onnx`
+- 模型 SHA-256 实算：`71b6d389cf7b857e45252a4b98cfced1a3ffca7bf24d9497d02d052a41d9493b`（与文档 0.3 一致）
+- 模型大小：593,915,961 字节（约 594 MB，不随 crate 提交）
+- 公式测试集：`D:\100_Projects\110_Daily\SnapClip\Formula-TestSet`（im2latex-100k 103,541 文件 / ocr_rec_latexocr_dataset_example / UniMER-Test：spe 6,762、cpe 5,921、sce 4,742、hwe 6,332）
+- 目标模块边界：`src/ocr/`（普通 OCR 专属）、`src/formula/`（公式专属）、共享层（runtime/input/vision/output/model_store/model_registry/error/evaluation）不得反向依赖领域模块；`evaluation` 拆分为 `evaluation::ocr` 与 `evaluation::formula`
+- 迁移方案：先移动 det/cls/rec → `ocr/`，再移动 pipeline → `ocr/pipeline/`，随后拆分 config/types/evaluation；每次拆分跑普通 OCR 全量回归；最后建立空 `formula/mod.rs`
+
+### 16.2 阶段 1 基线（2026-10-02）
+
+环境：
+
+- OS：Windows 11（10.0.26100），AMD64
+- CPU：13th Gen Intel Core i5-13600KF，14 核 / 20 逻辑线程
+- 内存：34,182,643,712 字节（约 31.8 GiB）
+- Rust / Cargo：1.98.1（stable-x86_64-pc-windows-msvc）
+- ORT provider：默认 CPU；DirectML/CUDA/CANN 由 feature 控制
+- 工作树：`rapid-ocr-rs` 仓库 clean，`main` @ `1e4fba8`
+
+执行命令与结果：
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --all-targets` | 76 passed；0 failed |
+| `cargo fmt --all -- --check` | 通过（exit 0） |
+| `cargo check` | 通过 |
+| `cargo test --features directml-provider` | 79 passed；0 failed |
+| `cargo test --features cuda-provider` | 79 passed；0 failed |
+| `cargo check --features directml-provider,cuda-provider,cann-provider` | 编译通过 |
+| 真实图片回归（`cargo run -q --bin rapidocr -- run --img-path 01基础多位置文本.png --config test-config-small.yaml --json`） | 输出 25 个文本区域（JSON 保存在 `target/baseline-real-image-small.json`），文本正确，无失败 |
+
+普通 OCR 基线验收：
+
+| 项目 | 修改前实际值 | 预期 |
+| --- | --- | --- |
+| 默认测试 | 76 passed | 不得有新增失败 |
+| DirectML 测试 | 79 passed | 不得有新增失败 |
+| CUDA 测试 | 79 passed | 不得有新增失败 |
+| CANN 编译 | 通过 | 编译通过或记录环境阻塞 |
+| 普通 OCR 区域数 | 25（01 基础多位置文本） | 保持 |
+| 普通 OCR 文本 | 与图片一致 | 保持 |
+| 普通 OCR 吞吐 | 沿用 `OCR-Model/bench-*.json` 与 `tests/baseline/*.json` | 记录差异并解释 |
+| 峰值内存 | 未单独测量（沿用既有记录） | 无不可接受增长 |
+
+未覆盖风险：阶段 1 未重新执行独立吞吐/内存 benchmark；采用既有 `OCR-Model/bench-*.json` 与 `crates/rapid-ocr-rs/tests/baseline/*.json` 作为吞吐/内存基线。阶段 11 最终回归时将补充独立对比。
