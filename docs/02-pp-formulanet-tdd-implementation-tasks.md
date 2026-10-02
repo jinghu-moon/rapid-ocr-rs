@@ -890,9 +890,9 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 
 | 阶段 | 状态 | 日期 | 提交 | 执行命令 | 关键结果 | 未覆盖风险 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 0A 设计冻结 | ☑ | 2026-10-02 | 见 §16 | 无源码修改；确认目录/依赖/迁移方案 | 模型 SHA-256 一致；测试集齐备；目标目录冻结 | typed contract 留待阶段 5 |
-| 1 基线 | ☑ | 2026-10-02 | 见 §16 | cargo test/fmt/check + provider 矩阵 | 默认 76/DirectML 79/CUDA 79 通过；CANN check 通过；真实图片回归正常 | 未重测独立吞吐/内存，沿用既有基准 |
-| 0B 结构重构 | ☑ | 2026-10-02 | 见 §17 | cargo check/test/fmt + provider 矩阵 + 真实图片回归 | 76 测试通过；DirectML/CUDA 79 通过；CANN check 通过；真实图片 42 区域文本一致 | 依赖边界靠 mod.rs 注释约束；阶段 11 最终复核 |
+| 0A 设计冻结 | ☑ | 2026-10-02 | `8e05bfa` | 无源码修改；确认目录/依赖/迁移方案 | 模型 SHA-256 一致；测试集齐备；目标目录冻结 | typed contract 留待阶段 5 |
+| 1 基线 | ☑ | 2026-10-02 | `8e05bfa` | cargo test/fmt/check + provider 矩阵 | 默认 76/DirectML 79/CUDA 79 通过；CANN check 通过；真实图片回归正常 | 未重测独立吞吐/内存，沿用既有基准 |
+| 0B 结构重构 | ☑ | 2026-10-02 | `b1846cc` | cargo check/test/fmt + provider 矩阵 + 真实图片回归 | 76 测试通过；DirectML/CUDA 79 通过；CANN check 通过；真实图片 42 区域文本一致 | 依赖边界靠 mod.rs 注释约束；阶段 11 最终复核 |
 | 2 fixture | ☐ |  |  |  |  |  |
 | 3 模型契约 | ☐ |  |  |  |  |  |
 | 4 预处理 | ☐ |  |  |  |  |  |
@@ -987,3 +987,13 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 
 - `rg 'crate::ocr|crate::formula' src/runtime src/input src/vision src/output src/error.rs src/model_store.rs src/model_registry.rs`：无输出，共享层无反向依赖。
 - 无兼容 wrapper、旧路径转发或重复实现；旧 `src/{det,cls,rec,pipeline,types,evaluation.rs}` 已删除。
+
+### 17.4 阶段提交
+
+| 阶段 | 提交 | 说明 |
+| --- | --- | --- |
+| 0A 设计冻结 | `8e05bfa` | `docs(formulanet): freeze phase 0A design and record phase 1 baseline` |
+| 1 基线 | `8e05bfa` | 与 0A 同一次文档提交（基线记录按阶段归档） |
+| 0B 结构重构 | `b1846cc` | `refactor(ocr): move ordinary OCR into ocr bounded context (phase 0B)` |
+
+后续阶段（2-12）尚未开始。
