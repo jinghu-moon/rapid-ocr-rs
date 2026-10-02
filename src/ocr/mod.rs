@@ -7,6 +7,7 @@ pub mod cls;
 pub mod det;
 pub mod pipeline;
 pub mod rec;
+pub mod session;
 
 pub mod config;
 pub mod types;

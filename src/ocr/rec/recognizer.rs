@@ -14,9 +14,9 @@ use crate::{
         decode::CtcLabelDecoder,
         preprocess::{batch_shape_for, write_resize_norm_img_into_slice_with_scratch},
     },
+    ocr::session::{OcrSession, OcrSessionKind},
     ocr::types::{LineResult, RecognizeOutput},
     runtime::provider::ProviderResolution,
-    runtime::session::OrtSession,
     vision::backend::resolve_backend_strict,
     vision::resize::LinearResizeScratch,
 };
@@ -25,7 +25,7 @@ use crate::{
 pub struct Recognizer {
     config: RecognizerConfig,
     vision_backend: VisionBackend,
-    session: OrtSession,
+    session: OcrSession,
     decoder: CtcLabelDecoder,
     batch_scratch: Vec<f32>,
 }
@@ -58,9 +58,9 @@ impl Recognizer {
         )?;
 
         let model_path = resolve_model_path(&config, &resolved, &model_store_dir)?;
-        let mut session = OrtSession::new(&model_path, &config.runtime)?;
+        let mut session = OcrSession::new(&model_path, &config.runtime, OcrSessionKind::Rec)?;
 
-        let character = session.character_list.take();
+        let character = session.take_character_list();
         let character_path = if character.is_none() {
             resolve_character_path(&config, &resolved, &model_store_dir)?
         } else {

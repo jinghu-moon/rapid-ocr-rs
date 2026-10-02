@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::{
     config::RuntimeConfig,
     error::{RapidOcrError, Result},
-    runtime::session::{OrtSession, TensorSpec},
+    runtime::{contracts::TensorSpec, session::OrtSession},
 };
 
 /// 公式模型签名探针结果。

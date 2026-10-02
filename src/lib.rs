@@ -33,6 +33,7 @@ pub use formula::model_info::{
 pub use formula::preprocess::{
     FORMULA_INPUT_SIZE, FORMULA_MEAN, FORMULA_STD, FormulaPreprocessor, FormulaTensor,
 };
+pub use formula::session::FormulaSession;
 pub use formula::tokenizer_metadata::{
     BOS_ID, BOS_TOKEN, EOS_ID, EOS_TOKEN, FormulaTokenizerMetadata, PAD_ID, PAD_TOKEN, UNK_ID,
     UNK_TOKEN,
@@ -50,7 +51,8 @@ pub use output::html::{relative_image_name, render_output_report, render_report}
 pub use output::json::{OcrJsonItem, to_output_items, to_output_json};
 pub use output::markdown::to_output_markdown;
 pub use output::visualize::draw_output;
+pub use runtime::contracts::{ModelIoProbe, TensorSpec};
 pub use runtime::provider::{ProviderResolution, ResolvedExecutionProvider};
-pub use runtime::session::{ModelIoProbe, OrtSession, TensorSpec};
+pub use runtime::session::OrtSession;
 
 pub type Quad = [[f32; 2]; 4];

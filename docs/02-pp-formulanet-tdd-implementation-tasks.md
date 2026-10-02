@@ -516,14 +516,14 @@ formula/
 
 ### 6.3 TDD 任务
 
-- [ ] Red：普通 CTC session 合约测试保持原行为。
-- [ ] Red：公式模型加载普通 CTC session 必须失败，错误明确指出契约不匹配。
-- [ ] Red：公式 session 可接受 `FLOAT [N,1,384,384]` -> `INT64 [N,L]`。
-- [ ] Red：错误 dtype、rank、缺失 output 均有测试。
-- [ ] Green：提取通用 session 创建和 provider 配置。
-- [ ] Green：实现 `runtime::contracts` 的通用契约验证，并分别实现 `ocr::session` 与 `formula::session` 的领域契约。
-- [ ] Refactor：删除旧 session 中的公式特判、重复 metadata 解析和临时 adapter。
-- [ ] 运行普通 OCR 全量回归后才进入公式 API 阶段。
+- [x] Red：普通 CTC session 合约测试保持原行为。
+- [x] Red：公式模型加载普通 CTC session 必须失败，错误明确指出契约不匹配。
+- [x] Red：公式 session 可接受 `FLOAT [N,1,384,384]` -> `INT64 [N,L]`。
+- [x] Red：错误 dtype、rank、缺失 output 均有测试。
+- [x] Green：提取通用 session 创建和 provider 配置。
+- [x] Green：实现 `runtime::contracts` 的通用契约验证，并分别实现 `ocr::session` 与 `formula::session` 的领域契约。
+- [x] Refactor：删除旧 session 中的公式特判、重复 metadata 解析和临时 adapter。
+- [x] 运行普通 OCR 全量回归后才进入公式 API 阶段。
 
 ---
 
@@ -1122,4 +1122,56 @@ Pillow 的 resize 与 Python OpenCV 的 SIMD BGR2GRAY 在当前环境下与 Rust
 | 阶段 | 提交 | 说明 |
 | --- | --- | --- |
 | 4 预处理 | `a79be8c` | `feat(formula): implement phase 4 preprocessing TDD` |
+
+---
+
+### 21. 阶段 5 执行记录（2026-10-02）
+
+#### 21.1 实现内容
+
+- 新增共享 `src/runtime/contracts.rs`：
+  - `TensorSpec` / `ModelIoProbe`；
+  - exactly-one input/output 校验；
+  - rank、dtype、固定 dim 校验；
+  - dtype 错误信息使用 `FLOAT32` / `INT64` 可读标签。
+- `src/runtime/session.rs` 只保留通用 session 生命周期、provider、线程和通用 tensor 运行能力：
+  - `OrtSession::open_unchecked`；
+  - `probe_io` / `metadata_custom`；
+  - `run_i64_2d` 与 FLOAT `ArrayD/2/3/4` 运行入口；
+  - 删除 `SessionContract`、硬编码 `character` 行解析和领域 contract 校验。
+- 新增 `src/ocr/session.rs`：
+  - `OcrSessionKind::{Rec,Cls,Det}`；
+  - `OcrSession::new` 校验 `FLOAT rank-4` 输入、按 kind 校验输出 rank、`FLOAT` dtype；
+  - CTC Rec 的 plain-line `character` metadata 解析移到 OCR 域。
+- 新增 `src/formula/session.rs`：
+  - `FormulaSession::new` 校验 `FLOAT [N,1,384,384]` 输入和 `INT64 [N,L]` 输出；
+  - `FormulaSession::run` 调用通用 `OrtSession::run_i64_2d`，并对运行时输入形状二次校验。
+- 普通 OCR `Detector` / `Classifier` / `Recognizer` 改为通过 `OcrSession` 使用 typed session。
+- 新增 `tests/fixtures/ocr-onnx/README.md` 与本地 ONNX contract fixture：
+  - `ocr_rec_ok` / `ocr_rec_output_rank2` / `ocr_rec_output_int64` / `ocr_rec_multi_input` / `ocr_rec_multi_output`；
+  - `ocr_cls_ok` / `ocr_det_ok`。
+
+#### 21.2 验证结果
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --lib session::tests` | 14 passed；0 failed |
+| `cargo test --all-targets` | 132 passed；0 failed |
+| `cargo test --features directml-provider` | 135 passed；0 failed |
+| `cargo fmt --all -- --check` | 通过 |
+| 真实 OCR 回归（small，01基础多位置文本） | 42 区域；processed 1984x1248；与阶段 4 前基线一致 |
+| 公式模型误载普通 Rec session | 按预期输出 rank 契约错误 |
+| 公式 session 运行 formula_ok fixture | 返回 INT64 rank-2 tensor，batch 行数=1 |
+
+#### 21.3 边界核验
+
+- `runtime` 不再包含 `character` metadata 行解析，也没有公式特判。
+- `ocr/session.rs` 与 `formula/session.rs` 各自维护领域 contract；共享层只暴露通用 `TensorSpec`。
+- 普通 OCR 的 `LineResult`/`RecognizeOutput` 类型未改变，输出文本不变。
+
+#### 21.4 阶段提交
+
+| 阶段 | 提交 | 说明 |
+| --- | --- | --- |
+| 5 runtime 契约 | 待记录 | `refactor(runtime): implement typed OCR and formula sessions (phase 5)` |
 

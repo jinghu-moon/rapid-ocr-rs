@@ -9,8 +9,8 @@ use crate::{
     error::{RapidOcrError, Result},
     model_registry::ModelRegistry,
     model_store::{default_model_store_dir, ensure_downloaded, verify_existing_file},
+    ocr::session::{OcrSession, OcrSessionKind},
     runtime::provider::ProviderResolution,
-    runtime::session::{OrtSession, SessionContract},
     vision::backend::resolve_backend_strict,
     vision::resize::LinearResizeScratch,
 };
@@ -64,7 +64,7 @@ pub struct ClsInPlaceOutput {
 pub struct Classifier {
     config: ClassifierConfig,
     vision_backend: VisionBackend,
-    session: OrtSession,
+    session: OcrSession,
     batch_scratch: Vec<f32>,
 }
 
@@ -98,8 +98,7 @@ impl Classifier {
             ));
         };
 
-        let session =
-            OrtSession::new_with_contract(&model_path, &config.runtime, SessionContract::Cls)?;
+        let session = OcrSession::new(&model_path, &config.runtime, OcrSessionKind::Cls)?;
         let vision_backend = resolve_backend_strict(config.runtime.vision_backend)?;
         Ok(Self {
             vision_backend,
