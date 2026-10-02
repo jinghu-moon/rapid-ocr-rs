@@ -1623,8 +1623,32 @@ cargo run --features cuda-provider --bin formula_bench -- --model <model.onnx> -
 - 删除 `src/formula/model_info.rs` 与 `src/evaluation/formula/fixture.rs` 中的全部绝对路径。
 
 **验证**：`src` 下已无 `D:\`/`C:\` 字面量；无环境变量时
-`cargo test --all-targets` = 245 passed / 0 failed（外部资产测试打印 skip 并返回），
-带 `RAPID_OCR_MODEL_ROOT` 时 245 passed 且真实模型测试真正执行。
+`cargo test --all-targets` = 246 passed / 0 failed（外部资产测试打印 skip 并返回），
+带 `RAPID_OCR_MODEL_ROOT` 时同样全绿且真实模型测试真正执行。
+
+**干净 clone 端到端验证**（决定性证据）：
+
+```powershell
+git clone <crate> $env:TEMP\rapid-ocr-rs-cleanclone
+cd $env:TEMP\rapid-ocr-rs-cleanclone
+cargo test --all-targets        # 不设置任何模型/测试集环境变量
+# -> 246 passed; 0 failed
+```
+
+**过程中发现并修复的第二个可复现性根因**：第一次干净 clone 运行失败，9 个契约测试报
+`ONNX Runtime error: Load model from …\formula_multi_input.onnx failed: Protobuf parsing failed`。
+
+- 根因：`core.autocrlf=true`（Windows 常见默认）会在 **checkout** 时把 blob 中的
+  `0x0A` 改写成 `0x0D 0x0A`。对 ONNX / NumPy / PNG 这类二进制文件，这是一次内容破坏；
+  而 `git cat-file blob` 校验证明**blob 本身是正确的**，只有工作区被改写。
+  这也解释了为什么“提交 fixture”并不足以保证干净 clone 可用。
+- 处理：新增 `.gitattributes`，把 `*.onnx` / `*.npy` / `*.png` / `*.jpg` / `*.jpeg` /
+  `*.webp` / `*.ico` / `*.gif` 声明为 `binary`（等价 `-text -diff`），
+  并执行 `git add --renormalize .`；
+- 新增 `tools/verify_committed_binaries.py`：逐字节比较
+  `git cat-file blob HEAD:<path>` 与工作区文件，证明 35 个已提交二进制 fixture
+  的 blob 与工作区完全一致（修复前后都一致，差别只在 checkout 行为）；
+- 修复后重新 clone 并运行：246 passed / 0 failed（无任何外部资产）。
 
 ### 29.2 P1 provider 不支持时仍可能静默回退 CPU
 
@@ -1685,8 +1709,9 @@ SHA-256 `71b6d389…d9493b`）：
 
 | 命令 | 结果 |
 | --- | --- |
-| `cargo test --all-targets` | 245 passed / 0 failed（无外部资产） |
-| `cargo test --all-targets`（带模型与测试集） | 245 passed / 0 failed |
+| `cargo test --all-targets` | 246 passed / 0 failed（无外部资产） |
+| `cargo test --all-targets`（带模型与测试集） | 246 passed / 0 failed |
+| `cargo test --all-targets`（干净 clone，无外部资产） | 246 passed / 0 failed |
 | `cargo test --features directml-provider` | 248 passed / 0 failed |
 | `cargo test --features cuda-provider` | 246 passed / 0 failed |
 | `cargo check --features directml-provider,cuda-provider,cann-provider` | 通过 |
@@ -1710,7 +1735,7 @@ provider 矩阵改为按特性分别验证（上表）。这与阶段 1 基线�
 
 | 项目 | 修改前基线 | 本次实测 | 判定 |
 | --- | --- | --- | --- |
-| `cargo test --all-targets` | 159 passed（阶段 11） | 245/246 passed（新增公式测试） | 无新增失败 |
+| `cargo test --all-targets` | 159 passed（阶段 11） | 246 passed（新增公式测试） | 无新增失败 |
 | 真实图片区域数（01基础多位置文本，small 配置） | 42 | 42 | 保持 |
 | processed size | 1984×1248 | 1984×1248 | 保持 |
 | 公式区域数（未传 `--formula-model`） | 不存在 | 0（`formulas: 0`，`items: 42`） | 公式关闭时无公式区域 |
@@ -1755,3 +1780,6 @@ token 序列、EOS 与 CER。
 | --- | --- | --- |
 | 第二轮审核修复 | `9db5dda` | `fix(formula): close the review gaps in the PP-FormulaNet integration` |
 | `OcrOutput::len` 语义修正 | `e08df20` | `fix(api): count formula regions in OcrOutput::len and document text_len` |
+| benchmark batch 判定口径 | `c1aa94b` | `fix(bench): compare EOS prefixes for batch determinism and reuse measured runs` |
+| 阶段 9 smoke 结果记录 | `e41f965` | `docs(formula): record phase 9 smoke results and the 501-image Rust/Python comparison` |
+| 二进制 fixture checkout 修复 | `b666390` | `fix(repo): mark binary fixtures so checkout cannot corrupt them` |
