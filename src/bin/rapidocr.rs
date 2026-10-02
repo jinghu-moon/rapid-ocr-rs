@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use rapid_ocr_rs::evaluation::{
+use rapid_ocr_rs::evaluation::ocr::{
     EvaluationCase, EvaluationReport, EvaluationSummary, evaluate_case,
 };
 use rapid_ocr_rs::{

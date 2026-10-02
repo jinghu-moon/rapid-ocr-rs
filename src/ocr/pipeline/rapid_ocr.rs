@@ -6,12 +6,12 @@ use std::{
 
 use crate::{
     api::OcrEngine as _,
-    cls::classifier::{Classifier, ClassifierConfig},
-    config::RecognizeOptions,
-    det::detector::{Detector, DetectorConfig},
     error::Result,
     input::image_loader::{LoadImage, OcrInput},
-    pipeline::{
+    ocr::cls::classifier::{Classifier, ClassifierConfig},
+    ocr::config::RecognizeOptions,
+    ocr::det::detector::{Detector, DetectorConfig},
+    ocr::pipeline::{
         config::EngineConfig,
         image_ops::{
             PreprocessRecord, apply_vertical_padding, crop_text_regions, map_boxes_to_original,
@@ -19,9 +19,9 @@ use crate::{
         },
         types::{ExecutionOptions, ExecutionOutput},
     },
-    rec::recognizer::Recognizer,
+    ocr::rec::recognizer::Recognizer,
+    ocr::types::{LineResult, WordBox},
     runtime::provider::ProviderResolution,
-    types::{LineResult, WordBox},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,7 +309,7 @@ impl RapidOcr {
                 self.config.det.runtime.vision_backend,
             )?;
             let filtered_crops = select_items_by_indices(mapped_crops, &kept_indices);
-            let word_boxes = crate::rec::word_boxes::compute_word_boxes_with_backend(
+            let word_boxes = crate::ocr::rec::word_boxes::compute_word_boxes_with_backend(
                 &filtered_crops,
                 &filtered_boxes,
                 &buffers.lines,
@@ -712,7 +712,9 @@ impl crate::api::OcrEngine for RapidOcrEngine {
             crate::api::EnhancementPolicy::ScreenAdaptive
         ) {
             let img = self.inner.loader.load(input)?;
-            input = OcrInput::Image(crate::pipeline::image_ops::enhance_screen_adaptive(&img)?);
+            input = OcrInput::Image(crate::ocr::pipeline::image_ops::enhance_screen_adaptive(
+                &img,
+            )?);
         }
         let max_side = request
             .preprocess
@@ -1347,7 +1349,7 @@ fn deduplicate_regions(mut regions: Vec<crate::api::OcrRegion>) -> Vec<crate::ap
                         .as_ref()
                         .is_some_and(|v| v.text == recognition.text)
                         && existing.polygon.is_some_and(|other| {
-                            crate::evaluation::polygon_iou(other.points, polygon.points) >= 0.5
+                            crate::evaluation::ocr::polygon_iou(other.points, polygon.points) >= 0.5
                         })
                 })
             })

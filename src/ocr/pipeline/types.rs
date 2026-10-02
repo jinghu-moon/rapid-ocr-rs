@@ -1,7 +1,7 @@
 use crate::{
     Quad,
-    det::detector::DetTimingBreakdown,
-    types::{LineResult, WordBox},
+    ocr::det::detector::DetTimingBreakdown,
+    ocr::types::{LineResult, WordBox},
 };
 
 /// Internal execution snapshot. It never crosses the public crate boundary.

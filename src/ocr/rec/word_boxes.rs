@@ -12,7 +12,7 @@ use crate::{
     Quad,
     config::{RecImage, VisionBackend},
     error::{RapidOcrError, Result},
-    types::{LineResult, WordBox, WordInfo, WordType},
+    ocr::types::{LineResult, WordBox, WordInfo, WordType},
     vision::backend::resolve_backend_strict,
 };
 
@@ -563,7 +563,7 @@ mod tests {
     use crate::{
         config::RecImage,
         error::RapidOcrError,
-        types::{LineResult, WordInfo, WordType},
+        ocr::types::{LineResult, WordInfo, WordType},
     };
 
     use super::compute_word_boxes;

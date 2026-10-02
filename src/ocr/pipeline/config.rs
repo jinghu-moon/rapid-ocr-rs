@@ -4,11 +4,11 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
 use crate::{
-    cls::classifier::ClassifierConfig,
-    config::RecognizerConfig,
     config::RuntimeConfig,
-    det::detector::DetectorConfig,
     error::{RapidOcrError, Result},
+    ocr::cls::classifier::ClassifierConfig,
+    ocr::config::RecognizerConfig,
+    ocr::det::detector::DetectorConfig,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

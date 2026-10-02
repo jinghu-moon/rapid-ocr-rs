@@ -4,18 +4,19 @@ use ndarray::ArrayView4;
 use rayon::prelude::*;
 
 use crate::{
-    config::{LangRec, RecImage, RecognizeOptions, RecognizerConfig, VisionBackend},
+    config::{LangRec, RecImage, VisionBackend},
     error::{RapidOcrError, Result},
     model_registry::{ModelRegistry, ResolvedRecModel},
     model_store::{default_model_store_dir, ensure_downloaded, verify_existing_file},
-    rec::{
+    ocr::config::{RecognizeOptions, RecognizerConfig},
+    ocr::rec::{
         bidi::reorder_bidi_for_display,
         decode::CtcLabelDecoder,
         preprocess::{batch_shape_for, write_resize_norm_img_into_slice_with_scratch},
     },
+    ocr::types::{LineResult, RecognizeOutput},
     runtime::provider::ProviderResolution,
     runtime::session::OrtSession,
-    types::{LineResult, RecognizeOutput},
     vision::backend::resolve_backend_strict,
     vision::resize::LinearResizeScratch,
 };
@@ -299,10 +300,11 @@ mod tests {
 
     use crate::{
         config::{
-            LangRec, ModelType, OcrVersion, ProviderPreference, RecImage, RecognizeOptions,
-            RecognizerConfig, RuntimeConfig, VisionBackend,
+            LangRec, ModelType, OcrVersion, ProviderPreference, RecImage, RuntimeConfig,
+            VisionBackend,
         },
-        rec::recognizer::Recognizer,
+        ocr::config::{RecognizeOptions, RecognizerConfig},
+        ocr::rec::recognizer::Recognizer,
         runtime::provider::ResolvedExecutionProvider,
     };
 
@@ -340,7 +342,7 @@ mod tests {
         model_store_dir.push("rec-parity-models");
 
         RecognizerConfig {
-            model: crate::config::ModelConfig {
+            model: crate::ocr::config::ModelConfig {
                 lang: LangRec::Ch,
                 ocr_version: version,
                 model_type,

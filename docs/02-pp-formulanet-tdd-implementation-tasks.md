@@ -166,16 +166,16 @@ src/
 
 结构重构验收：
 
-- [ ] 普通 OCR 专属实现全部位于 `src/ocr/`；
-- [ ] 公式实现全部位于 `src/formula/`，不混入 `src/ocr/`；
-- [ ] 共享模块不反向依赖任何领域模块；
-- [ ] 没有新增兼容 wrapper、旧路径转发或重复实现；
-- [ ] `cargo check`、普通 OCR 单元/集成测试和真实图片回归均通过；
-- [ ] 重构前后普通 OCR 的输出、错误语义和性能差异都有记录；
-- [ ] 目录边界和依赖方向写入模块 `mod.rs`，不依赖开发者记忆。
+- [x] 普通 OCR 专属实现全部位于 `src/ocr/`；
+- [x] 公式实现全部位于 `src/formula/`，不混入 `src/ocr/`；
+- [x] 共享模块不反向依赖任何领域模块；
+- [x] 没有新增兼容 wrapper、旧路径转发或重复实现；
+- [x] `cargo check`、普通 OCR 单元/集成测试和真实图片回归均通过；
+- [x] 重构前后普通 OCR 的输出、错误语义和性能差异都有记录；
+- [x] 目录边界和依赖方向写入模块 `mod.rs`，不依赖开发者记忆。
 - [x] 0A 设计冻结记录已完成；
-- [ ] 0B 结构重构实施已在阶段 1 基线之后完成；
-- [ ] 0B 完成后普通 OCR 全量回归通过，且阶段 1 基线仍可追溯。
+- [x] 0B 结构重构实施已在阶段 1 基线之后完成；
+- [x] 0B 完成后普通 OCR 全量回归通过，且阶段 1 基线仍可追溯。
 
 ---
 
@@ -892,7 +892,7 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 | --- | --- | --- | --- | --- | --- | --- |
 | 0A 设计冻结 | ☑ | 2026-10-02 | 见 §16 | 无源码修改；确认目录/依赖/迁移方案 | 模型 SHA-256 一致；测试集齐备；目标目录冻结 | typed contract 留待阶段 5 |
 | 1 基线 | ☑ | 2026-10-02 | 见 §16 | cargo test/fmt/check + provider 矩阵 | 默认 76/DirectML 79/CUDA 79 通过；CANN check 通过；真实图片回归正常 | 未重测独立吞吐/内存，沿用既有基准 |
-| 0B 结构重构 | ☐ |  |  |  |  |  |
+| 0B 结构重构 | ☑ | 2026-10-02 | 见 §17 | cargo check/test/fmt + provider 矩阵 + 真实图片回归 | 76 测试通过；DirectML/CUDA 79 通过；CANN check 通过；真实图片 42 区域文本一致 | 依赖边界靠 mod.rs 注释约束；阶段 11 最终复核 |
 | 2 fixture | ☐ |  |  |  |  |  |
 | 3 模型契约 | ☐ |  |  |  |  |  |
 | 4 预处理 | ☐ |  |  |  |  |  |
@@ -957,3 +957,33 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 | 峰值内存 | 未单独测量（沿用既有记录） | 无不可接受增长 |
 
 未覆盖风险：阶段 1 未重新执行独立吞吐/内存 benchmark；采用既有 `OCR-Model/bench-*.json` 与 `crates/rapid-ocr-rs/tests/baseline/*.json` 作为吞吐/内存基线。阶段 11 最终回归时将补充独立对比。
+
+---
+
+## 17. 阶段 0B 执行记录（2026-10-02）
+
+### 17.1 结构重构内容
+
+- 移动 `det`/`cls`/`rec` → `src/ocr/{det,cls,rec}`；移动 `pipeline` → `src/ocr/pipeline/`（含 `rapid_ocr.rs`、`config.rs`、`types.rs`、`image_ops.rs`）
+- 拆分 `config.rs`：共享层保留 `ColorOrder`/`VisionBackend`/`ModelType`/`OcrVersion`/`Lang*`/`ProviderPreference`/`RuntimeBackend`/`RuntimeConfig`/`RecImage`；`ModelConfig`/`RecognizerConfig`/`RecognizeOptions` 迁入 `src/ocr/config.rs`
+- 拆分 `types.rs`：`LineResult`/`WordBox`/`WordInfo`/`WordType`/`RecognizeOutput` 迁入 `src/ocr/types.rs`；`Quad` 保留共享 `lib.rs`
+- 拆分 `evaluation.rs` → `src/evaluation/{mod.rs, ocr.rs, formula.rs}`；`rapidocr` CLI 引用改为 `evaluation::ocr`
+- 建立空 `src/formula/mod.rs`，声明公式领域只依赖共享层
+- 更新 `lib.rs` 模块声明与公共导出；`src/ocr/mod.rs`、`src/ocr/pipeline/mod.rs` 写入依赖方向注释
+
+### 17.2 回归验证
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo check` | 通过 |
+| `cargo test --all-targets` | 76 passed（与阶段 1 基线一致） |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo test --features directml-provider` | 79 passed |
+| `cargo test --features cuda-provider` | 79 passed |
+| `cargo check --features directml-provider,cuda-provider,cann-provider` | 通过 |
+| 真实图片回归（small 配置，01基础多位置文本） | 42 个区域，文本逐项与基线一致（`target/baseline-real-image-small.json` vs `target/after-0b-real-image-small.json`） |
+
+### 17.3 边界核验
+
+- `rg 'crate::ocr|crate::formula' src/runtime src/input src/vision src/output src/error.rs src/model_store.rs src/model_registry.rs`：无输出，共享层无反向依赖。
+- 无兼容 wrapper、旧路径转发或重复实现；旧 `src/{det,cls,rec,pipeline,types,evaluation.rs}` 已删除。

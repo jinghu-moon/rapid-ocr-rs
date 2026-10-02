@@ -10,7 +10,7 @@ use ndarray::{ArrayView2, ArrayView3, Axis, s};
 
 use crate::{
     error::{RapidOcrError, Result},
-    types::{WordInfo, WordType},
+    ocr::types::{WordInfo, WordType},
 };
 
 #[derive(Debug, Clone)]

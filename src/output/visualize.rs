@@ -1,6 +1,6 @@
 use image::{Rgb, RgbImage};
 
-use crate::{OcrOutput, Quad, config::RecImage, types::WordBox};
+use crate::{OcrOutput, Quad, config::RecImage, ocr::types::WordBox};
 
 pub fn draw_ocr_result(img: &RecImage, boxes: &[Quad]) -> RgbImage {
     let mut canvas = to_rgb_image(img);
