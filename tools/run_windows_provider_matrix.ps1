@@ -90,8 +90,10 @@ foreach ($variant in $variants) {
             peak_working_set_bytes = $json.memory.peak_working_set_bytes
         }
         $resolution = $json.meta.provider_resolution.recognizer
-        Write-Host ("  fallback run: resolved={0} fallback={1} p50={2:N1}ms" -f `
-            $resolution.resolved, $resolution.fallback_to_cpu, $json.stats.ocr_total_ms.p50)
+        # 字段名是 `selected_ep`（“交给 ORT 的 EP 链头部”，不是逐节点执行证据）；
+        # 旧的 `resolved` 已删除，读它会打印空值。
+        Write-Host ("  fallback run: selected_ep={0} fallback={1} p50={2:N1}ms" -f `
+            $resolution.selected_ep, $resolution.fallback_to_cpu, $json.stats.ocr_total_ms.p50)
     }
     else {
         $entry['fallback_run'] = [ordered]@{ exit_code = $fallback.exit_code; stderr = $fallback.stderr }

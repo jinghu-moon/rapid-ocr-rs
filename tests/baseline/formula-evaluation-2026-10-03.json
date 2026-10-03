@@ -1,7 +1,14 @@
 {
   "tool": "tools/summarize_formula_eval.py",
+  "schema_version": 1,
+  "schema_epoch": "provider_resolved",
+  "historical": true,
+  "historical_reason": "这是一份**历史证据**，字段名早于 `selected_ep` 重命名：provider 用的是已删除的 `provider_resolved` / `provider.resolved`，而不是当前 schema 的 `provider_selected_ep` / `provider.selected_ep`。它无法用当前工具重新生成——`target/formula-eval` 下的 `bench-*.json` 原始报告本身也是旧 schema（其中 `provider_resolved` 的取值与本文档一致，但 `selected_ep` 从未被记录过，无法从磁盘恢复）。因此保留原文并显式标注，而不是用新字段名重写一份无法溯源的数据。新的 baseline 一律由 `tools/summarize_formula_eval.py --baseline-json` 写出，并带 `schema_version = 2` / `schema_epoch = provider_selected_ep`。",
+  "provider_field_renames": {
+    "provider_resolved": "deleted; current formula bench/eval reports emit `provider_selected_ep` (bench) and `provider.selected_ep` (eval)"
+  },
   "regenerate": "python tools/summarize_formula_eval.py --dir target/formula-eval --baseline-json tests\\baseline\\formula-evaluation-2026-10-03.json",
-  "note": "由 formula_eval / formula_bench 的报告精简而来；原始报告不随仓库提交。分片运行的吞吐是并发下界，权威性能数据来自串行无争用的 bench-*.json。dataset_manifests 记录每个数据集的内容摘要（content_sha256），可用 `formula_eval --manifest-only --expect-manifest <manifest>` 在几秒内确认图像文件没有被替换，而不需要重跑全量评测。",
+  "note": "由 formula_eval / formula_bench 的报告精简而来；原始报告不随仓库提交。分片运行的吞吐是并发下界，权威性能数据来自串行无争用的 bench-*.json。dataset_manifests 记录每个数据集的内容摘要（content_sha256），可用 `formula_eval --manifest-only --expect-manifest <manifest>` 在几秒内确认图像文件没有被替换，而不需要重跑全量评测。**本文档的 provider 字段是旧 schema（`provider_resolved`），见 `schema_version` / `historical_reason`。**",
   "evaluations": [
     {
       "dataset": "im2latex",

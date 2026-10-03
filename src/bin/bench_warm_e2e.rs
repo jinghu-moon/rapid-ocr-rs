@@ -195,8 +195,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // `stats.wall_ms` / `stats.ocr_total_ms` 完全一致（同一个 `stats()` helper）。
         "stages": stage_report,
         // 时间账本：每一项只算一次，余量显式列出，并给出守恒判定 + **解释**
-        // （`conservation.interpretation`）。它是**诊断**仪器：分量来自跨越
-        // `inner.run()` 的重叠窗口，因此占比只在 `conservation.overlap_ms` 内成立，
+        // （`conservation.interpretation`）。它是**诊断**仪器：`total_ms` 是“外层
+        // `preprocess_ms` 窗口 + 内层 `inner.run()` 窗口”的总窗口，而命名分量只是这些窗口里的
+        // 若干子窗口（两个窗口串行，不是重叠），因此占比只在 `conservation.excess_ms` 内成立，
         // 不能作为性能验收依据。
         "timing_ledger": ledger_report,
         // ORT 推理 vs Rust 前后处理的时间占比（阶段 6 门槛证据的来源之一）；
@@ -344,11 +345,14 @@ impl StageSamples {
 ///
 /// 每个样本各算一份账（[`TimingLedger::from_timings`]，每一项只算一次），再按字段求
 /// 均值。守恒检查建立在均值账本上，而**均值账本与每个样本账本一样并不严格守恒**：
-/// 外层 `preprocess_ms` 窗口与阶段计时跨越 `inner.run()`，分量不是互斥窗口。
+/// `total_ms` 是“外层 `preprocess_ms` 窗口（`rapid_ocr.rs:619-719`）+ 内层 `inner.run()`
+/// 窗口（`rapid_ocr.rs:106-130`）”的总窗口，命名分量只是其中的若干子窗口，
+/// 两者口径不同（**两个窗口串行，不是重叠**）。
 ///
 /// 因此这里必须把“不守恒该怎么读”一起写进 JSON：
-/// `conservation.interpretation` 明确写出“负残差 = 窗口重叠、账本是诊断工具、占比只在
-/// 残差量级内成立、`total_ms` 本身不受影响”，`conservation.overlap_ms` 给出该量级。
+/// `conservation.interpretation` 明确写出“残差是 `total_ms` 与命名分量之和的口径差异、
+/// 两个窗口串行、账本是诊断工具、占比只在残差量级内成立、`total_ms` 本身不受影响”，
+/// `conservation.excess_ms` 给出该量级。
 /// 报告的使用者**不得**把账本当作性能验收依据，也不得把 `conserved = false` 读成
 /// “总量算错了”。
 fn ledger_report(ledgers: &[TimingLedger]) -> serde_json::Value {
@@ -369,6 +373,8 @@ fn ledger_report(ledgers: &[TimingLedger]) -> serde_json::Value {
         "components": mean,
         "totals": {
             "input_ms": mean.input_ms(),
+            "input_preprocess_ms": mean.input_preprocess_ms,
+            "input_overflow_ms": mean.input_overflow_ms,
             "model_preprocess_ms": mean.model_preprocess_ms(),
             "inference_ms": mean.inference_ms(),
             "model_postprocess_ms": mean.model_postprocess_ms(),
@@ -379,9 +385,9 @@ fn ledger_report(ledgers: &[TimingLedger]) -> serde_json::Value {
             "unattributed_ms": mean.unattributed_ms,
         },
         "shares": shares,
-        // 守恒判据 + **怎么读它**：`conservation.interpretation` 说明负残差是计时窗口重叠
-        // （诊断仪器的局限），不是 `total_ms` 算错了；`overlap_ms` 是占比成立的上界。
-        // 这个账本是诊断工具，不能作为性能验收依据。
+        // 守恒判据 + **怎么读它**：`conservation.interpretation` 说明残差是“`total_ms` 的总窗口
+        // 与命名分量之和”的口径差异（两个窗口串行，不是重叠），不是 `total_ms` 算错了；
+        // `excess_ms` 是占比成立的上界。这个账本是诊断工具，不能作为性能验收依据。
         "conservation": conservation,
         // 每个样本各自的余量：用来看“均值守恒”是不是掩盖了单样本的大偏差。
         "per_sample_unattributed_ms": stats(
@@ -401,9 +407,9 @@ fn ledger_report(ledgers: &[TimingLedger]) -> serde_json::Value {
 /// 分子来自时间账本的均值，分母是 `stats.ocr_total_ms.avg`（同一个口径，来自
 /// `OcrTimings::total_ms`），因此 `inference + rust + unattributed == total` 按构造成立。
 ///
-/// 按构造成立**不等于**这些占比是精确划分：账本的各个分量来自互相重叠的计时窗口
+/// 按构造成立**不等于**这些占比是精确划分：账本的各个分量与 `total_ms` 的口径不同
 /// （见 `timing_ledger.conservation`），所以每一项占比只在
-/// `conservation.overlap_ms` 的量级内成立（release 实测 ±0.69%）。这个量级足以支撑
+/// `conservation.excess_ms` 的量级内成立（release 实测 ±0.69%）。这个量级足以支撑
 /// “瓶颈在 ORT（比每个 Rust 分量大一个数量级）”，但不足以支撑更细的性能结论。
 fn inference_share(ledgers: &[TimingLedger], total_avg: f64) -> serde_json::Value {
     if ledgers.is_empty() {

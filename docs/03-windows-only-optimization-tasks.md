@@ -273,6 +273,31 @@ cargo run --release --bin formula_eval -- --model <model> --dataset-root <Formul
 - [x] 公式 OCR：batch/profile 选择有数据；smoke 与 val-501 链路结果不变。（im2latex-100 逐位相同；val-501 未重跑，理由已记录）
 - [x] 无新增单图硬失败、OOM、provider fallback 或输入限制回归。
 
+#### 9.4.1 门槛证据的口径要求（复审第三轮加入）
+
+“瓶颈在 ORT”这一判断用的是**时间账本**（`src/runtime/timing.rs`，报告字段
+`timing_ledger`），它的口径必须被正确表述，否则同一份数字会被读成互相矛盾的结论：
+
+- 账本的 `total_ms` 是**两个串行窗口之和**：外层 `OcrTimings::preprocess_ms`
+  （`rapid_ocr.rs:619` → `:719`）加内层 `inner.run()` 的 e2e 窗口（`rapid_ocr.rs:106` →
+  `:130`，`total_ms = exec.e2e_ms + preprocess_ms` 见 `rapid_ocr.rs:910`）。
+  **两个窗口首尾相接，不存在重叠，也没有任何一段墙钟被计两次**——写“窗口重叠/重复计数”
+  属于与实现矛盾的因果陈述（该错误曾在终审报告里出现，已更正）。
+- 命名分量是这些窗口里的**子窗口**：`inner.run()` 窗口内的 `prepare_image` resize
+  （`rapid_ocr.rs:156-162`）、`apply_vertical_padding`（`:189-195`）、`crop_text_regions`
+  （`:210-212`）与 recognizer 的批次装配（`rec/recognizer.rs:89-98, 222-231`）不属于任何
+  阶段计时。因此 `attributed_ms` 会与 `total_ms` 相差一个**口径残差**
+  （release 实测约 −6.75 ms／页 = 0.69%），账本把它报为 `conservation.residual_ms` /
+  `excess_ms`，字段名里**不再**使用 `overlap`。
+- 由此得出的引用规则：账本是**诊断**仪器，**不是**验收证据；任何引用其占比的结论
+  （包括上面 86.03% / 0.58% 的后续修订值）都只能在残差量级（release ±0.69%）内成立，
+  并且不得据此声称 `total_ms` 高估或低估。
+- 输入侧另有明确不变量：`TimingLedger::input_ms() <= preprocess_ms` **按构造成立**；
+  当 `decode + resize + crop` 超过外层窗口时，超出量记为 `input_overflow_ms` 并留在残差里，
+  而不是被静默丢弃（见 `input_overflow_keeps_the_input_invariant_by_construction` 测试）。
+
+（完整修复记录、代码行号与证据见 `docs/04-windows-phase-reports.md` 的「复审第三轮」。）
+
 ---
 
 ## 10. 阶段 7：API、模块和文档清理
