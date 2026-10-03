@@ -593,6 +593,8 @@ const ERR_TEXT = {
   bad_host:'Host 校验失败（防 DNS rebinding）',
   payload_too_large:'请求体或下载总量超出上限（--max-body-mb / --max-download-mb）',
   result_too_large:'结果序列化超出上限（--max-result-mb）',
+  export_too_large:'导出文档超出上限（--max-export-mb），请改用“下载标注图”（annotated.png 不受该预算限制）',
+  original_evicted:'该任务的原图已被保留预算释放（410），标注图无法再生成；识别结果仍可查看，重新上传即可再标注',
   busy:'队列已满（503 busy），请稍后重试',
   models_missing:'模型文件缺失，请先在横幅中下载',
   models_corrupt:'模型文件损坏，建议重新下载',
@@ -891,6 +893,9 @@ function normalizeResult(r){
            ? r.plain_text
            : regions.map(x => x.text).filter(s => s !== '').join('\n'),
     timings: (r.timings && typeof r.timings === 'object') ? r.timings : {},
+    /* 时间账本：服务端由库的 TimingLedger 计算（命名分量 + 口径残差 + 库自己写的解释文案），
+       前端只展示、不重新测量、也不自己解释残差（M3 / §10.6）。 */
+    ledger: (r.timing_ledger && typeof r.timing_ledger === 'object') ? r.timing_ledger : null,
     raw: r
   };
 }
@@ -915,6 +920,7 @@ function normalizeStatus(s){
     fingerprint: (s.ort && s.ort.fingerprint) || s.ort_fingerprint || null,
     memory: (s.memory && s.memory.peak_working_set_bytes) != null
             ? s.memory.peak_working_set_bytes : s.peak_memory_bytes,
+    memorySource: (s.memory && s.memory.source) || null,
     queues: s.queues || null,
     limits: s.limits || null            /* §9.1 请求体上限：handleFile 的早期校验依赖该字段 */
   };
@@ -1844,19 +1850,49 @@ function renderDiag(){
   const s = state.status || emptyStatus();
   const fp = s.fingerprint;
   d.innerHTML = head +
-    `<div class="diag-sec">逐阶段耗时 · 时间账本（MS）</div>
+    `<div class="diag-sec">逐阶段耗时（MS）</div>
      <table class="diag-table">${rows.map(([k, v]) =>
         `<tr><td>${esc(k)}</td><td>${v.toFixed(1)}</td></tr>`).join('')}
        <tr class="total"><td>total</td><td>${total.toFixed(1)}</td></tr>
-     </table>
-     <div class="diag-sec">PROVIDER 实测</div>
+     </table>` +
+     ledgerHtml() +
+     `<div class="diag-sec">PROVIDER 实测</div>
      <p class="diag-line">requested ${esc(s.requested || '未知')} · selected_ep ${esc(s.selected_ep || '未知')}` +
      (s.fallback === true ? ' · 已回退 CPU' : s.fallback === false ? ' · 未回退' : ' · 回退状态未知') +
      ` — 本页任务的实测耗时见上表。</p>` +
      (fp ? `<div class="diag-sec">ORT 指纹</div>
        <p class="diag-line">${esc(fp.file || '')}${fp.size_bytes ? ' · ' + fmtBytes(fp.size_bytes) : ''}` +
        (fp.sha256 ? ' · sha256 ' + esc(String(fp.sha256).slice(0, 16)) + '…' : '') + '</p>' : '') +
-     `<p class="diag-note">口径说明：以上数据来自引擎内建 timings / stages 与 ORT 指纹，前端不重新测量；provider 名称不构成性能结论，请以实测耗时为准。</p>`;
+     `<div class="diag-sec">运行时与内存</div>
+      <p class="diag-line">ORT ${esc(s.ort || '—')} · 峰值工作集 ${s.memory != null ? fmtBytes(s.memory) : '—'}` +
+      (s.memorySource ? `（来源：${esc(s.memorySource)}）` : '') + '</p>' +
+     `<p class="diag-note">口径说明：以上数据来自引擎内建 timings / stages、库的时间账本与 ORT 指纹，前端不重新测量；
+      provider 名称不构成性能结论，请以实测耗时为准。账本的占比只在<b>口径残差</b>的量级内成立，
+      残差的含义以下方库原文为准。</p>`;
+}
+
+/* 时间账本（库的 TimingLedger）：命名分量 + 口径残差 + **库自己写的**解释文案。
+   刻意把 interpretation 原文展示出来——"两个窗口串行、不是重复计时""账本不是严格划分"
+   这些话只有库写得准确，前端自己拼一句"仅供参考"会丢掉可核对的口径（§10.6、M3）。 */
+function ledgerHtml(){
+  const l = state.result && state.result.ledger;
+  if(!l) return '';
+  const c = l.conservation || {};
+  const named = ['total_ms','attributed_ms','input_ms','inference_ms','rust_ms','unattributed_ms']
+    .filter(k => typeof l[k] === 'number')
+    .map(k => `<tr><td>${esc(k)}</td><td>${l[k].toFixed(1)}</td></tr>`).join('');
+  const residual = typeof c.residual_ms === 'number' ? c.residual_ms.toFixed(6) : '—';
+  const excess = typeof c.excess_ms === 'number' ? c.excess_ms.toFixed(6) : '—';
+  const tol = typeof c.tolerance_ms === 'number' ? c.tolerance_ms.toFixed(6) : '—';
+  const verdict = c.conserved === true ? '守恒（在容差内）' : '不守恒（口径差异，不是总量算错）';
+  return `<div class="diag-sec">时间账本 · 口径残差（MS，库数据）</div>
+    <table class="diag-table">${named}
+      <tr><td>residual_ms = attributed − total</td><td>${residual}</td></tr>
+      <tr><td>excess_ms = max(0, −residual)</td><td>${excess}</td></tr>
+      <tr><td>tolerance_ms</td><td>${tol}</td></tr>
+    </table>
+    <p class="diag-line">${esc(verdict)}</p>
+    <p class="diag-note">${esc(typeof c.interpretation === 'string' ? c.interpretation : '（服务端未提供账本解释文案）')}</p>`;
 }
 
 /* ================= 真实模式：status / models 轮询 ================= */

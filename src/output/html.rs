@@ -2,8 +2,64 @@ use std::{fmt::Write as _, path::Path};
 
 use crate::{OcrJsonItem, OcrOutput, error::Result};
 
+/// 报告渲染模式（`docs/05` §9.5）。
+///
+/// 两个模式共享同一套样式与同一个 SVG/列表结构，**唯一**区别是脚本段：
+///
+/// - [`ReportMode::Full`]：CLI `report --output-dir` 使用。保留内联 `<script>`
+///   （点击高亮、公式复制、滚动定位）与**相对路径** `image_href`——报告与同目录的原图
+///   一起被写出，因此离线可用（`relative_image_name` 的注释即此意）；
+/// - [`ReportMode::Static`]：Web 导出（`GET /api/jobs/{id}/export?format=html`）使用。
+///   **正文不含任何 `<script`**，样式内联保留；图片由调用方以 `data:image/png;base64,…`
+///   内嵌，因此导出的单文件脱离服务仍可查看。它由导出响应的独立 CSP
+///   （`script-src 'none'`；`docs/05` §9.5 第 2 条）背书：静态模式里没有任何脚本可被执行，
+///   也就不需要 nonce。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportMode {
+    Full,
+    Static,
+}
+
+/// HTML 报告里的注入点：脚本段**是**两个模式的唯一差异，因此它被抽成一个常量，
+/// 由 `render_report` 按模式拼接。`Full` 的产物与引入本模式之前逐字节相同。
+const REPORT_SCRIPT: &str = r#"  <script>
+    const items = [...document.querySelectorAll('.result')];
+    const polygons = [...document.querySelectorAll('polygon')];
+    const labels = [...document.querySelectorAll('.polygon-label')];
+    const formulaItems = [...document.querySelectorAll('.formulas li')];
+    function select(id, source) {
+      items.forEach(item => item.classList.toggle('active', item.dataset.target === id));
+      polygons.forEach(poly => poly.classList.toggle('active', poly.id === id));
+      labels.forEach(label => label.classList.toggle('active', label.dataset.target === id));
+      formulaItems.forEach(item => item.classList.toggle('active', item.dataset.target === id));
+      if (source === 'image') {
+        document.querySelector(`.result[data-target="${id}"]`)?.scrollIntoView({ behavior:'smooth', block:'nearest' });
+      }
+    }
+    items.forEach(item => item.addEventListener('click', () => select(item.dataset.target, 'result')));
+    polygons.forEach(poly => poly.addEventListener('click', () => select(poly.id, 'image')));
+    formulaItems.forEach(item => item.addEventListener('click', (event) => {
+      if (event.target.closest('.copy')) return;
+      select(item.dataset.target, 'formula');
+    }));
+    document.querySelectorAll('.formulas button.copy').forEach(button => {
+      button.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        try { await navigator.clipboard.writeText(button.dataset.latex); button.textContent = '已复制'; }
+        catch (error) { button.textContent = '复制失败'; }
+      });
+    });
+  </script>
+"#;
+
 /// Builds an offline report shell around an image and OCR polygons.
-/// `image_href` is intentionally a relative path so the report works offline.
+///
+/// `image_href` is intentionally a relative path so the report works offline when the
+/// report and the image are written into the same directory (**CLI**); the Web exporter
+/// passes a `data:image/png;base64,…` URL instead, because the export document must
+/// survive on its own (`docs/05` §9.5 item 5).
+///
+/// `mode` selects whether the interactive script is emitted at all; see [`ReportMode`].
 pub fn render_report(
     title: &str,
     image_href: &str,
@@ -11,6 +67,7 @@ pub fn render_report(
     height: u32,
     items: &[OcrJsonItem],
     timing_summary: &str,
+    mode: ReportMode,
 ) -> Result<String> {
     let mut polygons = String::new();
     let mut rows = String::new();
@@ -96,6 +153,12 @@ pub fn render_report(
         )
     };
 
+    // 两个模式的**唯一**差异：`Static` 不发出任何脚本（`docs/05` §9.5 的硬要求）。
+    let script = match mode {
+        ReportMode::Full => REPORT_SCRIPT,
+        ReportMode::Static => "",
+    };
+
     Ok(format!(
         r##"<!doctype html>
 <html lang="zh-CN">
@@ -146,35 +209,7 @@ pub fn render_report(
     <section class="viewer"><div class="image-stage"><img src="{image_href}" alt="OCR source"><svg viewBox="0 0 {width} {height}" aria-label="OCR polygons">{polygons}</svg></div></section>
     <aside><div class="summary">点击右侧文本或图片中的框，可检查原位坐标与识别结果是否对应。公式区域渲染为 LaTeX，不经过普通文本通道。</div><div class="results">{rows}</div>{formulas_section}</aside>
   </main>
-  <script>
-    const items = [...document.querySelectorAll('.result')];
-    const polygons = [...document.querySelectorAll('polygon')];
-    const labels = [...document.querySelectorAll('.polygon-label')];
-    const formulaItems = [...document.querySelectorAll('.formulas li')];
-    function select(id, source) {{
-      items.forEach(item => item.classList.toggle('active', item.dataset.target === id));
-      polygons.forEach(poly => poly.classList.toggle('active', poly.id === id));
-      labels.forEach(label => label.classList.toggle('active', label.dataset.target === id));
-      formulaItems.forEach(item => item.classList.toggle('active', item.dataset.target === id));
-      if (source === 'image') {{
-        document.querySelector(`.result[data-target="${{id}}"]`)?.scrollIntoView({{ behavior:'smooth', block:'nearest' }});
-      }}
-    }}
-    items.forEach(item => item.addEventListener('click', () => select(item.dataset.target, 'result')));
-    polygons.forEach(poly => poly.addEventListener('click', () => select(poly.id, 'image')));
-    formulaItems.forEach(item => item.addEventListener('click', (event) => {{
-      if (event.target.closest('.copy')) return;
-      select(item.dataset.target, 'formula');
-    }}));
-    document.querySelectorAll('.formulas button.copy').forEach(button => {{
-      button.addEventListener('click', async (event) => {{
-        event.stopPropagation();
-        try {{ await navigator.clipboard.writeText(button.dataset.latex); button.textContent = '已复制'; }}
-        catch (error) {{ button.textContent = '复制失败'; }}
-      }});
-    }});
-  </script>
-</body>
+{script}</body>
 </html>
 "##,
         title = escape_html(title),
@@ -187,6 +222,7 @@ pub fn render_report(
         polygons = polygons,
         rows = rows,
         formulas_section = formulas_section,
+        script = script,
     ))
 }
 
@@ -202,11 +238,16 @@ pub fn relative_image_name(image_path: &Path) -> String {
     format!("{stem}-source.{extension}")
 }
 
+/// `OcrOutput` → 报告 HTML（`mode` 决定是否发出脚本段，见 [`ReportMode`]）。
+///
+/// CLI 的 `report` 子命令固定传 [`ReportMode::Full`]（与引入本参数之前逐字节相同）；
+/// `rapidocr serve` 的导出固定传 [`ReportMode::Static`]。
 pub fn render_output_report(
     title: &str,
     image_href: &str,
     output: &OcrOutput,
     timing_summary: &str,
+    mode: ReportMode,
 ) -> Result<String> {
     let items = crate::output::json::to_output_items(output);
     render_report(
@@ -216,6 +257,7 @@ pub fn render_output_report(
         output.image.original_size.height,
         &items,
         timing_summary,
+        mode,
     )
 }
 
@@ -241,8 +283,32 @@ pub(crate) fn escape_attr(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{relative_image_name, render_report};
+    use super::{REPORT_SCRIPT, ReportMode, relative_image_name, render_report};
     use crate::OcrJsonItem;
+
+    /// 两个现有用例共用的样例：一个文本区域 + 一个公式区域（公式用于覆盖 LaTeX 分支）。
+    fn sample_items() -> Vec<OcrJsonItem> {
+        vec![
+            OcrJsonItem {
+                box_: Some([[1.0, 2.0], [30.0, 2.0], [30.0, 18.0], [1.0, 18.0]]),
+                txt: "<hello> & world".into(),
+                score: 0.875,
+                kind: "text",
+                latex: None,
+                eos_index: None,
+                truncated: None,
+            },
+            OcrJsonItem {
+                box_: Some([[1.0, 40.0], [80.0, 40.0], [80.0, 70.0], [1.0, 70.0]]),
+                txt: "a<b & c".into(),
+                score: 0.71,
+                kind: "formula",
+                latex: Some("a<b & c\nd".into()),
+                eos_index: None,
+                truncated: Some(true),
+            },
+        ]
+    }
 
     #[test]
     fn report_contains_original_coordinates_and_escaped_text() {
@@ -261,6 +327,7 @@ mod tests {
                 truncated: None,
             }],
             "total 12.3 ms",
+            ReportMode::Full,
         )
         .expect("report should render");
         assert!(html.contains("points=\"1,2 30,2 30,18 1,18\""));
@@ -299,6 +366,7 @@ mod tests {
                 },
             ],
             "total 12.3 ms",
+            ReportMode::Full,
         )
         .expect("report should render");
 
@@ -316,6 +384,76 @@ mod tests {
             !html.contains("a<b & c"),
             "raw LaTeX must never appear unescaped"
         );
+    }
+
+    /// §9.5 第 1 条：`Static` 正文**不含任何 `<script`**，且样式、多边形、列表、公式全部保留。
+    #[test]
+    fn static_mode_emits_no_script_at_all() {
+        let full = render_report(
+            "静态报告",
+            "data:image/png;base64,AAAA",
+            640,
+            480,
+            &sample_items(),
+            "total 12.3 ms",
+            ReportMode::Full,
+        )
+        .expect("full report");
+        let stat = render_report(
+            "静态报告",
+            "data:image/png;base64,AAAA",
+            640,
+            480,
+            &sample_items(),
+            "total 12.3 ms",
+            ReportMode::Static,
+        )
+        .expect("static report");
+
+        assert!(
+            full.contains("<script"),
+            "the CLI report must stay interactive"
+        );
+        assert!(
+            !stat.to_lowercase().contains("<script"),
+            "the static export must not contain any <script: {stat}"
+        );
+        assert!(!stat.contains("</script"), "{stat}");
+        assert!(!stat.contains("addEventListener"), "{stat}");
+        assert!(!stat.contains("navigator.clipboard"), "{stat}");
+        // 样式内联保留，结构（多边形 / 列表 / 公式 / 标题）一字不少。
+        assert!(stat.contains("<style>"), "{stat}");
+        assert!(stat.contains("points=\"1,2 30,2 30,18 1,18\""), "{stat}");
+        assert!(stat.contains("class=\"result formula-result\""), "{stat}");
+        assert!(stat.contains("class=\"formulas\""), "{stat}");
+        assert!(stat.contains("data:image/png;base64,AAAA"), "{stat}");
+
+        // 更强的等式：两个模式**只**差脚本段——把脚本段从 Full 里去掉就是 Static。
+        assert_eq!(full.replace(REPORT_SCRIPT, ""), stat);
+    }
+
+    /// `Full` 的产物必须与引入 `ReportMode` 之前逐字节相同：脚本段的位置与内容都钉住。
+    #[test]
+    fn full_mode_still_renders_the_exact_cli_script_block() {
+        let html = render_report(
+            "钉住",
+            "source.png",
+            640,
+            480,
+            &sample_items(),
+            "total 1.0 ms",
+            ReportMode::Full,
+        )
+        .expect("full report");
+        assert!(
+            html.contains(REPORT_SCRIPT),
+            "the CLI script block must be intact"
+        );
+        assert!(REPORT_SCRIPT.starts_with("  <script>\n"));
+        assert!(REPORT_SCRIPT.ends_with("  </script>\n"));
+        assert!(html.contains("  </main>\n  <script>\n"), "{html}");
+        assert!(html.ends_with("  </script>\n</body>\n</html>\n"), "{html}");
+        assert_eq!(html.matches("<script").count(), 1, "{html}");
     }
 
     #[test]

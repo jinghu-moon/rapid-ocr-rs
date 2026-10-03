@@ -29,10 +29,14 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 
+use rapid_ocr_rs::ProviderPreference;
+
 use super::admit::{
     self, AdmissionError, BodySource, ChunkOutcome, HttpMethod, RequestDescriptor, RouteDecision,
 };
+use super::cli::ProviderChoice;
 use super::error::ServeError;
+use super::export::ExportFormat;
 use super::run::ServeStartError;
 use super::security::{self, SECURITY_HEADERS};
 use super::server::{Body, READ_CHUNK_BYTES, ServeContext, ServeRuntime, ServeShared};
@@ -48,6 +52,18 @@ const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// `?max_side=` 的允许上界（与库内 `clamp(32.0, 8192.0)` 的量级一致，留出余量）。
 const MAX_SIDE_CEILING: u32 = 32_768;
 
+/// 导出响应的 CSP（§9.5 第 2 条，**独立**于主页面的 nonce CSP）。
+///
+/// 逐字来自 `docs/05` §9.5：
+/// `default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'none'; sandbox`。
+/// 三点含义：导出文档**不允许脚本**（`ReportMode::Static` 的正文里也一个 `<script` 都没有）、
+/// 样式内联允许（报告的全部样式都是内联 `<style>`）、图片只允许 `data:`（导出的标注图就是
+/// 内嵌的 data URL，因此脱离服务仍可查看）。
+///
+/// `style-src 'unsafe-inline'` **只**出现在这条导出响应上；主页面 CSP 仍是 nonce。
+pub(super) const EXPORT_CSP: &str =
+    "default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'none'; sandbox";
+
 /// 主页面 CSP（§9.5 第 3 条；**不含** `unsafe-inline`，nonce 与页面属性逐字节相同）。
 pub(super) fn page_csp(nonce: &str) -> String {
     format!(
@@ -57,7 +73,7 @@ pub(super) fn page_csp(nonce: &str) -> String {
     )
 }
 
-/// 路由表（§4.2 的 M1 子集 + M2 的 `POST /api/engine/reload`）。
+/// 路由表（§4.2 的全部端点；M3 起包含 `annotated.png` 与 `export`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Route {
     Page,
@@ -69,14 +85,22 @@ enum Route {
     Job(String),
     JobResult(String),
     JobCancel(String),
+    /// `GET /api/jobs/{id}/annotated.png`（M3）。
+    JobAnnotated(String),
+    /// `GET /api/jobs/{id}/export?format=…`（M3）。
+    JobExport(String),
 }
 
 impl Route {
     fn method(&self) -> HttpMethod {
         match self {
-            Self::Page | Self::Status | Self::Models | Self::Job(_) | Self::JobResult(_) => {
-                HttpMethod::Get
-            }
+            Self::Page
+            | Self::Status
+            | Self::Models
+            | Self::Job(_)
+            | Self::JobResult(_)
+            | Self::JobAnnotated(_)
+            | Self::JobExport(_) => HttpMethod::Get,
             Self::ModelsDownload | Self::EngineReload | Self::Ocr | Self::JobCancel(_) => {
                 HttpMethod::Post
             }
@@ -289,11 +313,32 @@ fn handle(shared: &Arc<ServeShared>, mut request: Request) {
     };
 
     let outcome = dispatch(shared, &mut request, &route, query, &descriptor, admitted);
-    let (body, headers) = match outcome {
-        Ok(result) => result,
-        Err(error) => (error_body(shared, &route, &error), Vec::new()),
-    };
-    let _ = respond(request, body, &headers);
+    match outcome {
+        Ok(Dispatch::Respond(body, headers)) => {
+            let _ = respond(request, body, &headers);
+        }
+        // 响应由另一个线程写（M3 的 provider 切换）：本线程立刻回到 accept 循环，
+        // 否则 `/api/status` 与 `/api/ocr` 会在整个切换序列期间停摆。
+        Ok(Dispatch::SwitchProvider(provider)) => {
+            if let Err(failure) = spawn_provider_switch(shared, provider, request) {
+                // 请求没人接手（已有切换在跑 / 线程起不来）：由本线程如实回答。
+                let (error, request) = *failure;
+                let _ = respond(request, Body::error(&error), &[]);
+            }
+        }
+        Err(error) => {
+            let body = error_body(shared, &route, &error);
+            let _ = respond(request, body, &[]);
+        }
+    }
+}
+
+/// 端点分发的结论（见 [`dispatch`]）。
+enum Dispatch {
+    /// 本线程写响应。
+    Respond(Body, Vec<(String, String)>),
+    /// 交给 [`spawn_provider_switch`]：它拥有请求对象（含写响应的责任）。
+    SwitchProvider(ProviderPreference),
 }
 
 /// 端点分发（准入已通过，这里才允许读 body）。
@@ -304,17 +349,23 @@ fn dispatch(
     query: &str,
     descriptor: &RequestDescriptor<'_>,
     admitted: admit::Admit,
-) -> Result<(Body, Vec<(String, String)>), ServeError> {
+) -> Result<Dispatch, ServeError> {
     match route {
-        Route::Page => Ok((
+        Route::Page => Ok(Dispatch::Respond(
             Body::html(shared.page().as_bytes().to_vec()),
             vec![(
                 "Content-Security-Policy".to_string(),
                 page_csp(shared.nonce()),
             )],
         )),
-        Route::Status => Ok((json_body(200, shared.status_json())?, Vec::new())),
-        Route::Models => Ok((json_body(200, shared.models_json())?, Vec::new())),
+        Route::Status => Ok(Dispatch::Respond(
+            json_body(200, shared.status_json())?,
+            Vec::new(),
+        )),
+        Route::Models => Ok(Dispatch::Respond(
+            json_body(200, shared.models_json())?,
+            Vec::new(),
+        )),
         Route::Ocr => {
             descriptor.check_content_type()?;
             let bytes = read_body(request, admitted)?;
@@ -322,22 +373,112 @@ fn dispatch(
             let class = shared.routing().class_for(query_param(query, "queue"))?;
             let value = shared.submit_ocr(bytes, class, max_side)?;
             // §4.2：任务提交返回 **202**（异步任务，不存在"同步返回结果"的第二套语义）。
-            Ok((json_body(202, value)?, Vec::new()))
+            Ok(Dispatch::Respond(json_body(202, value)?, Vec::new()))
         }
         Route::ModelsDownload => {
             check_json_content_type(descriptor.content_type)?;
             let bytes = read_body(request, admitted)?;
             let set_id = parse_set_id(&bytes)?;
             let value = shared.submit_download(&set_id)?;
-            Ok((json_body(202, value)?, Vec::new()))
+            Ok(Dispatch::Respond(json_body(202, value)?, Vec::new()))
         }
         Route::EngineReload => {
-            // 显式创建/重建引擎（§4.2、§7.6）。没有请求体，也不读 body。
-            Ok((json_body(200, shared.reload_engine())?, Vec::new()))
+            // 显式创建/重建引擎（§4.2、§7.6）：无 body = M2 的"按当前文件重建"；
+            // 带 `{"provider": …}` = M3 的显式 provider 设置应用（含 Rebuilding 序列）。
+            let provider = parse_provider_body(read_body(request, admitted)?)?;
+            let Some(provider) = provider else {
+                return Ok(Dispatch::Respond(
+                    json_body(200, shared.reload_engine(None)?)?,
+                    Vec::new(),
+                ));
+            };
+            // **委派**：切换序列要排空在跑的推理、再建两次会话，在 accept 线程上执行
+            // 会让整个服务（包括 `/api/status` 与 `POST /api/ocr`）在它结束前停摆，
+            // 而那两件事正是"`Rebuilding` 可见""新请求入队而不是被拒绝"的证据来源。
+            // 请求对象由 `handle` 交给那个线程（这里只做"要不要委派"的判定）。
+            Ok(Dispatch::SwitchProvider(provider))
         }
-        Route::Job(id) => Ok((json_body(200, shared.job_view(id)?)?, Vec::new())),
-        Route::JobResult(id) => Ok((shared.job_result(id)?, Vec::new())),
-        Route::JobCancel(id) => Ok((json_body(200, shared.cancel_job(id)?)?, Vec::new())),
+        Route::Job(id) => Ok(Dispatch::Respond(
+            json_body(200, shared.job_view(id)?)?,
+            Vec::new(),
+        )),
+        Route::JobResult(id) => Ok(Dispatch::Respond(shared.job_result(id)?, Vec::new())),
+        Route::JobCancel(id) => Ok(Dispatch::Respond(
+            json_body(200, shared.cancel_job(id)?)?,
+            Vec::new(),
+        )),
+        Route::JobAnnotated(id) => Ok(Dispatch::Respond(shared.annotated_png(id)?, Vec::new())),
+        Route::JobExport(id) => {
+            let Some(format) = export_format(query_param(query, "format")) else {
+                // 未知/缺失的 `format` 是协议级错误（§9.5 只定义了三个取值）。
+                return Err(ServeError::BadRequest);
+            };
+            let body = shared.export(id, format)?;
+            // §9.5 第 2 条：导出以**附件**形式返回，并带**独立的导出 CSP**。
+            // CSP 只加在 HTML 上：另外两种格式不是可渲染的文档，给它们加 CSP 没有意义。
+            let mut headers = vec![(
+                "Content-Disposition".to_string(),
+                content_disposition(id, format.extension()),
+            )];
+            if format == ExportFormat::Html {
+                headers.push((
+                    "Content-Security-Policy".to_string(),
+                    EXPORT_CSP.to_string(),
+                ));
+            }
+            Ok(Dispatch::Respond(body, headers))
+        }
+    }
+}
+
+/// 在独立线程里执行 provider 切换，并由那个线程写响应（§7.5、§7.6、M3）。
+///
+/// - 同一时刻只允许一个切换（[`ServeShared::begin_provider_switch`]）：第二个请求立刻得到
+///   503 `busy`，不排队；
+/// - 线程创建失败 / 已有切换在跑 → 把请求连同错误原样还给调用方
+///   （`Err(Box::new((error, request)))`，装箱只为不让 `Result` 的 `Err` 变体过大），
+///   由它写出对应的错误响应，绝不留下"没有响应的连接"；
+/// - 客户端仍然**只在序列结束（或失败）之后**才拿到响应，因此"显式设置应用"的语义不变。
+fn spawn_provider_switch(
+    shared: &Arc<ServeShared>,
+    provider: ProviderPreference,
+    request: Request,
+) -> Result<(), Box<(ServeError, Request)>> {
+    let Some(guard) = shared.begin_provider_switch() else {
+        return Err(Box::new((ServeError::Busy, request)));
+    };
+    let shared = Arc::clone(shared);
+    // 请求对象经一条容量 1 的 channel 交给新线程：**不**把它 move 进闭包，
+    // 因此线程创建失败时它还在这里，可以由调用方写出错误响应。
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Request>(1);
+    let spawned = thread::Builder::new()
+        .name("serve-provider-switch".to_string())
+        .spawn(move || {
+            // 资格在线程退出时释放（含 panic）。
+            let _guard = guard;
+            let Ok(request) = rx.recv() else {
+                return;
+            };
+            let started = Instant::now();
+            let body = match shared.apply_provider_request(provider, started) {
+                Ok(value) => match serde_json::to_vec(&value) {
+                    Ok(bytes) => Body::json(200, bytes),
+                    Err(_) => Body::error(&ServeError::Internal),
+                },
+                Err(error) => Body::error(&error),
+            };
+            let _ = respond(request, body, &[]);
+        });
+    match spawned {
+        Ok(_) => {
+            // 容量 1 且接收端已经在 `recv`，因此这次发送不会阻塞。
+            let _ = tx.send(request);
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("serve: cannot start the provider-switch thread: {error}");
+            Err(Box::new((ServeError::Internal, request)))
+        }
     }
 }
 
@@ -480,6 +621,54 @@ fn check_json_content_type(content_type: Option<&str>) -> Result<(), ServeError>
     Err(ServeError::BadRequest)
 }
 
+/// `POST /api/engine/reload` 的可选请求体（§4.2、§7.5）。
+///
+/// - **空 body**（M1/M2 的形状）：`None` → "按磁盘上的当前文件重建会话"；
+/// - `{"provider":"cpu|directml|cuda"}`：显式设置应用。
+///
+/// 与 `parse_set_id` 同一种白名单式校验：对象里**恰好**一个 `provider` 键，任何额外键
+/// （包括 `allow_provider_fallback`——它是 CLI 开关，不允许从 API 改）都会被拒绝，
+/// 而不是被忽略。
+fn parse_provider_body(bytes: Vec<u8>) -> Result<Option<ProviderPreference>, ServeError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| ServeError::BadRequest)?;
+    let object = value.as_object().ok_or(ServeError::BadRequest)?;
+    if object.len() != 1 {
+        return Err(ServeError::BadRequest);
+    }
+    let raw = object
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .ok_or(ServeError::BadRequest)?;
+    // 与 CLI 的 `--provider` 复用**同一个**映射（含单设备场景的 `device_id = 0`），
+    // 不在这里另写一套取值。
+    let provider = match raw.to_ascii_lowercase().as_str() {
+        "cpu" => ProviderChoice::Cpu,
+        "directml" => ProviderChoice::Directml,
+        "cuda" => ProviderChoice::Cuda,
+        _ => return Err(ServeError::BadRequest),
+    };
+    Ok(Some(provider.preference()))
+}
+
+/// `?format=` 的三个取值（§9.5）。
+fn export_format(raw: Option<&str>) -> Option<ExportFormat> {
+    match raw? {
+        "json" => Some(ExportFormat::Json),
+        "md" => Some(ExportFormat::Markdown),
+        "html" => Some(ExportFormat::Html),
+        _ => None,
+    }
+}
+
+/// 写出 `Content-Disposition: attachment; filename="…"`（§9.5）。
+fn content_disposition(job_id: &str, extension: &str) -> String {
+    format!("attachment; filename=\"ocr-{job_id}.{extension}\"")
+}
+
 /// 路由表：路径 → 路由；方法不匹配 → `MethodNotAllowed`。
 fn route_of(method: HttpMethod, path: &str) -> (RouteDecision, Option<Route>) {
     let candidate = match path {
@@ -507,7 +696,8 @@ fn route_of(method: HttpMethod, path: &str) -> (RouteDecision, Option<Route>) {
     }
 }
 
-/// `/api/jobs/{id}`、`/api/jobs/{id}/result`、`/api/jobs/{id}/cancel`。
+/// `/api/jobs/{id}`、`/api/jobs/{id}/result`、`/api/jobs/{id}/cancel`、
+/// `/api/jobs/{id}/annotated.png`、`/api/jobs/{id}/export`。
 fn job_route(path: &str) -> Option<Route> {
     let rest = path.strip_prefix("/api/jobs/")?;
     let mut parts = rest.split('/');
@@ -519,6 +709,8 @@ fn job_route(path: &str) -> Option<Route> {
         (None, None) => Some(Route::Job(id.to_string())),
         (Some("result"), None) => Some(Route::JobResult(id.to_string())),
         (Some("cancel"), None) => Some(Route::JobCancel(id.to_string())),
+        (Some("annotated.png"), None) => Some(Route::JobAnnotated(id.to_string())),
+        (Some("export"), None) => Some(Route::JobExport(id.to_string())),
         _ => None,
     }
 }
@@ -573,13 +765,16 @@ fn header_of(name: &str, value: &str) -> Header {
 #[cfg(test)]
 mod tests {
     use super::{
-        HttpMethod, Route, RouteDecision, check_json_content_type, page_csp, parse_max_side,
-        parse_set_id, query_param, route_of, split_url,
+        EXPORT_CSP, HttpMethod, Route, RouteDecision, check_json_content_type, content_disposition,
+        export_format, page_csp, parse_max_side, parse_provider_body, parse_set_id, query_param,
+        route_of, split_url,
     };
     use crate::serve::error::ServeError;
+    use crate::serve::export::ExportFormat;
+    use rapid_ocr_rs::ProviderPreference;
 
     #[test]
-    fn the_router_matches_the_m1_subset_and_nothing_else() {
+    fn the_router_matches_the_documented_endpoint_set_and_nothing_else() {
         let cases = [
             (HttpMethod::Get, "/", Route::Page),
             (HttpMethod::Get, "/api/status", Route::Status),
@@ -606,6 +801,17 @@ mod tests {
                 "/api/jobs/job-1/cancel",
                 Route::JobCancel("job-1".into()),
             ),
+            // M3 的两个端点现在是真实路由（不再是 404）。
+            (
+                HttpMethod::Get,
+                "/api/jobs/job-1/annotated.png",
+                Route::JobAnnotated("job-1".into()),
+            ),
+            (
+                HttpMethod::Get,
+                "/api/jobs/job-1/export",
+                Route::JobExport("job-1".into()),
+            ),
         ];
         for (method, path, expected) in cases {
             let (decision, route) = route_of(method, path);
@@ -613,11 +819,12 @@ mod tests {
             assert_eq!(route.as_ref(), Some(&expected), "{path}");
         }
 
-        // M3/M4 的端点**不存在**：必须 404，而不是"看起来能用"。
+        // 不存在的路径仍然 404（`?format=` 属于查询串，路由只看路径）。
         for path in [
-            "/api/jobs/job-1/annotated.png",
-            "/api/jobs/job-1/export",
             "/api/models/download/cancel",
+            "/api/jobs/job-1/annotated",
+            "/api/jobs/job-1/annotated.png/extra",
+            "/api/jobs/bogus/export/data",
             "/favicon.ico",
             "/api",
             "/api/jobs/",
@@ -634,6 +841,11 @@ mod tests {
         let (decision, route) = route_of(HttpMethod::Post, "/api/status");
         assert_eq!(decision, RouteDecision::MethodNotAllowed);
         assert_eq!(route.expect("known path").allow(), "GET");
+        for path in ["/api/jobs/job-1/annotated.png", "/api/jobs/job-1/export"] {
+            let (decision, route) = route_of(HttpMethod::Post, path);
+            assert_eq!(decision, RouteDecision::MethodNotAllowed, "{path}");
+            assert_eq!(route.expect("known path").allow(), "GET");
+        }
 
         // HEAD 只对 GET 路由放行。
         assert_eq!(route_of(HttpMethod::Head, "/").0, RouteDecision::Matched);
@@ -641,6 +853,82 @@ mod tests {
             route_of(HttpMethod::Head, "/api/ocr").0,
             RouteDecision::MethodNotAllowed
         );
+    }
+
+    /// 只有 §9.5 的三个格式被接受；缺失或未知取值都是 400（不是"猜一个默认值"）。
+    #[test]
+    fn only_the_three_documented_export_formats_are_accepted() {
+        assert_eq!(export_format(Some("json")), Some(ExportFormat::Json));
+        assert_eq!(export_format(Some("md")), Some(ExportFormat::Markdown));
+        assert_eq!(export_format(Some("html")), Some(ExportFormat::Html));
+        for bad in [None, Some(""), Some("JSON"), Some("pdf"), Some("mdx")] {
+            assert_eq!(export_format(bad), None, "{bad:?}");
+        }
+        assert_eq!(ExportFormat::Json.extension(), "json");
+        assert_eq!(ExportFormat::Markdown.extension(), "md");
+        assert_eq!(ExportFormat::Html.extension(), "html");
+        assert_eq!(
+            ExportFormat::Html.content_type(),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            content_disposition("job-1", ExportFormat::Html.extension()),
+            "attachment; filename=\"ocr-job-1.html\""
+        );
+    }
+
+    /// `POST /api/engine/reload` 的可选请求体：空 body = M2 的重建，带 provider = M3 的设置应用。
+    #[test]
+    fn the_reload_body_carries_at_most_a_provider() {
+        assert_eq!(parse_provider_body(Vec::new()).expect("no body"), None);
+        assert_eq!(
+            parse_provider_body(br#"{"provider":"cpu"}"#.to_vec()).expect("cpu"),
+            Some(ProviderPreference::Cpu)
+        );
+        assert_eq!(
+            parse_provider_body(br#"{"provider":" directml "}"#.to_vec()).expect("directml"),
+            Some(ProviderPreference::DirectMl { device_id: 0 })
+        );
+        assert_eq!(
+            parse_provider_body(br#"{"provider":"CUDA"}"#.to_vec()).expect("cuda"),
+            Some(ProviderPreference::Cuda { device_id: 0 })
+        );
+        for bad in [
+            &br#"{"provider":"tpu"}"#[..],
+            &br#"{"provider":null}"#[..],
+            &br#"{"provider":""}"#[..],
+            &br#"{"provider":"cpu","allow_provider_fallback":true}"#[..],
+            &br#"{"other":"cpu"}"#[..],
+            &br#"{}"#[..],
+            &br#"[]"#[..],
+            &br#"not json"#[..],
+        ] {
+            assert!(
+                matches!(
+                    parse_provider_body(bad.to_vec()),
+                    Err(ServeError::BadRequest)
+                ),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    /// §9.5 第 2 条：导出 CSP 逐字冻结，且与主页面 CSP 是两条不同的策略。
+    #[test]
+    fn the_export_csp_is_the_documented_one_and_differs_from_the_page_csp() {
+        assert_eq!(
+            EXPORT_CSP,
+            "default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'none'; \
+             sandbox"
+        );
+        assert!(EXPORT_CSP.contains("script-src 'none'"), "{EXPORT_CSP}");
+        assert!(EXPORT_CSP.contains("img-src data:"), "{EXPORT_CSP}");
+        assert!(!EXPORT_CSP.contains("nonce"), "{EXPORT_CSP}");
+        // 主页面仍然不允许内联样式；`unsafe-inline` 只出现在导出这一条响应上。
+        let page = page_csp("abc");
+        assert!(!page.contains("unsafe-inline"), "{page}");
+        assert_ne!(page, EXPORT_CSP);
     }
 
     #[test]

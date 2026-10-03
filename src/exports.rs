@@ -22,6 +22,10 @@ pub use crate::config::{
     RuntimeConfig,
 };
 pub use crate::error::{RapidOcrError, Result};
+// 输入层：`ImageInput::Encoded` 在管线内部走的就是这两个类型。导出它们是为了让
+// `rapidocr serve` 的 `/annotated.png` 能**复用同一个**解码实现（编码字节上限、header
+// 像素探测、EXIF 方向、解码错误语义只有一份），而不是在 serve 里另写一套图片解码
+// （docs/05 §4.5：原图只保留编码字节，注释图按需重新解码）。
 pub use crate::formula::contract::{
     FORMULA_INPUT_CHANNELS, FORMULA_INPUT_RANK, FORMULA_INPUT_SPATIAL, FORMULA_OUTPUT_RANK,
     FormulaContract, validate_formula_contract,
@@ -49,6 +53,7 @@ pub use crate::formula::tokenizer_metadata::{
     BOS_ID, BOS_TOKEN, EOS_ID, EOS_TOKEN, FormulaTokenizerMetadata, PAD_ID, PAD_TOKEN, UNK_ID,
     UNK_TOKEN,
 };
+pub use crate::input::image_loader::{LoadImage, OcrInput};
 pub use crate::model_registry::DefaultModelSelection;
 pub use crate::model_set::{
     ModelFileSpec, ModelFileState, ModelRole, ModelSet, ModelSetStatus, model_set_status,
@@ -73,7 +78,9 @@ pub use crate::ocr::pipeline::{
     rapid_ocr::{PipelineProviderResolutions, RapidOcr, RapidOcrEngine},
 };
 pub use crate::ocr::types::{LineResult, RecognizeOutput, WordBox, WordInfo, WordType};
-pub use crate::output::html::{relative_image_name, render_output_report, render_report};
+pub use crate::output::html::{
+    ReportMode, relative_image_name, render_output_report, render_report,
+};
 pub use crate::output::json::{OcrJsonItem, to_output_items, to_output_json};
 pub use crate::output::markdown::to_output_markdown;
 pub use crate::output::visualize::draw_output;

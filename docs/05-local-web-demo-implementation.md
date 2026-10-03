@@ -155,7 +155,7 @@ OCR（尤其公式路径）单图可达数秒至数十秒，**不得长期占用
 | `GET` | `/api/jobs/{id}/annotated.png` | 叠加检测框 PNG（原图淘汰 → 410 `original_evicted`） |
 | `GET` | `/api/jobs/{id}/export?format=json\|md\|html` | 导出（HTML 走静态模式 + 独立 CSP，§9.5） |
 | `POST` | `/api/jobs/{id}/cancel` | 取消（§4.3） |
-| `POST` | `/api/engine/reload` | 显式创建/重建引擎（无请求体；响应 `{outcome, engine, missing, corrupt, source, model_dir, load_ms}`，§7.6） |
+| `POST` | `/api/engine/reload` | 显式创建/重建引擎。请求体**可省略**：省略 = "按磁盘上的当前文件重建会话"；带 `{"provider":"cpu\|directml\|cuda"}` = **显式应用 provider 设置**（§7.6 的 `Rebuilding` 序列，运行期切换，M3）。响应 `{outcome, engine, provider, requested, selected_ep, fallback_to_cpu, missing, corrupt, source, model_dir, load_ms, rollback_ms, error}`（§7.6） |
 
 ### 4.3 状态机与取消语义
 
@@ -205,6 +205,7 @@ queued ──► running ──► succeeded
 | **tombstone** | 256 个 / 同 TTL | 淘汰时把 `job_id → evicted_at` 写入有界 FIFO tombstone 表；**这是 410 能成立的前提** |
 | 查询语义 | — | 活跃 → 正常；**在 tombstone 内 → 410 `job_evicted`**；两者都无 → 404 `job_not_found` |
 | 原图保留 | 仅编码字节，计入字节预算 | `annotated.png` **按需**从编码字节重新解码，**不长期保留 `RecImage`** |
+| 原图释放顺序 | 字节超限时**先释放最旧终态任务的原图**（任务记录与结果都保留 → 该端点是 410 `original_evicted`），全部释放完仍超限才淘汰整个终态任务 | M3 澄清：§4.2 冻结的 `original_evicted` 只有在"任务还在、原图已被预算收回"时才可达；若字节压力总是整任务淘汰，那个 `code` 永远不可达（M0c 的整任务淘汰因此是**第二步**，不是唯一一步）。另：失败/取消的任务**永不**会有注释图，它们的原图在进入终态时立即释放 |
 | 淘汰后访问 | — | 404 与 410 必须可区分，且有测试覆盖 tombstone 的容量与 TTL 淘汰 |
 
 ### 4.6 结果序列化上限
@@ -455,6 +456,27 @@ pub enum EngineState {
 - 模型下载完成（M2）后**不自动**重建引擎；在下一次 `POST /api/ocr` 或显式 `POST /api/engine/reload` 时创建（避免后台突然占用数百 MB）；
 - `POST /api/engine/reload`：`Ready → Loading → Ready|Failed`；`Loading` 期间新 OCR 请求排队（不拒绝）；`Failed` 时 OCR 返回 **503 `engine_unavailable`** 并附 `reason`；
 - 引擎 `Failed` 必须让 `/api/status` 明确显示原因，**不得**退化成模型不可用这种模糊状态。
+
+**M3 的运行期 provider 切换（显式设置应用，不是即时下拉）**：
+
+请求 = `POST /api/engine/reload` + `{"provider": "cpu|directml|cuda"}`；**请求只在序列结束或失败后才返回**，
+而在它执行期间服务必须继续可观测、可提交任务，因此完整顺序是：
+
+1. **先校验**（与启动期**同一套**规则：provider 名称、对应 feature 是否编译进来、§7.5 的回退语义）：
+   非法 → **400 `bad_request`**（`detail.reason` 是库侧原文），**任何状态都不动**；
+2. **暂停新任务**：`Ready → Rebuilding`（§7.6 的合法边）。此刻 `POST /api/ocr` 是
+   `OcrAdmission::Queue`——**入队（202）而不是拒绝**（状态机里那条规则就是为它冻结的）；
+   与此同时 `/api/status` 报告**新**的 `requested`，而 `selected_ep`/`fallback_to_cpu` 是 `null`
+   （未知态不得伪装成 `false`，§7.5）；
+3. **排空**：拿到"引擎会话"那把锁即"正在进行的那次推理已经结束"；在跑的推理**不**被中断（§4.3）；
+4. **销毁旧 engine → 创建新 engine**（顺序固定，避免失败时留下一个与 `/api/status` 不一致的可用引擎）；
+5. `Rebuilding → Ready`（成功）或 `Rebuilding → Failed`（失败）；
+6. **失败恢复旧 engine**（用旧配置重建会话）：成功 → 配置回到旧值、`outcome = "rolled_back"` 并带 `error`；
+   连旧引擎也起不来 → 明确 `Failed`，`reason` 里**两个原因都写**。
+
+执行方式：该序列在**独立线程**里跑、由那个线程写响应（accept 线程立刻回到循环），否则整个服务
+（包括 `/api/status` 与 `/api/ocr`）会在它结束前停摆，而"`Rebuilding` 可见""新任务入队"这两条本身就
+无法被观测。同时只允许一个切换在跑：第二个请求得到 **503 `busy`**（不排队）。
 
 ---
 

@@ -19,6 +19,7 @@
 //! | `PayloadTooLarge` | 413 | `payload_too_large` | §4.4 |
 //! | `ResultTooLarge` | 413 | `result_too_large` | §4.6 |
 //! | `ExportTooLarge` | 413 | `export_too_large` | §9.5 |
+//! | `OriginalEvicted` | 410 | `original_evicted` | §4.2（M3 新增，见下） |
 //! | `RequestTimeout` | 408 | `request_timeout` | §4.4 第 6 步（读取超时） |
 //! | `BadHost` | 421 | `bad_host` | §7.2 |
 //! | `JobNotFound` | 404 | `job_not_found` | §4.5 |
@@ -36,7 +37,7 @@
 //! | `Ocr(..)` | 见 [`classify_ocr_error`] | 见 [`classify_ocr_error`] | §11.1 |
 //! | `Internal` | 500 | `internal` | §11.1 |
 //!
-//! # 与 §11.1 变体清单的三处偏离（都是文档别处明确要求的行为）
+//! # 与 §11.1 变体清单的偏离（都是文档别处明确要求的行为）
 //!
 //! - [`ServeError::ExportTooLarge`]：§9.5 要求导出超过 `--max-export-mb` 时返回
 //!   **413 `export_too_large`**，而 §11.1 的枚举清单里没有任何变体能产生这个 `code`
@@ -46,6 +47,14 @@
 //! - [`ServeError::ModelSetNotFound`]（M2）：§4.2 的下载请求体里**只有** `set_id`，
 //!   而"未知集合"必须可定位（**绝不**回落到 `sets[0]`）。它与"请求体不合法"的 400 是
 //!   两件不同的事，因此不复用 `bad_request`；`detail` 给出请求的 id 与已知集合。
+//! - [`ServeError::OriginalEvicted`]（M3）：§4.2 给 `/api/jobs/{id}/annotated.png` 冻结了
+//!   **410 `original_evicted`**（"原图淘汰"）。它**不是** `job_evicted` 的同义词：
+//!   任务记录与结果都还在、只有原图编码字节被保留预算释放掉时才是这个结论
+//!   （见 `jobs.rs::JobStore::release_originals` 与 `server.rs` 的 `originals`）。
+//! - [`ServeError::ProviderRejected`]（M3）：运行期 `POST /api/engine/reload` 携带的 provider
+//!   无法生效（名称非法或对应 feature 未编译进来）。`code` 复用 §11.1 已有的
+//!   `bad_request`（400），但 `detail.reason` 必须保留**库侧原文**（§7.5 第 3 条要求启动期
+//!   与运行期给出同一句可定位措辞，见 `state.rs::ServeConfigPlan::validate`）。
 //!
 //! 其余变体与 §11.1 逐项一致。`engine_unavailable` 的 `reason` 字段来自 §7.6。
 //!
@@ -215,11 +224,9 @@ impl DownloadErrorMapping for DownloadError {
 ///
 /// # 协议变体与生产者
 ///
-/// [`Self::ExportTooLarge`]（§9.5 的 `--max-export-mb`）目前没有构造点：它的状态码与 `code`
-/// 由 §9.5 冻结，生产者在 M3 落地。删除它会让 §11.1 的契约失去覆盖
-/// （`every_variant_has_the_documented_status_and_code` 逐项断言了这张表），因此用
-/// **逐变体**的 `allow` 标明"协议项、生产者未到"——这与 M0c 那条覆盖整个子树的
-/// `#![allow(dead_code)]` 不是一回事。
+/// [`Self::ExportTooLarge`]、[`Self::OriginalEvicted`] 与 [`Self::ProviderRejected`] 的状态码与
+/// `code` 由 §9.5 / §4.2 / §7.5 冻结，生产者在 **M3**（`server.rs` 的导出、注释图与
+/// provider 切换）；它们现在都有真实构造点。
 ///
 /// [`Self::ModelsMissing`] 与 [`Self::ModelsCorrupt`] 的关系：两者都由
 /// `/api/models` 的同一份状态决定（有损坏文件就是 `models_corrupt`）。
@@ -228,9 +235,16 @@ pub enum ServeError {
     BadRequest,
     PayloadTooLarge,
     ResultTooLarge,
-    /// §9.5：导出文档（含内嵌图片）超过 `--max-export-mb`。**生产者：M3。**
-    #[allow(dead_code)]
-    ExportTooLarge,
+    /// §9.5：导出文档（含内嵌图片）超过 `--max-export-mb`。
+    ///
+    /// 带三个字段的原因：§9.5 要求"超限 → 413 `export_too_large`，错误信息**指向可直接
+    /// 下载的 `annotated.png`**（不得返回一个图片链接失效的 HTML）"。两个数值让用户知道
+    /// 差多少，`annotated` 给出那条仍然可用的路径（它不受导出预算约束）。
+    ExportTooLarge {
+        limit_bytes: u64,
+        observed_bytes: u64,
+        annotated: String,
+    },
     BadHost,
     BadOrigin,
     Unauthorized,
@@ -239,11 +253,23 @@ pub enum ServeError {
     Busy,
     JobNotFound,
     JobEvicted,
+    /// §4.2：`/annotated.png` 需要的那份**原图编码字节**已经被保留预算释放。
+    ///
+    /// 与 [`Self::JobEvicted`] 的区别是任务与结果都还在（`/result` 仍可读）。
+    OriginalEvicted,
     JobNotFinished,
     NotCancellable,
     ModelsMissing,
     ModelsCorrupt,
     DownloadsDisabled,
+    /// §7.5：`POST /api/engine/reload` 请求的 provider 无法生效。
+    ///
+    /// `reason` 是库侧 `resolve_execution_providers` 的**原文**（"…is not compiled in;
+    /// rebuild with `--features directml-provider`"），启动期与运行期因此措辞一致。
+    ProviderRejected {
+        provider: String,
+        reason: String,
+    },
     /// §6.5：下载前的**任务级**磁盘空间预检。**生产者：M2**（`submit_download`）。
     ///
     /// 它带两个数值（需求与可用），因为"空间不足"这条错误的价值全在这两个数上；
@@ -410,12 +436,13 @@ impl ServeError {
             | Self::NotCancellable
             | Self::ModelsMissing
             | Self::ModelsCorrupt => 409,
-            Self::JobEvicted => 410,
-            Self::PayloadTooLarge | Self::ResultTooLarge | Self::ExportTooLarge => 413,
+            Self::JobEvicted | Self::OriginalEvicted => 410,
+            Self::PayloadTooLarge | Self::ResultTooLarge | Self::ExportTooLarge { .. } => 413,
             Self::BadHost => 421,
             Self::UnsupportedInput => 422,
             Self::Busy | Self::EngineUnavailable { .. } => 503,
             Self::InsufficientDiskSpace { .. } => 507,
+            Self::ProviderRejected { .. } => 400,
             Self::Download(error) => error.status_code(),
             Self::Ocr(error) => classify_ocr_error(error).status,
             Self::Internal => 500,
@@ -434,17 +461,19 @@ impl ServeError {
             Self::ModelSetNotFound { .. } => "model_set_not_found",
             Self::JobNotFinished => "job_not_finished",
             Self::JobEvicted => "job_evicted",
+            Self::OriginalEvicted => "original_evicted",
             Self::NotCancellable => "not_cancellable",
             Self::ModelsMissing => "models_missing",
             Self::ModelsCorrupt => "models_corrupt",
             Self::PayloadTooLarge => "payload_too_large",
             Self::ResultTooLarge => "result_too_large",
-            Self::ExportTooLarge => "export_too_large",
+            Self::ExportTooLarge { .. } => "export_too_large",
             Self::BadHost => "bad_host",
             Self::UnsupportedInput => "unsupported_input",
             Self::Busy => "busy",
             Self::EngineUnavailable { .. } => "engine_unavailable",
             Self::InsufficientDiskSpace { .. } => "insufficient_disk_space",
+            Self::ProviderRejected { .. } => "bad_request",
             Self::Download(error) => error.code(),
             Self::Ocr(error) => classify_ocr_error(error).code,
             Self::Internal => "internal",
@@ -470,6 +499,12 @@ impl ServeError {
             Self::JobNotFound => "no such job".to_string(),
             Self::JobNotFinished => "the job has not finished yet".to_string(),
             Self::JobEvicted => "the job result has been evicted".to_string(),
+            Self::OriginalEvicted => {
+                "the retained copy of the original image has been released; the annotated image \
+                 can no longer be regenerated for this job (the result itself is still \
+                 available), upload the image again to annotate it"
+                    .to_string()
+            }
             Self::NotCancellable => {
                 "the job cannot be cancelled; only a job still queued can be cancelled".to_string()
             }
@@ -479,8 +514,17 @@ impl ServeError {
             Self::ResultTooLarge => {
                 "the serialized result exceeds the configured limit".to_string()
             }
-            Self::ExportTooLarge => {
-                "the exported document exceeds the configured limit".to_string()
+            Self::ExportTooLarge {
+                limit_bytes,
+                observed_bytes,
+                annotated,
+            } => format!(
+                "the exported document would be {observed_bytes} bytes, over the \
+                 --max-export-mb limit of {limit_bytes} bytes; download the annotated PNG from \
+                 {annotated} instead (it is not subject to the export budget)"
+            ),
+            Self::ProviderRejected { provider, reason } => {
+                format!("the requested provider `{provider}` cannot be used: {reason}")
             }
             Self::BadHost => {
                 "the Host header does not belong to this server (possible DNS rebinding)"
@@ -530,6 +574,21 @@ impl ServeError {
             Self::ModelSetNotFound { set_id, known } => serde_json::json!({
                 "set_id": set_id,
                 "known_sets": known,
+            }),
+            // §9.5：超限的导出必须**指向**仍然可用的 `annotated.png`（它就是那份图，
+            // 只是不内嵌进文档），否则用户拿到的是一条死路。
+            Self::ExportTooLarge {
+                limit_bytes,
+                observed_bytes,
+                annotated,
+            } => serde_json::json!({
+                "limit_bytes": limit_bytes,
+                "observed_bytes": observed_bytes,
+                "annotated": annotated,
+            }),
+            Self::ProviderRejected { provider, reason } => serde_json::json!({
+                "provider": provider,
+                "reason": reason,
             }),
             Self::Download(error) => error.detail(),
             Self::Ocr(error) => {
@@ -625,7 +684,7 @@ mod tests {
     /// 每个变体的 (状态码, code) 都被逐项锁住。
     #[test]
     fn every_variant_has_the_documented_status_and_code() {
-        let cases: [(ServeError, u16, &str); 20] = [
+        let cases: [(ServeError, u16, &str); 22] = [
             (ServeError::BadRequest, 400, "bad_request"),
             (ServeError::Unauthorized, 401, "unauthorized"),
             (ServeError::BadOrigin, 403, "bad_origin"),
@@ -642,12 +701,29 @@ mod tests {
             ),
             (ServeError::JobNotFinished, 409, "job_not_finished"),
             (ServeError::JobEvicted, 410, "job_evicted"),
+            (ServeError::OriginalEvicted, 410, "original_evicted"),
             (ServeError::NotCancellable, 409, "not_cancellable"),
             (ServeError::ModelsMissing, 409, "models_missing"),
             (ServeError::ModelsCorrupt, 409, "models_corrupt"),
             (ServeError::PayloadTooLarge, 413, "payload_too_large"),
             (ServeError::ResultTooLarge, 413, "result_too_large"),
-            (ServeError::ExportTooLarge, 413, "export_too_large"),
+            (
+                ServeError::ExportTooLarge {
+                    limit_bytes: 1024,
+                    observed_bytes: 4096,
+                    annotated: "/api/jobs/job-0/annotated.png".to_string(),
+                },
+                413,
+                "export_too_large",
+            ),
+            (
+                ServeError::ProviderRejected {
+                    provider: "directml".to_string(),
+                    reason: "not compiled in".to_string(),
+                },
+                400,
+                "bad_request",
+            ),
             (ServeError::BadHost, 421, "bad_host"),
             (ServeError::UnsupportedInput, 422, "unsupported_input"),
             (ServeError::Busy, 503, "busy"),
@@ -819,6 +895,45 @@ mod tests {
         assert_eq!(error.detail()["known_sets"][0], "PP-OCRv6");
         assert!(error.message().contains("nope"), "{}", error.message());
         assert!(error.message().contains("PP-OCRv6"), "{}", error.message());
+
+        // §9.5：超限的导出给出**两个数值**，并指向仍然可用的 annotated.png——
+        // 错误信息本身必须能回答"那我还能拿到什么"。
+        let error = ServeError::ExportTooLarge {
+            limit_bytes: 33_554_432,
+            observed_bytes: 40_000_000,
+            annotated: "/api/jobs/job-0/annotated.png".to_string(),
+        };
+        let detail = error.detail();
+        assert_eq!(error.status_code(), 413);
+        assert_eq!(error.code(), "export_too_large");
+        assert_eq!(detail["limit_bytes"], 33_554_432u64);
+        assert_eq!(detail["observed_bytes"], 40_000_000u64);
+        assert_eq!(detail["annotated"], "/api/jobs/job-0/annotated.png");
+        assert!(
+            error.message().contains("annotated.png"),
+            "{}",
+            error.message()
+        );
+        assert!(error.message().contains("33554432"), "{}", error.message());
+        assert!(error.message().contains("40000000"), "{}", error.message());
+
+        // §7.5：运行期 provider 拒绝保留库侧原文（启动期与运行期同一句措辞）。
+        let error = ServeError::ProviderRejected {
+            provider: "directml".to_string(),
+            reason: "execution provider directml is not compiled in; rebuild with \
+                     `--features directml-provider`"
+                .to_string(),
+        };
+        assert_eq!(error.status_code(), 400);
+        assert_eq!(error.code(), "bad_request");
+        assert_eq!(error.detail()["provider"], "directml");
+        assert!(
+            error.detail()["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("--features directml-provider")),
+            "{:?}",
+            error.detail()
+        );
     }
 
     /// `RapidOcrError` 的每一个变体都在同一张表里映射（无字符串匹配）。

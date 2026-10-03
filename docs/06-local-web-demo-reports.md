@@ -2845,3 +2845,423 @@ target\release\rapidocr.exe evaluate --manifest ..\..\OCR-test-image\golden-mani
    （超时值未改）。
 5. **未提交、未在干净 clone 上验证**：按要求不 commit；证据来自当前工作树。
 6. **`--allow-download-host` 的高风险警告仍是 stderr 文本**（M2 的既有结论，本阶段未改）。
+
+---
+
+## M3：诊断与导出（`annotated.png` / 三格式导出 / 时间账本 / provider 运行期切换）
+
+**阶段**：M3 —— `docs/05` §11「M3」的全部条目 + §4.2（两个新端点）、§4.5（原图保留与
+`original_evicted`）、§4.6（有界序列化）、§7.5/§7.6（provider 运行期切换与 `Rebuilding`）、
+§9.5（静态 HTML 导出与导出 CSP）、§10.6（诊断数据复用、不重新测量）。
+M1/M2 记录里"留给 M3"的接缝（`annotated.png` 的原图字节、导出与 `ReportMode::Static`、
+`POST /api/engine/reload` 的 `begin_rebuild`、诊断面板的数据来源）逐条收口。
+**开工基线**：`dcf8583`（M0 `1144ddb`/`dbab12e` + M1 `06bd0af` + M2 `8532fd8` + M2b `dcf8583`
+已提交，工作树干净）。
+**日期**：2026-10-04（接在 M2b 记录之后）
+**提交**：`（未提交：按要求不 commit）`
+
+### 环境
+
+| 项目 | 值 |
+| --- | --- |
+| target | Windows x64 + MSVC ABI：`x86_64-pc-windows-msvc` |
+| 工具链 | rustc 1.98.1 / cargo 1.98.1 |
+| crate | `rapid-ocr-rs` 0.7.0（独立 git 仓库，本阶段未提交） |
+| 页面语法检查 | node v24.12.0（`node --check`） |
+| 真实资产 | `OCR-Model/small/`、`OCR-Model/test-config-small.yaml`、`OCR-test-image/`（12 图 + golden） |
+
+**变更规模**（`git diff --numstat`，15 个跟踪文件 +3112 / −256；其中本记录的追加 +420，
+其余 14 个跟踪文件 +2692 / −256；另有新增文件 `src/bin/serve/export.rs` 433 行）：
+
+| 文件 | 行数 | 改动 |
+| --- | --- | --- |
+| `src/output/html.rs` | 328 → 375 | `ReportMode::{Full,Static}`；脚本段抽成常量；两个渲染入口都收 `mode` |
+| `src/exports.rs` | +8/−1 | 导出 `ReportMode` 与 `LoadImage`/`OcrInput`（复用库的唯一解码实现） |
+| `src/bin/rapidocr.rs` | +3/−1 | `report` 显式传 `ReportMode::Full`（CLI 输出不变） |
+| `src/bin/serve/export.rs` | **新增 433** | 标注 PNG、base64/data URL、三种导出文档、时间账本 JSON、`ExportFormat` |
+| `src/bin/serve/error.rs` | 1008 → 1083 | `ExportTooLarge{limit,observed,annotated}`、`OriginalEvicted`(410)、`ProviderRejected`(400) |
+| `src/bin/serve/jobs.rs` | 1322 → 1414 | `original_retained`、字节压力下**先释放原图**、`release_original`/`take_released_originals` |
+| `src/bin/serve/results.rs` | 226 → 272 | 成功载荷改为 `Arc<OcrOutput>` + 实测序列化长度；`text_bounded` |
+| `src/bin/serve/server.rs` | 1413 → 1781 | 原图保留区、`plan` 可切换、`annotated_png`/`export`/`job_snapshot`、`apply_provider`、worker 先建引擎再取任务 |
+| `src/bin/serve/http.rs` | 714 → 938 | 两个新路由、导出头与导出 CSP、reload 的可选 provider 体、切换线程 |
+| `src/bin/serve/state.rs` | +71 | `ServeConfigPlan::with_provider`（复用启动期规则） |
+| `src/bin/serve/{mod,run}.rs` | +4 | 新模块与 `allow_provider_fallback` 接线 |
+| `src/bin/serve/tests.rs` | 2716 → 3432 | 11 个新 HTTP 测试 + `SessionPlan`/`ReleaseOnDrop` 接缝 + 2 个按新行为改写的既有测试 |
+| `src/bin/web/index.html` | +40/−4 | 诊断面板的时间账本/运行时段；两条错误文案 |
+| `docs/05-local-web-demo-implementation.md` | +23/−1 | 三处**实现证明文档不完整**的更正（见文末） |
+
+**没有新增依赖**：`Cargo.toml` 未改（base64 是自己写的 20 行 + RFC 4648 向量测试）。
+
+---
+
+### 交付物 1：`GET /api/jobs/{id}/annotated.png`（§4.2、§4.5）
+
+**根因**：M1 在识别开始时就把编码原图**丢掉了**，而 §4.5 的字节账本仍然按
+`--max-body-mb` 记着它——账目与事实分叉，`annotated.png` 因此不可能实现。
+本阶段的修法是让"保留"名副其实（而不是把字节再读一次或长期保留解码结果）：
+
+```rust
+// server.rs
+/// 保留的**原图编码字节**（只保留编码字节，绝不保留解码结果）。
+struct RetainedOcr { bytes: Arc<[u8]>, max_side: Option<u32> }
+// JobState.originals: HashMap<String, RetainedOcr>   ← 与 JobStore 同一把锁
+// worker 取用时只克隆 Arc（一份图片都不复制）
+fn retained_ocr(&self, id: &str) -> Option<(Arc<[u8]>, Option<u32>)>;
+// 端点
+pub fn annotated_png(&self, id: &str) -> Result<Body, ServeError>;
+
+// export.rs（唯一实现）
+pub(super) fn decode_original(bytes: &[u8]) -> Result<RecImage, ExportError>;   // 库的 LoadImage
+pub(super) fn annotated_png(original: Arc<[u8]>, output: &OcrOutput) -> Result<Vec<u8>, ExportError>;
+```
+
+`decode_original` 走库里**同一个** [`LoadImage`]/[`OcrInput`]（编码字节上限、header 像素
+探测、EXIF 方向、解码错误语义只有一份），叠加用 §1.1 指定的
+`output::visualize::draw_output`，PNG 编码用 crate 既有的 `image`。
+
+**状态码（逐条可定位）**：
+
+| 情形 | 结果 | 依据 |
+| --- | --- | --- |
+| 任务不存在 | 404 `job_not_found` | §4.5 |
+| 任务已淘汰 | 410 `job_evicted` | §4.5 |
+| 排队/运行/失败/取消（没有区域可叠） | **409 `job_not_finished`** | 与 `/result` 同语义：不能凭空造一张图 |
+| 结果在、原图被保留预算释放 | **410 `original_evicted`** | §4.2 |
+| 正常 | 200 `image/png` | §4.2 |
+
+**`original_evicted` 的生产者（新增的保留顺序）**：§4.2 冻结了这个 `code`，但 §4.5 原来的
+"超限按最旧终态优先**淘汰整个任务**"会让它**永远不可达**（任务被淘汰时客户端拿到的是
+`job_evicted`）。因此字节上限分两步：
+
+1. **先释放最旧终态任务的原图**（`original_retained = false`，`retained_bytes` 同步减少）：
+   任务记录与结果都留下，`/result` 与 `/api/jobs/{id}` 照常可用，只有 `/annotated.png`
+   变成 410 `original_evicted`；
+2. 原图都释放完仍超限 → 才淘汰整个终态任务（M0c 起的原有行为，仍是第二步）。
+
+另外两条"原图再也用不上"的路径也立即释放（记账同步）：**失败**与**取消**的任务
+（它们永远不会有注释图），以及被 TTL/数量上限淘汰的任务（随任务一起消失）。
+活跃任务（`queued`/`running`）的原图**永不**释放：worker 还要用它解码。
+
+**修改前后行为对比（交付物 1）**
+
+| 项目 | 修改前（M1/M2） | 修改后 | 预期 |
+| --- | --- | --- | --- |
+| 编码原图 | 读完 body → 识别开始即丢弃（`pending.remove`）；`retained_bytes` 仍按它记账 | 识别后仍在保留区（`Arc<[u8]>`，一份），记账与事实一致 | §4.5 |
+| `/annotated.png` | 路由不存在 → 404 `not_found` | 真 PNG（尺寸 = 解码后的原图；检测框由 `draw_output` 画出） | §4.2 |
+| 原图被淘汰 | 无此状态（要么任务在、要么任务没了） | 任务在、原图没了 → 410 `original_evicted`（结果仍可读） | §4.2 |
+| 字节上限超限 | 淘汰最旧终态任务 | **先**释放它的原图，**再**按需淘汰任务 | 让 §4.2 的 `code` 可达（docs/05 §4.5 已记） |
+
+---
+
+### 交付物 2：`GET /api/jobs/{id}/export?format=json|md|html`（§4.2、§4.6、§9.5）
+
+**库侧**：`output/html.rs` 新增 `ReportMode::{Full, Static}`，两个渲染入口都收它：
+
+```rust
+pub enum ReportMode { Full, Static }
+pub fn render_report(title, image_href, width, height, items, timing_summary, mode) -> Result<String>;
+pub fn render_output_report(title, image_href, output, timing_summary, mode) -> Result<String>;
+```
+
+两个模式的**唯一**差异是常量 `REPORT_SCRIPT`（1570 字符，Full 才拼进去）：`Static` 的正文
+不含任何 `<script`，而样式、SVG、列表与公式段一字不少。`Static` 的文档由导出响应的独立 CSP
+（`script-src 'none'`）背书，因此不需要 nonce。
+
+**serve 侧**：三种格式全部由**库的渲染器**产生，且都经有界写入器：
+
+| 格式 | 来源 | 上限 | 附件名 / Content-Type |
+| --- | --- | --- | --- |
+| `json` | `export::result_json`（= `/result` 的**同一份**值：库 `to_output_json` + `plain_text` + `timing_ledger`） | `--max-result-mb`（§4.6，任务侧已强制）且 ≤ `--max-export-mb` | `ocr-<id>.json` / `application/json; charset=utf-8` |
+| `md` | 库 `to_output_markdown` | `--max-export-mb` | `ocr-<id>.md` / `text/markdown; charset=utf-8` |
+| `html` | 库 `render_output_report(.., ReportMode::Static)` + `data:image/png;base64,…` 内嵌 | `--max-export-mb`（含内嵌图片） | `ocr-<id>.html` / `text/html; charset=utf-8` + **导出 CSP** |
+
+**HTML 的体积判定分两步，两步都不截断**：
+
+1. **投影**：先用空 `image_href` 渲染一遍量出正文大小（data URL 只含 base64 字母与前缀，
+   `escape_attr` 不改动其中任何字符，因此 `正文 + data_url` 就是最终长度）。超限时**根本不
+   构造**那份大文档——`3200×2000` 的标注 PNG 远超 `--max-result-mb` 的那条风险在这里被挡住；
+2. **有界写入**：最终文档仍经 `results::text_bounded`，任何意外都会变成 413 而不是一条内容
+   缺失的文档。
+
+超限 → **413 `export_too_large`**，`detail` 三个字段：`limit_bytes`、`observed_bytes`（**完整**
+文档长度：json 用 worker 已测的 `serialized_bytes`，md/html 用渲染结果长度）、
+`annotated`（`/api/jobs/{id}/annotated.png`，**不受导出预算约束**，直接可用）。
+JSON 与 Markdown 不需要原图；HTML 需要——原图已被释放时是 410 `original_evicted`
+（宁可不给，也不给一条图片链接失效的文档，§9.5 第 5 条）。
+
+**导出 CSP（§9.5 第 2 条，逐字冻结，只加在 HTML 上）**：
+
+```text
+default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'none'; sandbox
+```
+
+主页面 CSP 仍是 nonce 且**不含** `unsafe-inline`（既有测试继续断言这一点）。
+
+**页面改动（`src/bin/web/index.html`，`__CSP_NONCE__`/`__SRV_TOKEN__` 字面量未动）**：
+`ERR_TEXT` 增加 `export_too_large`（文案明确指向"下载标注图"）与 `original_evicted`
+（说明结果仍可看、重新上传即可再标注）。两个导出/下载按钮**本来就是**调这两个端点，
+现在端点存在即可用，因此没有其它改动。
+
+---
+
+### 交付物 3：诊断面板的数据（§10.6、§11 M3）
+
+**不重新测量任何库已经报告的东西**：
+
+| 面板需要的 | 来源 | 状态 |
+| --- | --- | --- |
+| 逐阶段耗时 | `/result.timings`（库 `OcrTimings`）+ `/result.stages` | M1 已有 |
+| **时间账本 + 口径残差 + 自解释文案** | `/result.timing_ledger`（库 `TimingLedger`） | **M3 新增** |
+| ORT 指纹（已脱敏） | `/api/status.ort.version` + `.ort.fingerprint`（只给文件名/体积/SHA-256/DLL 名单） | M1 已有 |
+| 峰值工作集 | `/api/status.memory.{peak_working_set_bytes, source}`（库 `runtime::memory`） | M1 已有 |
+| provider 三字段 | `/api/status.provider.{requested, selected_ep, fallback_to_cpu}` | M1/M0c 已有 |
+| 原图保留概况 | `/api/status.retention.retained_originals`（新增的诊断计数字段） | **M3 新增** |
+
+`timing_ledger` 的字段全部由库计算，serve 不做任何算术：
+
+```jsonc
+"timing_ledger": {
+  "total_ms": …, "input_preprocess_ms": …, … "unattributed_ms": …,   // TimingLedger 的全部字段
+  "attributed_ms": …, "input_ms": …, "inference_ms": …, "rust_ms": …, // 库的同名方法
+  "shares": { … } | null,                                            // LedgerShares
+  "conservation": { "residual_ms": …, "excess_ms": …, "tolerance_ms": …,
+                    "conserved": false, "interpretation": "…" }        // 库写的自解释文案
+}
+```
+
+**面板必须显示"不是严格划分"这句话**：页面把 `conservation.interpretation` **原文**渲染出来
+（`ledgerHtml()`，在折叠的诊断面板里），并且把 `residual_ms` / `excess_ms` / `tolerance_ms`
+单列成表，因此"占比"不会被读成严格划分。这句文案是库写的（`conservation_interpretation`），
+前端**不**自己改写成"仅供参考"——那样会丢掉可核对的口径（两个窗口串行、不是重复计时）。
+
+---
+
+### 交付物 4：provider 运行期切换（§7.5、§7.6、§11 M3）
+
+**入口**：`POST /api/engine/reload` 的**可选**请求体 `{"provider":"cpu|directml|cuda"}`
+（白名单式校验：恰好一个键；`allow_provider_fallback` **不能**从 API 改，它是启动期开关）。
+
+**顺序**（`server.rs::apply_provider`，逐条对应 §7.6 的 M3 段）：
+
+1. **先校验**：`ServeConfigPlan::with_provider(requested, allow_provider_fallback)` 就是
+   启动期的**同一个** `validate`（名称/feature 判定 + §7.5 的 `fail_if_provider_unavailable`
+   语义），非法 → **400 `bad_request`** + `detail.{provider, reason}`（`reason` 是库侧原文，
+   例如 "DirectML provider support is not compiled in; rebuild with `--features directml-provider`"），
+   **状态一字未动**；
+2. **暂停新任务**：`Ready → Rebuilding`（§7.6 的合法边）；`POST /api/ocr` 此刻是
+   `OcrAdmission::Queue` → **202 `queued`**（不是 409/503）；`/api/status` 报告**新**的
+   `requested`，而 `selected_ep`/`fallback_to_cpu` 是 `null`；
+3. **排空**：`engine_load` 已被本线程持有，worker 只有在拿到它之后才会去拿 `engine`，
+   因此随后获取 `engine` 锁**恰好等到正在进行的那次推理结束**（不中断推理，§4.3）；
+4. **销毁旧 engine → 创建新 engine**（顺序固定，避免失败时留下与 `/api/status` 不一致的引擎）；
+5. `Rebuilding → Ready`（成功）或 `Rebuilding → Failed`；
+6. **失败恢复旧 engine**（用旧配置重建会话）：成功 → 配置回到旧值、`outcome = "rolled_back"`
+   且带 `error`/`rollback_ms`；连旧引擎也起不来 → 明确 `Failed`，`reason` 里两个原因都写。
+
+**执行方式（M3 的设计决定）**：切换序列在**独立线程** `serve-provider-switch` 里跑、由那个
+线程写响应；accept 线程立刻回到循环。理由是可验证性本身就是需求的一部分：如果在 accept 线程
+上同步执行，`/api/status` 与 `/api/ocr` 会在整个序列（排空 + 两次建会话）期间停摆，那么
+"`Rebuilding` 可见"与"新任务入队而不是被拒绝"这两条**根本不可能被观测**。客户端语义不变：
+**请求只在序列结束或失败后才返回**。同时只允许一个切换在跑（`AtomicBool` + RAII 凭据），
+第二个请求得到 **503 `busy`**（不排队）。
+
+**worker 的一个必要改动**：会话创建从"取任务之后"移到"取任务**之前**"
+（`ocr_worker`：`has_queued_work` → `ensure_engine_loaded(false)` → 才 `next_scheduled`）。
+否则 worker 会把队列里的任务标成 `running`、然后阻塞在 `engine_load` 上干等切换结束——
+排空判据（"没有推理在跑"）就不再干净，任务视图也会撒谎。改完之后：切换期间任务一律留在
+`queued`，切换结束后它们用**新**引擎执行（测试用 `served` 记录逐次证明）。
+
+---
+
+### 验证 1：静态检查、feature 矩阵与依赖隔离
+
+日志：`target/m3-verify/m3-gates.log`（1–7 号单次连续执行）、`target/m3-verify/tree-*.txt`。
+
+| # | 命令 | 结果 | 退出码 |
+| --- | --- | --- | --- |
+| 1 | `cargo fmt --all -- --check` | 无输出 | 0 |
+| 2 | `cargo clippy --all-targets -- -D warnings` | 无 warning | 0 |
+| 3 | `cargo clippy --features serve --all-targets -- -D warnings` | 无 warning | 0 |
+| 4 | `cargo test --all-targets` | 384 + 2 + 4 + 14 + 0 = **404 passed, 0 failed** | 0 |
+| 5 | `cargo test --features serve --all-targets` | 404 + **203** = **607 passed, 0 failed** | 0 |
+| 6 | `cargo build --release --bins` | 0 | 0 |
+| 7 | `cargo build --release --bins --features serve` | 0 | 0 |
+
+**依赖隔离（默认构建的依赖图逐字节未变）**：
+
+| 证据 | 值 |
+| --- | --- |
+| `cargo tree -e normal -p rapid-ocr-rs` | 606 行，SHA-256 `BD2AB5E41B1A6D649E2F80B0D3D3E55327B96EB7C6F861E55DFC7C8501C3F6FC` |
+| 与 M2b 快照 `target/m2b-verify/tree-default.txt` 比较 | **0 处差异**；与 M0c 快照同样 0 差异 |
+| 与 `--no-default-features` / `--features serve` 快照比较 | 各 **0 处差异**（605 / 611 行） |
+| 默认树里的 `tiny_http` | **0** 次（serve 树 1 次） |
+| `Cargo.toml` | **未改**（本阶段没有新增任何依赖） |
+
+**测试增量与基线对比（AGENTS.md §6）**
+
+| 项目 | 修改前（M2b） | 修改后 | 说明 |
+| --- | --- | --- | --- |
+| `cargo test --all-targets` | 382+2+4+14 = 402 | **384+2+4+14 = 404** | +2：`output/html.rs` 的 `Static` 无脚本 + `Full` 脚本段钉住 |
+| `cargo test --features serve --all-targets` | 402+176 = 578 | **404+203 = 607** | +29 净增（库 +2、serve 二进制 +27） |
+| serve 各文件测试数 | `export` 0 / `http` 5 / `jobs` 22 / `results` 3 / `state` 21 / `tests` 41 | **6 / 8 / 26 / 5 / 22 / 52** | 新增模块与用例 |
+| 删除/跳过/弱化的测试 | — | **0**（3 个既有测试按**新行为**改写，见下） |  |
+
+**按新行为改写的 3 个既有测试（不是弱化）**：
+
+1. `http::tests::the_router_matches_the_m1_subset_and_nothing_else` →
+   `the_router_matches_the_documented_endpoint_set_and_nothing_else`：两个 M3 端点从"必须 404"
+   变成真实路由（404 列表换成 `annotated`（无 `.png`）/`export/data` 等**仍然**不存在的路径，
+   并新增"这两个端点只接受 GET"的 405 + `Allow: GET` 断言）；
+2. `tests::unknown_paths_are_404_and_wrong_methods_are_405`：同样把两个端点移出 404 列表，
+   改断言 **404 `job_not_found`**（路由存在、任务不存在）与 POST → 405 `Allow: GET`；
+3. `jobs::tests::eviction_by_bytes_uses_the_original_plus_result_budget`：字节超限的**预期行为**
+   变了（先释放原图而不是淘汰任务），断言随之改写为"a 的原图被释放、a 的结果仍在、账本减少"；
+   整任务淘汰那条路径由新增的 `when_only_results_remain_the_oldest_terminal_job_is_evicted` 覆盖。
+
+---
+
+### 验证 2：12 图硬门槛（`target/m3-gate/`，**没有**覆盖 `tests/baseline/`）
+
+```powershell
+target\release\bench_warm_e2e.exe --config <OCR-Model>\test-config-small.yaml --images-dir <OCR-test-image> `
+  --warmup-rounds 1 --rounds 3 --max-side-len 2000 --intra-threads 16 --output target\m3-gate\bench-cpu-2000.json
+target\release\rapidocr.exe evaluate --manifest <OCR-test-image>\golden-manifest.json `
+  --config <OCR-Model>\test-config-small.yaml --output target\m3-gate\evaluation-cpu.json
+```
+
+| 门槛 | 文档要求 | 本次实测（release） | 比较方式 | 结论 |
+| --- | --- | --- | --- | --- |
+| 12 图区域数均值 | `34.833333333333336` | **`34.833333333333336`**（36 样本） | 原始 JSON 的数字**字面量**字符串精确比较 | 逐位相同 |
+| 12 图 mean CER | `0.44765135645866394` | **`0.44765135645866394`**（12 例） | 同上 | 逐位相同 |
+
+`git status --porcelain -- tests/baseline` 为空。
+
+---
+
+### 验证 3：CLI 的 `report` / `run` 输出未变（**本阶段改了报告渲染器**）
+
+`ReportMode` 是新增参数，因此必须证明 `Full` 的产物与本阶段之前相同。做法是**真实前后对比**
+（`target/m3-cli-pin/`）：改动前用当时的 release 二进制把两张真图跑一遍 `rapidocr report` 与
+一次 `rapidocr run --json`（`before/`），改动后（同一个 `report` 命令、同一个 `--config`、
+同样的两张图）再跑一遍（`after/`）。
+
+报告里嵌的是**实测耗时**（`total N ms`），它每次运行都会变，因此逐字节相同的比较对象是
+"去掉那一处计时摘要之后的文档"：
+
+```text
+01基础多位置文本.html : html-without-timing identical=True | script block identical=True | script chars=1570
+04表格与键值对.html    : html-without-timing identical=True | script block identical=True | script chars=1570
+run --json regions: before=42 after=42
+run --json texts identical=True
+run --json first-point x identical=True
+```
+
+即：除 `total N ms` 这一处计时摘要外，`Full` 模式的报告**逐字节相同**（含 1570 字符的内联
+脚本段）；`run --json` 的 42 个区域、逐区域文本与多边形坐标完全相同。
+另有两条不依赖计时的单元断言钉住同一件事：
+`output::html::tests::{full_mode_still_renders_the_exact_cli_script_block, static_mode_emits_no_script_at_all}`
+（后者断言 `Full == Static + 脚本段` 这一等式）。
+
+---
+
+### 验证 4：M3 的 HTTP 端到端断言（`src/bin/serve/tests.rs`，真实绑定端口）
+
+| 验收项 | 测试 | 关键断言（实测通过） |
+| --- | --- | --- |
+| 标注图成功 | `the_annotated_png_is_a_real_png_with_the_original_dimensions_and_drawn_boxes` | 200 `image/png`；`\x89PNG\r\n\x1a\n` 签名；解码后 100×50 = `image.original_size`；像素 (1,1) = 调色板第 0 色 `[255,0,0]`（证明 `draw_output` 真跑了）；`original_retained == true` |
+| 原图淘汰 | `the_annotated_png_is_410_original_evicted_once_the_budget_releases_the_original` | 1 MiB 保留预算；`original_retained == false`；**410 `original_evicted`**；`/api/jobs/{id}` 仍 200、`/result` 仍 200 且字节数与释放前一致；`retention.retained_originals == 0`、`retained_bytes == 结果长度` |
+| 三格式导出 | `every_export_format_is_served_as_an_attachment_and_the_html_is_static_and_offline` | JSON 与 `/result` **逐字节相同**；三种格式都有 `Content-Disposition: attachment; filename="ocr-<id>.<ext>"`；HTML 无 `<script`（大小写不敏感）、恰好一个 `src="` 且是 `data:image/png;base64,`、无 `/api/` 链接、含 `<style>`、带**导出 CSP**；主页面 CSP 不含 `unsafe-inline`；未知/缺失 `format` → 400 |
+| 超限导出 | `an_export_over_the_limit_is_a_413_pointing_at_the_annotated_png` | 三种格式都 413 `export_too_large`；`detail.limit_bytes == 1 MiB`、`detail.annotated == /api/jobs/{id}/annotated.png`、`message` 含 `annotated.png`；json 的 `observed_bytes` = `/result` 长度（worker 已测）；**同一任务的 `annotated.png` 仍是 200**（"指向"必须真的可用） |
+| 限额内导出 | `an_export_under_the_limit_is_served_intact` | 三种格式都 200 且非空 |
+| 导出前置状态 | `exports_require_a_successful_job` | 失败任务：`annotated.png` 与 `export?format=md` 都是 409 `job_not_finished` |
+| 诊断字段 | `the_diagnostics_payload_reports_the_library_ledger_fingerprint_and_memory` | `/result.timings` 含 `total_ms/preprocess_ms/detector_infer_ms/recognizer_infer_ms/postprocess_ms`；`timing_ledger` 含命名分量与 `attributed_ms/input_ms/inference_ms/rust_ms`；`conservation.residual_ms == -1.0`、`conserved == false`、`excess_ms == 1.0`；`interpretation` **含 `NOT a strict partition`**、`residual_ms = -1.000000`、`SCOPE difference`；`/api/status` 的 `ort.fingerprint{file,complete}`、`memory{peak_working_set_bytes,source}`、provider 三字段、`queues.text.wait_bound` 都在 |
+| 切换成功 | `switching_the_provider_rebuilds_the_session_and_queues_requests_meanwhile` | 切换中 `/api/status.engine.state == "rebuilding"`、`provider.requested == "cpu"` 而 `selected_ep/fallback_to_cpu == null`；`POST /api/ocr` → **202 `queued`**；排空后的第一个任务已 `succeeded`；放行后响应 `outcome=ready`、`selected_ep=scripted-2`、`error=null`、工厂调用数 **2**；队列里的任务随后 `succeeded`，`/api/status` 的 `selected_ep` 也是 `scripted-2` |
+| 切换失败回滚 | `a_failed_switch_rolls_back_to_the_previous_engine` | 响应 `outcome="rolled_back"`、`error` 含 "scripted session 2"、`rollback_ms` 是数字；`engine.state=ready`、`selected_ep=scripted-3`（恢复出来的旧会话）；工厂调用数 **3**；之后一次识别仍成功 |
+| 回滚也失败 | `a_switch_that_cannot_restore_the_old_engine_lands_in_failed` | `outcome="failed"`、`engine.state="failed"`；`reason` 同时含两个原因（session 2 与 "restoring the previous engine" 与 session 3）；`/api/status` 的 `engine.reason` 与响应**同一句**；`POST /api/ocr` → **503 `engine_unavailable`** |
+| provider 非法 | `requesting_a_provider_that_is_not_compiled_in_is_a_400_and_changes_nothing` | 400 `bad_request`；`detail.reason` 含 `directml-provider`（库侧原文）；工厂调用数仍为 **1**、`/api/status` 仍是 `scripted-1`/`ready`；服务照常可用（构建里真的编译了 DirectML 时该用例转为断言"切换确实发生"，两个分支都断言真实行为） |
+
+---
+
+### 关键行为对比（AGENTS.md §9）
+
+| 项目 | 修改前（M2b） | 修改后（M3） | 预期结果 |
+| --- | --- | --- | --- |
+| 原图编码字节（修改） | 识别开始即丢弃（记账仍算它） | 留在保留区（只编码字节、`Arc` 共享；失败/取消/淘汰时释放） | §4.5，`annotated.png` 才有可能 |
+| 字节预留顺序（修改） | 超限 → 淘汰最旧终态任务 | 先释放其原图（任务与结果保留），再按需淘汰任务 | §4.2 的 410 `original_evicted` 可达（docs/05 §4.5 已记） |
+| `/annotated.png`（新增） | 路由不存在（404 `not_found`） | 200 `image/png`（库的唯一解码 + `draw_output`）；原图没了是 410 `original_evicted` | §4.2 |
+| 结果载荷（修改） | 只留序列化 JSON 字节 | `Arc<OcrOutput>` + worker 实测长度（导出用库渲染器的前提） | §4.6，且内存不重复保留两份 |
+| 报告渲染（修改） | 只有一种内联脚本的输出 | `ReportMode::{Full,Static}`；CLI 仍 `Full`（**逐字节相同**，见验证 3），导出用 `Static`（**无 `<script`**） | §9.5 第 1 条 |
+| 导出（新增） | 路由不存在 | json/md/html 三格式；附件头；HTML 带**导出 CSP**；图片 `data:` 内嵌（真离线）；超 `--max-export-mb` → 413 `export_too_large`（`detail` 指向 `annotated.png`） | §4.6、§9.5 |
+| 诊断面板（修改） | 只有逐阶段耗时 + ORT 指纹（无账本、无内存） | 增加库的时间账本（分量 + 残差 + `interpretation` 原文）与运行时/内存行 | §10.6、§11 M3 |
+| provider 运行期切换（新增） | `Rebuilding`/`begin_rebuild` 无生产者 | 显式设置应用：校验 → `Rebuilding`（OCR 202 入队）→ 排空 → 销毁 → 重建 → `Ready`；失败回滚或 `failed`；同时只允许一个 | §7.5、§7.6 |
+| OCR worker（修改） | 取任务 → 建引擎 | 建引擎 → 取任务（切换期间任务留在 `queued`，不假装 `running`） | 排空判据干净 |
+| 页面（修改） | 无账本展示；未知错误码走通用文案 | 账本段（含 `interpretation` 原文）+ 运行时/内存段；`export_too_large`/`original_evicted` 文案 | §9.2 |
+| 依赖 / 推理链路 | — | `Cargo.toml` 未改；三份依赖树与 M2b 快照 **0 差异**；推理链路一行未动，两个硬门槛逐位相同 | §2.1 |
+
+**证据：未触碰的文件**
+
+- `Temp/demo3-v2.html`：`git status --porcelain -- Temp/demo3-v2.html` 为空
+  （SHA-256 `14871FED101D11451F9B799FD199144D6CEC7874C5682D0D630DED1F5E3D46EE`）；
+- `docs/03-windows-only-optimization-tasks.md`：`git status --porcelain` 为空；
+- `tests/baseline/`：`git status --porcelain -- tests/baseline` 为空（门槛输出写在 `target/m3-gate/`）；
+- 页面模板的注入契约未动：`__CSP_NONCE__` ×4、`__SRV_TOKEN__` ×3、真实 `nonce="…"` 属性 ×3；
+  真实 IIFE 块 69,168 字符，`node --check` exit 0。
+
+---
+
+### 与 `docs/05` §11「M3」验收清单的对照
+
+| §11 M3 条目 | 本阶段 | 证据 |
+| --- | --- | --- |
+| 时间账本、ORT/provider 指纹、内存信息进入诊断面板（含口径说明） | ✅ 完成 | 交付物 3；`/result.timing_ledger`（库 `TimingLedger`）+ `/api/status.{ort,memory,provider}`；面板渲染 `interpretation` 原文 |
+| `annotated.png`、Markdown/HTML 导出（HTML 走 `ReportMode::Static` + 独立 CSP，§9.5） | ✅ 完成 | 交付物 1/2；11 个 HTTP 测试 + 6 个 `export` 单测 |
+| provider 运行期切换：暂停新任务 → 排空 → 销毁旧 engine → 创建新 engine → `rebuilding`；失败恢复旧 engine 或明确 `failed` | ✅ 完成 | 交付物 4；4 个 HTTP 测试（成功 / 回滚 / 回滚也失败 / provider 非法） |
+| 测试：导出 HTML 可用且不含 `<script>`、CSP 头正确 | ✅ 完成 | `every_export_format_is_served_...`（含 `data:` 内嵌、附件头、导出 CSP）；库侧 `static_mode_emits_no_script_at_all` |
+| M4 的条目（公式模型下载、公式队列、公式区域展示、CER 评估） | ⛔ 不在 M3 | 见下表接缝 |
+
+---
+
+### 接缝（留给 M4）
+
+1. **公式模型与路由**：`ModelPlan::resolve` 仍固定 `ModelRequest::text_only`；
+   `OcrRouting { formula: true }` 的生产来源（端点参数或 CLI）仍未接线，
+   因此 `?queue=formula` 在生产路径仍是 400（M1 起的语义未变）；
+2. **公式区域进入导出/诊断**：库的渲染器与账本已经支持 `formula_ms` / `formula` 区域
+   （`to_output_markdown`、`render_output_report`、`TimingLedger.formula_ms`），但生产路径
+   跑不出公式区域，因此这一层只有单元/夹具证据；M4 接上公式管线即可复用，无需新协议；
+3. **评估（CER/精确匹配）**：复用库的 `evaluation`，不另写指标（M4 条目）；
+4. **`--max-export-mb` 的图片部分**：当前把标注 PNG 与文档一起计入同一预算（§9.5 的原文），
+   若 M4 要给"只导结果、不嵌图"的选项，需要先改 §9.5；
+5. **`annotated.png` 的解码开销**：每次请求都重新解码原图（这是 §4.5"不长期保留 `RecImage`"
+   的直接后果），大图上单次约几十 ms；没有做缓存（缓存会重新引入"长期保留解码结果"）。
+   如需优化，应先改 §4.5；
+6. **`POST /api/engine/reload` 的无 body 形式仍是同步的**（M2 的接缝 3 未变）：它在
+   accept 线程上建会话，因此慢机器上会短暂挡住其它请求。M3 只为**provider 切换**做了
+   异步化（那条路径长得多）；把无 body 的 reload 也异步化属于同一类改动，留给 M4；
+7. **`serve-provider-switch` 线程与关闭**：切换进行中被关闭时，那个线程会继续跑完
+   （它持有 `engine_load`）；若会话创建本身永远卡住（例如底层驱动挂死），
+   `ServeRuntime::stop()` 的 join 会跟着挂住——这是 M2 起就存在的同类风险
+   （accept 线程上的同步加载），M3 没有加剧，但也没有消除。
+
+### 未覆盖风险（如实）
+
+1. **未提交、未在干净 clone 上验证**：按要求不 commit；证据来自当前工作树（`dcf8583` + 本阶段改动）。
+2. **provider 切换的"成功路径"没有真实加速器证据**：三份门禁都不带 `directml-provider`，
+   因此 `with_provider` 的成功分支用的是脚本化引擎（`selected_ep = scripted-N`）。
+   真实 EP 的切换只有"校验被拒"这一条走的是生产代码路径；若要真实的 DirectML/CUDA 切换证据，
+   需要 `--features directml-provider`（或 CUDA）的构建与可用设备，本阶段没有。
+3. **`original_evicted` 的场景是"单任务自身超过预算"**：测试用一个 1 MiB 保留预算 + 一张
+   0.8 MiB 的原图 + 0.25 MiB 的结果触发它；"多任务竞争预算导致最旧任务的原图被释放"这条
+   由 `jobs.rs` 的单元测试（`an_over_budget_store_releases_originals_before_evicting_jobs`）
+   覆盖，HTTP 层没有第二个场景（不是遗漏，是不想为了覆盖面把测试写成时序敏感的）。
+4. **HTML 导出的体积判定是"投影 + 有界写入"两步**：投影用"空 `image_href` 渲染一遍"量正文，
+   依据是 data URL 只含 `escape_attr` 不改动的字符。若将来图片 URL 变成需要转义的形状
+   （例如带 `&` 的查询串），这条等式不再成立——那时**第二步**有界写入仍会拒绝，不会发出超限文档。
+5. **手工浏览器闭环未做**：页面里"下载标注图""导出 JSON/MD/HTML"的点击路径只做了
+   HTTP 层与 `node --check` 验证；真实浏览器里的下载与诊断面板展开没有人工复核
+   （M1/M2 的同类未覆盖风险仍在）。
+6. **诊断面板展示的是英文长文案**：`interpretation` 是库写的英文（报告里的其它 `basis`/`note`
+   也是英文），本阶段**没有**把它翻译成中文再展示——翻译本身就是第二套解释，容易与库原文分叉。
+7. **`/api/status.retention.retained_originals` 是 M3 新增的诊断字段**，页面不读它
+   （只用它做测试断言）；若前端要用，需要像 M2 的 `download_hosts`/`engine_load_ms` 那样
+   在 `docs/05` §4.2 的 `/api/status` 一栏登记。

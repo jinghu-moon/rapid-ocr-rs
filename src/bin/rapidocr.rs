@@ -5,7 +5,8 @@ use rapid_ocr_rs::evaluation::ocr::{
 use rapid_ocr_rs::{
     ClassifierPlan, ClassifierPolicy, DetectionPolicy, EngineConfig, FormulaPolicy, ImageInput,
     OcrEngine, OcrRequest, OutputPolicy, PreprocessPolicy, RapidOcrEngine, RecognitionPolicy,
-    StagePlan, TextOrder, WordOutputMode, render_output_report, to_output_items, to_output_json,
+    ReportMode, StagePlan, TextOrder, WordOutputMode, render_output_report, to_output_items,
+    to_output_json,
 };
 use std::{
     path::{Path, PathBuf},
@@ -265,6 +266,7 @@ fn report_cmd(
             source_name,
             &output,
             &format!("total {:.1} ms", output.timings.total_ms),
+            ReportMode::Full,
         )?;
         std::fs::write(output_dir.join(html_name), html)?;
     }

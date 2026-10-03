@@ -30,6 +30,7 @@
 //! | [`model_plan`] | 模型集的单一来源解析、逐文件状态、引擎路径绑定 | §5.3、§5.4、§7.6 |
 //! | [`engine`] | `OcrBackend` + 引擎工厂（测试可替换） | §8.2 |
 //! | [`results`] | 有界结果存储与有界序列化 | §4.5、§4.6 |
+//! | [`export`] | 标注 PNG、base64、JSON/Markdown/HTML 导出文档与时间账本 | §4.2、§9.5 |
 //! | [`download`] | 独立下载 worker + 可注入执行体 + `--allow-download-host` 校验 | §8.1、§6 |
 //! | [`server`] | 运行期核心：共享状态、worker、TTL 清理、端点语义、惰性建引擎 | §4、§7.6、§8 |
 //! | [`http`] | `tiny_http` 接线：路由、准入、响应头 | §4.2、§4.4、§7 |
@@ -56,6 +57,7 @@ mod cli;
 mod download;
 mod engine;
 mod error;
+mod export;
 mod http;
 mod jobs;
 mod limits;

@@ -494,6 +494,31 @@ impl ServeConfigPlan {
     pub fn requested_label(&self) -> String {
         rapid_ocr_rs::format_provider_preference(self.requested)
     }
+
+    /// M3：运行期切换 provider 时**重新应用同一套规则**。
+    ///
+    /// 实现上就是再用一次 [`Self::validate`]（`cli_provider = Some(requested)`、
+    /// `cli_max_side = None`，即保留当前 `max_side_len`），因此：
+    ///
+    /// - provider 名称非法 / 对应 feature 未编译进来 → 与启动期**同一句**可定位错误；
+    /// - `fail_if_provider_unavailable` 的冻结语义（§7.5：非 cpu provider 默认强制不回退，
+    ///   只有显式 `--allow-provider-fallback` 才允许回退）逐字沿用，
+    ///   `allow_provider_fallback` 由调用方传入**启动期的那个开关值**；
+    /// - 其余配置（模型路径、线程、`max_side_len`…）保持不变。
+    ///
+    /// 刻意**不**在 serve 里另写一份 provider 规则：那样启动期与运行期就会有两种解释。
+    pub fn with_provider(
+        &self,
+        requested: ProviderPreference,
+        allow_provider_fallback: bool,
+    ) -> Result<Self, StartupConfigError> {
+        Self::validate(
+            self.engine.clone(),
+            Some(requested),
+            None,
+            allow_provider_fallback,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -885,6 +910,52 @@ mod tests {
         )
         .expect("cpu is always resolvable");
         assert!(!plan.fail_if_provider_unavailable);
+    }
+
+    /// M3：运行期切换 provider 复用启动期的**同一套**规则（`with_provider`）。
+    ///
+    /// 这里只断言两件与 provider 无关、因此与 feature 编译情况无关的事：
+    /// 1. 目标 provider 合法时，新计划的 `requested` 就是它，`max_side_len` 等其余配置**不变**；
+    /// 2. `fail_if_provider_unavailable` 的冻结语义逐字沿用（非 cpu 默认强制不回退，
+    ///    只有显式回退开关时才允许）。
+    #[test]
+    fn switching_a_provider_reuses_the_frozen_startup_rules() {
+        let mut engine = EngineConfig::default();
+        engine.global.max_side_len = 1600;
+        let base = ServeConfigPlan::validate(engine, Some(ProviderPreference::Cpu), None, false)
+            .expect("cpu is always resolvable");
+
+        // 切到"就是 cpu"：新计划与原计划等价（同一条规则的再次应用）。
+        let same = base
+            .with_provider(ProviderPreference::Cpu, false)
+            .expect("cpu stays resolvable");
+        assert_eq!(same.requested, ProviderPreference::Cpu);
+        assert_eq!(same.requested_label(), "cpu");
+        assert_eq!(same.engine.global.max_side_len, 1600);
+        assert!(!same.fail_if_provider_unavailable);
+
+        // 关闭回退开关时，非 cpu provider 必须携带"强制不回退"（§7.5）。
+        // 该请求能不能真的建立会话与这里的规则无关：名称/feature 非法会返回 Err。
+        match base.with_provider(ProviderPreference::DirectMl { device_id: 0 }, false) {
+            Ok(plan) => assert!(
+                plan.fail_if_provider_unavailable,
+                "a non-cpu provider must fail rather than silently fall back"
+            ),
+            Err(error) => assert!(
+                error.to_string().contains("provider"),
+                "the only allowed failure here is the provider configuration: {error}"
+            ),
+        }
+        match base.with_provider(ProviderPreference::DirectMl { device_id: 0 }, true) {
+            Ok(plan) => assert!(
+                !plan.fail_if_provider_unavailable,
+                "--allow-provider-fallback keeps its documented meaning"
+            ),
+            Err(error) => assert!(
+                error.to_string().contains("provider"),
+                "the only allowed failure here is the provider configuration: {error}"
+            ),
+        }
     }
 
     /// §3：优先级 CLI > `--config` YAML > 内建默认（这里用"给/不给 CLI 值"两种情形证明）。

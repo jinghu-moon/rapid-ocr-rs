@@ -14,16 +14,47 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::sync::Arc;
 
+use rapid_ocr_rs::OcrOutput;
 use serde::Serialize;
 
 use super::error::ErrorBody;
 
+/// 成功任务保留的载荷（§4.5、§4.6）。
+///
+/// # 为什么保留结构化的 `OcrOutput` 而不是只留 JSON 字节
+///
+/// M3 的三种导出（`json`/`md`/`html`）由**库的渲染器**产生，它们都接收 `&OcrOutput`
+/// （`to_output_markdown`、`render_output_report`）——只留一份 JSON 文本会让 markdown /
+/// HTML 导出只能靠重新解析 JSON 拼凑，那是第二套实现。
+///
+/// 因此这里保留的是**结构化结果**（没有任何像素数据：`OcrOutput` 只有尺寸、阶段报告、
+/// 区域与计时），`serialized_bytes` 是 worker 里用**有界写入器**实测出的序列化长度
+/// （`JobStore` 的 `result_bytes` 口径 = "序列化后的结果"，与 §4.5 逐字一致）。
+/// 每个请求的 JSON 都由同一个 [`super::export::result_json`] 在有界写入器里重新产生，
+/// 因此响应路径上的分配上限仍然是 `--max-result-mb`。
+#[derive(Debug, Clone)]
+pub(super) struct Succeeded {
+    pub output: Arc<OcrOutput>,
+    /// worker 的**有界**序列化实测长度（= `/result` 与 `export?format=json` 的字节数）。
+    pub serialized_bytes: u64,
+}
+
+impl Succeeded {
+    pub fn new(output: Arc<OcrOutput>, serialized_bytes: u64) -> Self {
+        Self {
+            output,
+            serialized_bytes,
+        }
+    }
+}
+
 /// 一个任务的终态载荷。
 #[derive(Debug, Clone)]
 pub(super) enum Outcome {
-    /// 已序列化的结果 JSON（已通过 [`serialize_bounded`] 的体积上限检查）。
-    Succeeded(Vec<u8>),
+    /// 识别成功：结构化结果 + 实测的序列化长度（已通过 [`serialize_bounded`] 的体积上限检查）。
+    Succeeded(Succeeded),
     /// 失败：**保留原始的状态码与错误体**，这样 `/result` 能重放
     /// `422 unsupported_input` / `413 result_too_large` / `503 engine_unavailable`
     /// 这些真实原因，而不是把它们压成一句 `job_not_finished`。
@@ -34,7 +65,7 @@ impl Outcome {
     /// 该载荷占用的字节数（进 `JobStore` 的字节账本）。
     pub fn bytes(&self) -> u64 {
         match self {
-            Self::Succeeded(bytes) => bytes.len() as u64,
+            Self::Succeeded(succeeded) => succeeded.serialized_bytes,
             Self::Failed(_, body) => {
                 (body.code.len() + body.message.len() + body.detail.to_string().len()) as u64
             }
@@ -169,11 +200,28 @@ pub(super) fn serialize_bounded<T: Serialize>(
     }
 }
 
+/// 把一段**已经渲染好的**文本写进有界缓冲区（§9.5 的导出）。
+///
+/// 库的两个渲染器（`to_output_markdown`、`render_output_report`）返回 `String`，
+/// 因此这一层的职责是把"能不能发出去"变成一个**可拒绝**的判定：超限即 `TooLarge`，
+/// 绝不截断（截断会产出一个看起来正常、实际内容缺失的导出文档）。
+pub(super) fn text_bounded(text: &str, limit: u64) -> Result<Vec<u8>, SerializeError> {
+    let mut writer = BoundedWriter::new(limit);
+    match writer.write_all(text.as_bytes()) {
+        Ok(()) => Ok(writer.buffer),
+        Err(_) if writer.exceeded => Err(SerializeError::TooLarge),
+        Err(error) => Err(SerializeError::Internal(error.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::json;
 
-    use super::{Outcome, ResultStore, SerializeError, serialize_bounded};
+    use super::{Outcome, ResultStore, SerializeError, Succeeded, serialize_bounded, text_bounded};
+    use crate::serve::tests::scripted_output;
 
     #[test]
     fn a_result_over_the_limit_aborts_without_building_a_large_buffer() {
@@ -187,22 +235,32 @@ mod tests {
         assert!(serialize_bounded(&small, 6).is_err());
     }
 
+    /// §9.5：渲染好的文档同样走有界写入器，超限即 `TooLarge`，**绝不**截断。
+    #[test]
+    fn rendered_documents_are_bounded_and_never_truncated() {
+        assert_eq!(text_bounded("abcdef", 6).expect("exact fit").len(), 6);
+        let error = text_bounded("abcdef", 5).expect_err("one byte over must abort");
+        assert!(matches!(error, SerializeError::TooLarge), "{error:?}");
+        // 空文档在 0 上限下也通过（0 是合法上限的边界）。
+        assert!(text_bounded("", 0).is_ok());
+    }
+
     #[test]
     fn the_store_counts_bytes_and_refuses_to_overflow() {
         let mut store = ResultStore::new(2, 8);
-        assert!(store.insert("a", Outcome::Succeeded(vec![0; 4])));
-        assert!(store.insert("b", Outcome::Succeeded(vec![0; 4])));
+        assert!(store.insert("a", succeed(4)));
+        assert!(store.insert("b", succeed(4)));
         assert_eq!(store.len(), 2);
         assert_eq!(store.bytes(), 8);
         // 数量上限。
-        assert!(!store.insert("c", Outcome::Succeeded(vec![0; 1])));
+        assert!(!store.insert("c", succeed(1)));
         // 字节上限（同一条目不能重复登记）。
-        assert!(!store.insert("a", Outcome::Succeeded(vec![0; 1])));
+        assert!(!store.insert("a", succeed(1)));
         store.retain_only(|id| id == "a");
         assert_eq!(store.len(), 1);
         assert_eq!(store.bytes(), 4);
         assert!(store.get("b").is_none());
-        assert!(store.insert("b", Outcome::Succeeded(vec![0; 4])));
+        assert!(store.insert("b", succeed(4)));
     }
 
     #[test]
@@ -222,5 +280,23 @@ mod tests {
             other => panic!("expected a failure outcome, got {other:?}"),
         }
         assert!(store.bytes() > 0);
+    }
+
+    /// 成功载荷的账本口径 = worker 实测的序列化长度（不是结构体的内存占用估算）。
+    #[test]
+    fn the_succeeded_payload_accounts_for_its_measured_serialization() {
+        let outcome = succeed(1234);
+        assert_eq!(outcome.bytes(), 1234);
+        match &outcome {
+            Outcome::Succeeded(succeeded) => {
+                assert_eq!(succeeded.serialized_bytes, 1234);
+                assert_eq!(succeeded.output.image.original_size.width, 100);
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    fn succeed(bytes: u64) -> Outcome {
+        Outcome::Succeeded(Succeeded::new(Arc::new(scripted_output(1, 0)), bytes))
     }
 }

@@ -27,7 +27,7 @@
 //! 公式队列在 M1 生产路径上不可达（§10.8），因此这里显式把 `OcrRouting { formula: true }`
 //! 打开，并用 `?queue=formula` 选择队列——这就是"测试专用慢速路径"的全部内容。
 
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -65,6 +65,10 @@ struct Scripted {
     fail: bool,
     calls: Arc<AtomicUsize>,
     running: Arc<AtomicBool>,
+    /// 本后端的 `selected_ep` 标签（M3 的 provider 切换靠它证明"换了哪个会话"）。
+    ep: String,
+    /// 每次识别是谁服务的（按顺序），用来断言"队列里的任务用了新引擎"。
+    served: Arc<Mutex<Vec<String>>>,
 }
 
 impl Scripted {
@@ -76,6 +80,8 @@ impl Scripted {
             fail: false,
             calls: Arc::new(AtomicUsize::new(0)),
             running: Arc::new(AtomicBool::new(false)),
+            ep: "cpu".to_string(),
+            served: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -104,6 +110,11 @@ struct ScriptedBackend {
 impl OcrBackend for ScriptedBackend {
     fn recognize(&mut self, _request: OcrRequest) -> Result<OcrOutput, RapidOcrError> {
         self.state.calls.fetch_add(1, Ordering::SeqCst);
+        self.state
+            .served
+            .lock()
+            .expect("the scripted recorder is not poisoned")
+            .push(self.state.ep.clone());
         self.state.running.store(true, Ordering::SeqCst);
         if !self.state.delay.is_zero() {
             std::thread::sleep(self.state.delay);
@@ -119,14 +130,16 @@ impl OcrBackend for ScriptedBackend {
 
     fn provider(&self) -> BackendProvider {
         BackendProvider {
-            selected_ep: "cpu".to_string(),
+            selected_ep: self.state.ep.clone(),
             fallback_to_cpu: false,
         }
     }
 }
 
 /// 一份结构完整、可被 `to_output_json` 序列化的输出。
-fn scripted_output(regions: usize, text_bytes: usize) -> OcrOutput {
+///
+/// `pub(crate)`：`results.rs` 的单元测试也用它构造成功载荷（同一份样例，避免两处各写一套）。
+pub(crate) fn scripted_output(regions: usize, text_bytes: usize) -> OcrOutput {
     let provider = ProviderResolutionInfo {
         requested: GenericProviderPreference::Cpu,
         selected_ep: ResolvedProvider::Cpu,
@@ -191,6 +204,8 @@ struct TestOptions {
     limits: RawServeLimits,
     allow_download: bool,
     allow_download_hosts: Vec<String>,
+    /// `--allow-provider-fallback`（§7.5）：运行期切换 provider 会用同一个值。
+    allow_provider_fallback: bool,
     routing: OcrRouting,
     engine_factory: EngineFactory,
     downloader: DownloaderFactory,
@@ -205,6 +220,7 @@ impl TestOptions {
             limits: RawServeLimits::default(),
             allow_download: false,
             allow_download_hosts: Vec::new(),
+            allow_provider_fallback: false,
             routing: OcrRouting::text_only(),
             engine_factory: scripted.factory(),
             downloader: ScriptedDownload::default().factory(),
@@ -248,9 +264,14 @@ impl TestServer {
         let token = ServeToken::generate();
         let nonce = generate_nonce();
         let page = render_page(&token, &nonce).expect("the page must inject cleanly");
-        let startup =
-            ServeStartup::validate(options.limits, options.engine_config, None, None, false)
-                .expect("the test limits must be valid");
+        let startup = ServeStartup::validate(
+            options.limits,
+            options.engine_config,
+            None,
+            None,
+            options.allow_provider_fallback,
+        )
+        .expect("the test limits must be valid");
         let model_plan =
             ModelPlan::resolve(&options.model_dir, &startup.plan.engine).expect("model plan");
         let snapshot = model_plan.snapshot();
@@ -265,6 +286,8 @@ impl TestServer {
             nonce,
             allow_download: options.allow_download,
             allow_download_hosts: options.allow_download_hosts,
+            // §7.5：`ServeStartup::validate` 用的是同一个开关，运行期切换 provider 也用它。
+            allow_provider_fallback: options.allow_provider_fallback,
             routing: options.routing,
             engine_factory: options.engine_factory,
             downloader: options.downloader,
@@ -322,23 +345,7 @@ impl TestServer {
         headers: &[(&str, &str)],
         body: Option<&[u8]>,
     ) -> RawResponse {
-        let mut raw = format!("{method} {path} HTTP/1.1\r\nConnection: close\r\n");
-        for (name, value) in headers {
-            raw.push_str(&format!("{name}: {value}\r\n"));
-        }
-        match body {
-            Some(body) => {
-                raw.push_str(&format!("Content-Length: {}\r\n", body.len()));
-                raw.push_str("\r\n");
-                let mut bytes = raw.into_bytes();
-                bytes.extend_from_slice(body);
-                send(self.addr, &bytes)
-            }
-            None => {
-                raw.push_str("\r\n");
-                send(self.addr, raw.as_bytes())
-            }
-        }
+        raw_request(self.addr, method, path, headers, body)
     }
 
     fn submit_ocr(&self, body: &[u8]) -> RawResponse {
@@ -411,6 +418,39 @@ impl RawResponse {
 
     fn code(&self) -> String {
         self.json()["code"].as_str().unwrap_or_default().to_string()
+    }
+}
+
+/// 一次原始请求的自由函数形式（**并发**测试用：另一个线程只需要有 `addr` 就能发请求，
+/// 而不必借用 `TestServer`。M3 的 provider 切换请求会一直阻塞到切换序列结束，
+/// 因此它必须在后台线程里发出）。
+///
+/// 每个请求都带 `Connection: close`：响应因此一定以关闭连接结束，测试客户端不必
+/// 依赖 `Content-Length`（`tiny_http` 对 >32 KiB 的已知长度响应用 chunked，
+/// 内联页面正是这种）。
+fn raw_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+) -> RawResponse {
+    let mut raw = format!("{method} {path} HTTP/1.1\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        raw.push_str(&format!("{name}: {value}\r\n"));
+    }
+    match body {
+        Some(body) => {
+            raw.push_str(&format!("Content-Length: {}\r\n", body.len()));
+            raw.push_str("\r\n");
+            let mut bytes = raw.into_bytes();
+            bytes.extend_from_slice(body);
+            send(addr, &bytes)
+        }
+        None => {
+            raw.push_str("\r\n");
+            send(addr, raw.as_bytes())
+        }
     }
 }
 
@@ -1034,15 +1074,26 @@ fn an_over_long_content_length_is_rejected_before_the_body_is_read() {
 fn unknown_paths_are_404_and_wrong_methods_are_405() {
     let server = TestServer::start(TestOptions::new(empty_model_dir("route"), Scripted::fast()));
 
-    // M3 的端点不存在 → 404（不是 200，也不是 500）。
+    // 不存在的东西仍然是 404（`not_found` 只用于"没有这条路由"）。
     for path in [
-        "/api/jobs/job-0/annotated.png",
-        "/api/jobs/job-0/export?format=json",
         "/favicon.ico",
+        "/api",
+        "/api/jobs/job-0/annotated",
+        "/api/nope",
     ] {
         let response = server.get(path);
         assert_eq!(response.status, 404, "{path}: {}", response.text());
         assert_eq!(response.code(), "not_found", "{path}");
+    }
+
+    // M3 的两个端点现在是**真实路由**：任务不存在 → 404 `job_not_found`（不是路由没匹配）。
+    for path in [
+        "/api/jobs/job-0/annotated.png",
+        "/api/jobs/job-0/export?format=json",
+    ] {
+        let response = server.get(path);
+        assert_eq!(response.status, 404, "{path}: {}", response.text());
+        assert_eq!(response.code(), "job_not_found", "{path}");
     }
 
     let response = server.get("/api/ocr");
@@ -1055,6 +1106,13 @@ fn unknown_paths_are_404_and_wrong_methods_are_405() {
     assert_eq!(response.status, 405, "{}", response.text());
     assert_eq!(response.code(), "method_not_allowed");
     assert_eq!(response.header("Allow"), Some("POST"));
+
+    // M3 的两个端点只接受 GET。
+    for path in ["/api/jobs/job-0/annotated.png", "/api/jobs/job-0/export"] {
+        let response = server.post(path, &[], b"");
+        assert_eq!(response.status, 405, "{path}: {}", response.text());
+        assert_eq!(response.header("Allow"), Some("GET"), "{path}");
+    }
 }
 
 #[test]
@@ -1734,6 +1792,97 @@ fn gated_engine_factory(gate: Arc<Gate>, counter: Arc<AtomicUsize>) -> EngineFac
     })
 }
 
+// ------------------------------------------------------- M3：引擎会话脚本（provider 切换）
+
+/// "第几次建立会话"的脚本：在哪一次阻塞、哪几次失败、每次的 `selected_ep` 标签。
+///
+/// M3 的 provider 切换必须在**同一个进程里**观察到三次建会话（启动、切换、回滚），
+/// 而这三次调用只有次数上的区别，因此用序号来驱动它是最直接的做法。
+#[derive(Clone)]
+struct SessionPlan {
+    calls: Arc<AtomicUsize>,
+    /// 第 N 次（1 基）调用在返回前阻塞在闸门上（观察 `rebuilding`）。
+    gate_at: Option<usize>,
+    /// 第 N 次调用返回错误（模拟"新 provider 建不起来"）。
+    fail_at: Vec<usize>,
+    /// 建立出来的后端每次识别要花多久（"排空"要有一个真在跑的任务）。
+    delay: Duration,
+}
+
+impl SessionPlan {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            gate_at: None,
+            fail_at: Vec::new(),
+            delay: Duration::ZERO,
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn factory(&self, gate: Option<Arc<Gate>>) -> EngineFactory {
+        let plan = self.clone();
+        Arc::new(
+            move |_config: &EngineConfig| -> Result<Box<dyn OcrBackend>, RapidOcrError> {
+                let index = plan.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if plan.gate_at == Some(index)
+                    && let Some(gate) = &gate
+                {
+                    gate.wait();
+                }
+                if plan.fail_at.contains(&index) {
+                    return Err(RapidOcrError::UnsupportedProvider(format!(
+                        "scripted session {index} cannot be created"
+                    )));
+                }
+                Ok(Box::new(ScriptedBackend {
+                    state: Scripted {
+                        // 标签编码"第几个会话"：`/api/status` 的 `selected_ep` 因此能证明
+                        // 换上的是**新**引擎，而不是留着旧的那一个。
+                        ep: format!("scripted-{index}"),
+                        delay: plan.delay,
+                        ..Scripted::fast()
+                    },
+                }))
+            },
+        )
+    }
+}
+
+/// 闸门的 RAII 放行器：**任何**提前失败（panic 展开）都会放行被闸住的会话创建线程。
+///
+/// 没有它的话，一个断言失败会把那个线程永远留在闸门后面，而它持有 `engine_load`，
+/// 于是 `ServeRuntime::stop()` 的 join 也会跟着挂住——测试失败的方式会从"一条红"
+/// 变成"整个测试进程挂死"。
+struct ReleaseOnDrop {
+    gate: Arc<Gate>,
+    released: AtomicBool,
+}
+
+impl ReleaseOnDrop {
+    fn new(gate: Arc<Gate>) -> Self {
+        Self {
+            gate,
+            released: AtomicBool::new(false),
+        }
+    }
+
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::SeqCst) {
+            self.gate.release();
+        }
+    }
+}
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 // ---------------------------------------------------------------- M2：下载（无网络）
 
 /// 一个真实的下载任务从 202 走到 succeeded：进度逐文件推进、文件真的落盘、
@@ -2312,6 +2461,830 @@ fn the_engine_is_created_lazily_on_the_next_ocr_request_and_loading_is_visible()
     assert!(
         status["engine_load_ms"].as_u64().is_some(),
         "the session creation time must be reported: {status}"
+    );
+}
+
+// ---------------------------------------------------------------- M3：标注图与导出
+
+/// 一张真实的 PNG（`scripted_output` 的 `image.original_size` 是 100×50，两者必须一致：
+/// 标注图是画在**被解码的原图**上的，尺寸对不上就说明这条链路有假）。
+fn flat_source_png() -> Vec<u8> {
+    let image = image::RgbImage::from_fn(100, 50, |x, y| {
+        image::Rgb([(x % 256) as u8, (y % 256) as u8, 40])
+    });
+    let mut bytes = Vec::new();
+    image
+        .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .expect("the fixture PNG encodes");
+    bytes
+}
+
+/// 一张"压不动"的 PNG（伪随机像素）：体积可控，用于字节预算测试。
+fn noise_png(dimension: u32) -> Vec<u8> {
+    let mut state = 0x1234_5678_9abc_def0_u64;
+    let image = image::RgbImage::from_fn(dimension, dimension, |_, _| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        image::Rgb([
+            (state >> 33) as u8,
+            (state >> 41) as u8,
+            (state >> 49) as u8,
+        ])
+    });
+    let mut bytes = Vec::new();
+    image
+        .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .expect("the noise PNG encodes");
+    bytes
+}
+
+/// 至少 `minimum` 字节的 PNG（选最小的那个够用的尺寸，因此不会超出保留预算太多）。
+fn source_png_at_least(minimum: usize) -> Vec<u8> {
+    for dimension in [360_u32, 420, 480, 520, 560] {
+        let png = noise_png(dimension);
+        if png.len() >= minimum {
+            return png;
+        }
+    }
+    panic!("cannot build a PNG of at least {minimum} bytes");
+}
+
+/// §4.2/§4.5：`/annotated.png` 是**真正**的 PNG、尺寸等于原图、且检测框真的画上去了。
+#[test]
+fn the_annotated_png_is_a_real_png_with_the_original_dimensions_and_drawn_boxes() {
+    let server = TestServer::start(TestOptions::new(
+        complete_model_dir("m3-annotated"),
+        Scripted {
+            // 一个区域：画布上只有第一个调色板颜色（纯红），断言因此是精确的。
+            regions: 1,
+            ..Scripted::fast()
+        },
+    ));
+    let source = flat_source_png();
+    let accepted = server.submit_ocr(&source).json();
+    let id = accepted["job_id"].as_str().expect("job id").to_string();
+    let view = server.wait_terminal(&id, Duration::from_secs(20));
+    assert_eq!(view["state"], "succeeded", "{view}");
+    assert_eq!(
+        view["original_retained"], true,
+        "the encoded original stays in the retention area after OCR (§4.5): {view}"
+    );
+
+    let result = server.get(&format!("/api/jobs/{id}/result")).json();
+    let expected = (
+        result["image"]["original_size"]["width"].as_u64(),
+        result["image"]["original_size"]["height"].as_u64(),
+    );
+    assert_eq!(expected, (Some(100), Some(50)), "{result}");
+
+    let response = server.get(&format!("/api/jobs/{id}/annotated.png"));
+    assert_eq!(response.status, 200, "{}", response.text());
+    assert_eq!(response.header("Content-Type"), Some("image/png"));
+    // 三个安全头对**每个**响应都成立（§7.3）。
+    assert_eq!(response.header("X-Content-Type-Options"), Some("nosniff"));
+    assert_eq!(response.header("Cache-Control"), Some("no-store"));
+    assert_eq!(&response.body[..8], b"\x89PNG\r\n\x1a\n", "PNG signature");
+    let decoded = image::load_from_memory(&response.body).expect("the annotation is a real image");
+    assert_eq!(
+        (decoded.width() as u64, decoded.height() as u64),
+        (expected.0.unwrap(), expected.1.unwrap()),
+        "the canvas is the decoded original, not a guess"
+    );
+    // 第一个区域的框角 (1,1) 被画成了调色板的第 0 种颜色（纯红）——证明 `draw_output` 真的跑了。
+    assert_eq!(
+        decoded.to_rgb8().get_pixel(1, 1).0,
+        [255, 0, 0],
+        "the detection box must be drawn on the retained original"
+    );
+}
+
+/// §4.2/§4.5：原图编码字节被保留预算释放后，`/annotated.png` 是 **410 `original_evicted`**，
+/// 而**结果仍然可读**（这正是这个 `code` 与 `job_evicted` 的区别）。
+///
+/// 让一个任务自己的"原图 + 结果"超过 1 MiB 预算即可确定性触发：预算超限时先释放**最旧终态
+/// 任务的原图**（此刻就是它自己），任务与结果都留下。
+#[test]
+fn the_annotated_png_is_410_original_evicted_once_the_budget_releases_the_original() {
+    let mut raw = limits(4, 2);
+    raw.max_retained_mb = 1;
+    raw.max_result_mb = 8;
+    let scripted = || Scripted {
+        regions: 1,
+        text_bytes: 128 * 1024,
+        ..Scripted::fast()
+    };
+
+    // 先在一个**同样的**运行时上量出结果 JSON 的真实大小（同一份脚本化输出，确定性）。
+    let probe = TestServer::start(TestOptions {
+        limits: raw,
+        ..TestOptions::new(complete_model_dir("m3-annotated-evicted-probe"), scripted())
+    });
+    let accepted = probe.submit_ocr(&flat_source_png()).json();
+    let probe_id = accepted["job_id"].as_str().expect("job id").to_string();
+    assert_eq!(
+        probe.wait_terminal(&probe_id, Duration::from_secs(30))["state"],
+        "succeeded"
+    );
+    let result_bytes = probe
+        .get(&format!("/api/jobs/{probe_id}/result"))
+        .body
+        .len() as u64;
+    assert!(
+        result_bytes < 1 << 20,
+        "the result store's own budget is 1 MiB, so the fixture result must fit: {result_bytes}"
+    );
+
+    // 原图必须"一个装得下、加上结果就装不下"：条件不成立时下面会直接失败，
+    // 而不是悄悄退化成"其实没触发预算"。
+    let needed = (1 << 20) - result_bytes + 64 * 1024;
+    let source = source_png_at_least(needed as usize);
+    assert!(
+        source.len() as u64 <= 1 << 20,
+        "the original alone must fit the 1 MiB budget: {} bytes",
+        source.len()
+    );
+    assert!(
+        source.len() as u64 + result_bytes > 1 << 20,
+        "the original plus the result must exceed it: {} + {result_bytes}",
+        source.len()
+    );
+
+    let server = TestServer::start(TestOptions {
+        limits: raw,
+        ..TestOptions::new(complete_model_dir("m3-annotated-evicted"), scripted())
+    });
+    let accepted = server.submit_ocr(&source).json();
+    let id = accepted["job_id"].as_str().expect("job id").to_string();
+    let view = server.wait_terminal(&id, Duration::from_secs(30));
+    assert_eq!(view["state"], "succeeded", "{view}");
+    assert_eq!(
+        view["original_retained"], false,
+        "the byte budget released the original: {view}"
+    );
+
+    let response = server.get(&format!("/api/jobs/{id}/annotated.png"));
+    assert_eq!(response.status, 410, "{}", response.text());
+    assert_eq!(response.code(), "original_evicted");
+    assert!(
+        response
+            .json()
+            .get("detail")
+            .is_some_and(serde_json::Value::is_null),
+        "the body still carries the frozen three keys: {}",
+        response.text()
+    );
+
+    // 任务与结果**都还在**（与 `job_evicted` 的区别就在这里）。
+    assert_eq!(server.get(&format!("/api/jobs/{id}")).status, 200);
+    let result = server.get(&format!("/api/jobs/{id}/result"));
+    assert_eq!(result.status, 200, "{}", result.text());
+    assert_eq!(result.body.len() as u64, result_bytes, "byte for byte");
+    // 状态里也如实反映"保留区里还有几份原图"。
+    let status = server.get("/api/status").json();
+    assert_eq!(status["retention"]["retained_originals"], 0, "{status}");
+    assert!(
+        status["retention"]["retained_bytes"].as_u64() == Some(result_bytes),
+        "the byte ledger follows the release: {status}"
+    );
+}
+
+/// §4.2/§9.5：三种导出都由**库的渲染器**产生，HTML 是静态的（正文无 `<script`），
+/// 图片以 `data:` 内嵌，且以附件形式返回并带独立的导出 CSP。
+#[test]
+fn every_export_format_is_served_as_an_attachment_and_the_html_is_static_and_offline() {
+    let server = TestServer::start(TestOptions::new(
+        complete_model_dir("m3-export"),
+        Scripted {
+            regions: 2,
+            ..Scripted::fast()
+        },
+    ));
+    let accepted = server.submit_ocr(&flat_source_png()).json();
+    let id = accepted["job_id"].as_str().expect("job id").to_string();
+    assert_eq!(
+        server.wait_terminal(&id, Duration::from_secs(20))["state"],
+        "succeeded"
+    );
+
+    // (a) JSON 导出与 `/result` 逐字节相同（同一份值、同一个有界写入器）。
+    let result = server.get(&format!("/api/jobs/{id}/result"));
+    let json = server.get(&format!("/api/jobs/{id}/export?format=json"));
+    assert_eq!(json.status, 200, "{}", json.text());
+    assert_eq!(
+        json.header("Content-Type"),
+        Some("application/json; charset=utf-8")
+    );
+    assert_eq!(
+        json.header("Content-Disposition"),
+        Some(format!("attachment; filename=\"ocr-{id}.json\"").as_str())
+    );
+    assert_eq!(json.body, result.body, "the same bytes as /result");
+    assert_eq!(json.header("Content-Security-Policy"), None);
+
+    // (b) Markdown 导出。
+    let markdown = server.get(&format!("/api/jobs/{id}/export?format=md"));
+    assert_eq!(markdown.status, 200, "{}", markdown.text());
+    assert_eq!(
+        markdown.header("Content-Type"),
+        Some("text/markdown; charset=utf-8")
+    );
+    assert_eq!(
+        markdown.header("Content-Disposition"),
+        Some(format!("attachment; filename=\"ocr-{id}.md\"").as_str())
+    );
+    let markdown_text = markdown.text();
+    assert!(markdown_text.contains("region-0"), "{markdown_text}");
+
+    // (c) HTML 导出：静态模式 + data: 内嵌图片 + 导出 CSP + 附件头。
+    let html = server.get(&format!("/api/jobs/{id}/export?format=html"));
+    assert_eq!(html.status, 200, "{}", html.text());
+    assert_eq!(
+        html.header("Content-Type"),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(
+        html.header("Content-Disposition"),
+        Some(format!("attachment; filename=\"ocr-{id}.html\"").as_str())
+    );
+    assert_eq!(
+        html.header("Content-Security-Policy"),
+        Some(super::http::EXPORT_CSP)
+    );
+    let html_text = html.text();
+    assert!(
+        !html_text.to_lowercase().contains("<script"),
+        "the export must not contain any <script: {html_text}"
+    );
+    assert!(
+        html_text.contains("data:image/png;base64,"),
+        "the annotated image must be embedded, not linked: {html_text}"
+    );
+    // 真正离线可用：唯一的 `src` 就是那条 data URL，没有相对路径、没有指向本服务的链接。
+    assert_eq!(
+        html_text.matches("src=\"").count(),
+        1,
+        "exactly one image source: {html_text}"
+    );
+    assert!(
+        html_text.contains("src=\"data:image/png;base64,"),
+        "the image must be embedded: {html_text}"
+    );
+    assert!(!html_text.contains("/api/"), "no service link: {html_text}");
+    assert!(html_text.contains("<style>"), "{html_text}");
+    // 主页面 CSP 不含 unsafe-inline；导出 CSP 只出现在导出这条响应上。
+    let page = server.get("/");
+    assert!(
+        !page
+            .header("Content-Security-Policy")
+            .unwrap_or_default()
+            .contains("unsafe-inline")
+    );
+
+    // 未知/缺失的 format 是 400（不猜默认值）。
+    for bad in ["", "?format=pdf", "?format=JSON"] {
+        let response = server.get(&format!("/api/jobs/{id}/export{bad}"));
+        assert_eq!(response.status, 400, "{bad}: {}", response.text());
+        assert_eq!(response.code(), "bad_request", "{bad}");
+    }
+}
+
+/// §4.6/§9.5：`--max-export-mb` 用有界写入器强制，超限是 **413 `export_too_large`**，
+/// `detail` 指向**仍然可用**的 `annotated.png`；刚好在限额内的导出是 200。
+#[test]
+fn an_export_over_the_limit_is_a_413_pointing_at_the_annotated_png() {
+    let mut raw = limits(4, 2);
+    // 结果预算（8 MiB）比导出预算（1 MiB）大：任务会成功，导出才会超限。
+    raw.max_result_mb = 8;
+    raw.max_export_mb = 1;
+    let server = TestServer::start(TestOptions {
+        limits: raw,
+        ..TestOptions::new(
+            complete_model_dir("m3-export-too-large"),
+            Scripted {
+                regions: 1,
+                // Markdown 只包含**一份**文本（JSON 会重复若干份），因此这个尺寸要让
+                // 最"瘦"的那份文档也超过 1 MiB 的导出预算。
+                text_bytes: 1400 * 1024,
+                ..Scripted::fast()
+            },
+        )
+    });
+    let accepted = server.submit_ocr(&flat_source_png()).json();
+    let id = accepted["job_id"].as_str().expect("job id").to_string();
+    assert_eq!(
+        server.wait_terminal(&id, Duration::from_secs(30))["state"],
+        "succeeded"
+    );
+    let result_bytes = server.get(&format!("/api/jobs/{id}/result")).body.len() as u64;
+    assert!(
+        result_bytes > 1 << 20,
+        "the fixture must be over the export budget: {result_bytes}"
+    );
+    assert!(
+        result_bytes < 8 << 20,
+        "the fixture must stay inside --max-result-mb: {result_bytes}"
+    );
+
+    for format in ["json", "md", "html"] {
+        let response = server.get(&format!("/api/jobs/{id}/export?format={format}"));
+        assert_eq!(
+            response.status,
+            413,
+            "{format}: HTTP {} ({} bytes)",
+            response.status,
+            response.body.len()
+        );
+        assert_eq!(response.code(), "export_too_large", "{format}");
+        let body = response.json();
+        assert_eq!(body["detail"]["limit_bytes"], 1 << 20, "{format}: {body}");
+        assert_eq!(
+            body["detail"]["annotated"],
+            format!("/api/jobs/{id}/annotated.png"),
+            "{format}: {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("annotated.png")),
+            "{format}: {body}"
+        );
+        if format == "json" {
+            // 有界写入器中止时不知道完整长度，而那个长度是 worker **已经测过**的事实。
+            assert_eq!(body["detail"]["observed_bytes"], result_bytes, "{body}");
+        } else {
+            assert!(
+                body["detail"]["observed_bytes"]
+                    .as_u64()
+                    .is_some_and(|n| n > 1 << 20),
+                "{format}: {body}"
+            );
+        }
+    }
+    // 即使导出被拒，`annotated.png` 本身照旧可用（§9.5 要求的"指向"必须是真的）。
+    let annotated = server.get(&format!("/api/jobs/{id}/annotated.png"));
+    assert_eq!(annotated.status, 200, "{}", annotated.text());
+    assert_eq!(&annotated.body[..8], b"\x89PNG\r\n\x1a\n");
+}
+
+/// 刚好在 `--max-export-mb` 之内的导出是 200（上限是"不得超过"，不是"必须小于"）。
+#[test]
+fn an_export_under_the_limit_is_served_intact() {
+    let mut raw = limits(4, 2);
+    raw.max_export_mb = 1;
+    let server = TestServer::start(TestOptions {
+        limits: raw,
+        ..TestOptions::new(
+            complete_model_dir("m3-export-under"),
+            Scripted {
+                regions: 1,
+                text_bytes: 64 * 1024,
+                ..Scripted::fast()
+            },
+        )
+    });
+    let accepted = server.submit_ocr(&flat_source_png()).json();
+    let id = accepted["job_id"].as_str().expect("job id").to_string();
+    assert_eq!(
+        server.wait_terminal(&id, Duration::from_secs(20))["state"],
+        "succeeded"
+    );
+    for format in ["json", "md", "html"] {
+        let response = server.get(&format!("/api/jobs/{id}/export?format={format}"));
+        assert_eq!(response.status, 200, "{format}: {}", response.text());
+        assert!(!response.body.is_empty(), "{format}");
+    }
+}
+
+/// §4.2/§4.5：导出与标注只需要**成功的**任务；其它状态是 409 `job_not_finished`
+/// （没有区域可导出/叠加，不能凭空造一份）。
+#[test]
+fn exports_require_a_successful_job() {
+    let server = TestServer::start(TestOptions {
+        limits: limits(2, 1),
+        ..TestOptions::new(
+            complete_model_dir("m3-export-not-finished"),
+            Scripted::slow(Duration::from_millis(500)),
+        )
+    });
+    let accepted = server.submit_ocr(b"image").json();
+    let id = accepted["job_id"].as_str().expect("job id").to_string();
+    for path in [
+        format!("/api/jobs/{id}/annotated.png"),
+        format!("/api/jobs/{id}/export?format=json"),
+        format!("/api/jobs/{id}/export?format=html"),
+    ] {
+        let response = server.get(&path);
+        assert!(
+            response.status == 409 || response.status == 200,
+            "{path}: {}",
+            response.text()
+        );
+    }
+
+    // 失败的 OCR 任务：三种导出与标注图都是 409（`/result` 才是重放错误的地方）。
+    let failing = TestServer::start(TestOptions::new(
+        complete_model_dir("m3-export-failed"),
+        Scripted {
+            fail: true,
+            ..Scripted::fast()
+        },
+    ));
+    let accepted = failing.submit_ocr(b"image").json();
+    let id = accepted["job_id"].as_str().expect("job id").to_string();
+    assert_eq!(
+        failing.wait_terminal(&id, Duration::from_secs(20))["state"],
+        "failed"
+    );
+    for path in [
+        format!("/api/jobs/{id}/annotated.png"),
+        format!("/api/jobs/{id}/export?format=md"),
+    ] {
+        let response = failing.get(&path);
+        assert_eq!(response.status, 409, "{path}: {}", response.text());
+        assert_eq!(response.code(), "job_not_finished", "{path}");
+    }
+}
+
+/// §10.6/§11 M3：诊断面板要的数据全部来自**库已经报告的**东西，不重新测量。
+///
+/// `/result` 给出逐阶段 `timings` 与时间账本（含残差与自解释文案）；`/api/status` 给出
+/// ORT 指纹（已脱敏）、峰值工作集与 provider 三字段。
+#[test]
+fn the_diagnostics_payload_reports_the_library_ledger_fingerprint_and_memory() {
+    let server = TestServer::start(TestOptions::new(
+        complete_model_dir("m3-diagnostics"),
+        Scripted::fast(),
+    ));
+    let accepted = server.submit_ocr(&flat_source_png()).json();
+    let id = accepted["job_id"].as_str().expect("job id").to_string();
+    assert_eq!(
+        server.wait_terminal(&id, Duration::from_secs(20))["state"],
+        "succeeded"
+    );
+
+    let result = server.get(&format!("/api/jobs/{id}/result")).json();
+    let timings = result["timings"].as_object().expect("the stage timings");
+    for key in [
+        "total_ms",
+        "preprocess_ms",
+        "detector_infer_ms",
+        "recognizer_infer_ms",
+        "postprocess_ms",
+    ] {
+        assert!(timings.get(key).is_some(), "missing {key}: {result}");
+    }
+    let ledger = &result["timing_ledger"];
+    assert!(ledger["total_ms"].is_number(), "{ledger}");
+    assert!(ledger["input_preprocess_ms"].is_number(), "{ledger}");
+    assert!(ledger["unattributed_ms"].is_number(), "{ledger}");
+    assert!(ledger["attributed_ms"].is_number(), "{ledger}");
+    assert!(ledger["inference_ms"].is_number(), "{ledger}");
+    assert!(ledger["rust_ms"].is_number(), "{ledger}");
+    assert_eq!(ledger["shares"]["inference_share"], 0.0, "{ledger}");
+    let conservation = &ledger["conservation"];
+    // `scripted_output` 的 `total_ms = 1.0`、所有分量 0 → 残差 −1.0（可精确断言）。
+    assert_eq!(conservation["residual_ms"], -1.0, "{conservation}");
+    assert_eq!(conservation["conserved"], false, "{conservation}");
+    assert_eq!(conservation["excess_ms"], 1.0, "{conservation}");
+    let interpretation = conservation["interpretation"]
+        .as_str()
+        .expect("the ledger explains itself");
+    assert!(
+        interpretation.contains("NOT a strict partition"),
+        "the panel must be able to show this wording verbatim: {interpretation}"
+    );
+    assert!(
+        interpretation.contains("residual_ms = -1.000000"),
+        "the interpretation quotes the actual residual: {interpretation}"
+    );
+    assert!(
+        interpretation.contains("SCOPE difference"),
+        "and says what the residual is: {interpretation}"
+    );
+
+    let status = server.get("/api/status").json();
+    assert!(status["ort"]["version"].is_string(), "{status}");
+    assert_eq!(status["ort"]["fingerprint"]["complete"], true, "{status}");
+    assert!(
+        status["ort"]["fingerprint"]["file"].is_string(),
+        "the fingerprint gives a file name, never a path: {status}"
+    );
+    assert!(
+        status["memory"]["peak_working_set_bytes"]
+            .as_u64()
+            .is_some(),
+        "{status}"
+    );
+    assert!(status["memory"]["source"].is_string(), "{status}");
+    assert_eq!(status["provider"]["requested"], "cpu");
+    assert_eq!(status["provider"]["selected_ep"], "cpu");
+    assert_eq!(status["provider"]["fallback_to_cpu"], false);
+    assert!(status["queues"]["text"]["wait_bound"].as_u64().is_some());
+}
+
+// ------------------------------------------------- M3：provider 运行期切换（§7.5/§7.6）
+
+/// M3 的完整序列：暂停新任务（`rebuilding`）→ 排空 → 销毁旧 engine → 建立新 engine，
+/// 期间到达的 `POST /api/ocr` **入队（202）而不是被拒绝**，切换完成后它们用**新**引擎执行。
+#[test]
+fn switching_the_provider_rebuilds_the_session_and_queues_requests_meanwhile() {
+    let dir = manifest_model_dir(
+        "m3-provider-switch",
+        &["det.onnx", "rec.onnx", "dict.txt"],
+        None,
+    );
+    let gate = Gate::new();
+    let plan = SessionPlan {
+        gate_at: Some(2),
+        // 排空要有对象：这个会话每次识别花 300 ms，切换因此必须等它跑完。
+        delay: Duration::from_millis(300),
+        ..SessionPlan::new()
+    };
+    let server = TestServer::start(TestOptions {
+        engine_factory: plan.factory(Some(Arc::clone(&gate))),
+        ..TestOptions::new(dir, Scripted::slow(Duration::from_millis(300)))
+    });
+
+    // 启动期预加载：会话 1。
+    let status = server.get("/api/status").json();
+    assert_eq!(status["engine"]["state"], "ready", "{status}");
+    assert_eq!(status["provider"]["selected_ep"], "scripted-1", "{status}");
+    assert_eq!(plan.calls(), 1);
+
+    // 一个长任务正在推理（排空的对象）。
+    let running_id = server.submit_ocr(b"image").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            server.get(&format!("/api/jobs/{running_id}")).json()["state"] == "running"
+        }),
+        "the first job must be running when the switch starts"
+    );
+
+    // 切换请求在后台线程里发出：它**只有**在序列结束（或失败）后才返回。
+    let addr = server.addr;
+    let host = server.host.clone();
+    let origin = server.origin.clone();
+    let token = server.token.clone();
+    let switch = std::thread::spawn(move || {
+        raw_request(
+            addr,
+            "POST",
+            "/api/engine/reload",
+            &[
+                ("Host", host.as_str()),
+                ("X-RapidOCR-Token", token.as_str()),
+                ("Origin", origin.as_str()),
+                ("Content-Type", "application/json"),
+            ],
+            Some(br#"{"provider":"cpu"}"#),
+        )
+    });
+    // 断言失败也一定放行，否则这个测试会从"一条红"变成"挂死整个测试进程"。
+    let release = ReleaseOnDrop::new(Arc::clone(&gate));
+
+    gate.arrive(); // 新会话正在建立
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            server.get("/api/status").json()["engine"]["state"] == "rebuilding"
+        }),
+        "`Rebuilding` must be observable through /api/status"
+    );
+    // 排空已经完成：在跑的任务结束了（它用会话 1 执行）。
+    assert_eq!(
+        server.get(&format!("/api/jobs/{running_id}")).json()["state"],
+        "succeeded"
+    );
+
+    // 切换期间：三字段里 requested 已经是新值，selected_ep/fallback 是 null（未知态不装 false）。
+    let status = server.get("/api/status").json();
+    assert_eq!(status["engine"]["state"], "rebuilding", "{status}");
+    assert_eq!(status["provider"]["requested"], "cpu", "{status}");
+    assert_eq!(
+        status["provider"]["selected_ep"],
+        serde_json::Value::Null,
+        "{status}"
+    );
+    assert_eq!(
+        status["provider"]["fallback_to_cpu"],
+        serde_json::Value::Null,
+        "{status}"
+    );
+
+    // 切换期间的 OCR 请求：**202 queued**（`OcrAdmission::Queue`），不是 503/409。
+    let queued = server.submit_ocr(b"during-rebuild");
+    assert_eq!(queued.status, 202, "{}", queued.text());
+    assert_eq!(queued.json()["state"], "queued");
+    let queued_id = queued.json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+
+    release.release();
+    drop(release);
+    let response = switch.join().expect("the switch thread must finish");
+    assert_eq!(response.status, 200, "{}", response.text());
+    let body = response.json();
+    assert_eq!(body["outcome"], "ready", "{body}");
+    assert_eq!(body["engine"]["selected_ep"], "scripted-2", "{body}");
+    assert_eq!(body["selected_ep"], "scripted-2", "{body}");
+    assert_eq!(body["fallback_to_cpu"], false, "{body}");
+    assert_eq!(body["error"], serde_json::Value::Null, "{body}");
+    assert_eq!(
+        plan.calls(),
+        2,
+        "the switch destroys the old session and builds one new"
+    );
+
+    // 队列里的任务用**新**引擎跑完（`served` 记录了每次识别是谁服务的）。
+    let view = server.wait_terminal(&queued_id, Duration::from_secs(20));
+    assert_eq!(view["state"], "succeeded", "{view}");
+    let status = server.get("/api/status").json();
+    assert_eq!(status["engine"]["state"], "ready", "{status}");
+    assert_eq!(status["provider"]["selected_ep"], "scripted-2", "{status}");
+    assert!(
+        status["engine_load_ms"].as_u64().is_some(),
+        "the new session's creation time is reported: {status}"
+    );
+}
+
+/// 新 provider 建不起来时**恢复旧引擎**：状态回到 `Ready`（旧会话在线），
+/// 响应如实给出 `outcome = "rolled_back"` 与失败原因。
+#[test]
+fn a_failed_switch_rolls_back_to_the_previous_engine() {
+    let dir = manifest_model_dir(
+        "m3-provider-rollback",
+        &["det.onnx", "rec.onnx", "dict.txt"],
+        None,
+    );
+    let plan = SessionPlan {
+        fail_at: vec![2],
+        ..SessionPlan::new()
+    };
+    let server = TestServer::start(TestOptions {
+        engine_factory: plan.factory(None),
+        ..TestOptions::new(dir, Scripted::fast())
+    });
+    assert_eq!(
+        server.get("/api/status").json()["provider"]["selected_ep"],
+        "scripted-1"
+    );
+
+    let response = server.post(
+        "/api/engine/reload",
+        &[("Content-Type", "application/json")],
+        br#"{"provider":"cpu"}"#,
+    );
+    assert_eq!(response.status, 200, "{}", response.text());
+    let body = response.json();
+    assert_eq!(body["outcome"], "rolled_back", "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("scripted session 2")),
+        "{body}"
+    );
+    assert!(body["rollback_ms"].as_u64().is_some(), "{body}");
+    // 生效的是恢复出来的旧会话（第三个会话），`/api/status` 与响应一致。
+    assert_eq!(body["engine"]["state"], "ready", "{body}");
+    assert_eq!(body["engine"]["selected_ep"], "scripted-3", "{body}");
+    assert_eq!(
+        plan.calls(),
+        3,
+        "one failed attempt + one successful restore"
+    );
+
+    let status = server.get("/api/status").json();
+    assert_eq!(status["engine"]["state"], "ready", "{status}");
+    assert_eq!(status["provider"]["selected_ep"], "scripted-3", "{status}");
+    assert_eq!(status["provider"]["requested"], "cpu", "{status}");
+    // 服务仍然可用：一次识别照样成功。
+    let id = server.submit_ocr(b"image").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    assert_eq!(
+        server.wait_terminal(&id, Duration::from_secs(20))["state"],
+        "succeeded"
+    );
+}
+
+/// 连旧引擎也恢复不了 → 明确 `failed`（原因里两个都写），OCR 随后是 503 `engine_unavailable`。
+#[test]
+fn a_switch_that_cannot_restore_the_old_engine_lands_in_failed() {
+    let dir = manifest_model_dir(
+        "m3-provider-dead",
+        &["det.onnx", "rec.onnx", "dict.txt"],
+        None,
+    );
+    let plan = SessionPlan {
+        fail_at: vec![2, 3],
+        ..SessionPlan::new()
+    };
+    let server = TestServer::start(TestOptions {
+        engine_factory: plan.factory(None),
+        ..TestOptions::new(dir, Scripted::fast())
+    });
+
+    let response = server.post(
+        "/api/engine/reload",
+        &[("Content-Type", "application/json")],
+        br#"{"provider":"cpu"}"#,
+    );
+    assert_eq!(response.status, 200, "{}", response.text());
+    let body = response.json();
+    assert_eq!(body["outcome"], "failed", "{body}");
+    assert_eq!(body["engine"]["state"], "failed", "{body}");
+    let reason = body["engine"]["reason"].as_str().expect("a reason");
+    assert!(reason.contains("scripted session 2"), "{reason}");
+    assert!(reason.contains("restoring the previous engine"), "{reason}");
+    assert!(reason.contains("scripted session 3"), "{reason}");
+
+    // `/api/status` 必须显示同一个原因（不得退化成"模型不可用"这种模糊状态）。
+    let status = server.get("/api/status").json();
+    assert_eq!(status["engine"]["state"], "failed", "{status}");
+    assert_eq!(status["engine"]["reason"], reason, "{status}");
+    assert_eq!(status["provider"]["requested"], "cpu", "{status}");
+    assert_eq!(status["provider"]["selected_ep"], serde_json::Value::Null);
+
+    // 引擎不可用：OCR 是 503 `engine_unavailable` + reason（不是 500、也不是假装成功）。
+    let response = server.submit_ocr(b"image");
+    assert_eq!(response.status, 503, "{}", response.text());
+    assert_eq!(response.code(), "engine_unavailable");
+    assert_eq!(plan.calls(), 3);
+}
+
+/// §7.5：请求一个本构建里没编译进来的 provider 是**可定位的客户端错误**（400 + 库侧原文），
+/// 且**任何状态都不动**（不销毁旧引擎、不进入 `Rebuilding`）。
+///
+/// 若本构建真的编译了该 provider（`--features directml-provider`），这个请求是合法的，
+/// 测试转而断言"切换确实发生了"——两个分支都断言真实行为，没有"跳过"。
+#[test]
+fn requesting_a_provider_that_is_not_compiled_in_is_a_400_and_changes_nothing() {
+    let dir = manifest_model_dir(
+        "m3-provider-invalid",
+        &["det.onnx", "rec.onnx", "dict.txt"],
+        None,
+    );
+    let plan = SessionPlan::new();
+    let server = TestServer::start(TestOptions {
+        engine_factory: plan.factory(None),
+        ..TestOptions::new(dir, Scripted::fast())
+    });
+    assert_eq!(
+        server.get("/api/status").json()["provider"]["selected_ep"],
+        "scripted-1"
+    );
+
+    let response = server.post(
+        "/api/engine/reload",
+        &[("Content-Type", "application/json")],
+        br#"{"provider":"directml"}"#,
+    );
+    if cfg!(feature = "directml-provider") {
+        assert_eq!(response.status, 200, "{}", response.text());
+        assert_eq!(response.json()["engine"]["state"], "ready");
+        assert_eq!(plan.calls(), 2, "this build can switch to DirectML");
+        return;
+    }
+
+    assert_eq!(response.status, 400, "{}", response.text());
+    assert_eq!(response.code(), "bad_request");
+    let body = response.json();
+    // 标签来自库的 `format_provider_preference`（含 `device_id`），serve 不另写措辞。
+    assert!(
+        body["detail"]["provider"]
+            .as_str()
+            .is_some_and(|provider| provider.starts_with("directml")),
+        "{body}"
+    );
+    assert!(
+        body["detail"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("directml-provider")),
+        "the library's own wording must survive: {body}"
+    );
+    // 状态一字未动：还是会话 1，工厂没有被再调用一次。
+    assert_eq!(
+        plan.calls(),
+        1,
+        "a rejected request must not touch the engine"
+    );
+    let status = server.get("/api/status").json();
+    assert_eq!(status["engine"]["state"], "ready", "{status}");
+    assert_eq!(status["provider"]["selected_ep"], "scripted-1", "{status}");
+    assert_eq!(status["provider"]["requested"], "cpu", "{status}");
+    // 服务照常可用。
+    let id = server.submit_ocr(b"image").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    assert_eq!(
+        server.wait_terminal(&id, Duration::from_secs(20))["state"],
+        "succeeded"
     );
 }
 

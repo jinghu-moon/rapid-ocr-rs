@@ -268,6 +268,12 @@ pub struct JobRecord {
     pub finished_ms: Option<Millis>,
     /// 保留的**原件**字节数（编码后的图片，不保留解码结果）。
     pub original_bytes: u64,
+    /// 原件编码字节**当前是否还在**保留区里（M3）。
+    ///
+    /// `original_bytes == 0`（下载任务，或空请求体）时为 `false`：那些任务根本没有原图。
+    /// 由保留预算释放后也会变成 `false`——此时 `/api/jobs/{id}/annotated.png` 是
+    /// **410 `original_evicted`**，而任务与结果仍然可查（§4.2 与 §4.5 的区分）。
+    pub original_retained: bool,
     /// 保留的**结果**字节数（序列化后的结果）。
     pub result_bytes: u64,
     /// 失败分类（`Failed` 时存在；`Failed` 之外的终态为 `None`）。
@@ -281,9 +287,14 @@ pub struct JobRecord {
 }
 
 impl JobRecord {
-    /// 该任务占用的保留字节（原件 + 结果）。
+    /// 该任务占用的保留字节（原件 + 结果）。原件被释放后只算结果。
     pub fn total_bytes(&self) -> u64 {
-        self.original_bytes.saturating_add(self.result_bytes)
+        let original = if self.original_retained {
+            self.original_bytes
+        } else {
+            0
+        };
+        original.saturating_add(self.result_bytes)
     }
 
     /// 已耗时：从开始执行（未开始则从入队）到结束（未结束则到 `now`）。
@@ -312,6 +323,7 @@ impl JobRecord {
             failure: self.failure.clone(),
             download: self.download.clone(),
             cancel_requested: self.cancel_requested,
+            original_retained: self.original_retained,
         }
     }
 }
@@ -334,6 +346,9 @@ pub struct JobView {
     pub download: Option<DownloadProgress>,
     /// 已登记取消请求（运行中的下载任务会在文件边界兑现，§6.6）。
     pub cancel_requested: bool,
+    /// 原图编码字节是否仍在保留区里（M3）。为 `false` 时 `/annotated.png` 是 410
+    /// `original_evicted`；`/result` 不受影响。
+    pub original_retained: bool,
 }
 
 /// 取消的结论（§4.3 与 §6.6）。
@@ -359,6 +374,8 @@ pub struct TickReport {
     pub evicted_for_bytes: usize,
     /// 因 TTL 到期被移除的 tombstone。
     pub expired_tombstones: usize,
+    /// 因字节上限被**释放原图**（任务与结果保留）的数量（M3）。
+    pub released_originals: usize,
 }
 
 /// 任务 ID 生成器。
@@ -387,6 +404,8 @@ pub struct JobStore {
     tombstones: VecDeque<(String, Millis)>,
     retained_bytes: u64,
     next_seq: u64,
+    /// 原图刚被释放的任务 id（等待调用方把字节真丢掉，见 [`Self::take_released_originals`]）。
+    released_originals: Vec<String>,
 }
 
 impl JobStore {
@@ -397,6 +416,7 @@ impl JobStore {
             tombstones: VecDeque::new(),
             retained_bytes: 0,
             next_seq: 0,
+            released_originals: Vec::new(),
         }
     }
 
@@ -430,6 +450,7 @@ impl JobStore {
             started_ms: None,
             finished_ms: None,
             original_bytes,
+            original_retained: original_bytes > 0,
             result_bytes: 0,
             failure: None,
             download: None,
@@ -524,6 +545,9 @@ impl JobStore {
     }
 
     /// `Running → Failed`，同时登记机器可读的分类（`code`/`status`/`detail`）。
+    ///
+    /// 失败任务**永远不会**有注释图（没有 `OcrOutput` 就没有可用于叠加的区域），因此
+    /// 这里同时释放它的原图编码字节（§4.5 的字节账本随之如实减少）。
     pub fn fail_classified(
         &mut self,
         id: &str,
@@ -540,6 +564,7 @@ impl JobStore {
             record.finished_ms = Some(now);
             record.position = None;
         }
+        self.release_original(id);
         self.enforce_retention(now);
         Ok(())
     }
@@ -552,20 +577,30 @@ impl JobStore {
     ///   [`Self::finish_cancelled`] 落地；
     /// - `Running` 的 OCR 任务与全部终态 → [`ServeError::NotCancellable`]（409），状态不变。
     pub fn cancel(&mut self, id: &str, now: Millis) -> Result<CancelOutcome, ServeError> {
-        let record = self.record_mut(id)?;
-        match record.state {
-            JobState::Queued => {
-                record.state = JobState::Cancelled;
-                record.finished_ms = Some(now);
+        // 先把两个字段拷出来：下面要按"状态 + 类型"分支，并且分支里会再可变借用存储
+        // （释放原图 / 登记取消请求），因此不能把 `record` 的借用带进 match 的臂里。
+        let (state, kind) = {
+            let record = self.record_mut(id)?;
+            (record.state, record.kind)
+        };
+        match (state, kind) {
+            (JobState::Queued, _) => {
+                {
+                    let record = self.record_mut(id)?;
+                    record.state = JobState::Cancelled;
+                    record.finished_ms = Some(now);
+                }
+                // 取消的任务不会有注释图：原图随取消一起释放（字节账本同步）。
+                self.release_original(id);
                 self.enforce_retention(now);
                 Ok(CancelOutcome::Cancelled)
             }
-            JobState::Running if record.kind == JobKind::ModelDownload => {
-                record.cancel_requested = true;
+            (JobState::Running, JobKind::ModelDownload) => {
+                self.record_mut(id)?.cancel_requested = true;
                 Ok(CancelOutcome::CancelRequested)
             }
-            JobState::Running => Err(ServeError::NotCancellable),
-            JobState::Succeeded | JobState::Failed | JobState::Cancelled => {
+            (JobState::Running, _) => Err(ServeError::NotCancellable),
+            (JobState::Succeeded | JobState::Failed | JobState::Cancelled, _) => {
                 Err(ServeError::NotCancellable)
             }
         }
@@ -583,6 +618,7 @@ impl JobStore {
             record.finished_ms = Some(now);
             record.position = None;
         }
+        self.release_original(id);
         self.enforce_retention(now);
         Ok(())
     }
@@ -648,9 +684,10 @@ impl JobStore {
             report.expired_tombstones += 1;
         }
 
-        let (for_count, for_bytes) = self.enforce_retention(now);
-        report.evicted_for_count += for_count;
-        report.evicted_for_bytes += for_bytes;
+        let retention = self.enforce_retention(now);
+        report.evicted_for_count += retention.evicted_for_count;
+        report.evicted_for_bytes += retention.evicted_for_bytes;
+        report.released_originals += retention.released_originals;
         report
     }
 
@@ -699,6 +736,33 @@ impl JobStore {
         Err(ServeError::JobNotFound)
     }
 
+    /// 释放某个任务的原图编码字节（记账同步）。
+    ///
+    /// 返回 `true` 表示这次调用真的释放了；调用方**必须**去把那份字节丢掉
+    /// （[`Self::take_released_originals`] 会给出 id）。
+    ///
+    /// 它有两个调用者，语义都是"这份原图再也用不上了"：
+    /// 1. 终态且**不可能**再有注释图的路径（失败/取消，见 `fail_classified` 与 `cancel`）；
+    /// 2. 字节预算压力下的保留策略（[`Self::enforce_retention`]）。
+    pub fn release_original(&mut self, id: &str) -> bool {
+        let Some(record) = self.jobs.get_mut(id) else {
+            return false;
+        };
+        if !record.original_retained || record.original_bytes == 0 {
+            return false;
+        }
+        record.original_retained = false;
+        let released = record.original_bytes;
+        self.retained_bytes = self.retained_bytes.saturating_sub(released);
+        self.released_originals.push(id.to_string());
+        true
+    }
+
+    /// 取走"原图刚被释放"的任务 id（调用方据此丢弃字节；取走后列表清空）。
+    pub fn take_released_originals(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.released_originals)
+    }
+
     fn evict(&mut self, id: &str, now: Millis) {
         if let Some(record) = self.jobs.remove(id) {
             self.retained_bytes = self.retained_bytes.saturating_sub(record.total_bytes());
@@ -713,30 +777,45 @@ impl JobStore {
         }
     }
 
-    /// 数量与字节双重上限：只淘汰终态任务，**最旧终态优先**。
+    /// 数量与字节双重上限。
     ///
-    /// 返回 `(因数量淘汰数, 因字节淘汰数)`。
-    fn enforce_retention(&mut self, now: Millis) -> (usize, usize) {
-        let mut for_count = 0;
-        let mut for_bytes = 0;
-        loop {
-            let over_count = self.terminal_count() > self.limits.max_retained;
-            let over_bytes = self.retained_bytes > self.limits.max_retained_bytes;
-            if !over_count && !over_bytes {
-                break;
-            }
+    /// **数量上限**只能靠淘汰整个终态任务解决（最旧终态优先）。
+    ///
+    /// **字节上限**分两步（M3 明确下来的顺序，见 `docs/06` 的 M3 记录）：
+    /// 1. 先释放**最旧终态任务**的原图编码字节——结果（通常小一个数量级）与任务记录都留下，
+    ///    `/result` 与 `/api/jobs/{id}` 照常可用，只有 `/annotated.png` 变成
+    ///    **410 `original_evicted`**（§4.2 冻结的结论；没有这一步该 `code` 永远不可达）；
+    /// 2. 原图都释放完仍然超限 → 才淘汰整个终态任务（M0c 起的原有行为）。
+    ///
+    /// 活跃任务（`queued`/`running`）**永不**释放、也永不淘汰：它们的字节由队列容量与
+    /// `--max-body-mb` 约束，而 worker 还需要那份原图去识别。
+    fn enforce_retention(&mut self, now: Millis) -> RetentionReport {
+        let mut report = RetentionReport::default();
+
+        // 1) 数量上限：最旧终态优先。
+        while self.terminal_count() > self.limits.max_retained {
             let Some(oldest) = self.oldest_terminal() else {
-                // 只剩活跃任务：活跃任务不淘汰（其总量由队列容量与 body 上限约束）。
                 break;
             };
             self.evict(&oldest, now);
-            if over_count {
-                for_count += 1;
-            } else {
-                for_bytes += 1;
-            }
+            report.evicted_for_count += 1;
         }
-        (for_count, for_bytes)
+
+        // 2) 字节上限：先释放原图，再淘汰整个任务。
+        while self.retained_bytes > self.limits.max_retained_bytes {
+            if let Some(id) = self.oldest_terminal_with_original() {
+                self.release_original(&id);
+                report.released_originals += 1;
+                continue;
+            }
+            let Some(oldest) = self.oldest_terminal() else {
+                // 只剩活跃任务：它们的字节不由保留上限约束。
+                break;
+            };
+            self.evict(&oldest, now);
+            report.evicted_for_bytes += 1;
+        }
+        report
     }
 
     fn oldest_terminal(&self) -> Option<String> {
@@ -746,6 +825,24 @@ impl JobStore {
             .min_by_key(|record| (record.finished_ms.unwrap_or(record.queued_ms), record.seq))
             .map(|record| record.id.clone())
     }
+
+    /// 仍持有原图、且原图字节非零的最旧终态任务（见 [`Self::enforce_retention`]）。
+    fn oldest_terminal_with_original(&self) -> Option<String> {
+        self.jobs
+            .values()
+            .filter(|record| record.state.is_terminal())
+            .filter(|record| record.original_retained && record.original_bytes > 0)
+            .min_by_key(|record| (record.finished_ms.unwrap_or(record.queued_ms), record.seq))
+            .map(|record| record.id.clone())
+    }
+}
+
+/// [`JobStore::enforce_retention`] 的一轮结论（对 `TickReport` 可加）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RetentionReport {
+    evicted_for_count: usize,
+    evicted_for_bytes: usize,
+    released_originals: usize,
 }
 
 #[cfg(test)]
@@ -955,7 +1052,12 @@ mod tests {
         );
     }
 
-    /// §4.5：字节上限同样只淘汰终态任务。
+    /// §4.5：字节上限的账本口径是"原件 + 结果"。
+    ///
+    /// **M3 起的行为**：字节超限时先释放**最旧终态任务的原图**（结果与任务保留，见
+    /// [`JobStore::enforce_retention`]），因此这里 a 不再被淘汰，而是丢掉它的 60 字节原图；
+    /// "原图都释放完仍然超限才淘汰整个任务"由
+    /// `when_only_results_remain_the_oldest_terminal_job_is_evicted` 覆盖。
     #[test]
     fn eviction_by_bytes_uses_the_original_plus_result_budget() {
         let mut store = JobStore::new(limits(32, 100, 16, 1_000_000));
@@ -964,14 +1066,21 @@ mod tests {
         store.succeed("a", 20, 0).expect("-> succeeded");
         assert_eq!(store.retained_bytes(), 80);
 
-        // 新任务带来 60 字节原件 → 140 > 100 → 淘汰最旧的终态任务 a。
+        // 新任务带来 60 字节原件 → 140 > 100 → 先释放最旧终态任务 a 的原图（60）。
         insert_ocr(&mut store, "b", 60, 0);
-        assert_eq!(store.retained_bytes(), 60);
-        assert!(matches!(
-            store.record("a").expect_err("evicted for bytes"),
-            ServeError::JobEvicted
-        ));
-        assert!(store.record("b").is_ok());
+        assert_eq!(
+            store.retained_bytes(),
+            80,
+            "a's original is what paid for it"
+        );
+        assert_eq!(
+            store.record("a").expect("a survives").result_bytes,
+            20,
+            "the result is still retained and readable"
+        );
+        assert!(!store.record("a").expect("present").original_retained);
+        assert!(store.record("b").is_ok(), "the active job is untouched");
+        assert_eq!(store.take_released_originals(), vec!["a".to_string()]);
     }
 
     /// 活跃任务永不淘汰：字节超限但没有终态任务可淘汰时，账本如实超过上限。
@@ -1118,20 +1227,120 @@ mod tests {
         store.succeed("a", 250, 0).expect("-> succeeded");
         assert_eq!(store.retained_bytes(), 1_250);
         assert_eq!(store.record("a").expect("present").result_bytes, 250);
+        assert!(
+            store.record("a").expect("present").original_retained,
+            "a 64 MB budget holds both the original and the result"
+        );
 
         insert_ocr(&mut store, "b", 500, 0);
         assert_eq!(store.retained_bytes(), 1_750);
-        // 淘汰 a 后账本必须减掉它的全部占用。
-        let mut tight = JobStore::new(limits(1, 1_200, 16, 1_000_000));
-        insert_ocr(&mut tight, "a", 1_000, 0);
-        tight.start("a", 0).expect("-> running");
-        tight.succeed("a", 250, 0).expect("-> succeeded");
-        insert_ocr(&mut tight, "b", 500, 0);
-        assert_eq!(tight.retained_bytes(), 500, "a's 1250 bytes were released");
+    }
+
+    /// §4.5 / §4.2（M3）：字节上限先**释放原图**（结果与任务保留），原图都释放完才淘汰整个任务。
+    ///
+    /// 这一步是 `/annotated.png` 的 410 `original_evicted` 能成立的前提：任务记录还在、
+    /// 结果还能读，只有那份编码原图被预算收回了。
+    #[test]
+    fn an_over_budget_store_releases_originals_before_evicting_jobs() {
+        let mut store = JobStore::new(limits(32, 1_200, 16, 1_000_000));
+        insert_ocr(&mut store, "a", 1_000, 0);
+        store.start("a", 0).expect("-> running");
+        // 1300 > 1200：先释放 a 的原图（1000），任务与结果都留下。
+        store.succeed("a", 300, 0).expect("-> succeeded");
+        assert_eq!(store.retained_bytes(), 300);
+        assert!(store.record("a").is_ok(), "the job itself must survive");
+        assert_eq!(store.record("a").expect("present").result_bytes, 300);
+        assert!(!store.record("a").expect("present").original_retained);
+        assert_eq!(store.take_released_originals(), vec!["a".to_string()]);
+
+        insert_ocr(&mut store, "b", 600, 0);
+        store.start("b", 0).expect("-> running");
+        store.succeed("b", 100, 0).expect("-> succeeded");
+        // 300 + 700 = 1000 ≤ 1200：没有新的释放。
+        assert_eq!(store.retained_bytes(), 1_000);
+        assert!(store.record("b").expect("present").original_retained);
+
+        insert_ocr(&mut store, "c", 600, 0);
+        // 1000 + 600 = 1600 > 1200：释放最旧**仍持有原图**的终态任务（b，600）→ 1000。
+        assert_eq!(store.retained_bytes(), 1_000);
+        assert!(!store.record("b").expect("present").original_retained);
+        assert!(store.record("c").is_ok(), "the active job is never touched");
+        assert_eq!(store.take_released_originals(), vec!["b".to_string()]);
+    }
+
+    /// 原图都释放完仍然超限 → 才退回"淘汰整个终态任务"（M0c 起的原有行为）。
+    #[test]
+    fn when_only_results_remain_the_oldest_terminal_job_is_evicted() {
+        let mut store = JobStore::new(limits(32, 500, 16, 1_000_000));
+        insert_ocr(&mut store, "a", 1_000, 0);
+        store.start("a", 0).expect("-> running");
+        // 1250 > 500 → 释放 a 的原图 → 250 ≤ 500。
+        store.succeed("a", 250, 0).expect("-> succeeded");
+        assert_eq!(store.retained_bytes(), 250);
+        assert_eq!(store.take_released_originals(), vec!["a".to_string()]);
+
+        insert_ocr(&mut store, "b", 0, 0);
+        store.start("b", 1).expect("-> running");
+        // 250 + 400 = 650 > 500：没有任何可释放的原图（a 已释放、b 本来就没有），
+        // 于是淘汰最旧的终态任务 a。
+        store.succeed("b", 400, 1).expect("-> succeeded");
+        assert_eq!(store.retained_bytes(), 400);
         assert!(matches!(
-            tight.record("a").expect_err("evicted"),
+            store.record("a").expect_err("evicted"),
             ServeError::JobEvicted
         ));
+        assert!(store.record("b").is_ok());
+        assert!(store.take_released_originals().is_empty());
+    }
+
+    /// 活跃任务的字节由队列容量与 `--max-body-mb` 约束：保留上限**不**动它们。
+    #[test]
+    fn active_jobs_keep_their_original_even_over_the_byte_budget() {
+        let mut store = JobStore::new(limits(32, 100, 16, 1_000_000));
+        insert_ocr(&mut store, "queued", 1_000, 0);
+        assert_eq!(store.retained_bytes(), 1_000);
+        assert!(
+            store.record("queued").expect("present").original_retained,
+            "the worker still needs that original to decode the image"
+        );
+        store.start("queued", 1).expect("-> running");
+        assert!(store.record("queued").expect("present").original_retained);
+        assert!(store.take_released_originals().is_empty());
+    }
+
+    /// 失败与取消的任务**永不**会有注释图：它们的原图随终态一起释放。
+    #[test]
+    fn failed_and_cancelled_jobs_release_their_original() {
+        let mut failed = store();
+        insert_ocr(&mut failed, "boom", 900, 0);
+        failed.start("boom", 0).expect("-> running");
+        failed
+            .fail_classified(
+                "boom",
+                JobFailure::new(422, "unsupported_input", "x", serde_json::Value::Null),
+                0,
+            )
+            .expect("-> failed");
+        assert!(!failed.record("boom").expect("present").original_retained);
+        assert_eq!(failed.retained_bytes(), 0);
+        assert_eq!(failed.take_released_originals(), vec!["boom".to_string()]);
+
+        let mut cancelled = store();
+        insert_ocr(&mut cancelled, "gone", 700, 0);
+        assert_eq!(
+            cancelled.cancel("gone", 0).expect("queued cancel"),
+            CancelOutcome::Cancelled
+        );
+        assert!(!cancelled.record("gone").expect("present").original_retained);
+        assert_eq!(cancelled.retained_bytes(), 0);
+        assert_eq!(
+            cancelled.take_released_originals(),
+            vec!["gone".to_string()]
+        );
+
+        // 显式释放是幂等的，未知 id / 零字节原图都不是错误（返回 false）。
+        assert!(!cancelled.release_original("gone"));
+        assert!(!cancelled.release_original("nobody"));
     }
 
     #[test]
@@ -1166,6 +1375,10 @@ mod tests {
         assert_eq!(json["download"]["bytes_total"], 300);
         assert_eq!(json["download"]["current_file"], serde_json::Value::Null);
         assert_eq!(json["cancel_requested"], false);
+        assert_eq!(
+            json["original_retained"], false,
+            "a download job has no original image at all"
+        );
     }
 
     /// §6.6：运行中的**下载**可以取消（登记请求，状态不变），由 worker 在文件边界落地；
@@ -1296,6 +1509,7 @@ mod tests {
             "failure",
             "download",
             "cancel_requested",
+            "original_retained",
         ] {
             assert!(json.get(key).is_some(), "missing {key}: {json}");
         }
@@ -1303,6 +1517,7 @@ mod tests {
         assert_eq!(json["started_ms"], serde_json::Value::Null);
         assert_eq!(json["elapsed_ms"], 4);
         assert_eq!(json["failure"], serde_json::Value::Null);
+        assert_eq!(json["original_retained"], true, "{json}");
     }
 
     /// 一次 tick 可以同时报告四类清理结果。

@@ -191,6 +191,8 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
         nonce,
         allow_download: args.allow_download,
         allow_download_hosts,
+        // §7.5：运行期切换 provider 必须沿用启动期的同一个开关值。
+        allow_provider_fallback: args.allow_provider_fallback(),
         // §10.8：M1 的公式路由固定关闭（M4 才会接上真实来源）。
         routing: OcrRouting::text_only(),
         engine_factory: super::engine::real_engine_factory(),

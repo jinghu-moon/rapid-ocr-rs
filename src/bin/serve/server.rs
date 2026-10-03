@@ -35,10 +35,9 @@ use std::time::{Duration, Instant};
 
 use rapid_ocr_rs::{
     ALLOWED_DOWNLOAD_HOSTS, DetectionPolicy, DownloadError, FormulaPolicy, ImageInput, OcrOutput,
-    OcrRequest, OrtRuntimeFingerprint, OutputPolicy, PreprocessPolicy, RapidOcrError,
-    RecognitionPolicy, StagePlan, TextOrder, WordOutputMode, available_disk_bytes,
+    OcrRequest, OrtRuntimeFingerprint, OutputPolicy, PreprocessPolicy, ProviderPreference,
+    RapidOcrError, RecognitionPolicy, StagePlan, WordOutputMode, available_disk_bytes,
     ort_runtime_fingerprint, ort_runtime_version, peak_memory_source, peak_working_set_bytes,
-    to_output_json,
 };
 use serde_json::{Value, json};
 
@@ -47,6 +46,7 @@ use super::download::{
 };
 use super::engine::{BackendProvider, EngineFactory, OcrBackend};
 use super::error::{ErrorBody, ServeError};
+use super::export::{self, ExportError, ExportFormat, ExportRequest};
 use super::jobs::{
     CancelOutcome, DownloadProgress, JobFailure, JobIdGenerator, JobKind, JobQueue,
     JobState as JobLifecycle, JobStore, JobStoreLimits, Millis,
@@ -54,7 +54,7 @@ use super::jobs::{
 use super::limits::ServeLimits;
 use super::model_plan::{ModelPlan, ModelReport, ModelSnapshot, PendingDownload, source_label};
 use super::queue::{DualQueueScheduler, QueueClass, ScheduledJob, SchedulerConfig};
-use super::results::{Outcome, ResultStore, SerializeError, serialize_bounded};
+use super::results::{Outcome, ResultStore, SerializeError, Succeeded, serialize_bounded};
 use super::security::{LocalOrigin, ServeToken};
 use super::state::{
     EngineState, EngineStateMachine, OcrAdmission, ProviderStatus, ServeConfigPlan, ServiceState,
@@ -140,31 +140,51 @@ pub(super) struct ServeContext {
     pub allow_download: bool,
     /// `--allow-download-host` 的**显式**扩展（§6.1 第 3 条；库常量不被修改）。
     pub allow_download_hosts: Vec<String>,
+    /// `--allow-provider-fallback`（§7.5）。运行期切换 provider 时**必须**沿用同一个开关，
+    /// 否则同一条冻结规则会有两种解释（见 [`ServeShared::switch_provider`]）。
+    pub allow_provider_fallback: bool,
     pub routing: OcrRouting,
     pub engine_factory: EngineFactory,
     pub downloader: DownloaderFactory,
     pub free_space: FreeSpaceFactory,
 }
 
-/// 待处理的原图字节（只有 worker 会取走它）。
-struct PendingOcr {
-    bytes: Vec<u8>,
+/// 保留的**原图编码字节**（§4.5：只保留编码字节，绝不保留解码结果）。
+///
+/// 识别前它是待处理的输入，识别成功后它继续留在保留区里，供
+/// `/api/jobs/{id}/annotated.png` **按需**重新解码；被保留预算释放（或任务失败/取消）时
+/// 条目被移除，该端点随之变成 410 `original_evicted`。
+///
+/// 字节用 `Arc<[u8]>` 持有：worker 与 HTTP 线程都只克隆这个引用，不复制图片。
+struct RetainedOcr {
+    bytes: Arc<[u8]>,
     max_side: Option<u32>,
 }
 
-/// 任务存储 + 调度器 + 结果存储 + 待处理原图（同一把锁下的一个整体）。
+/// 任务存储 + 调度器 + 结果存储 + 保留的原图（同一把锁下的一个整体）。
 ///
-/// 原图与任务**同锁**，因此"任务存在"与"原图还在"不可能分叉；之所以不把 `Vec<u8>` 放进
-/// `JobStore`（M0c 的纯逻辑类型）：那会让 TTL/淘汰的单元测试也必须携带图片字节。
+/// 原图与任务**同锁**，因此"任务存在"与"原图还在"不可能分叉；之所以不把 `Arc<[u8]>`
+/// 放进 `JobStore`（M0c 的纯逻辑类型）：那会让 TTL/淘汰的单元测试也必须携带图片字节。
 struct JobState {
     store: JobStore,
     scheduler: DualQueueScheduler,
     results: ResultStore,
     ids: JobIdGenerator,
-    pending: HashMap<String, PendingOcr>,
+    /// 仍在保留区里的原图编码字节（§4.5）。任务被淘汰 / 原图被释放时同步移除。
+    originals: HashMap<String, RetainedOcr>,
 }
 
 impl JobState {
+    /// 把 `JobStore` 刚释放掉原图的任务从保留区里真正丢弃（§4.5）。
+    ///
+    /// `JobStore` 负责**记账**（`retained_bytes`、`original_retained`），字节本身在这里；
+    /// 两者必须在同一个锁里收敛，否则 `/api/status` 的 `retained_bytes` 会与真实占用分叉。
+    fn sync_originals(&mut self) {
+        for id in self.store.take_released_originals() {
+            self.originals.remove(&id);
+        }
+    }
+
     /// 队列里每个任务的 `position` 以**调度器**为唯一事实来源（§4.2 的 `position`）。
     ///
     /// 不属于双队列的任务（下载）由 [`JobQueue::class`] 过滤掉：它们的 `position`
@@ -201,7 +221,9 @@ impl JobState {
 pub(super) struct ServeShared {
     service: ServiceState,
     limits: ServeLimits,
-    plan: ServeConfigPlan,
+    /// 当前生效的运行配置。M3 起它可以在**运行期**被显式切换（provider），因此放在锁后面：
+    /// 读取一律用 [`Self::plan_snapshot`] / [`Self::requested_label`]，绝不长时间持有。
+    plan: Mutex<ServeConfigPlan>,
     model_plan: ModelPlan,
     token: ServeToken,
     local: LocalOrigin,
@@ -209,15 +231,25 @@ pub(super) struct ServeShared {
     nonce: String,
     allow_download: bool,
     allow_download_hosts: Vec<String>,
+    /// `--allow-provider-fallback`（§7.5）：运行期切换 provider 复用**同一个**开关。
+    allow_provider_fallback: bool,
     routing: OcrRouting,
     engine_state: Mutex<EngineStateMachine>,
     engine: Mutex<Option<Box<dyn OcrBackend>>>,
-    /// 引擎加载的互斥：`POST /api/ocr` 的惰性创建与 `POST /api/engine/reload` 只能有一个
-    /// 在建立会话（`engine_state` 的锁**不**覆盖加载过程，否则 `/api/status` 在加载期间
-    /// 会被阻塞、也看不到 `loading`）。
+    /// 引擎加载的互斥：`POST /api/ocr` 的惰性创建、`POST /api/engine/reload` 与 M3 的
+    /// provider 切换只能有一个在动引擎（`engine_state` 的锁**不**覆盖加载过程，否则
+    /// `/api/status` 在加载期间会被阻塞、也看不到 `loading`/`rebuilding`）。
+    ///
+    /// **锁序**：永远是 `engine_load` → `engine`（切换 provider 时按这个顺序同时持有两者）。
     engine_load: Mutex<()>,
     /// 上一次**真正建立会话**的耗时（毫秒）；`None` = 还没有建立过。
     engine_load_ms: Mutex<Option<u64>>,
+    /// 是否已经有一个 provider 切换在跑（M3）。
+    ///
+    /// 切换序列比一次请求的合理占线时间长得多（排空 + 两次建会话），因此它在**独立线程**里
+    /// 执行、由那个线程写响应（见 `http.rs::spawn_provider_switch`）。这个标志保证同时
+    /// 只有一个切换：第二个请求得到 503 `busy`，而不是排队等一个可能很久的序列。
+    provider_switch: AtomicBool,
     jobs: Mutex<JobState>,
     queue_signal: Condvar,
     download_tx: SyncSender<DownloadCommand>,
@@ -236,9 +268,18 @@ impl ServeShared {
         lock(&self.engine_state).state().clone()
     }
 
+    /// 当前生效的运行配置快照（克隆；调用方不得在持有其它锁时长期持有它）。
+    pub fn plan_snapshot(&self) -> ServeConfigPlan {
+        lock(&self.plan).clone()
+    }
+
+    /// `/api/status` 的 `requested`（生效值，不是"曾经请求过"的值）。
+    pub fn requested_label(&self) -> String {
+        lock(&self.plan).requested_label()
+    }
+
     pub fn provider_status(&self) -> ProviderStatus {
-        self.engine_state()
-            .provider_status(&self.plan.requested_label())
+        self.engine_state().provider_status(&self.requested_label())
     }
 
     pub fn token(&self) -> &ServeToken {
@@ -263,7 +304,7 @@ impl ServeShared {
 
     /// 引擎配置里的 `min_side_len`（`?max_side=` 的下界：低于它会让预处理区间上下界颠倒）。
     pub fn min_side_len(&self) -> u32 {
-        self.plan.engine.global.min_side_len as u32
+        self.plan_snapshot().engine.global.min_side_len as u32
     }
 
     /// `/api/models` 与 OCR 409 的**同一份**模型状态（§7.6 的"字段一致"）。
@@ -324,7 +365,7 @@ impl ServeShared {
     /// `LoadedModule.path` 是本机绝对路径，绝不能进响应）。
     pub fn status_json(&self) -> Value {
         let engine_state = self.engine_state();
-        let provider = engine_state.provider_status(&self.plan.requested_label());
+        let provider = engine_state.provider_status(&self.requested_label());
         let (queues, retention) = {
             let state = lock(&self.jobs);
             let scheduler = state.scheduler.config();
@@ -353,6 +394,8 @@ impl ServeShared {
                     "tombstones": state.store.tombstone_len(),
                     "results": state.results.len(),
                     "result_bytes": state.results.bytes(),
+                    // M3 的诊断口径：还在保留区里的原图份数（§4.5 的字节预算对象）。
+                    "retained_originals": state.originals.len(),
                     "job_ttl_ms": state.store.limits().ttl_ms,
                 }),
             )
@@ -385,6 +428,8 @@ impl ServeShared {
             "downloads_allowed": self.allow_download,
             "download_hosts": self.effective_download_hosts(),
             "engine_load_ms": self.engine_load_ms(),
+            "allow_provider_fallback": self.allow_provider_fallback,
+            "max_side_len": self.plan_snapshot().engine.global.max_side_len,
         })
     }
 
@@ -456,6 +501,11 @@ impl ServeShared {
         state.scheduler.queued_len(class) >= state.scheduler.config().capacity(class)
     }
 
+    /// 调度器里是否还有任务（OCR worker 在**取任务之前**判断"要不要建引擎"）。
+    fn has_queued_work(&self) -> bool {
+        !lock(&self.jobs).scheduler.is_empty()
+    }
+
     /// `POST /api/ocr`：准入已经在 http 层完成，这里只建任务并入队（§4.4 第 7 步）。
     pub fn submit_ocr(
         &self,
@@ -481,9 +531,18 @@ impl ServeShared {
             return Err(error);
         }
         // 原图与任务在**同一把锁**下登记，因此 worker 不可能看到"有任务但没原图"。
-        state
-            .pending
-            .insert(id.clone(), PendingOcr { bytes, max_side });
+        // M3 起这份字节**不再**在识别后被丢掉（§4.5：annotated.png 按需重新解码），
+        // 它的账目由 `JobStore::original_bytes` 承担，释放时经 `sync_originals` 同步移除。
+        state.originals.insert(
+            id.clone(),
+            RetainedOcr {
+                bytes: Arc::from(bytes.into_boxed_slice()),
+                max_side,
+            },
+        );
+        // 新任务可能把字节预算推过上限：`insert` 内部已经按"先释放原图、再淘汰任务"处理，
+        // 这里把释放结果落成真正的丢弃。
+        state.sync_originals();
         state.sync_positions();
         drop(state);
         self.queue_signal.notify_all();
@@ -636,24 +695,32 @@ impl ServeShared {
 
     /// `GET /api/jobs/{id}/result`。
     ///
-    /// 成功 → 已序列化的结果字节；失败 → **重放原始状态码与错误体**
+    /// 成功 → 结果的 JSON（用**有界写入器**重新序列化，与 `export?format=json`
+    /// 逐字节相同；长度上限仍是 `--max-result-mb`）；
+    /// 失败 → **重放原始状态码与错误体**
     /// （`422 unsupported_input` / `413 result_too_large` / `503 engine_unavailable`）；
     /// 未完成（含已取消）→ 409 `job_not_finished`，任务的确切状态由
     /// `GET /api/jobs/{id}` 如实给出。
     pub fn job_result(&self, id: &str) -> Result<Body, ServeError> {
-        let state = lock(&self.jobs);
-        let record = state.store.record(id)?;
-        let outcome = state.results.get(id);
-        match record.state {
-            JobLifecycle::Succeeded => match outcome {
-                Some(Outcome::Succeeded(bytes)) => Ok(Body::json(200, bytes.clone())),
-                _ => Err(ServeError::Internal),
-            },
-            JobLifecycle::Failed => match outcome {
-                Some(Outcome::Failed(status, body)) => {
-                    Ok(Body::json(*status, render_error_body(body)))
+        let snapshot = self.job_snapshot(id)?;
+        match snapshot.state {
+            JobLifecycle::Succeeded => {
+                let Some(output) = snapshot.output else {
+                    return Err(ServeError::Internal);
+                };
+                let value = export::result_json(&output).map_err(ServeError::from)?;
+                match serialize_bounded(&value, self.limits.max_result_bytes) {
+                    Ok(bytes) => Ok(Body::json(200, bytes)),
+                    Err(SerializeError::TooLarge) => Err(ServeError::ResultTooLarge),
+                    Err(SerializeError::Internal(reason)) => {
+                        eprintln!("serve: cannot serialize the result of {id}: {reason}");
+                        Err(ServeError::Internal)
+                    }
                 }
-                _ => Err(ServeError::Internal),
+            }
+            JobLifecycle::Failed => match snapshot.failure {
+                Some((status, body)) => Ok(Body::json(status, render_error_body(&body))),
+                None => Err(ServeError::Internal),
             },
             JobLifecycle::Queued | JobLifecycle::Running | JobLifecycle::Cancelled => {
                 Err(ServeError::JobNotFinished)
@@ -661,9 +728,112 @@ impl ServeShared {
         }
     }
 
+    /// `GET /api/jobs/{id}/annotated.png`（§4.2、§4.5）。
+    ///
+    /// 原图只保留**编码字节**，这里按需重新解码（库的 `LoadImage`）、用
+    /// `output::visualize::draw_output` 叠加检测框、再编码成 PNG。
+    ///
+    /// - 任务不在 / 已淘汰 → 404 `job_not_found` / 410 `job_evicted`（[`Self::job_snapshot`]）；
+    /// - 还没有结果（排队/运行中/失败/取消）→ **409 `job_not_finished`**（与 `/result` 同语义：
+    ///   没有区域可叠，不能凭空造一张图）；
+    /// - 结果在、原图被保留预算释放 → **410 `original_evicted`**（§4.2 冻结的结论）。
+    pub fn annotated_png(&self, id: &str) -> Result<Body, ServeError> {
+        let snapshot = self.job_snapshot(id)?;
+        if snapshot.state != JobLifecycle::Succeeded {
+            return Err(ServeError::JobNotFinished);
+        }
+        let Some(output) = snapshot.output else {
+            return Err(ServeError::Internal);
+        };
+        let Some(original) = snapshot.original else {
+            return Err(ServeError::OriginalEvicted);
+        };
+        // 标注 PNG 没有文档预算，因此这里不会出现 `TooLarge`。
+        let png = export::annotated_png(original, &output)
+            .map_err(|error| export_failure(error, 0, ""))?;
+        Ok(Body::typed(200, "image/png", png))
+    }
+
+    /// `GET /api/jobs/{id}/export?format=json|md|html`（§4.2、§4.6、§9.5）。
+    ///
+    /// - `json`：与 `/result` **同一份** JSON（库的 `to_output_json` + `plain_text` +
+    ///   `timing_ledger`），上限仍是 `--max-result-mb`（§4.6）且不得超过 `--max-export-mb`；
+    /// - `md`：库的 `to_output_markdown`；
+    /// - `html`：库的报告渲染器 + **[`ReportMode::Static`]**（正文不含任何 `<script`）+
+    ///   标注图 `data:` 内嵌，因此导出文件脱离服务仍可查看（§9.5 第 5 条）。
+    ///
+    /// 三者都经**有界写入器**：超限是 413 `export_too_large`（`detail` 指向
+    /// `/api/jobs/{id}/annotated.png`），**绝不**截断、也绝不返回一条图片链接已死的文档。
+    pub fn export(&self, id: &str, format: ExportFormat) -> Result<Body, ServeError> {
+        let snapshot = self.job_snapshot(id)?;
+        if snapshot.state != JobLifecycle::Succeeded {
+            return Err(ServeError::JobNotFinished);
+        }
+        let Some(output) = snapshot.output else {
+            return Err(ServeError::Internal);
+        };
+        let limit = self.limits.max_export_bytes;
+        let annotated = format!("/api/jobs/{id}/annotated.png");
+        let document = match format {
+            ExportFormat::Json => export::json_document(&output, limit, snapshot.serialized_bytes),
+            ExportFormat::Markdown => export::markdown_document(&ExportRequest {
+                output: &output,
+                png: &[],
+                title: &format!("ocr-{id}"),
+                limit_bytes: limit,
+            }),
+            ExportFormat::Html => {
+                // HTML 必须是**真正可离线使用**的单文件：没有内嵌图片就没有意义，
+                // 因此原图被释放时如实报 410，而不是发一条外链失效的文档（§9.5 第 5 条）。
+                let Some(original) = snapshot.original else {
+                    return Err(ServeError::OriginalEvicted);
+                };
+                let png = export::annotated_png(original, &output)
+                    .map_err(|error| export_failure(error, limit, &annotated))?;
+                export::html_document(&ExportRequest {
+                    output: &output,
+                    png: &png,
+                    title: &format!("ocr-{id}"),
+                    limit_bytes: limit,
+                })
+            }
+        };
+        let bytes = document.map_err(|error| export_failure(error, limit, &annotated))?;
+        Ok(Body::typed(200, format.content_type(), bytes))
+    }
+
+    /// 一次任务查询在**同一把锁**下取得的全部结论。
+    ///
+    /// 正是这一步消除了"判定成功 → 结果已被淘汰"的分叉：状态、结果与原图三者要么
+    /// 一起存在，要么一起不存在。
+    fn job_snapshot(&self, id: &str) -> Result<JobSnapshot, ServeError> {
+        let state = lock(&self.jobs);
+        let record = state.store.record(id)?;
+        let outcome = state.results.get(id);
+        let (output, serialized_bytes, failure) = match outcome {
+            Some(Outcome::Succeeded(succeeded)) => (
+                Some(Arc::clone(&succeeded.output)),
+                succeeded.serialized_bytes,
+                None,
+            ),
+            Some(Outcome::Failed(status, body)) => (None, 0, Some((*status, body.clone()))),
+            None => (None, 0, None),
+        };
+        Ok(JobSnapshot {
+            state: record.state,
+            output,
+            serialized_bytes,
+            failure,
+            original: state
+                .originals
+                .get(id)
+                .map(|retained| Arc::clone(&retained.bytes)),
+        })
+    }
+
     /// `POST /api/jobs/{id}/cancel`（§4.3 与 §6.6）。
     ///
-    /// 排队中 → 立即取消（并从调度器/待处理原图里移除）；运行中的**下载** → 登记取消请求
+    /// 排队中 → 立即取消（并从调度器/保留原图里移除）；运行中的**下载** → 登记取消请求
     /// （状态仍是 `running`，视图里的 `cancel_requested` 为 `true`，worker 在文件边界兑现）；
     /// 运行中的 OCR 与终态 → 409 `not_cancellable`。
     pub fn cancel_job(&self, id: &str) -> Result<Value, ServeError> {
@@ -674,8 +844,9 @@ impl ServeShared {
             if let Some(class) = queue.class() {
                 state.scheduler.remove(class, id);
             }
-            state.pending.remove(id);
         }
+        // 取消的任务不会有注释图：`cancel` 已经在记账层释放了原图，这里把字节真正丢掉。
+        state.sync_originals();
         state.sync_positions();
         let view = state.store.view(id, monotonic_ms())?;
         Ok(serde_json::to_value(view).expect("JobView serialization cannot fail"))
@@ -760,9 +931,15 @@ impl ServeShared {
         self.model_plan.set_ids()
     }
 
-    /// OCR worker 用：取走待处理的原图。
-    fn take_pending_ocr(&self, id: &str) -> Option<PendingOcr> {
-        lock(&self.jobs).pending.remove(id)
+    /// OCR worker 用：取走待处理的原图**引用**。
+    ///
+    /// M3 起它**不**移除保留区里的字节（识别成功后 `/annotated.png` 还要用它）：
+    /// 返回的是 `Arc` 克隆，图片本身一份都不复制。
+    fn retained_ocr(&self, id: &str) -> Option<(Arc<[u8]>, Option<u32>)> {
+        lock(&self.jobs)
+            .originals
+            .get(id)
+            .map(|retained| (Arc::clone(&retained.bytes), retained.max_side))
     }
 
     /// OCR worker 用：登记终态载荷并结算任务状态。
@@ -777,6 +954,7 @@ impl ServeShared {
         };
         if !state.results.insert(job_id, outcome) {
             let _ = state.store.fail(job_id, "the result store is full", now);
+            state.sync_originals();
             return;
         }
         match failure {
@@ -787,6 +965,26 @@ impl ServeShared {
                 let _ = state.store.fail_classified(job_id, failure, now);
             }
         }
+        // 失败任务的原图已经在记账层释放；成功任务的原图可能因字节预算被释放。
+        state.sync_originals();
+    }
+
+    /// 建立一次会话（**唯一**实现：钉住模型路径 → 调工厂 → 记录耗时）。
+    ///
+    /// `docs/05` §5.3/§7.6：引擎的模型路径一律由 `--model-dir` 的模型集钉住，
+    /// 而不是由 `--config` 的 `model_path` 决定；探测与真实加载用同一段代码。
+    fn create_session(
+        &self,
+        plan: &ServeConfigPlan,
+    ) -> (Result<Box<dyn OcrBackend>, RapidOcrError>, u64) {
+        let started = Instant::now();
+        let mut config = plan.engine.clone();
+        let result = match self.model_plan.pin_engine_paths(&mut config) {
+            Ok(()) => (self.engine_factory)(&config),
+            Err(error) => Err(RapidOcrError::ModelResolve(error.to_string())),
+        };
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        (result, elapsed_ms)
     }
 
     /// 惰性创建 / 显式重建引擎（§7.6）。
@@ -797,16 +995,21 @@ impl ServeShared {
     ///   的锁**不被持有**，因此 `/api/status` 能看到 `loading`，新 OCR 请求排队而不被拒绝）；
     /// - 模型仍缺失 → 保持 `blocked_models_missing` 并刷新缺失清单（`models_still_missing`）；
     /// - `force = false`（`POST /api/ocr` 的惰性路径）在已经 `Ready` 且引擎在场时立即返回，
-    ///   `force = true`（`POST /api/engine/reload`）即使已 `Ready` 也重新建立会话
-    ///   （用户的显式意图是"按磁盘上的当前文件重新加载"）。
+    ///   `force = true`（`POST /api/engine/reload` 的**无请求体**形式）即使已 `Ready`
+    ///   也重新建立会话（用户的显式意图是"按磁盘上的当前文件重新加载"）。
+    ///
+    /// **M3 的 provider 切换不经过这里**：它走
+    /// [`Self::apply_provider`] 的 `Ready → Rebuilding → …` 序列（暂停新任务 → 排空 →
+    /// 销毁旧 engine → 建立新 engine），因为那是"切换设置"，与"按当前文件重建"是两件事。
     fn ensure_engine_loaded(&self, force: bool) -> EngineLoad {
+        let plan = self.plan_snapshot();
         if !force
             && matches!(self.engine_state(), EngineState::Ready { .. })
             && lock(&self.engine).is_some()
         {
             return EngineLoad::Ready;
         }
-        // 一次只允许一个加载者（惰性路径与 reload 可能同时到达）。
+        // 一次只允许一个加载者（惰性路径、reload 与 provider 切换可能同时到达）。
         let _loading = lock(&self.engine_load);
         if !force
             && matches!(self.engine_state(), EngineState::Ready { .. })
@@ -814,7 +1017,11 @@ impl ServeShared {
         {
             return EngineLoad::Ready;
         }
+        self.load_engine(&plan)
+    }
 
+    /// `engine_load` 已经持有的加载路径（见 [`Self::ensure_engine_loaded`] 的文档）。
+    fn load_engine(&self, plan: &ServeConfigPlan) -> EngineLoad {
         let blocking = self.models().blocking_names();
         {
             let mut machine = lock(&self.engine_state);
@@ -845,13 +1052,7 @@ impl ServeShared {
         }
 
         // 建立会话期间**不持有** `engine_state`（见方法文档）。
-        let started = Instant::now();
-        let mut config = self.plan.engine.clone();
-        let result = match self.model_plan.pin_engine_paths(&mut config) {
-            Ok(()) => (self.engine_factory)(&config),
-            Err(error) => Err(RapidOcrError::ModelResolve(error.to_string())),
-        };
-        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let (result, elapsed_ms) = self.create_session(plan);
         let mut provider: Option<BackendProvider> = None;
         let mut reason: Option<String> = None;
         {
@@ -872,7 +1073,7 @@ impl ServeShared {
         match (provider, reason) {
             (Some(provider), _) => {
                 let _ = machine.load_succeeded(
-                    self.plan.requested_label(),
+                    plan.requested_label(),
                     provider.selected_ep,
                     provider.fallback_to_cpu,
                 );
@@ -891,30 +1092,229 @@ impl ServeShared {
 
     /// `POST /api/engine/reload`（§4.2、§7.6）。
     ///
+    /// 请求体**可选**：不带 body 是 M2 的"按磁盘上的当前文件重建会话"；带
+    /// `{"provider": "cpu"|"directml"|"cuda"}` 是 M3 的**显式设置应用**
+    /// （[`Self::apply_provider`]，含 `Ready → Rebuilding → …` 的完整序列）。
+    ///
     /// 响应体里的 `engine` 与 `/api/status` 的 `engine` **是同一个值**（冻结的
     /// `EngineState` 形状），因此"模型仍缺失"时客户端读到的是
     /// `{"state":"blocked_models_missing","missing":[…]}`——**不是**一句模糊的失败。
-    /// `missing`/`corrupt` 与 `/api/models` 同源同值；`load_ms` 是**本次** reload 的墙钟耗时
+    /// `missing`/`corrupt` 与 `/api/models` 同源同值；`load_ms` 是**本次调用**的墙钟耗时
     /// （`/api/status` 的 `engine_load_ms` 是上一次真正建立会话的耗时）。
-    pub fn reload_engine(&self) -> Value {
+    pub fn reload_engine(&self, provider: Option<ProviderPreference>) -> Result<Value, ServeError> {
         let started = Instant::now();
-        let outcome = self.ensure_engine_loaded(true);
-        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let report = self.models();
-        let outcome_label = match outcome {
-            EngineLoad::Ready => "ready",
-            EngineLoad::BlockedModelsMissing => "blocked_models_missing",
-            EngineLoad::Failed => "failed",
+        let Some(requested) = provider else {
+            let outcome = self.ensure_engine_loaded(true);
+            return Ok(self.engine_payload(outcome, started, None, None));
         };
+        self.apply_provider(requested, started)
+    }
+
+    /// M3 的 provider 设置应用：**入口与实现**（见 [`Self::apply_provider`] 的文档）。
+    ///
+    /// `http.rs` 在独立线程里调用它（那个线程负责写响应），因此 `/api/status` 与
+    /// `POST /api/ocr` 在切换期间照常可用。
+    pub fn apply_provider_request(
+        &self,
+        requested: ProviderPreference,
+        started: Instant,
+    ) -> Result<Value, ServeError> {
+        self.apply_provider(requested, started)
+    }
+
+    /// 取得"由我执行这次 provider 切换"的资格（同时只允许一个）。
+    ///
+    /// 第二个并发请求拿到 `None` → 503 `busy`（**不排队**：排队只会让两个客户端都等到
+    /// 一个很长的序列结束，而结果还是后者的设置生效）。凭据持有 `Arc`，因此它可以被
+    /// 移动到执行切换的那个线程里。
+    pub fn begin_provider_switch(self: &Arc<Self>) -> Option<ProviderSwitchGuard> {
+        self.provider_switch
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        Some(ProviderSwitchGuard {
+            shared: Arc::clone(self),
+        })
+    }
+
+    /// 运行期切换 provider 的**唯一**入口（§7.5、§7.6、M3）。
+    ///
+    /// 顺序逐条对应 `docs/05` §11 的 M3 清单：
+    ///
+    /// 1. **校验**：用启动期**同一套**规则（[`ServeConfigPlan::validate`]：provider 名称、
+    ///    对应 feature 是否编译进来、`fail_if_provider_unavailable` 的冻结语义）先算出新配置。
+    ///    配置非法（例如 `--features directml-provider` 没打开的构建里请求 `directml`）→
+    ///    **400 `bad_request`** + `detail.reason` 是库侧原文，**任何状态都不动**；
+    /// 2. **暂停新任务**：`Ready → Rebuilding`（§7.6 的合法边）。此刻 `POST /api/ocr` 的准入是
+    ///    `OcrAdmission::Queue`——**入队（202）而不是拒绝**（§7.6 原文：`Loading`/`Rebuilding`
+    ///    期间新请求排队；状态机里那条规则就是为它冻结的）；
+    /// 3. **排空**：`engine_load` 已经被本线程持有，worker 只有在拿到它之后才会去拿 `engine`，
+    ///    因此随后获取 `engine` 锁会**恰好等到正在进行的那次推理结束**；从这一刻起既没有
+    ///    推理在跑，也不会有新的推理开始（在跑的推理不会被中断，§4.3）；
+    /// 4. **销毁旧 engine → 建立新 engine**（顺序与 [`Self::load_engine`] 一致：旧会话先丢，
+    ///    避免失败时留下一个与 `/api/status` 不一致的可用引擎）；
+    /// 5. `Rebuilding → Ready`（成功）或 `Rebuilding → Failed`（失败）；
+    /// 6. **失败恢复旧 engine**：用旧配置重建会话。成功 → 状态回到 `Ready`、生效配置回到旧值
+    ///    （如实反映"切换没生效"），响应 `outcome = "rolled_back"` 并带 `error`；
+    ///    连旧引擎也起不来 → 明确的 `Failed`，`reason` 里**两个原因都写**。
+    ///
+    /// 非 `Ready` 状态（`BlockedModelsMissing`/`Failed`/`Loading`）没有"旧引擎要销毁、
+    /// 运行中任务要排空"这件事：应用设置后走 `Loading → Ready|Failed`（与 M2 同一条路径）。
+    fn apply_provider(
+        &self,
+        requested: ProviderPreference,
+        started: Instant,
+    ) -> Result<Value, ServeError> {
+        let old_plan = self.plan_snapshot();
+        let new_plan = old_plan
+            .clone()
+            .with_provider(requested, self.allow_provider_fallback)
+            .map_err(|error| ServeError::ProviderRejected {
+                provider: rapid_ocr_rs::format_provider_preference(requested),
+                reason: error.to_string(),
+            })?;
+
+        // 整个切换序列都在 `engine_load` 的临界区里：worker 的 `ensure_engine_loaded`
+        // 会一直等到切换结束，因此它**看不到** `Rebuilding`（它只会在切换完成后继续），
+        // 而 `/api/status` 能看到——状态锁不被持有。
+        let _loading = lock(&self.engine_load);
+
+        {
+            let mut machine = lock(&self.engine_state);
+            if machine.begin_rebuild().is_err() {
+                // 状态在上一行之后变了（例如并发的惰性创建把它推到了 `Failed`）：
+                // 按普通加载路径应用设置，不假装进入过 `Rebuilding`。
+                drop(machine);
+                *lock(&self.plan) = new_plan.clone();
+                let outcome = self.load_engine(&new_plan);
+                return Ok(self.engine_payload(outcome, started, None, None));
+            }
+        }
+        // `requested` 立刻生效：`Rebuilding` 期间 `/api/status` 报告**新**的 requested，
+        // 而 `selected_ep` / `fallback_to_cpu` 是 `null`（`EngineState::provider_status`
+        // 的未知态语义：不把"还不知道"伪装成 `false`）。
+        *lock(&self.plan) = new_plan.clone();
+
+        // 排空 + 销毁旧 engine：拿到 `engine` 锁即"在跑的推理已经结束"。
+        let mut engine = lock(&self.engine);
+        *engine = None;
+        let (created, session_ms) = self.create_session(&new_plan);
+        *lock(&self.engine_load_ms) = Some(session_ms);
+        match created {
+            Ok(backend) => {
+                let provider = backend.provider();
+                *engine = Some(backend);
+                drop(engine);
+                // 状态锁在**单独的块**里，绝不跨到 `engine_payload`（它自己也要读状态锁，
+                // 而 `std::sync::Mutex` 不可重入）。
+                {
+                    let mut machine = lock(&self.engine_state);
+                    let _ = machine.load_succeeded(
+                        new_plan.requested_label(),
+                        provider.selected_ep,
+                        provider.fallback_to_cpu,
+                    );
+                }
+                Ok(self.engine_payload(EngineLoad::Ready, started, None, None))
+            }
+            Err(new_error) => {
+                let new_reason = new_error.to_string();
+                // 恢复旧引擎：用**旧配置**重建会话（旧对象已经被销毁，只能重建）。
+                let (restored, rollback_ms) = self.create_session(&old_plan);
+                *lock(&self.engine_load_ms) = Some(rollback_ms);
+                match restored {
+                    Ok(backend) => {
+                        let provider = backend.provider();
+                        *engine = Some(backend);
+                        drop(engine);
+                        // 生效配置回到旧值：`/api/status` 必须报告**真正在跑的那个** provider。
+                        *lock(&self.plan) = old_plan.clone();
+                        {
+                            let mut machine = lock(&self.engine_state);
+                            let _ = machine.load_succeeded(
+                                old_plan.requested_label(),
+                                provider.selected_ep,
+                                provider.fallback_to_cpu,
+                            );
+                        }
+                        Ok(self.engine_payload(
+                            EngineLoad::Ready,
+                            started,
+                            Some(new_reason),
+                            Some(rollback_ms),
+                        ))
+                    }
+                    Err(restore_error) => {
+                        let reason = format!(
+                            "switching the execution provider to {} failed ({new_reason}); \
+                             restoring the previous engine ({}) also failed ({restore_error})",
+                            new_plan.requested_label(),
+                            old_plan.requested_label()
+                        );
+                        drop(engine);
+                        {
+                            let mut machine = lock(&self.engine_state);
+                            let _ = machine.load_failed(reason.clone());
+                        }
+                        Ok(self.engine_payload(
+                            EngineLoad::Failed,
+                            started,
+                            Some(reason),
+                            Some(rollback_ms),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    /// reload / provider 切换的响应体（`engine` 与 `/api/status` 同形同值）。
+    ///
+    /// `error` 非空且 `outcome` 是 `ready` 时，`outcome` 报 **`rolled_back`**：
+    /// 请求的设置没有生效、旧引擎仍在服务，客户端据此可以区分"切过去了"与"没切成"。
+    fn engine_payload(
+        &self,
+        outcome: EngineLoad,
+        started: Instant,
+        error: Option<String>,
+        rollback_ms: Option<u64>,
+    ) -> Value {
+        let report = self.models();
+        let provider = self.provider_status();
+        let outcome_label = match (&error, outcome) {
+            (Some(_), EngineLoad::Ready) => "rolled_back",
+            _ => match outcome {
+                EngineLoad::Ready => "ready",
+                EngineLoad::BlockedModelsMissing => "blocked_models_missing",
+                EngineLoad::Failed => "failed",
+            },
+        };
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         json!({
             "outcome": outcome_label,
             "engine": self.engine_state(),
+            "provider": provider,
+            "requested": provider.requested,
+            "selected_ep": provider.selected_ep,
+            "fallback_to_cpu": provider.fallback_to_cpu,
             "missing": report.missing_names(),
             "corrupt": report.corrupt_names(),
             "source": source_label(self.model_plan.source()),
             "model_dir": REDACTED_MODEL_DIR,
             "load_ms": elapsed_ms,
+            "rollback_ms": rollback_ms,
+            "error": error,
         })
+    }
+}
+
+/// [`ServeShared::begin_provider_switch`] 的资格凭据：`Drop` 时释放（panic 也释放）。
+pub(super) struct ProviderSwitchGuard {
+    shared: Arc<ServeShared>,
+}
+
+impl Drop for ProviderSwitchGuard {
+    fn drop(&mut self) {
+        self.shared.provider_switch.store(false, Ordering::SeqCst);
     }
 }
 
@@ -924,6 +1324,40 @@ fn missing_models_reason(blocking: &[String]) -> String {
         "the model files are missing or corrupt, so no session can be created: {}",
         blocking.join(", ")
     )
+}
+
+/// 一次任务查询的完整结论（同一把锁下取出，见 [`ServeShared::job_snapshot`]）。
+struct JobSnapshot {
+    state: JobLifecycle,
+    /// `Succeeded` 时的结构化结果。
+    output: Option<Arc<OcrOutput>>,
+    /// worker 实测的结果序列化长度（导出 JSON 的 `--max-export-mb` 拒绝里要用它）。
+    serialized_bytes: u64,
+    /// `Failed` 时要重放的状态码与错误体。
+    failure: Option<(u16, ErrorBody)>,
+    /// 仍在保留区里的**编码原图**（`None` = 已被保留预算释放，或本就没有）。
+    original: Option<Arc<[u8]>>,
+}
+
+/// 导出/标注失败的统一映射。
+///
+/// - `Decode`：原图解码失败仍是库的错误分类（422 `unsupported_input` 等）；
+/// - `TooLarge`：只在导出文档里有意义（`limit_bytes` / `annotated` 由调用方给出；
+///   标注 PNG 没有文档预算，因此那条路径不会产生它）；
+/// - `Render` / `Internal`：500（渲染器或序列化器报错，不是客户端的问题）。
+fn export_failure(error: ExportError, limit_bytes: u64, annotated: &str) -> ServeError {
+    match error {
+        ExportError::TooLarge { observed_bytes } => ServeError::ExportTooLarge {
+            limit_bytes,
+            observed_bytes,
+            annotated: annotated.to_string(),
+        },
+        ExportError::Decode(error) => ServeError::from(error),
+        ExportError::Render(reason) | ExportError::Internal(reason) => {
+            eprintln!("serve: export/annotation failed: {reason}");
+            ServeError::Internal
+        }
+    }
 }
 
 /// HTTP 层的响应体（状态码 + Content-Type + 字节）。
@@ -947,6 +1381,15 @@ impl Body {
         Self {
             status: 200,
             content_type: "text/html; charset=utf-8",
+            bytes,
+        }
+    }
+
+    /// 任意二进制体（导出文档、标注 PNG）。
+    pub fn typed(status: u16, content_type: &'static str, bytes: Vec<u8>) -> Self {
+        Self {
+            status,
+            content_type,
             bytes,
         }
     }
@@ -993,7 +1436,7 @@ impl ServeRuntime {
         let shared = Arc::new(ServeShared {
             service,
             limits: context.limits,
-            plan: context.plan,
+            plan: Mutex::new(context.plan),
             model_plan: context.model_plan,
             token: context.token,
             local: context.local,
@@ -1001,11 +1444,13 @@ impl ServeRuntime {
             nonce: context.nonce,
             allow_download: context.allow_download,
             allow_download_hosts: context.allow_download_hosts,
+            allow_provider_fallback: context.allow_provider_fallback,
             routing: context.routing,
             engine_state: Mutex::new(machine),
             engine: Mutex::new(backend),
             engine_load: Mutex::new(()),
             engine_load_ms: Mutex::new(None),
+            provider_switch: AtomicBool::new(false),
             jobs: Mutex::new(JobState {
                 store: JobStore::new(JobStoreLimits::from_limits(&context.limits)),
                 scheduler: DualQueueScheduler::new(SchedulerConfig::from_limits(&context.limits)),
@@ -1014,7 +1459,7 @@ impl ServeRuntime {
                     context.limits.max_retained_bytes,
                 ),
                 ids: JobIdGenerator::default(),
-                pending: HashMap::new(),
+                originals: HashMap::new(),
             }),
             queue_signal: Condvar::new(),
             download_tx,
@@ -1067,7 +1512,7 @@ impl Drop for ServeRuntime {
 fn load_engine(context: &ServeContext) -> (EngineStateMachine, Option<Box<dyn OcrBackend>>) {
     // `EngineStateMachine::start(Complete)` 已经进入 `Loading`（模型齐备就是要预加载），
     // 因此这里**不**再调 `begin_loading`——它只用于从 `Blocked`/`Ready`/`Failed` 重新进入
-    // `Loading`，也就是 M3 的 `POST /api/engine/reload`。
+    // `Loading`（`POST /api/engine/reload` 与惰性创建都走 `load_engine`）。
     let mut machine = EngineStateMachine::start(context.snapshot.readiness());
     if !context.snapshot.blocking_names().is_empty() {
         return (machine, None);
@@ -1103,12 +1548,42 @@ fn load_engine(context: &ServeContext) -> (EngineStateMachine, Option<Box<dyn Oc
 /// 取出任务后先确保引擎在场（M2 的惰性创建：`POST /api/ocr` 只把状态推进 `Loading`，
 /// 会话在这里建立，accept 线程绝不建立会话）。建不起来时任务以**同一份**错误映射失败
 /// （409 `models_missing` + 与 `/api/models` 同源同值的清单 / 503 `engine_unavailable` + reason）。
+///
+/// # M3：建会话在**取任务之前**
+///
+/// `ensure_engine_loaded` 只有在 `engine_load` 空闲时才返回——provider 切换期间它一直
+/// 被切换线程持有，因此本 worker 会在**还没有把任何任务标成 `running`** 的时候等在那里。
+/// 这有两个直接好处（§7.6 的"暂停新任务 → 排空"）：
+///
+/// 1. 排空判据是干净的：`Rebuilding` 期间不存在"状态是 running、其实在等引擎"的任务；
+/// 2. 切换结束后本 worker 直接看到 `Ready`（新引擎），队列里的任务用**新**引擎执行，
+///    `/api/ocr` 在切换期间返回的是 202 `queued`（`OcrAdmission::Queue`），不是拒绝。
 fn ocr_worker(runtime: Arc<ServeShared>) {
     while !runtime.is_shutting_down() {
+        if !runtime.has_queued_work() {
+            wait_for_work(&runtime);
+            continue;
+        }
+        match runtime.ensure_engine_loaded(false) {
+            EngineLoad::Ready => {}
+            EngineLoad::BlockedModelsMissing => {
+                // 与 `/api/models` 同源同值的 409（`code`/`detail` 都是同一份计算）。
+                fail_next_queued(&runtime, runtime.models_missing_outcome());
+                continue;
+            }
+            EngineLoad::Failed => {
+                let reason = runtime
+                    .engine_failure_reason()
+                    .unwrap_or_else(|| "the OCR engine could not be created".to_string());
+                fail_next_queued(&runtime, failure(503, "engine_unavailable", reason));
+                continue;
+            }
+        }
         let Some(scheduled) = next_scheduled(&runtime) else {
             continue;
         };
-        let Some(pending) = runtime.take_pending_ocr(&scheduled.id) else {
+        // M3：原图留在保留区里（`/annotated.png` 还要用它），这里只克隆引用。
+        let Some((bytes, max_side)) = runtime.retained_ocr(&scheduled.id) else {
             // 只有取消能走到这里；防御性记录，绝不把任务永久留在 `Running`。
             runtime.finish(
                 &scheduled.id,
@@ -1116,18 +1591,17 @@ fn ocr_worker(runtime: Arc<ServeShared>) {
             );
             continue;
         };
-        let outcome = match runtime.ensure_engine_loaded(false) {
-            EngineLoad::Ready => recognize(&runtime, &scheduled.id, pending),
-            EngineLoad::BlockedModelsMissing => runtime.models_missing_outcome(),
-            EngineLoad::Failed => {
-                let reason = runtime
-                    .engine_failure_reason()
-                    .unwrap_or_else(|| "the OCR engine could not be created".to_string());
-                failure(503, "engine_unavailable", reason)
-            }
-        };
+        let outcome = recognize(&runtime, &scheduled.id, bytes, max_side);
         runtime.finish(&scheduled.id, outcome);
     }
+}
+
+/// 引擎建不起来时，把下一个排队任务按同一份错误映射结算（不执行推理）。
+fn fail_next_queued(runtime: &ServeShared, outcome: Outcome) {
+    let Some(scheduled) = next_scheduled(runtime) else {
+        return;
+    };
+    runtime.finish(&scheduled.id, outcome);
 }
 
 /// 等一个任务（阻塞在条件变量上，最长 [`WORKER_POLL`]）。
@@ -1151,15 +1625,29 @@ fn next_scheduled(runtime: &ServeShared) -> Option<ScheduledJob> {
     }
 }
 
+/// 在**不取任务**的前提下等一会儿（`has_queued_work` 与 `next_scheduled` 之间的那段空闲）。
+fn wait_for_work(runtime: &ServeShared) {
+    let state = lock(&runtime.jobs);
+    if !state.scheduler.is_empty() || runtime.is_shutting_down() {
+        return;
+    }
+    let _ = runtime.queue_signal.wait_timeout(state, WORKER_POLL);
+}
+
 /// 一次识别：锁引擎 → 推理 → 有界序列化（§4.6）。
-fn recognize(runtime: &ServeShared, job_id: &str, pending: PendingOcr) -> Outcome {
+fn recognize(
+    runtime: &ServeShared,
+    job_id: &str,
+    bytes: Arc<[u8]>,
+    max_side: Option<u32>,
+) -> Outcome {
     let request = OcrRequest {
-        input: ImageInput::Encoded(Arc::from(pending.bytes)),
+        input: ImageInput::Encoded(bytes),
         roi: None,
         scale_hint: None,
         stages: StagePlan::default(),
         preprocess: PreprocessPolicy {
-            max_side: pending.max_side,
+            max_side,
             ..PreprocessPolicy::default()
         },
         detection: DetectionPolicy::default(),
@@ -1188,30 +1676,28 @@ fn recognize(runtime: &ServeShared, job_id: &str, pending: PendingOcr) -> Outcom
             }
         }
     };
-    serialize_output(&output, runtime.limits.max_result_bytes)
+    serialize_output(output, runtime.limits.max_result_bytes)
 }
 
 /// `OcrOutput` → 有界 JSON（§4.6：超限即中止，绝不先建大 `String`）。
 ///
-/// 字段沿用库的 `to_output_json`（`regions` / `text` / `items` / `formulas` / `timings` / …），
-/// 并**额外**给出 `plain_text`：内联页面（docs/05 §9 的冻结契约）的"复制全文"读的就是这个名字，
-/// 值与 `text` 逐字节相同（同一个 `plain_text(TextOrder::Reading)`）。
-fn serialize_output(output: &OcrOutput, limit: u64) -> Outcome {
-    let mut value = match to_output_json(output) {
+/// 字段由 [`super::export::result_json`] 给出（库的 `to_output_json` + `plain_text` +
+/// `timing_ledger`），因此 worker 在这里测得的字节数就是 `/result` 与
+/// `export?format=json` 的字节数。**保留下来的是结构化结果**（`Arc<OcrOutput>`），
+/// 三个格式的导出因此都能用库的渲染器，而不是解析 JSON 拼第二套实现。
+fn serialize_output(output: OcrOutput, limit: u64) -> Outcome {
+    let value = match export::result_json(&output) {
         Ok(value) => value,
         Err(error) => {
             let serve_error = ServeError::from(error);
             return Outcome::Failed(serve_error.status_code(), serve_error.body());
         }
     };
-    if let Value::Object(object) = &mut value {
-        object.insert(
-            "plain_text".to_string(),
-            Value::String(output.plain_text(TextOrder::Reading)),
-        );
-    }
     match serialize_bounded(&value, limit) {
-        Ok(bytes) => Outcome::Succeeded(bytes),
+        Ok(bytes) => {
+            let serialized_bytes = bytes.len() as u64;
+            Outcome::Succeeded(Succeeded::new(Arc::new(output), serialized_bytes))
+        }
         Err(SerializeError::TooLarge) => {
             let error = ServeError::ResultTooLarge;
             Outcome::Failed(error.status_code(), error.body())
@@ -1262,12 +1748,15 @@ fn sweeper(runtime: Arc<ServeShared>) {
                 .map(|view| view.id)
                 .collect();
             let dropped_results = state.results.retain_only(|id| live.contains(id));
-            let before = state.pending.len();
-            state.pending.retain(|id, _| live.contains(id));
-            let dropped_pending = before - state.pending.len();
-            if dropped_results > 0 || dropped_pending > 0 {
+            // 先落成保留策略刚释放的那批（M3 的字节预算），再按"任务还在不在"收尾。
+            state.sync_originals();
+            let before = state.originals.len();
+            state.originals.retain(|id, _| live.contains(id));
+            let dropped_originals = before - state.originals.len();
+            if dropped_results > 0 || dropped_originals > 0 {
                 eprintln!(
-                    "serve: dropped {dropped_results} result(s) and {dropped_pending} pending image(s)"
+                    "serve: dropped {dropped_results} result(s) and {dropped_originals} retained \
+                     original(s)"
                 );
             }
         }
