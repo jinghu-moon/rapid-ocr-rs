@@ -9,7 +9,7 @@ use ort::{
 };
 
 use crate::{
-    config::{RuntimeBackend, RuntimeConfig},
+    config::RuntimeConfig,
     error::{RapidOcrError, Result},
     runtime::contracts::{ModelIoProbe, TensorSpec},
     runtime::provider::{ProviderResolution, resolve_execution_providers},
@@ -235,13 +235,8 @@ fn open_session(
     model_path: &Path,
     runtime_cfg: &RuntimeConfig,
 ) -> Result<(Session, ProviderResolution)> {
-    if runtime_cfg.backend != RuntimeBackend::OnnxCpu {
-        return Err(RapidOcrError::UnsupportedBackend(format!(
-            "only `onnx_cpu` is supported in this release, got {:?}",
-            runtime_cfg.backend
-        )));
-    }
-
+    // 只有 ONNX Runtime 一种后端：以前这里的单变体 `RuntimeBackend` 检查属于伪抽象，
+    // 已随枚举一起删除。provider 差异完全由 `resolve_execution_providers` 表达。
     let mut builder = Session::builder().map_err(ort_error)?;
     builder = builder
         .with_optimization_level(GraphOptimizationLevel::Level3)

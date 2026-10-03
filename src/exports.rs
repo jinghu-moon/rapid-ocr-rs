@@ -19,7 +19,7 @@ pub use crate::api::{
 };
 pub use crate::config::{
     ColorOrder, LangCls, LangDet, LangRec, ModelType, OcrVersion, ProviderPreference, RecImage,
-    RuntimeBackend, RuntimeConfig, VisionBackend,
+    RuntimeConfig, VisionBackend,
 };
 pub use crate::error::{RapidOcrError, Result};
 pub use crate::formula::contract::{
@@ -66,7 +66,9 @@ pub use crate::runtime::contracts::{ModelIoProbe, TensorSpec};
 pub use crate::runtime::memory::{
     PEAK_MEMORY_SOURCE, peak_memory_failure_reason, peak_memory_source, peak_working_set_bytes,
 };
-pub use crate::runtime::provider::{ProviderResolution, ResolvedExecutionProvider};
+pub use crate::runtime::provider::{
+    ProviderResolution, ResolvedExecutionProvider, ort_runtime_version,
+};
 pub use crate::runtime::session::OrtSession;
 
 /// 四边形（左上、右上、右下、左下）。

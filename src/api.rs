@@ -1084,19 +1084,25 @@ where
         })
 }
 
+/// 实际交给 ONNX Runtime 的加速提供者。
+///
+/// Windows-only 之后只剩 CPU / DirectML / CUDA；CANN 已整体删除。
+///
+/// **重要**：`Resolved` 表示“EP 链已按请求建立且 `is_available()` 自报可用”，
+/// **不代表**模型真的在该 EP 上逐节点执行（ORT 不通过该 API 暴露逐节点分配）。
+/// 任何加速结论都必须有实测耗时支撑，见 `runtime::provider` 与
+/// `docs/04-windows-phase-reports.md` 的阶段 0 记录。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolvedProvider {
     Cpu,
     DirectMl,
     Cuda,
-    Cann,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderPreference {
     Cpu,
     DirectMl { device_id: usize },
     Cuda { device_id: usize },
-    Cann { device_id: usize },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderResolutionInfo {

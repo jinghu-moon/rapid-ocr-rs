@@ -152,6 +152,10 @@ impl LangRec {
     }
 }
 
+/// 执行提供者偏好。
+///
+/// Windows-only 之后只剩三个：CPU（默认）、CUDA、DirectML。
+/// CANN 不是 Windows 目标，已整体删除（feature、枚举变体、序列化与测试）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderPreference {
@@ -163,22 +167,16 @@ pub enum ProviderPreference {
     DirectMl {
         device_id: usize,
     },
-    Cann {
-        device_id: usize,
-    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeBackend {
-    #[default]
-    OnnxCpu,
-}
-
+/// 单个 ONNX Runtime 会话的运行时配置。
+///
+/// 这里**没有** `backend` 字段：本 crate 只使用 ONNX Runtime，曾经的单变体枚举
+/// `RuntimeBackend::OnnxCpu` 是伪抽象（只有一个取值，却要检查、序列化并出现在 YAML 里），
+/// 已删除。provider 选择由 [`RuntimeConfig::provider_preference`] 表达。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
-    pub backend: RuntimeBackend,
     pub intra_threads: Option<usize>,
     pub inter_threads: Option<usize>,
     pub auto_tune_threads: bool,
@@ -192,7 +190,6 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            backend: RuntimeBackend::default(),
             intra_threads: None,
             inter_threads: None,
             auto_tune_threads: true,
@@ -332,7 +329,7 @@ impl RecImage {
 mod tests {
     use std::borrow::Cow;
 
-    use super::{ColorOrder, RecImage, RuntimeBackend, RuntimeConfig, VisionBackend};
+    use super::{ColorOrder, ProviderPreference, RecImage, RuntimeConfig, VisionBackend};
 
     #[test]
     fn rec_image_rejects_zero_dimension() {
@@ -344,17 +341,42 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_default_backend_matches_feature() {
+    fn runtime_config_defaults_are_explicit() {
         let cfg = RuntimeConfig::default();
-        assert_eq!(cfg.backend, RuntimeBackend::OnnxCpu);
         assert!(cfg.auto_tune_threads);
         assert_eq!(cfg.rayon_threads, None);
         assert!(cfg.enable_cpu_mem_arena);
         assert!(!cfg.fail_if_provider_unavailable);
+        assert_eq!(cfg.provider_preference, ProviderPreference::Cpu);
         #[cfg(feature = "opencv-backend")]
         assert_eq!(cfg.vision_backend, VisionBackend::OpenCv);
         #[cfg(not(feature = "opencv-backend"))]
         assert_eq!(cfg.vision_backend, VisionBackend::PureRust);
+    }
+
+    /// YAML 里已经删除的字段必须被拒绝，并且错误要能定位到字段名。
+    #[test]
+    fn removed_runtime_fields_are_rejected_with_a_locating_error() {
+        // `backend`（单变体伪抽象）与 `provider_preference: cann` 都已删除。
+        let error = serde_yaml::from_str::<RuntimeConfig>("backend: onnx_cpu")
+            .expect_err("the removed `backend` field must not deserialize");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "error must locate the removed field: {error}"
+        );
+
+        let error = serde_yaml::from_str::<RuntimeConfig>("provider_preference: cann")
+            .expect_err("the removed CANN provider must not deserialize");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown variant") || message.contains("did not match any variant"),
+            "error must locate the removed provider: {message}"
+        );
+
+        // 仍然合法的取值必须继续工作。
+        let config: RuntimeConfig = serde_yaml::from_str("provider_preference: cpu")
+            .expect("the supported CPU preference must deserialize");
+        assert_eq!(config.provider_preference, ProviderPreference::Cpu);
     }
 
     #[test]

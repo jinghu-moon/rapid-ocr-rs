@@ -608,9 +608,6 @@ impl RapidOcrEngine {
                 crate::config::ProviderPreference::Cuda { device_id } => {
                     crate::api::ProviderPreference::Cuda { device_id }
                 }
-                crate::config::ProviderPreference::Cann { device_id } => {
-                    crate::api::ProviderPreference::Cann { device_id }
-                }
             },
             resolved: match resolution.resolved {
                 crate::runtime::provider::ResolvedExecutionProvider::Cpu => {
@@ -621,9 +618,6 @@ impl RapidOcrEngine {
                 }
                 crate::runtime::provider::ResolvedExecutionProvider::Cuda => {
                     crate::api::ResolvedProvider::Cuda
-                }
-                crate::runtime::provider::ResolvedExecutionProvider::Cann => {
-                    crate::api::ResolvedProvider::Cann
                 }
             },
             fallback_to_cpu: resolution.fallback_used,

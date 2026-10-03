@@ -167,6 +167,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "init_ms": init_ms,
             "benchmark": benchmark_meta,
             "provider_resolution": provider_resolution,
+            // 实际加载的 ONNX Runtime 版本：本 crate 链接导入库，运行时可能加载系统
+            // 自带的 `onnxruntime.dll`，这决定了哪些加速 provider 真正可用。
+            "ort_runtime_version": rapid_ocr_rs::ort_runtime_version(),
         },
         "stats": {
             "wall_ms": stats(&wall),

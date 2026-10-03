@@ -139,25 +139,25 @@ cargo run --release --bin formula_eval -- --model <model> --dataset-root <Formul
 
 ### 5.1 删除 CANN
 
-- [ ] 从 `Cargo.toml` 删除 `cann-provider = ["ort/cann"]`。
-- [ ] 从 `config::ProviderPreference`、`api::ProviderPreference`、`ResolvedExecutionProvider`、provider resolution、pipeline 映射和输出序列化中删除 `Cann`。
-- [ ] 删除 CANN 专属 `cfg`、测试、README、阶段 02 文档中的验收项；历史报告只保留为历史记录，不作为当前支持声明。
-- [ ] 为删除后的 provider 集合增加穷举测试：CPU、DirectML、CUDA 的请求、不可用、strict/fallback 语义均有覆盖。
+- [x] 从 `Cargo.toml` 删除 `cann-provider = ["ort/cann"]`。（`cargo check --features cann-provider` 明确报“没有该 feature”）
+- [x] 从 `config::ProviderPreference`、`api::ProviderPreference`、`ResolvedExecutionProvider`、provider resolution、pipeline 映射和输出序列化中删除 `Cann`。
+- [x] 删除 CANN 专属 `cfg`、测试、README、阶段 02 文档中的验收项；历史报告只保留为历史记录，不作为当前支持声明。（README 与 provider 模块文档已改为 CPU/DirectML/CUDA）
+- [x] 为删除后的 provider 集合增加穷举测试：CPU、DirectML、CUDA 的请求、不可用、strict/fallback 语义均有覆盖。
 
 ### 5.2 简化 ONNX Runtime 入口
 
-- [ ] 评估 `RuntimeBackend`：当前只有 `OnnxCpu` 一个变体且实际承载 CPU/DirectML/CUDA，删除枚举和 `backend` 字段，避免伪抽象。
-- [ ] `runtime/session.rs` 直接构造 ORT Session；保留 `GraphOptimizationLevel::Level3`、arena 和 provider resolution 的真实配置。
-- [ ] 统一 provider 错误文本，区分“feature 未启用”“运行库不可用”“严格模式拒绝 fallback”。
-- [ ] 保持公式 session 的“不允许静默回退”契约；普通 OCR 的 fallback 行为要用测试锁定。
+- [x] 评估 `RuntimeBackend`：当前只有 `OnnxCpu` 一个变体且实际承载 CPU/DirectML/CUDA，删除枚举和 `backend` 字段，避免伪抽象。
+- [x] `runtime/session.rs` 直接构造 ORT Session；保留 `GraphOptimizationLevel::Level3`、arena 和 provider resolution 的真实配置。
+- [x] 统一 provider 错误文本，区分“feature 未启用”“运行库不可用”“严格模式拒绝 fallback”。（并修掉“DirectML is only available on Windows”这条与本机矛盾的文案）
+- [x] 保持公式 session 的“不允许静默回退”契约；普通 OCR 的 fallback 行为要用测试锁定。
 
 ### 5.3 验收
 
-- [ ] `cargo test --all-targets`。
-- [ ] `cargo test --features directml-provider`。
-- [ ] `cargo test --features cuda-provider`。
-- [ ] `cargo check --features directml-provider,cuda-provider`。
-- [ ] 配置 YAML 不再接受 `cann` 或 `onnx_cpu` 之外的已删除字段；错误必须可定位。
+- [x] `cargo test --all-targets`。（lib 263 + bin 18 passed）
+- [x] `cargo test --features directml-provider`。（263 passed）
+- [x] `cargo test --features cuda-provider`。（261 passed）
+- [x] `cargo check --features directml-provider,cuda-provider`。
+- [x] 配置 YAML 不再接受 `cann` 或 `onnx_cpu` 之外的已删除字段；错误必须可定位。（`unknown field` + `unknown variant` 测试）
 
 ---
 

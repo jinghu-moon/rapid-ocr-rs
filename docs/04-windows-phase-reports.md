@@ -180,6 +180,95 @@ pwsh -NoProfile -File tools/check_platform_gate.ps1
 
 ---
 
+## 阶段 2：裁剪 Provider 与 ONNX Runtime 运行时
+
+**阶段**：2
+**日期**：2026-10-03
+**提交**：`（本阶段提交）`
+**变更摘要**：
+
+- **删除 CANN**：`cann-provider` feature、`config::ProviderPreference::Cann`、
+  `api::ProviderPreference::Cann`、`api::ResolvedProvider::Cann`、provider 解析分支、
+  pipeline 映射与全部 CANN 测试。`cargo check --features cann-provider` 现在给出
+  `the package 'rapid-ocr-rs' does not contain this feature: cann-provider`。
+- **删除 `RuntimeBackend`**：单变体枚举（只有 `OnnxCpu`）连同 `RuntimeConfig.backend`
+  字段与 `runtime/session.rs` 里的检查一起删除 —— 它承载不了任何选择，却要序列化、
+  要出现在 YAML 里。provider 选择只由 `provider_preference` 表达。
+  YAML 中残留的 `backend: onnx_cpu` 现在被 `deny_unknown_fields` 拒绝，并列出可接受字段。
+- **统一 provider 错误文本**（三类可区分）：feature 未编译进来 / 运行库不可用 /
+  严格模式拒绝回退。顺带修掉了一条与本机事实矛盾的文案：未启用 feature 时不再报
+  “DirectML is only available on Windows”。
+- **新增 `ort_runtime_version()`**（查询 `OrtGetApiBase()->GetVersionString()`），并写入
+  benchmark 报告：本 crate 链接导入库，运行时实际加载哪个 ONNX Runtime 决定了哪些 EP 可用。
+- 移除外部配置文件 `OCR-Model/test-config{,-small,-tiny}.yaml` 中已删除的 `backend:` 行
+  （否则引擎构造会被新校验拒绝）。
+
+**执行命令**：
+
+```powershell
+cargo test --all-targets
+cargo test --features directml-provider
+cargo test --features cuda-provider
+cargo check --features directml-provider,cuda-provider
+cargo check --features cann-provider   # 预期并实测：明确报“没有该 feature”
+cargo clippy --all-targets -- -D warnings
+```
+
+**关键结果**：
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --all-targets` | lib 263 + bin 18 passed / 0 failed（阶段 1 为 256） |
+| `--features directml-provider` | lib 263 passed |
+| `--features cuda-provider` | lib 261 passed |
+| `--features directml-provider,cuda-provider` | 编译通过 |
+| `--features cann-provider` | 明确失败：`does not contain this feature` |
+| 删除字段的 YAML | 明确失败：`unknown field 'backend', expected one of …` |
+| fmt / clippy | 通过 |
+
+**CUDA 报告不诚实的根因（阶段 0 发现，本阶段定性）**：
+
+| 现象 | 实测 |
+| --- | --- |
+| CPU p50 | 1039.5 ms |
+| DirectML p50 | **508.7 ms**（约 2×；`DirectML.dll` 已加载） |
+| CUDA p50 | **1034.2 ms**（与 CPU 相同，**即使 `onnxruntime_providers_cuda.dll` 就在 exe 旁**） |
+| 加载的 ONNX Runtime | `ort_runtime_version()` = **1.28.0** |
+| CUDA 工具链 | 已安装（`cudart64_12.dll`、`cublas64_12.dll` 在 PATH 上） |
+| **cuDNN** | **缺失**（`cudnn*.dll` 不存在） |
+
+结论：CUDA EP 的 provider 库能被加载、`is_available()` 返回 true，但缺少 cuDNN 时
+它无法真正执行模型，节点全部落在 CPU —— 而 `resolved = Cuda, fallback_used = false`
+会让调用方以为加速已生效。
+因此 crate 明确写入规则：**加速结论必须来自实测 P50/P90，不得仅凭 `resolved` 宣称加速**；
+在装上与 ORT 版本匹配的 cuDNN 之前，本机 CUDA 记为**未验证**，不作为可用 provider 声明。
+报告字段同时记录 provider 解析结果、实测耗时与 ORT 版本，便于审查时一眼看出矛盾。
+
+**基线对比**（12 图，max_side_len 2000，intra_threads 16）：
+
+| 指标 | 阶段 0 基线 | 阶段 2 后 | 判定 |
+| --- | ---: | ---: | --- |
+| mean CER（硬门槛） | 0.4477 | 0.4477 | 未退化 |
+| 区域数均值（硬门槛） | 34.8 | 34.8 | 未退化 |
+| OCR p50 (ms) | 1001.1 | 1037.2 | +3.6%，噪声范围 |
+| OCR p90 (ms) | 1153.6 | 1135.3 | 未退化 |
+| init (ms) | 143.6 | 140.9 | 未退化 |
+| 峰值工作集 (MB) | 1284.0 | 1285.0 | 未退化 |
+
+**未覆盖风险**：
+
+- CUDA 在本机仍**无法验证**：缺 cuDNN。装上与 ORT 1.28 匹配的 cuDNN 后必须重跑
+  本阶段的 provider 矩阵，才能改变“未验证”的结论。
+- DirectML 只在一台机器上验证；`resolved = DirectMl` + 实测 2× 收益目前一致，
+  但仍需在目标机器上复测（README 保留“不得假设 GPU 更快”的说明）。
+- `is_available()` 与实际执行之间的落差是 ORT 的行为，本 crate 无法在 API 层消除，
+  只能通过文档规则 + 报告字段暴露；阶段 6 会加入“声称加速但实测与 CPU 无差异”的检查工具。
+
+**是否触发公式 smoke / val-501 / 全量评测**：未触发。本阶段只改 provider 枚举、
+runtime 配置形状与错误文本，不触及模型调用、预处理、tokenizer、postprocess、batch/EOS 或指标实现。
+
+---
+
 ## 阶段完成记录模板（后续阶段沿用）
 
 ```text
