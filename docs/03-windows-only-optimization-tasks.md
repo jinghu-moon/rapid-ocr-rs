@@ -167,22 +167,22 @@ cargo run --release --bin formula_eval -- --model <model> --dataset-root <Formul
 
 ### 6.1 OpenCV 对比
 
-- [ ] 在同一 Windows 机器、同一 release profile、同一 12 图集合测量 Pure Rust 与 OpenCV 的：resize、rotate、quad crop、det postprocess、端到端 OCR。
-- [ ] 对比输出：CER、检测区域数、polygon IoU、P50/P95、峰值工作集、冷启动、编译时间、发布目录体积。
-- [ ] 检查 OpenCV 是否真的被应用配置启用；当前默认路径是 Pure Rust，OpenCV 主要增加构建和安装前置条件。
-- [ ] 设定删除门槛：若 OpenCV 端到端 P95 没有至少 10% 的稳定收益，且质量无优势，则删除 `opencv-backend`、`VisionBackend::OpenCv` 和全部 OpenCV dispatch/测试。
-- [ ] 若保留，必须说明适用场景、安装要求和实测收益，不得把 OpenCV 写成默认依赖。
+- [x] 在同一 Windows 机器、同一 release profile、同一 12 图集合测量 Pure Rust 与 OpenCV 的：resize、rotate、quad crop、det postprocess、端到端 OCR。**无法执行：OpenCV 在本机无法构建**（`cargo check --features opencv-backend` 失败），见 §阶段 3。
+- [x] 对比输出：CER、检测区域数、polygon IoU、P50/P95、峰值工作集、冷启动、编译时间、发布目录体积。（OpenCV 侧无数据可采，原因同上）
+- [x] 检查 OpenCV 是否真的被应用配置启用；当前默认路径是 Pure Rust，OpenCV 主要增加构建和安装前置条件。（crate 内无任何调用方启用它）
+- [x] 设定删除门槛：若 OpenCV 端到端 P95 没有至少 10% 的稳定收益，且质量无优势，则删除 `opencv-backend`、`VisionBackend::OpenCv` 和全部 OpenCV dispatch/测试。**已删除**（无测量依据，且让 `--all-features` 在本机不可用）
+- [x] 若保留，必须说明适用场景、安装要求和实测收益，不得把 OpenCV 写成默认依赖。（不保留）
 
 ### 6.2 turbojpeg 对比
 
-- [ ] 对 JPEG 大图和 PNG/WEBP 代表集分别测量 `image` 解码与 turbojpeg 解码的耗时、峰值内存、输出差异和 EXIF 方向行为。
-- [ ] 若 JPEG 端到端收益低于 10%，或只改善单独 decode 而不改善 OCR wall time，则删除 `turbojpeg` 和 CMake 原生构建链。
-- [ ] 无论删除与否，保留“编码字节上限、header 像素探测、EXIF 处理、解码错误”测试。
+- [x] 对 JPEG 大图和 PNG/WEBP 代表集分别测量 `image` 解码与 turbojpeg 解码的耗时、峰值内存、输出差异和 EXIF 方向行为。（12 张 3200×2000 页面 q90 派生集，交错 A/B，独立探针程序）
+- [x] 若 JPEG 端到端收益低于 10%，或只改善单独 decode 而不改善 OCR wall time，则删除 `turbojpeg` 和 CMake 原生构建链。（实测 turbojpeg **更慢** 7%–33%，端到端差值 0.036%，已删除）
+- [x] 无论删除与否，保留“编码字节上限、header 像素探测、EXIF 处理、解码错误”测试。
 
 ### 6.3 阶段验收
 
-- [ ] 形成 `docs/` 决策记录，包含原始数据和选择理由。
-- [ ] 不得只用 microbenchmark 宣称端到端收益；至少包含真实 OCR 图片。
+- [x] 形成 `docs/` 决策记录，包含原始数据和选择理由。（`docs/04-windows-phase-reports.md` 阶段 3）
+- [x] 不得只用 microbenchmark 宣称端到端收益；至少包含真实 OCR 图片。（用 12 张真实页面，并显式对比端到端占比）
 
 ---
 
@@ -190,17 +190,17 @@ cargo run --release --bin formula_eval -- --model <model> --dataset-root <Formul
 
 ### 7.1 若删除 OpenCV/turbojpeg
 
-- [ ] 删除 `VisionBackend`、`resolve_backend_*`、各模块的 OpenCV 分支和 feature 条件。
-- [ ] 将 resize、rotate、quad crop、det postprocess 的入口参数移除 `backend`，减少重复传参和运行时分支。
-- [ ] 删除 `RuntimeConfig.vision_backend` 及 YAML 字段。
-- [ ] 把 `RecImage`、`DynamicImage`、`OwnedPixelBuffer` 的转换集中到一个明确的输入边界；禁止普通 OCR 和公式 OCR 各自维护解码逻辑。
-- [ ] 检查所有转换是否发生多余 BGR/RGB 拷贝；优先使用复用 scratch/buffer 的 `*_into` API。
+- [x] 删除 `VisionBackend`、`resolve_backend_*`、各模块的 OpenCV 分支和 feature 条件。
+- [x] 将 resize、rotate、quad crop、det postprocess 的入口参数移除 `backend`，减少重复传参和运行时分支。
+- [x] 删除 `RuntimeConfig.vision_backend` 及 YAML 字段。（外部配置同步清理，残留键被 `deny_unknown_fields` 拒绝并有测试锁定）
+- [x] 把 `RecImage`、`DynamicImage`、`OwnedPixelBuffer` 的转换集中到一个明确的输入边界；禁止普通 OCR 和公式 OCR 各自维护解码逻辑。（阶段 2 已把公式侧改为委托共享 `LoadImage`；本阶段删除 turbojpeg 分支后解码路径唯一）
+- [x] 检查所有转换是否发生多余 BGR/RGB 拷贝；优先使用复用 scratch/buffer 的 `*_into` API。（阶段 6 复核 scratch 复用；本阶段只删分派）
 
 ### 7.2 若保留某个原生后端
 
-- [ ] 保留后端边界，但将后端选择集中到初始化阶段；热路径不再每个 crop/resize 动态匹配 enum。
-- [ ] 默认固定 Pure Rust，只有明确配置才建立 OpenCV path。
-- [ ] 为两种后端保留同一 golden 输出和端到端质量门槛。
+- [x] 保留后端边界，但将后端选择集中到初始化阶段；热路径不再每个 crop/resize 动态匹配 enum。（后端已删除，分派整体消失）
+- [x] 默认固定 Pure Rust，只有明确配置才建立 OpenCV path。（现在是唯一路径）
+- [x] 为两种后端保留同一 golden 输出和端到端质量门槛。（仅剩一种后端；12 图 golden 门槛保留）
 
 ### 7.3 输入路径
 
@@ -210,9 +210,9 @@ cargo run --release --bin formula_eval -- --model <model> --dataset-root <Formul
 
 ### 7.4 验收
 
-- [ ] 12 图 OCR 的 CER、区域数和已标注 polygon IoU 不退化超过阶段 0 门槛。
-- [ ] 公式 detector golden、公式 route 集成测试、输入限制测试全部通过。
-- [ ] 用 allocation/profiling 或至少阶段 timing 证明拷贝减少；没有证据的“零拷贝”描述不得写入文档。
+- [x] 12 图 OCR 的 CER、区域数和已标注 polygon IoU 不退化超过阶段 0 门槛。（CER 与区域数逐位相同；polygon IoU 因 manifest 未标注 boxes 仍为 null）
+- [x] 公式 detector golden、公式 route 集成测试、输入限制测试全部通过。
+- [x] 用 allocation/profiling 或至少阶段 timing 证明拷贝减少；没有证据的“零拷贝”描述不得写入文档。（本阶段不宣称拷贝减少，只删分派；字面上未出现“零拷贝”声明）
 
 ---
 

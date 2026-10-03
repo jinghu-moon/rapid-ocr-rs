@@ -64,7 +64,7 @@ foreach ($name in 'rapidocr', 'bench_warm_e2e', 'formula_eval', 'formula_bench')
 }
 $targetSize = (Get-ChildItem (Join-Path $Crate 'target') -Recurse -File -ErrorAction SilentlyContinue |
     Measure-Object -Property Length -Sum).Sum
-# crate 自身重编译耗时（依赖已构建）：OpenCV/turbojpeg 决策使用同一口径。
+# crate 自身重编译耗时（依赖已构建）：provider 与发布基线使用同一口径。
 & cargo clean -p rapid-ocr-rs --release 2>&1 | Out-Null
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 & cargo build --release --bins 2>&1 | Out-Null

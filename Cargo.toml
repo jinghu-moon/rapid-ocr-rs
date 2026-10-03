@@ -18,7 +18,6 @@ kamadak-exif = "0.6"
 nalgebra = "0.33"
 ndarray = "0.17"
 num_cpus = "1.16"
-opencv = { version = "0.94", optional = true, default-features = false, features = ["clang-runtime", "imgproc"] }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "std"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -28,7 +27,6 @@ sha2 = "0.10"
 thiserror = "2"
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 unicode-bidi = "0.3"
-turbojpeg = { version = "1.4.0", default-features = false, features = ["cmake"] }
 rayon = "1.10"
 regex = "1"
 clap = { version = "4.5", features = ["derive"] }
@@ -40,12 +38,11 @@ cli-default = ["download-binaries", "copy-dylibs", "directml-provider"]
 ort-runtime = ["ort/default"]
 download-binaries = ["ort/download-binaries"]
 copy-dylibs = ["ort/copy-dylibs"]
-opencv-backend = ["dep:opencv"]
 directml-provider = ["ort/directml"]
 cuda-provider = ["ort/cuda"]
 
 [lints.rust]
-# `ort` / `turbojpeg` 链接的预编译原生库在 MSVC 下会偶发报告
+# `ort` 链接的预编译原生库在 MSVC 下会偶发报告
 # `LNK4098: defaultlib 'LIBCMT'/'LIBCMTD' conflicts with use of other libs`。
 # 该诊断来自第三方预编译二进制而不是本 crate 的代码，却会让
 # `cargo clippy --all-targets -- -D warnings` 随机失败，因此显式允许该 lint。

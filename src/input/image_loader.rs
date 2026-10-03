@@ -7,7 +7,6 @@ use std::{
 
 use exif::{In, Reader as ExifReader, Tag};
 use image::{DynamicImage, GrayImage, ImageBuffer, LumaA, RgbImage, RgbaImage};
-use turbojpeg::{PixelFormat, decompress};
 
 use crate::{
     config::RecImage,
@@ -295,13 +294,7 @@ impl LoadImage {
             None
         };
 
-        // Match Python PIL JPEG decode path as closely as possible for non-oriented images.
-        if orientation.unwrap_or(1) == 1
-            && let Ok(img) = decode_bytes_with_turbojpeg(bytes)
-        {
-            return Ok(img);
-        }
-
+        // Decode with the pure-Rust `image` crate, then apply EXIF orientation.
         let mut dyn_img = image::load_from_memory(bytes)
             .map_err(|e| RapidOcrError::InvalidImage(e.to_string()))?;
         if apply_exif_transpose {
@@ -382,44 +375,6 @@ fn apply_exif_orientation(img: DynamicImage, orientation: Option<u32>) -> Dynami
         8 => img.rotate270(),
         _ => img,
     }
-}
-
-fn decode_bytes_with_turbojpeg(bytes: &[u8]) -> Result<RecImage> {
-    if !looks_like_jpeg(bytes) {
-        return Err(RapidOcrError::InvalidImage("not a jpeg stream".to_string()));
-    }
-
-    let decoded = decompress(bytes, PixelFormat::BGR)
-        .map_err(|e| RapidOcrError::InvalidImage(format!("turbojpeg decode failed: {e}")))?;
-
-    let width = decoded.width;
-    let height = decoded.height;
-    if width == 0 || height == 0 {
-        return Err(RapidOcrError::InvalidImage(
-            "decoded image width/height cannot be zero".to_string(),
-        ));
-    }
-
-    let row_bytes = width * 3;
-    let bgr = if decoded.pitch == row_bytes {
-        decoded.pixels
-    } else {
-        let mut compact = vec![0_u8; row_bytes * height];
-        for y in 0..height {
-            let src_start = y * decoded.pitch;
-            let src_end = src_start + row_bytes;
-            let dst_start = y * row_bytes;
-            compact[dst_start..dst_start + row_bytes]
-                .copy_from_slice(&decoded.pixels[src_start..src_end]);
-        }
-        compact
-    };
-
-    RecImage::from_bgr_u8(width, height, bgr)
-}
-
-fn looks_like_jpeg(bytes: &[u8]) -> bool {
-    bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
 }
 
 fn dynamic_to_rec_image(img: DynamicImage) -> Result<RecImage> {

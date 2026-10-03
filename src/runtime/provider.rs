@@ -109,6 +109,13 @@ pub fn ort_runtime_version() -> Option<String> {
 }
 
 /// “feature 未编译进来”的统一错误文本。
+///
+/// 两个加速 feature 都被打开时，所有 `#[cfg(not(feature = ...))]` 分支都不存在，
+/// 于是这里没有调用点；文本定义仍然保留一处，避免两套措辞。
+#[cfg_attr(
+    all(feature = "cuda-provider", feature = "directml-provider"),
+    allow(dead_code)
+)]
 fn feature_disabled(provider: &str, feature: &str) -> RapidOcrError {
     RapidOcrError::UnsupportedProvider(format!(
         "{provider} provider support is not compiled in; rebuild with `--features {feature}`"

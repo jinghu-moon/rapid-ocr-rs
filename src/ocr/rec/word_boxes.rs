@@ -1,19 +1,10 @@
 use nalgebra::{SMatrix, SVector};
-#[cfg(feature = "opencv-backend")]
-use opencv::{
-    core::{self, Mat, Point2f},
-    imgproc,
-    prelude::*,
-};
 
-#[cfg(test)]
-use crate::vision::backend::default_backend;
 use crate::{
     Quad,
-    config::{RecImage, VisionBackend},
+    config::RecImage,
     error::{RapidOcrError, Result},
     ocr::types::{LineResult, WordBox, WordInfo, WordType},
-    vision::backend::resolve_backend_strict,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,30 +13,12 @@ enum Direction {
     Vertical,
 }
 
-#[cfg(test)]
 pub fn compute_word_boxes(
     imgs: &[RecImage],
     dt_boxes: &[Quad],
     lines: &[LineResult],
     return_single_char_box: bool,
 ) -> Result<Vec<Vec<WordBox>>> {
-    compute_word_boxes_with_backend(
-        imgs,
-        dt_boxes,
-        lines,
-        return_single_char_box,
-        default_backend(),
-    )
-}
-
-pub fn compute_word_boxes_with_backend(
-    imgs: &[RecImage],
-    dt_boxes: &[Quad],
-    lines: &[LineResult],
-    return_single_char_box: bool,
-    backend: VisionBackend,
-) -> Result<Vec<Vec<WordBox>>> {
-    let backend = resolve_backend_strict(backend)?;
     if imgs.len() != dt_boxes.len() || imgs.len() != lines.len() {
         return Err(RapidOcrError::InvalidInput(format!(
             "compute_word_boxes input length mismatch: imgs={}, dt_boxes={}, lines={}",
@@ -60,7 +33,6 @@ pub fn compute_word_boxes_with_backend(
         dt_boxes,
         lines,
         return_single_char_box,
-        backend,
     ))
 }
 
@@ -69,7 +41,6 @@ fn compute_word_boxes_unchecked(
     dt_boxes: &[Quad],
     lines: &[LineResult],
     return_single_char_box: bool,
-    backend: VisionBackend,
 ) -> Vec<Vec<WordBox>> {
     let mut out = Vec::new();
 
@@ -96,8 +67,7 @@ fn compute_word_boxes_unchecked(
 
         adjust_box_overlap(&mut word_boxes);
         let direction = get_box_direction(*det_box);
-        let mapped =
-            reverse_rotate_crop_image_with_backend(*det_box, &word_boxes, direction, backend);
+        let mapped = reverse_rotate_crop_image(*det_box, &word_boxes, direction);
 
         let item = word_content
             .into_iter()
@@ -326,141 +296,6 @@ fn reverse_rotate_crop_image(
     out
 }
 
-fn reverse_rotate_crop_image_with_backend(
-    bbox_points: Quad,
-    word_points_list: &[Quad],
-    direction: Direction,
-    backend: VisionBackend,
-) -> Vec<Quad> {
-    match backend {
-        VisionBackend::PureRust => {
-            reverse_rotate_crop_image(bbox_points, word_points_list, direction)
-        }
-        VisionBackend::OpenCv => {
-            #[cfg(feature = "opencv-backend")]
-            {
-                reverse_rotate_crop_image_opencv(bbox_points, word_points_list, direction)
-                    .unwrap_or_else(|_| {
-                        reverse_rotate_crop_image(bbox_points, word_points_list, direction)
-                    })
-            }
-            #[cfg(not(feature = "opencv-backend"))]
-            {
-                reverse_rotate_crop_image(bbox_points, word_points_list, direction)
-            }
-        }
-    }
-}
-
-#[cfg(feature = "opencv-backend")]
-fn reverse_rotate_crop_image_opencv(
-    bbox_points: Quad,
-    word_points_list: &[Quad],
-    direction: Direction,
-) -> Result<Vec<Quad>> {
-    let left = bbox_points
-        .iter()
-        .map(|p| p[0])
-        .fold(f32::INFINITY, |acc, v| acc.min(v)) as i32;
-    let top = bbox_points
-        .iter()
-        .map(|p| p[1])
-        .fold(f32::INFINITY, |acc, v| acc.min(v)) as i32;
-
-    let mut local_bbox = bbox_points;
-    for p in &mut local_bbox {
-        p[0] -= left as f32;
-        p[1] -= top as f32;
-    }
-
-    let img_crop_width = l2(local_bbox[0], local_bbox[1]) as i32;
-    let img_crop_height = l2(local_bbox[0], local_bbox[3]) as i32;
-
-    let src = [
-        Point2f::new(local_bbox[0][0], local_bbox[0][1]),
-        Point2f::new(local_bbox[1][0], local_bbox[1][1]),
-        Point2f::new(local_bbox[2][0], local_bbox[2][1]),
-        Point2f::new(local_bbox[3][0], local_bbox[3][1]),
-    ];
-    let dst = [
-        Point2f::new(0.0, 0.0),
-        Point2f::new(img_crop_width as f32, 0.0),
-        Point2f::new(img_crop_width as f32, img_crop_height as f32),
-        Point2f::new(0.0, img_crop_height as f32),
-    ];
-
-    let m = imgproc::get_perspective_transform_slice(&src, &dst, core::DECOMP_LU).map_err(|e| {
-        RapidOcrError::Config(format!("opencv getPerspectiveTransform failed: {e}"))
-    })?;
-
-    let mut inv = Mat::default();
-    core::invert(&m, &mut inv, core::DECOMP_LU)
-        .map_err(|e| RapidOcrError::Config(format!("opencv invert failed: {e}")))?;
-
-    let mut inv64 = Mat::default();
-    inv.convert_to(&mut inv64, core::CV_64F, 1.0, 0.0)
-        .map_err(|e| RapidOcrError::Config(format!("opencv convert_to(CV_64F) failed: {e}")))?;
-
-    let h00 = *inv64
-        .at_2d::<f64>(0, 0)
-        .map_err(|e| RapidOcrError::Config(format!("opencv mat access failed: {e}")))?;
-    let h01 = *inv64
-        .at_2d::<f64>(0, 1)
-        .map_err(|e| RapidOcrError::Config(format!("opencv mat access failed: {e}")))?;
-    let h02 = *inv64
-        .at_2d::<f64>(0, 2)
-        .map_err(|e| RapidOcrError::Config(format!("opencv mat access failed: {e}")))?;
-    let h10 = *inv64
-        .at_2d::<f64>(1, 0)
-        .map_err(|e| RapidOcrError::Config(format!("opencv mat access failed: {e}")))?;
-    let h11 = *inv64
-        .at_2d::<f64>(1, 1)
-        .map_err(|e| RapidOcrError::Config(format!("opencv mat access failed: {e}")))?;
-    let h12 = *inv64
-        .at_2d::<f64>(1, 2)
-        .map_err(|e| RapidOcrError::Config(format!("opencv mat access failed: {e}")))?;
-    let h20 = *inv64
-        .at_2d::<f64>(2, 0)
-        .map_err(|e| RapidOcrError::Config(format!("opencv mat access failed: {e}")))?;
-    let h21 = *inv64
-        .at_2d::<f64>(2, 1)
-        .map_err(|e| RapidOcrError::Config(format!("opencv mat access failed: {e}")))?;
-    let h22 = *inv64
-        .at_2d::<f64>(2, 2)
-        .map_err(|e| RapidOcrError::Config(format!("opencv mat access failed: {e}")))?;
-
-    let mut out = Vec::with_capacity(word_points_list.len());
-    for word_points in word_points_list {
-        let mut mapped = [[0.0_f32; 2]; 4];
-
-        for (idx, point) in word_points.iter().enumerate() {
-            let mut p = *point;
-            if matches!(direction, Direction::Vertical) {
-                p = s_rotate(-90.0_f32.to_radians(), p[0], p[1], 0.0, 0.0);
-                p[0] += img_crop_width as f32;
-            }
-
-            let x = p[0] as f64;
-            let y = p[1] as f64;
-            let px = h00 * x + h01 * y + h02;
-            let py = h10 * x + h11 * y + h12;
-            let pz = h20 * x + h21 * y + h22;
-
-            let mapped_x = if pz.abs() > f64::EPSILON { px / pz } else { px };
-            let mapped_y = if pz.abs() > f64::EPSILON { py / pz } else { py };
-
-            mapped[idx] = [
-                (mapped_x + left as f64) as i32 as f32,
-                (mapped_y + top as f64) as i32 as f32,
-            ];
-        }
-
-        out.push(order_points(mapped));
-    }
-
-    Ok(out)
-}
-
 fn homography_from_4pt(src: Quad, dst: Quad) -> SMatrix<f32, 3, 3> {
     let mut a = SMatrix::<f32, 8, 8>::zeros();
     let mut b = SVector::<f32, 8>::zeros();
@@ -603,28 +438,5 @@ mod tests {
         let err = compute_word_boxes(&[img], &det, &[line.clone(), line], false)
             .expect_err("should reject mismatched lengths");
         assert!(matches!(err, RapidOcrError::InvalidInput(_)));
-    }
-
-    #[test]
-    fn checked_backend_rejects_opencv_without_feature() {
-        #[cfg(not(feature = "opencv-backend"))]
-        {
-            let img = RecImage::from_bgr_u8(20, 20, vec![0; 20 * 20 * 3]).expect("valid image");
-            let line = LineResult {
-                text: "A".to_string(),
-                score: 1.0,
-                word_info: None,
-            };
-            let det = [[[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]]];
-            let err = super::compute_word_boxes_with_backend(
-                &[img],
-                &det,
-                &[line],
-                false,
-                crate::config::VisionBackend::OpenCv,
-            )
-            .expect_err("must reject opencv backend without feature");
-            assert!(matches!(err, RapidOcrError::Config(_)));
-        }
     }
 }

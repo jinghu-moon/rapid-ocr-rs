@@ -13,24 +13,6 @@ pub enum ColorOrder {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum VisionBackend {
-    #[cfg_attr(not(feature = "opencv-backend"), default)]
-    PureRust,
-    #[cfg_attr(feature = "opencv-backend", default)]
-    OpenCv,
-}
-
-impl VisionBackend {
-    pub fn is_supported(self) -> bool {
-        match self {
-            Self::PureRust => true,
-            Self::OpenCv => cfg!(feature = "opencv-backend"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
 pub enum ModelType {
     #[default]
     Mobile,
@@ -184,7 +166,6 @@ pub struct RuntimeConfig {
     pub enable_cpu_mem_arena: bool,
     pub fail_if_provider_unavailable: bool,
     pub provider_preference: ProviderPreference,
-    pub vision_backend: VisionBackend,
 }
 
 impl Default for RuntimeConfig {
@@ -197,7 +178,6 @@ impl Default for RuntimeConfig {
             enable_cpu_mem_arena: true,
             fail_if_provider_unavailable: false,
             provider_preference: ProviderPreference::default(),
-            vision_backend: VisionBackend::default(),
         }
     }
 }
@@ -329,7 +309,7 @@ impl RecImage {
 mod tests {
     use std::borrow::Cow;
 
-    use super::{ColorOrder, ProviderPreference, RecImage, RuntimeConfig, VisionBackend};
+    use super::{ColorOrder, ProviderPreference, RecImage, RuntimeConfig};
 
     #[test]
     fn rec_image_rejects_zero_dimension() {
@@ -348,21 +328,25 @@ mod tests {
         assert!(cfg.enable_cpu_mem_arena);
         assert!(!cfg.fail_if_provider_unavailable);
         assert_eq!(cfg.provider_preference, ProviderPreference::Cpu);
-        #[cfg(feature = "opencv-backend")]
-        assert_eq!(cfg.vision_backend, VisionBackend::OpenCv);
-        #[cfg(not(feature = "opencv-backend"))]
-        assert_eq!(cfg.vision_backend, VisionBackend::PureRust);
     }
 
     /// YAML 里已经删除的字段必须被拒绝，并且错误要能定位到字段名。
     #[test]
     fn removed_runtime_fields_are_rejected_with_a_locating_error() {
-        // `backend`（单变体伪抽象）与 `provider_preference: cann` 都已删除。
+        // `backend`（单变体伪抽象）、`provider_preference: cann` 与 `vision_backend`
+        // （OpenCV 后端删除后不再有后端可选）都已删除。
         let error = serde_yaml::from_str::<RuntimeConfig>("backend: onnx_cpu")
             .expect_err("the removed `backend` field must not deserialize");
         assert!(
             error.to_string().contains("unknown field"),
             "error must locate the removed field: {error}"
+        );
+
+        let error = serde_yaml::from_str::<RuntimeConfig>("vision_backend: pure_rust")
+            .expect_err("the removed `vision_backend` field must not deserialize");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "error must locate the removed backend field: {error}"
         );
 
         let error = serde_yaml::from_str::<RuntimeConfig>("provider_preference: cann")

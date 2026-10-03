@@ -269,6 +269,131 @@ runtime 配置形状与错误文本，不触及模型调用、预处理、tokeni
 
 ---
 
+## 阶段 3：OpenCV 与 turbojpeg 的实测决策
+
+**阶段**：3
+**日期**：2026-10-03
+**提交**：`（与阶段 4 同一提交）`
+**变更摘要**：只做决策与测量，删除动作在阶段 4。
+
+### 3.1 OpenCV：删除
+
+**证据（本机实测，不是“依赖少所以删”）**：
+
+| 项目 | 结果 |
+| --- | --- |
+| `cargo check --features opencv-backend` | **失败**：`failed to run custom build command for opencv v0.94.4`（找不到 OpenCV 安装，`CMAKE_PREFIX_PATH`/`OPENCV_CMAKE_NAME` 均未设置） |
+| 默认路径 | 纯 Rust（`VisionBackend::default()` 在未启用 feature 时就是 `PureRust`） |
+| 调用方 | crate 内没有任何地方启用它；`opencv-backend` 只出现在 Cargo.toml、vision 分派代码与 README 说明里 |
+
+**判定**：无法在本机构建、因而**无法测量**其端到端收益。任务文档 §0.2 要求“性能优化必须有测量依据”，
+§0.3 要求进验证矩阵的东西必须可验证 —— 一个既不能构建也不能测量的后端不能作为当前支持面保留。
+因此删除 `opencv-backend`、`VisionBackend`、`vision/backend.rs` 与全部分派分支。
+README 同步删除“`--all-features` 需要 OpenCV 安装”的说明。
+
+> 这不是“因为依赖多所以删”，而是“没有任何测量支持保留，且它让 `--all-features` 在本机不可用”。
+
+### 3.2 turbojpeg：删除
+
+对 12 张真实页面（源 PNG 为 3200×2000）生成 q90 JPEG 派生集（4:2:0 与 4:4:4），
+在**独立探针程序**里对 `image`（zune-jpeg）与 turbojpeg 做**交错 A/B** 解码对比，
+两条路径的调用方式与 crate 内完全一致（含 crate 实际使用的 BGR 输出路径），
+两解码器输出每通道最大差异 3–5/255：
+
+| 配置 | image | turbojpeg | 加速比 |
+| --- | ---: | ---: | ---: |
+| side=2000 4:2:0（RGB，N=40） | 4.839 ms | 5.212 ms | **0.928×** |
+| side=2000 4:2:0（**BGR，crate 实际调用**） | 5.586 ms | 6.930 ms | **0.806×** |
+| 3200×2000 4:2:0（RGB） | 10.586 ms | 11.612 ms | **0.912×** |
+| 3200×2000 4:2:0（**BGR**） | 10.755 ms | 14.276 ms | **0.753×** |
+| 3200×2000 4:4:4 q90（RGB） | 13.345 ms | 17.268 ms | **0.773×** |
+
+turbojpeg **在所有配置下都更慢**（7%–33%），12 个文件中只赢 1 个（1%）。
+峰值内存也没有优势（解码增量约 18.0 vs 18.5 MiB）。
+解码在端到端中的占比：side=2000 时 4.84 ms ≈ 1030 ms 页面的 **0.47%**，
+两条路径的**差值是 0.37 ms = 0.036%**；即使不降采样（3200×2000）也只有 0.10%。
+
+**判定**：删除门槛要求“端到端收益低于 10% 则删除”，实测收益为**负值**（−0.036% 到 −0.10%），
+且“只改善单独 decode 而不改善端到端”的例外条款也不适用 —— 它连单独 decode 都更慢。
+因此删除 turbojpeg 依赖与 CMake 原生构建链。
+
+**测量注意事项（必须随结论一起记录）**：本机（i5-13600KF 混合 P/E 核）绝对耗时波动可达 25%，
+两次**完全相同**的基线跑出 p50 726 ms 与 1011 ms；因此结论建立在**交错 A/B 的比值**
+（4 次运行稳定在 0.906–0.920）与**逐图 CER 逐位一致**上，而不是单次绝对值。
+
+---
+
+## 阶段 4：视觉与输入路径重构
+
+**阶段**：4
+**日期**：2026-10-03
+**提交**：`（本阶段提交）`
+**变更摘要**：执行阶段 3 的删除决策，并收敛视觉/输入边界。
+
+- 删除 `src/vision/backend.rs` 与 `mod backend`；`VisionBackend` 从 `config.rs`、`exports.rs`
+  与公开 API 消失。
+- 删除 `image_backend.rs` / `rotate_crop.rs` / `resize.rs` / `det/postprocess` /
+  `det/preprocess.rs` / `cls/preprocess.rs` / `rec/preprocess.rs` / `rec/word_boxes.rs` 中
+  的全部 OpenCV 分支与 `#[cfg(feature = "opencv-backend")]`；保留的正是原先
+  `not(feature = "opencv-backend")` 的行为。
+- 视觉入口不再接受 `backend` 参数：`image_backend::{resize_image, rotate_180_image}`、
+  `rotate_crop::rotate_crop_image`、`image_ops::{resize_image_within_bounds,
+  crop_text_regions, map_img_to_original, resize_with_bound}`、
+  `cls/rec::preprocess::write_resize_norm_img_into_slice*`、`word_boxes::compute_word_boxes`、
+  `rapid_ocr::prepare_image`。`DetPreProcess` / `DbPostProcess` / `Classifier` / `Recognizer`
+  去掉 backend 字段。热路径上不再有“每个 crop/resize 动态匹配 enum”。
+- 删除 `resolve_backend_or_pure_rust` 这条宽松回退：核心路径只有纯 Rust，没有“静默回退”概念。
+- turbojpeg：`image_loader.rs` 删除 import、`decode_bytes_with_turbojpeg`、`looks_like_jpeg`
+  与“orientation==1 时先试 turbojpeg”的分支；保留编码字节上限、header 像素探测、
+  EXIF 转置、解码错误语义及全部相关测试。
+- 顺带把**标识符里残留 `opencv` 的纯 Rust 辅助函数**改名（`lu_solve_8x8`、
+  `sklansky_*`、`convex_hull_*`、`unclip_polygon_like_opencv_db` 等），
+  它们与 OpenCV 的数值一致性要求改写进注释，不再有引用非依赖库的名字。
+- `Cargo.toml`：删除 `opencv`、`turbojpeg` 依赖与 `opencv-backend` feature；
+  `[lints.rust]` 的原因说明收窄为只涉及 `ort`。
+- `Cargo.lock` 减少 322 行，`opencv`/`turbojpeg`/`cmake`/`clang` 条目全部消失。
+- 外部配置 `OCR-Model/test-config{,-small,-tiny}.yaml` 删除 9 行 `vision_backend: pure_rust`
+  （现在会被 `deny_unknown_fields` 拒绝）。
+
+**执行命令与关键结果**：
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo clippy --all-targets -- -D warnings` | 通过（0 warning） |
+| `cargo test --all-targets` | lib 258 + bin 18 passed / 0 failed（阶段 2 为 263；减少的是仅覆盖 OpenCV 的对比测试） |
+| `cargo test --features directml-provider` | 通过 |
+| `cargo check --features directml-provider,cuda-provider` | 通过，0 warning |
+| `cargo build --release --bins` | 通过 |
+
+**基线对比**（12 图，max_side_len 2000，intra_threads 16）：
+
+| 指标 | 阶段 0 基线 | 阶段 4 后 | 判定 |
+| --- | ---: | ---: | --- |
+| mean CER（硬门槛） | 0.44765135645866394 | **0.44765135645866394**（逐位相同） | 未退化 |
+| 区域数均值（硬门槛） | 34.833333 | **34.833333** | 未退化 |
+| OCR p50 (ms) | 1001.1 | 997.6 | 未退化 |
+| OCR p90 (ms) | 1153.6 | 1109.5 | 未退化 |
+| init (ms) | 143.6 | 127.0 | 略优 |
+| 峰值工作集 (MB) | 1284.0 | 1283.0 | 未退化 |
+| `rapidocr.exe` | 34.6 MB | 33.3 MB | −3.7% |
+| `bench_warm_e2e.exe` | 34.4 MB | 33.1 MB | −3.7% |
+
+**未覆盖风险**：
+
+- 删除了 OpenCV 与纯 Rust 的数值一致性对比测试（它们只在 `opencv-backend` 下编译，
+  本机无法运行）。原有的纯 Rust 实现本身未改动，且 12 图 CER 逐位不变；
+  但**“纯 Rust 与 OpenCV 数值一致”这一历史结论不再由测试守护**，将来若要重新引入
+  OpenCV，必须重建这些对比测试。
+- 逐图 CER 逐位一致说明这次重构没有改变数值行为；但本机耗时噪声大（同一二进制两次
+  p50 可差 39%），因此“耗时未退化”只能作为量级判断，不能当成精确收益。
+- 大图输入的 scratch/buffer 复用仍是阶段 6 的范围（本阶段只删分派，未改缓冲策略）。
+
+**是否触发公式 smoke / val-501 / 全量评测**：未触发。本阶段不触及公式链路、
+tokenizer、postprocess、batch/EOS 或指标实现；普通 OCR 的预处理数值结果逐位未变。
+
+---
+
 ## 阶段完成记录模板（后续阶段沿用）
 
 ```text

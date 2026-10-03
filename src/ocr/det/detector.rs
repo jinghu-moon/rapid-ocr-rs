@@ -11,7 +11,6 @@ use crate::{
     model_store::{default_model_store_dir, ensure_downloaded, verify_existing_file},
     ocr::session::{OcrSession, OcrSessionKind},
     runtime::provider::ProviderResolution,
-    vision::backend::resolve_backend_strict,
 };
 
 use super::{
@@ -113,14 +112,11 @@ impl Detector {
             ));
         };
 
-        let det_vision_backend = resolve_backend_strict(config.runtime.vision_backend)?;
-
         let pre = DetPreProcess {
             limit_side_len: config.limit_side_len,
             limit_type: config.limit_type,
             mean: config.mean,
             std: config.std,
-            vision_backend: det_vision_backend,
         };
         let post = DbPostProcess {
             thresh: config.thresh,
@@ -129,7 +125,6 @@ impl Detector {
             unclip_ratio: config.unclip_ratio,
             use_dilation: config.use_dilation,
             score_mode: config.score_mode,
-            vision_backend: pre.vision_backend,
             ..DbPostProcess::default()
         };
         let session = OcrSession::new(&model_path, &config.runtime, OcrSessionKind::Det)?;

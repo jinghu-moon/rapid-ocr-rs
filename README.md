@@ -543,9 +543,6 @@ cargo clippy --all-targets -- -D warnings
 cargo check --features directml-provider,cuda-provider
 ```
 
-`--all-features` additionally enables `opencv-backend`; that build requires an
-OpenCV installation and is not part of the checks above.
-
 ### Verification tiers: what to run, and when
 
 Full-dataset evaluation is **not** a routine regression step. A complete run over
@@ -601,9 +598,6 @@ cargo check --features directml-provider,cuda-provider
 cargo test --features directml-provider
 cargo test --features cuda-provider
 ```
-
-`--all-features` additionally enables `opencv-backend`; that build requires an
-OpenCV installation and is not part of the provider-only verification above.
 
 ## Implementation reference
 

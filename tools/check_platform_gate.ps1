@@ -3,7 +3,7 @@
 # 期望行为：在非 Windows target 上编译 `src/platform_gate.rs` 时，**只**得到我们自己的
 # `compile_error!`，而不是“缺少某个 Windows API”或依赖项的模糊错误。
 #
-# 之所以单独编译这一个文件：门槛本身没有任何依赖，因此可以独立于 ort/turbojpeg 等
+# 之所以单独编译这一个文件：门槛本身没有任何依赖，因此可以独立于 ort 等
 # 需要在目标平台上构建的原生依赖进行验证。`lib.rs` 通过 `#[path]` 引入的就是同一个文件。
 #
 # 用法：pwsh -NoProfile -File tools/check_platform_gate.ps1

@@ -99,7 +99,7 @@ impl RapidOcr {
         let e2e_start = Instant::now();
         let mut output = ExecutionOutput::default();
         let switches = self.resolve_run_switches(&opts);
-        let mut prepared = self.prepare_image(input, switches.use_det)?;
+        let mut prepared = self.prepare_image(input)?;
         output.decode_ms = Some(prepared.decode_ms);
         output.resize_ms = Some(prepared.resize_ms);
         output.processed_size = Some((
@@ -140,23 +140,17 @@ impl RapidOcr {
         }
     }
 
-    fn prepare_image(&mut self, input: OcrInput, use_det: bool) -> Result<PreparedImage> {
+    fn prepare_image(&mut self, input: OcrInput) -> Result<PreparedImage> {
         let decode_start = Instant::now();
         let ori_img = self.loader.load(input)?;
         let decode_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
         let ori_h = ori_img.height();
         let ori_w = ori_img.width();
-        let preprocessing_backend = if use_det {
-            self.config.det.runtime.vision_backend
-        } else {
-            self.config.rec.runtime.vision_backend
-        };
         let resize_start = Instant::now();
         let (proc_img, ratio_h, ratio_w) = resize_image_within_bounds(
             ori_img,
             self.config.global.min_side_len,
             self.config.global.max_side_len,
-            preprocessing_backend,
         )?;
         let resize_ms = resize_start.elapsed().as_secs_f32() * 1000.0;
 
@@ -207,11 +201,7 @@ impl RapidOcr {
 
             if switches.need_stage_images {
                 let crop_start = Instant::now();
-                buffers.stage_images = crop_text_regions(
-                    &prepared.proc_img,
-                    &buffers.det_boxes,
-                    self.config.det.runtime.vision_backend,
-                )?;
+                buffers.stage_images = crop_text_regions(&prepared.proc_img, &buffers.det_boxes)?;
                 output.crop_ms = Some(crop_start.elapsed().as_secs_f32() * 1000.0);
             }
         } else if switches.need_stage_images {
@@ -302,19 +292,14 @@ impl RapidOcr {
 
         let mut computed_word_boxes = None;
         if switches.return_word_box && !filtered_boxes.is_empty() && !buffers.lines.is_empty() {
-            let mapped_crops = map_img_to_original(
-                &buffers.stage_images,
-                prepared.ratio_h,
-                prepared.ratio_w,
-                self.config.det.runtime.vision_backend,
-            )?;
+            let mapped_crops =
+                map_img_to_original(&buffers.stage_images, prepared.ratio_h, prepared.ratio_w)?;
             let filtered_crops = select_items_by_indices(mapped_crops, &kept_indices);
-            let word_boxes = crate::ocr::rec::word_boxes::compute_word_boxes_with_backend(
+            let word_boxes = crate::ocr::rec::word_boxes::compute_word_boxes(
                 &filtered_crops,
                 &filtered_boxes,
                 &buffers.lines,
                 switches.return_single_char_box,
-                self.config.rec.runtime.vision_backend,
             )?;
             computed_word_boxes = Some(word_boxes);
         }

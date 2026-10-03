@@ -1,10 +1,8 @@
 use crate::{
     Quad,
-    config::{RecImage, VisionBackend},
+    config::RecImage,
     error::{RapidOcrError, Result},
-    vision::{
-        image_backend::resize_image as resize_image_with_backend, rotate_crop::rotate_crop_image,
-    },
+    vision::{image_backend::resize_image, rotate_crop::rotate_crop_image},
 };
 use rayon::prelude::*;
 
@@ -20,20 +18,19 @@ pub fn resize_image_within_bounds(
     img: RecImage,
     min_side_len: usize,
     max_side_len: usize,
-    backend: VisionBackend,
 ) -> Result<(RecImage, f32, f32)> {
     let mut current = img;
     let mut ratio_h = 1.0_f32;
     let mut ratio_w = 1.0_f32;
 
     if current.width().max(current.height()) > max_side_len {
-        let (resized, rh, rw) = resize_with_bound(&current, max_side_len, true, backend)?;
+        let (resized, rh, rw) = resize_with_bound(&current, max_side_len, true)?;
         current = resized;
         ratio_h = rh;
         ratio_w = rw;
     }
     if current.width().min(current.height()) < min_side_len {
-        let (resized, rh, rw) = resize_with_bound(&current, min_side_len, false, backend)?;
+        let (resized, rh, rw) = resize_with_bound(&current, min_side_len, false)?;
         current = resized;
         ratio_h = rh;
         ratio_w = rw;
@@ -72,11 +69,7 @@ pub fn apply_vertical_padding(
     Ok((padded, padding_h))
 }
 
-pub fn crop_text_regions(
-    img: &RecImage,
-    det_boxes: &[Quad],
-    backend: VisionBackend,
-) -> Result<Vec<RecImage>> {
+pub fn crop_text_regions(img: &RecImage, det_boxes: &[Quad]) -> Result<Vec<RecImage>> {
     let crops: Vec<Result<RecImage>> = det_boxes
         .par_iter()
         .map(|box_| {
@@ -85,7 +78,7 @@ pub fn crop_text_regions(
                 p[0] = p[0].clamp(0.0, img.width().saturating_sub(1) as f32);
                 p[1] = p[1].clamp(0.0, img.height().saturating_sub(1) as f32);
             }
-            let mut crop = rotate_crop_image(img, pts, backend)?;
+            let mut crop = rotate_crop_image(img, pts)?;
             if crop.height() as f32 / crop.width().max(1) as f32 >= 1.5 {
                 crop = rotate_90(crop)?;
             }
@@ -118,18 +111,13 @@ pub fn map_boxes_to_original(
     }
 }
 
-pub fn map_img_to_original(
-    imgs: &[RecImage],
-    ratio_h: f32,
-    ratio_w: f32,
-    backend: VisionBackend,
-) -> Result<Vec<RecImage>> {
+pub fn map_img_to_original(imgs: &[RecImage], ratio_h: f32, ratio_w: f32) -> Result<Vec<RecImage>> {
     let mapped: Vec<Result<RecImage>> = imgs
         .par_iter()
         .map(|img| {
             let ori_h = (img.height() as f32 * ratio_h).round_ties_even().max(1.0) as usize;
             let ori_w = (img.width() as f32 * ratio_w).round_ties_even().max(1.0) as usize;
-            resize_image(img, ori_w, ori_h, backend)
+            resize_image(img, ori_w, ori_h)
         })
         .collect();
 
@@ -138,15 +126,6 @@ pub fn map_img_to_original(
         out.push(item?);
     }
     Ok(out)
-}
-
-pub fn resize_image(
-    img: &RecImage,
-    new_w: usize,
-    new_h: usize,
-    backend: VisionBackend,
-) -> Result<RecImage> {
-    resize_image_with_backend(img, new_w, new_h, backend)
 }
 
 /// Applies deterministic contrast normalization for screenshot-like images.
@@ -182,7 +161,6 @@ fn resize_with_bound(
     img: &RecImage,
     side_len: usize,
     use_max: bool,
-    backend: VisionBackend,
 ) -> Result<(RecImage, f32, f32)> {
     let h = img.height();
     let w = img.width();
@@ -196,7 +174,7 @@ fn resize_with_bound(
     resize_h = ((resize_h as f32 / 32.0).round_ties_even() as usize * 32).max(32);
     resize_w = ((resize_w as f32 / 32.0).round_ties_even() as usize * 32).max(32);
 
-    let resized = resize_image(img, resize_w, resize_h, backend)?;
+    let resized = resize_image(img, resize_w, resize_h)?;
     let ratio_h = h as f32 / resize_h as f32;
     let ratio_w = w as f32 / resize_w as f32;
     Ok((resized, ratio_h, ratio_w))

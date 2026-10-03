@@ -19,7 +19,7 @@ pub use crate::api::{
 };
 pub use crate::config::{
     ColorOrder, LangCls, LangDet, LangRec, ModelType, OcrVersion, ProviderPreference, RecImage,
-    RuntimeConfig, VisionBackend,
+    RuntimeConfig,
 };
 pub use crate::error::{RapidOcrError, Result};
 pub use crate::formula::contract::{

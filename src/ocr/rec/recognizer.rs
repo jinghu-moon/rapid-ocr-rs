@@ -4,7 +4,7 @@ use ndarray::ArrayView4;
 use rayon::prelude::*;
 
 use crate::{
-    config::{LangRec, RecImage, VisionBackend},
+    config::{LangRec, RecImage},
     error::{RapidOcrError, Result},
     model_registry::{ModelRegistry, ResolvedRecModel},
     model_store::{default_model_store_dir, ensure_downloaded, verify_existing_file},
@@ -17,14 +17,12 @@ use crate::{
     ocr::session::{OcrSession, OcrSessionKind},
     ocr::types::{LineResult, RecognizeOutput},
     runtime::provider::ProviderResolution,
-    vision::backend::resolve_backend_strict,
     vision::resize::LinearResizeScratch,
 };
 
 #[derive(Debug)]
 pub struct Recognizer {
     config: RecognizerConfig,
-    vision_backend: VisionBackend,
     session: OcrSession,
     decoder: CtcLabelDecoder,
     batch_scratch: Vec<f32>,
@@ -48,7 +46,6 @@ impl Recognizer {
             .model_store_dir
             .clone()
             .unwrap_or_else(default_model_store_dir);
-        let vision_backend = resolve_backend_strict(config.runtime.vision_backend)?;
 
         let registry = ModelRegistry::from_default_yaml()?;
         let resolved = registry.resolve_rec(
@@ -71,7 +68,6 @@ impl Recognizer {
 
         Ok(Self {
             config,
-            vision_backend,
             session,
             decoder,
             batch_scratch: Vec::new(),
@@ -153,7 +149,6 @@ impl Recognizer {
                                 image,
                                 max_wh_ratio,
                                 self.config.rec_img_shape,
-                                self.vision_backend,
                                 dst,
                                 tmp_bgr,
                                 resize_scratch,
@@ -174,7 +169,6 @@ impl Recognizer {
                     image,
                     max_wh_ratio,
                     self.config.rec_img_shape,
-                    self.vision_backend,
                     &mut self.batch_scratch[..sample_len],
                     &mut tmp_bgr,
                     &mut resize_scratch,
@@ -292,143 +286,4 @@ fn resolve_character_path(
 
     let path = ensure_downloaded(dict_url, None, model_store_dir)?;
     Ok(Some(path))
-}
-
-#[cfg(all(test, feature = "opencv-backend"))]
-mod tests {
-    use std::{fs, path::PathBuf};
-
-    use crate::{
-        config::{
-            LangRec, ModelType, OcrVersion, ProviderPreference, RecImage, RuntimeConfig,
-            VisionBackend,
-        },
-        ocr::config::{RecognizeOptions, RecognizerConfig},
-        ocr::rec::recognizer::Recognizer,
-        runtime::provider::ResolvedExecutionProvider,
-    };
-
-    fn test_images() -> Vec<RecImage> {
-        let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        root.push("test");
-        root.push("test_files");
-
-        let mut paths = fs::read_dir(&root)
-            .expect("test fixture directory should exist")
-            .map(|entry| entry.expect("fixture entry should be readable").path())
-            .filter(|path| {
-                path.extension()
-                    .and_then(|v| v.to_str())
-                    .is_some_and(|ext| {
-                        matches!(ext.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg")
-                    })
-            })
-            .collect::<Vec<_>>();
-        paths.sort();
-
-        paths
-            .into_iter()
-            .map(|path| RecImage::from_path(&path).expect("fixture image should load"))
-            .collect()
-    }
-
-    fn recognizer_config(
-        version: OcrVersion,
-        model_type: ModelType,
-        vision_backend: VisionBackend,
-    ) -> RecognizerConfig {
-        let mut model_store_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        model_store_dir.push("target");
-        model_store_dir.push("rec-parity-models");
-
-        RecognizerConfig {
-            model: crate::ocr::config::ModelConfig {
-                lang: LangRec::Ch,
-                ocr_version: version,
-                model_type,
-                model_path: None,
-                rec_keys_path: None,
-                allow_download: true,
-            },
-            runtime: RuntimeConfig {
-                vision_backend,
-                auto_tune_threads: false,
-                intra_threads: Some(1),
-                inter_threads: Some(1),
-                rayon_threads: Some(1),
-                provider_preference: ProviderPreference::Cpu,
-                ..RuntimeConfig::default()
-            },
-            rec_batch_num: 6,
-            rec_img_shape: [3, 48, 320],
-            model_store_dir: Some(model_store_dir),
-        }
-    }
-
-    #[test]
-    #[ignore = "downloads v4/v5/v6 recognition models and runs ONNX inference on all image fixtures"]
-    fn pure_and_opencv_recognition_match_ch_v4_v5_v6_on_test_images() {
-        let images = test_images();
-        let versions = [
-            (OcrVersion::PPocrV4, ModelType::Mobile),
-            (OcrVersion::PPocrV5, ModelType::Mobile),
-            (OcrVersion::PPocrV6, ModelType::Small),
-        ];
-
-        for (version, model_type) in versions {
-            let mut pure = Recognizer::new(recognizer_config(
-                version,
-                model_type,
-                VisionBackend::PureRust,
-            ))
-            .expect("pure recognizer should initialize");
-            let mut opencv = Recognizer::new(recognizer_config(
-                version,
-                model_type,
-                VisionBackend::OpenCv,
-            ))
-            .expect("opencv recognizer should initialize");
-
-            assert!(matches!(
-                pure.provider_resolution().resolved,
-                ResolvedExecutionProvider::Cpu
-            ));
-            assert!(matches!(
-                opencv.provider_resolution().resolved,
-                ResolvedExecutionProvider::Cpu
-            ));
-
-            let opts = RecognizeOptions {
-                return_word_box: false,
-                return_single_char_box: false,
-            };
-            let pure_out = pure
-                .recognize(&images, opts)
-                .expect("pure recognition should run");
-            let opencv_out = opencv
-                .recognize(&images, opts)
-                .expect("opencv recognition should run");
-
-            assert_eq!(
-                pure_out.lines.len(),
-                opencv_out.lines.len(),
-                "line count mismatch for {version:?}"
-            );
-            for (idx, (pure_line, opencv_line)) in pure_out
-                .lines
-                .iter()
-                .zip(opencv_out.lines.iter())
-                .enumerate()
-            {
-                assert_eq!(
-                    pure_line.text, opencv_line.text,
-                    "text mismatch for {version:?} image index {idx}"
-                );
-                assert_eq!(
-                    pure_line.score, opencv_line.score,
-                    "score mismatch for {version:?} image index {idx}"
-                );
-            }
-        }
-    }
 }

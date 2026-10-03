@@ -3,53 +3,44 @@ use ndarray::Array3;
 use std::sync::OnceLock;
 
 use crate::{
-    config::{RecImage, VisionBackend},
+    config::RecImage,
     error::{RapidOcrError, Result},
-    vision::{
-        backend::resolve_backend_strict,
-        image_backend::{resize_image, rotate_180_image},
-        resize::{LinearResizeScratch, resize_bgr_inter_linear_into_with_scratch},
-    },
+    vision::resize::{LinearResizeScratch, resize_bgr_inter_linear_into_with_scratch},
 };
 
 #[cfg(test)]
 pub fn resize_norm_img(img: &RecImage, cls_image_shape: [usize; 3]) -> Result<Array3<f32>> {
-    resize_norm_img_with_backend(img, cls_image_shape, VisionBackend::PureRust)
-}
-
-#[cfg(test)]
-pub fn resize_norm_img_with_backend(
-    img: &RecImage,
-    cls_image_shape: [usize; 3],
-    backend: VisionBackend,
-) -> Result<Array3<f32>> {
-    let backend = resolve_backend_strict(backend)?;
-    resize_norm_img_impl(img, cls_image_shape, backend)
+    let (img_c, img_h, img_w) = validate_cls_shape(cls_image_shape)?;
+    let sample_len = img_c
+        .checked_mul(img_h)
+        .and_then(|v| v.checked_mul(img_w))
+        .ok_or_else(|| RapidOcrError::InvalidInput("cls sample size overflow".to_string()))?;
+    let mut out = vec![0.0_f32; sample_len];
+    write_resize_norm_img_into_slice(img, cls_image_shape, &mut out)?;
+    Array3::from_shape_vec((img_c, img_h, img_w), out).map_err(|e| {
+        RapidOcrError::InvalidInput(format!("failed to build cls normalized tensor: {e}"))
+    })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_resize_norm_img_into_slice(
     img: &RecImage,
     cls_image_shape: [usize; 3],
-    backend: VisionBackend,
     dst: &mut [f32],
 ) -> Result<()> {
-    write_resize_norm_img_into_slice_impl(img, cls_image_shape, backend, dst)
+    let (img_c, img_h, img_w) = validate_cls_shape(cls_image_shape)?;
+    let resized_w = calc_resized_width(img, img_h, img_w);
+    let resized = crate::vision::image_backend::resize_image(img, resized_w, img_h)?;
+    write_resized_into_slice(&resized, img_c, img_h, img_w, dst)
 }
 
 pub(crate) fn write_resize_norm_img_into_slice_with_scratch(
     img: &RecImage,
     cls_image_shape: [usize; 3],
-    backend: VisionBackend,
     dst: &mut [f32],
     tmp_bgr: &mut Vec<u8>,
     resize_scratch: &mut LinearResizeScratch,
 ) -> Result<()> {
-    let backend = resolve_backend_strict(backend)?;
-    if backend != VisionBackend::PureRust {
-        return write_resize_norm_img_into_slice_impl(img, cls_image_shape, backend, dst);
-    }
-
     let (img_c, img_h, img_w) = validate_cls_shape(cls_image_shape)?;
     let sample_len = img_c
         .checked_mul(img_h)
@@ -63,8 +54,7 @@ pub(crate) fn write_resize_norm_img_into_slice_with_scratch(
     }
     dst.fill(0.0);
 
-    let ratio = img.width() as f32 / img.height() as f32;
-    let resized_w = ((img_h as f32 * ratio).ceil() as usize).min(img_w).max(1);
+    let resized_w = calc_resized_width(img, img_h, img_w);
     let src = img.as_bgr_cow();
     resize_bgr_inter_linear_into_with_scratch(
         src.as_ref(),
@@ -103,36 +93,18 @@ pub(crate) fn write_resize_norm_img_into_slice_with_scratch(
     Ok(())
 }
 
-#[cfg(test)]
-fn resize_norm_img_impl(
-    img: &RecImage,
-    cls_image_shape: [usize; 3],
-    backend: VisionBackend,
-) -> Result<Array3<f32>> {
-    let (img_c, img_h, img_w) = validate_cls_shape(cls_image_shape)?;
-    let sample_len = img_c
-        .checked_mul(img_h)
-        .and_then(|v| v.checked_mul(img_w))
-        .ok_or_else(|| RapidOcrError::InvalidInput("cls sample size overflow".to_string()))?;
-    let mut out = vec![0.0_f32; sample_len];
-    write_resize_norm_img_into_slice_impl(img, cls_image_shape, backend, &mut out)?;
-    Array3::from_shape_vec((img_c, img_h, img_w), out).map_err(|e| {
-        RapidOcrError::InvalidInput(format!("failed to build cls normalized tensor: {e}"))
-    })
+fn calc_resized_width(img: &RecImage, img_h: usize, img_w: usize) -> usize {
+    let ratio = img.width() as f32 / img.height() as f32;
+    ((img_h as f32 * ratio).ceil() as usize).min(img_w).max(1)
 }
 
-pub fn rotate_180_with_backend(img: &RecImage, backend: VisionBackend) -> Result<RecImage> {
-    let backend = resolve_backend_strict(backend)?;
-    rotate_180_image(img, backend)
-}
-
-fn write_resize_norm_img_into_slice_impl(
-    img: &RecImage,
-    cls_image_shape: [usize; 3],
-    backend: VisionBackend,
+fn write_resized_into_slice(
+    resized: &RecImage,
+    img_c: usize,
+    img_h: usize,
+    img_w: usize,
     dst: &mut [f32],
 ) -> Result<()> {
-    let (img_c, img_h, img_w) = validate_cls_shape(cls_image_shape)?;
     let sample_len = img_c
         .checked_mul(img_h)
         .and_then(|v| v.checked_mul(img_w))
@@ -146,9 +118,6 @@ fn write_resize_norm_img_into_slice_impl(
 
     dst.fill(0.0);
 
-    let ratio = img.width() as f32 / img.height() as f32;
-    let resized_w = ((img_h as f32 * ratio).ceil() as usize).min(img_w).max(1);
-    let resized = resize_image(img, resized_w, img_h, backend)?;
     let src = resized.as_bgr_cow();
     let src = src.as_ref();
     let plane_stride = img_h * img_w;
@@ -165,7 +134,7 @@ fn write_resize_norm_img_into_slice_impl(
         unsafe {
             let mut src_px = src.as_ptr().add(y * row_src_stride);
             let dst_ptr = dst.as_mut_ptr();
-            for x in 0..resized_w {
+            for x in 0..resized.width() {
                 let row_offset = row_base + x;
                 let b = normalize_to_signed_unit(*src_px);
                 let g = normalize_to_signed_unit(*src_px.add(1));
@@ -219,10 +188,14 @@ fn validate_cls_shape(cls_image_shape: [usize; 3]) -> Result<(usize, usize, usiz
     Ok((img_c, img_h, img_w))
 }
 
+pub fn rotate_180_image(img: &RecImage) -> Result<RecImage> {
+    crate::vision::image_backend::rotate_180_image(img)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{resize_norm_img, write_resize_norm_img_into_slice};
-    use crate::config::{RecImage, VisionBackend};
+    use crate::config::RecImage;
 
     #[test]
     fn write_into_slice_matches_array_output() {
@@ -236,7 +209,7 @@ mod tests {
         let arr = resize_norm_img(&image, shape).expect("array output should work");
 
         let mut buf = vec![0.0_f32; arr.len()];
-        write_resize_norm_img_into_slice(&image, shape, VisionBackend::PureRust, &mut buf)
+        write_resize_norm_img_into_slice(&image, shape, &mut buf)
             .expect("slice writer should work");
 
         let arr_slice = arr.as_slice().expect("array should be contiguous");

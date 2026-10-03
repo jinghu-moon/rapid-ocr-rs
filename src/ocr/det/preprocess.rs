@@ -1,13 +1,9 @@
 use rayon::prelude::*;
 
 use crate::{
-    config::{RecImage, VisionBackend},
+    config::RecImage,
     error::{RapidOcrError, Result},
-    vision::{
-        backend::resolve_backend_strict,
-        image_backend::resize_image,
-        resize::{LinearResizeScratch, resize_bgr_inter_linear_into_with_scratch},
-    },
+    vision::resize::{LinearResizeScratch, resize_bgr_inter_linear_into_with_scratch},
 };
 
 #[derive(Debug, Clone)]
@@ -16,7 +12,6 @@ pub struct DetPreProcess {
     pub limit_type: String,
     pub mean: [f32; 3],
     pub std: [f32; 3],
-    pub vision_backend: VisionBackend,
 }
 
 impl Default for DetPreProcess {
@@ -26,7 +21,6 @@ impl Default for DetPreProcess {
             limit_type: "min".to_string(),
             mean: [0.5, 0.5, 0.5],
             std: [0.5, 0.5, 0.5],
-            vision_backend: VisionBackend::PureRust,
         }
     }
 }
@@ -55,31 +49,22 @@ impl DetPreProcess {
             })?;
         buffer.resize(expected_len, 0.0);
 
-        let backend = resolve_backend_strict(self.vision_backend)?;
-        match backend {
-            VisionBackend::PureRust => {
-                let src = img.as_bgr_cow();
-                resize_bgr_inter_linear_into_with_scratch(
-                    src.as_ref(),
-                    img.width(),
-                    img.height(),
-                    resize_w,
-                    resize_h,
-                    &mut scratch.tmp_bgr,
-                    &mut scratch.resize,
-                )?;
-                self.normalize_bgr_into_slice(
-                    &scratch.tmp_bgr,
-                    resize_w,
-                    resize_h,
-                    &mut buffer[..expected_len],
-                )?;
-            }
-            VisionBackend::OpenCv => {
-                let resized = resize_image(img, resize_w, resize_h, backend)?;
-                self.normalize_resized_into_slice(&resized, &mut buffer[..expected_len])?;
-            }
-        }
+        let src = img.as_bgr_cow();
+        resize_bgr_inter_linear_into_with_scratch(
+            src.as_ref(),
+            img.width(),
+            img.height(),
+            resize_w,
+            resize_h,
+            &mut scratch.tmp_bgr,
+            &mut scratch.resize,
+        )?;
+        self.normalize_bgr_into_slice(
+            &scratch.tmp_bgr,
+            resize_w,
+            resize_h,
+            &mut buffer[..expected_len],
+        )?;
 
         Ok((resize_h, resize_w))
     }
@@ -111,15 +96,6 @@ impl DetPreProcess {
         resize_h = ((resize_h as f32 / 32.0).round_ties_even() as usize * 32).max(32);
         resize_w = ((resize_w as f32 / 32.0).round_ties_even() as usize * 32).max(32);
         Ok((resize_h, resize_w))
-    }
-
-    fn normalize_resized_into_slice(
-        &self,
-        resized: &RecImage,
-        out_slice: &mut [f32],
-    ) -> Result<()> {
-        let src = resized.as_bgr_cow();
-        self.normalize_bgr_into_slice(src.as_ref(), resized.width(), resized.height(), out_slice)
     }
 
     fn normalize_bgr_into_slice(
