@@ -10,23 +10,39 @@
 //! 自动调优规则和 Rayon 的默认规则，而且失败是无声的。
 //!
 //! 现在只有一份运行时配置（`EngineConfig::runtime`），由 [`RuntimeProfile::resolve`]
-//! 解析成明确数字的 [`ThreadPlan`]；三个 ORT 会话都从
-//! [`RuntimeProfile::session_runtime`] 取设置，Rayon 全局线程池也由同一个 plan 初始化
-//! 并且**必须成功**（显式请求无法生效时返回 [`RapidOcrError::Config`]，不再静默）。
+//! 解析成 [`ThreadPlan`]；三个 ORT 会话都从 [`RuntimeProfile::session_runtime`] 取设置，
+//! Rayon 全局线程池也由同一个 plan 初始化并且**必须成功**（显式请求无法生效时返回
+//! [`RapidOcrError::Config`]，不再静默）。
 //!
 //! # 解析规则（全部由本模块的测试覆盖）
 //!
+//! plan 里三个线程字段都是 `Option<usize>`，`None` 的语义是**不配置**：
+//! 交给 ORT / Rayon 自己的默认值，而不是替它们编一个数字。
+//!
 //! - `budget` = `min(std::thread::available_parallelism(), num_cpus::get_physical())`，
-//!   至少 1。复用 `runtime::session::auto_tuned_thread_budget`，不新增第二份实现。
-//! - `ort_intra`：显式设置 `intra_threads`（`Some(n)`，`n > 0`）时为 `n`，且
-//!   `source = Explicit`；否则 `source = Auto` 且 `ort_intra = budget`。
-//! - `ort_inter`：显式设置 `inter_threads`（`> 0`）时用它，否则 1
-//!   （ORT 的 inter 并行对本 workload 无益）。
-//! - `rayon`：显式设置 `rayon_threads`（`> 0`）时用它，否则 `clamp(budget / 4, 1, 8)`。
+//!   至少 1。
+//! - 显式值优先：`intra_threads` / `inter_threads` / `rayon_threads` 只要给了 `Some(n)`
+//!   且 `n > 0`，就原样进入 plan（`ort_intra` 显式时 `source = Explicit`）。
+//! - 其余字段取决于 `auto_tune_threads`（这是公开字段的既有含义，
+//!   **`false` 必须表示“不要自动配置”**）：
+//!   - `true` → 自动策略：`ort_intra = Some(budget)`、`ort_inter = Some(1)`
+//!     （ORT 的 inter 并行对本 workload 无益）、`rayon = Some(clamp(budget / 4, 1, 8))`；
+//!   - `false` → 三个字段全为 `None`，一个都不配置。
 //! - `sessions`：分类器启用时 3（det + cls + rec），否则 2（det + rec）。
 //!
 //! `session_runtime()` 返回的 [`RuntimeConfig`] 里 `auto_tune_threads = false`：线程数
-//! 已经在 plan 里算清楚了，再让 ORT 自动调优就会重新引入第二套规则。
+//! 已经在 plan 里一次算清楚，再让 ORT 自动调优就会重新引入第二套规则。
+//! plan 里的 `None` 会原样透传给 `OrtSession`（即不调用 `with_intra_threads` /
+//! `with_inter_threads`），因此“未配置”在执行侧也是真的未配置。
+//!
+//! # 为什么 plan 必须是 `Option`
+//!
+//! `auto_tune_threads = false` 曾经被本模块忽略：这里无条件算出
+//! `ort_intra = budget` 并写进 `session_runtime()`，而 `runtime/session.rs` 当时的
+//! `derive_runtime_threads` 却认为 `false` 表示“不自动配置 ORT 线程”。同一份
+//! [`RuntimeConfig`] 于是通过 `RapidOcrEngine` 和通过 `FormulaSession` /
+//! `formula_bench` / `formula_eval` 会得到不同行为。现在只有这一份解析实现
+//! （`runtime/session.rs` 的重复逻辑已删除），`None` 让“未配置”成为可表达、可报告的状态。
 //!
 //! # 这是简化，不是加速
 //!
@@ -50,8 +66,20 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::{ProviderPreference, RuntimeConfig},
     error::{RapidOcrError, Result},
-    runtime::session::auto_tuned_thread_budget,
 };
+
+/// 自动调优时的线程预算：`min(逻辑核数, 物理核数)`，至少 1。
+///
+/// 这是本 crate 里**唯一**的线程预算定义处：它只被 [`RuntimeProfile::plan`] 使用，
+/// 也是“这个进程按自动策略会用多少线程”的唯一解释。
+fn auto_tuned_thread_budget() -> usize {
+    let physical_cores = num_cpus::get_physical().max(1);
+    let available = std::thread::available_parallelism()
+        .ok()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    available.clamp(1, physical_cores)
+}
 
 /// ORT intra 线程数的来源：用户显式指定，还是本机预算自动推导。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,19 +91,23 @@ pub enum ThreadSource {
 
 /// 一次解析的线程分配结果（可序列化，便于基准报告直接内嵌）。
 ///
+/// `None` 表示**该值未被配置**，运行时会使用 ORT / Rayon 自己的默认值；报告里的
+/// `null` 就是这个意思，不是“0 线程”，也不是“未知”。
+///
 /// `rayon` 是**生效值**：如果进程里已经存在 Rayon 全局线程池（Rayon 只允许一个），
-/// [`RuntimeProfile::resolve`] 会把它改写成实际的池大小，因此报告不会撒谎。
+/// [`RuntimeProfile::resolve`] 会把它改写成实际的池大小；未配置（`None`）时不会去改
+/// 任何东西，也不会因为“已有池”而报错。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadPlan {
     pub source: ThreadSource,
     /// 用于分配的线程总预算。
     pub budget: usize,
-    /// 每个 ORT 会话的 intra 线程数。
-    pub ort_intra: usize,
-    /// 每个 ORT 会话的 inter 线程数。
-    pub ort_inter: usize,
-    /// Rayon 全局线程池的线程数（生效值）。
-    pub rayon: usize,
+    /// 每个 ORT 会话的 intra 线程数；`None` = 不配置，用 ORT 默认值。
+    pub ort_intra: Option<usize>,
+    /// 每个 ORT 会话的 inter 线程数；`None` = 不配置，用 ORT 默认值。
+    pub ort_inter: Option<usize>,
+    /// Rayon 全局线程池的线程数（生效值）；`None` = 不配置，用 Rayon 默认值。
+    pub rayon: Option<usize>,
     /// 共享该预算的 ORT 会话数量。
     pub sessions: usize,
 }
@@ -99,23 +131,26 @@ impl RuntimeProfile {
     }
 
     /// 纯函数部分：只根据配置与本机预算推导 plan，不产生任何副作用。
+    ///
+    /// 显式值永远优先；未被显式指定的字段在 `auto_tune_threads = true` 时按自动策略
+    /// 填充，在 `false` 时保持 `None`（不配置）。
     pub fn plan(runtime: &RuntimeConfig, classifier_enabled: bool) -> Self {
         let budget = auto_tuned_thread_budget().max(1);
         let explicit_intra = runtime.intra_threads.filter(|value| *value > 0);
+        let explicit_inter = runtime.inter_threads.filter(|value| *value > 0);
+        let explicit_rayon = runtime.rayon_threads.filter(|value| *value > 0);
         let source = if explicit_intra.is_some() {
             ThreadSource::Explicit
         } else {
             ThreadSource::Auto
         };
-        let ort_intra = explicit_intra.unwrap_or(budget);
-        let ort_inter = runtime
-            .inter_threads
-            .filter(|value| *value > 0)
-            .unwrap_or(1);
-        let rayon = runtime
-            .rayon_threads
-            .filter(|value| *value > 0)
-            .unwrap_or_else(|| (budget / 4).clamp(1, 8));
+        // `auto_tune_threads = false` 表示“不要自动配置”：三个字段保持 `None`，
+        // 由 ORT / Rayon 使用自己的默认值。这是公开字段的既有含义，必须在这里生效，
+        // 否则同一份 `RuntimeConfig` 在引擎路径与公式路径上会得到不同行为。
+        let auto = runtime.auto_tune_threads;
+        let ort_intra = explicit_intra.or(auto.then_some(budget));
+        let ort_inter = explicit_inter.or(auto.then_some(1));
+        let rayon = explicit_rayon.or_else(|| auto.then(|| (budget / 4).clamp(1, 8)));
         Self {
             provider: runtime.provider_preference,
             cpu_mem_arena: runtime.enable_cpu_mem_arena,
@@ -137,13 +172,17 @@ impl RuntimeProfile {
     /// Rayon 每个进程只允许一个全局线程池，`build_global()` 在第二次调用（或进程里
     /// 已有池）时必然失败，所以失败本身不是错误：
     ///
+    /// - `rayon = None`（未配置）→ **什么都不做**：不去建立池，也不把“已经存在池”
+    ///   当成错误。请求方明确说过不要配置，这里就不能替它做主；
     /// - 池不存在 → 按 plan 建立，`rayon` 保持请求值；
     /// - 池已存在且线程数与请求一致 → 成功；
     /// - 池已存在且线程数不同：`ThreadSource::Explicit`（用户显式指定过线程数）时返回
     ///   [`RapidOcrError::Config`] 说明无法生效；`Auto` 时接受已有池并把 `rayon`
     ///   改写成实际值，让报告与执行保持一致。
     pub fn apply_rayon_global_pool(&mut self) -> Result<()> {
-        let requested = self.threads.rayon;
+        let Some(requested) = self.threads.rayon else {
+            return Ok(());
+        };
         if rayon::ThreadPoolBuilder::new()
             .num_threads(requested)
             .build_global()
@@ -163,7 +202,7 @@ impl RuntimeProfile {
                  only one global pool per process"
             )));
         }
-        self.threads.rayon = actual;
+        self.threads.rayon = Some(actual);
         Ok(())
     }
 
@@ -173,12 +212,16 @@ impl RuntimeProfile {
     /// 让总线程数失控。这里**刻意不提供** per-stage override——当前没有这个需求；
     /// 将来若真的需要，正确的做法是加一个显式的 override 字段，而不是把整份 runtime
     /// 配置重新复制三份。
+    ///
+    /// plan 里的 `None` 原样透传，因此 `auto_tune_threads = false` 且没有显式值时，
+    /// `OrtSession` 看到的是 `None`（不调用 `with_*_threads`），ORT 保留自己的默认值。
     pub fn session_runtime(&self) -> RuntimeConfig {
         RuntimeConfig {
-            intra_threads: Some(self.threads.ort_intra),
-            inter_threads: Some(self.threads.ort_inter),
+            intra_threads: self.threads.ort_intra,
+            inter_threads: self.threads.ort_inter,
+            // plan 已经把该算的都算完了；这里再让 ORT 自动调优就会重新引入第二套规则。
             auto_tune_threads: false,
-            rayon_threads: Some(self.threads.rayon),
+            rayon_threads: self.threads.rayon,
             enable_cpu_mem_arena: self.cpu_mem_arena,
             fail_if_provider_unavailable: self.fail_if_provider_unavailable,
             provider_preference: self.provider,
@@ -189,11 +232,10 @@ impl RuntimeProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeProfile, ThreadPlan, ThreadSource};
+    use super::{RuntimeProfile, ThreadPlan, ThreadSource, auto_tuned_thread_budget};
     use crate::{
         config::{ProviderPreference, RuntimeConfig},
         error::RapidOcrError,
-        runtime::session::auto_tuned_thread_budget,
     };
 
     /// 显式设置必须逐字段生效，且不依赖本机核数。
@@ -211,9 +253,9 @@ mod tests {
         };
         let profile = RuntimeProfile::plan(&runtime, false);
         assert_eq!(profile.threads.source, ThreadSource::Explicit);
-        assert_eq!(profile.threads.ort_intra, 6);
-        assert_eq!(profile.threads.ort_inter, 2);
-        assert_eq!(profile.threads.rayon, 3);
+        assert_eq!(profile.threads.ort_intra, Some(6));
+        assert_eq!(profile.threads.ort_inter, Some(2));
+        assert_eq!(profile.threads.rayon, Some(3));
         assert_eq!(profile.threads.sessions, 2);
         assert_eq!(profile.formula_batch, 5);
         assert!(!profile.cpu_mem_arena);
@@ -233,12 +275,80 @@ mod tests {
         let profile = RuntimeProfile::plan(&RuntimeConfig::default(), false);
         assert_eq!(profile.threads.source, ThreadSource::Auto);
         assert_eq!(profile.threads.budget, budget);
-        assert_eq!(profile.threads.ort_intra, budget);
-        assert_eq!(profile.threads.ort_inter, 1);
-        assert_eq!(profile.threads.rayon, (budget / 4).clamp(1, 8));
+        assert_eq!(profile.threads.ort_intra, Some(budget));
+        assert_eq!(profile.threads.ort_inter, Some(1));
+        assert_eq!(profile.threads.rayon, Some((budget / 4).clamp(1, 8)));
         assert!(
-            (1..=8).contains(&profile.threads.rayon),
+            (1..=8).contains(&profile.threads.rayon.expect("auto plan sets rayon")),
             "the auto Rayon share must stay small and bounded"
+        );
+    }
+
+    /// **P1-2 根因回归**：`auto_tune_threads = false` 且没有任何显式值时，三个线程字段
+    /// 必须都是 `None`（不配置），而不是被 profile 悄悄填成自动策略的数字。
+    ///
+    /// 旧行为：`ort_intra = Some(budget)`、`rayon = Some(clamp(budget/4,1,8))`，
+    /// `session_runtime()` 把它们当成显式值下发 —— 于是公开字段
+    /// `auto_tune_threads = false` 在引擎路径上被完全忽略。
+    #[test]
+    fn auto_tune_disabled_configures_nothing() {
+        let runtime = RuntimeConfig {
+            auto_tune_threads: false,
+            ..RuntimeConfig::default()
+        };
+        let profile = RuntimeProfile::plan(&runtime, false);
+        assert_eq!(profile.threads.source, ThreadSource::Auto);
+        assert_eq!(profile.threads.ort_intra, None);
+        assert_eq!(profile.threads.ort_inter, None);
+        assert_eq!(profile.threads.rayon, None);
+
+        // 透传到会话必须仍然是 `None`：`OrtSession` 只有拿到 `Some` 才会调用
+        // `with_intra_threads` / `with_inter_threads`。
+        let session = profile.session_runtime();
+        assert_eq!(session.intra_threads, None);
+        assert_eq!(session.inter_threads, None);
+        assert_eq!(session.rayon_threads, None);
+        // plan 已经解析完毕，ORT 自己那套 auto_tune 也必须关掉，避免第二套规则。
+        assert!(!session.auto_tune_threads);
+    }
+
+    /// `auto_tune_threads = false` 与显式 intra 混用：显式值仍然生效，其余保持未配置。
+    #[test]
+    fn auto_tune_disabled_keeps_explicit_intra_only() {
+        let runtime = RuntimeConfig {
+            intra_threads: Some(6),
+            auto_tune_threads: false,
+            ..RuntimeConfig::default()
+        };
+        let profile = RuntimeProfile::plan(&runtime, false);
+        assert_eq!(profile.threads.source, ThreadSource::Explicit);
+        assert_eq!(profile.threads.ort_intra, Some(6));
+        assert_eq!(profile.threads.ort_inter, None);
+        assert_eq!(profile.threads.rayon, None);
+
+        let session = profile.session_runtime();
+        assert_eq!(session.intra_threads, Some(6));
+        assert_eq!(session.inter_threads, None);
+        assert_eq!(session.rayon_threads, None);
+    }
+
+    /// `auto_tune_threads = false` 且 `rayon` 未配置时，`resolve` 不得建立全局池，
+    /// 也不得因为“进程里已经有池”而报错 —— 请求方明确说过不要配置。
+    #[test]
+    fn unconfigured_rayon_is_left_alone_even_with_an_existing_pool() {
+        let _ = rayon::ThreadPoolBuilder::new().build_global();
+        let before = rayon::current_num_threads();
+        let runtime = RuntimeConfig {
+            auto_tune_threads: false,
+            ..RuntimeConfig::default()
+        };
+        let profile = RuntimeProfile::resolve(&runtime, false)
+            .expect("not configuring Rayon must never fail, even if a pool already exists");
+        assert_eq!(profile.threads.rayon, None);
+        assert_eq!(
+            rayon::current_num_threads(),
+            before,
+            "an unconfigured plan must not resize the live pool"
         );
     }
 
@@ -254,9 +364,9 @@ mod tests {
         };
         let profile = RuntimeProfile::plan(&runtime, false);
         assert_eq!(profile.threads.source, ThreadSource::Auto);
-        assert!(profile.threads.ort_intra >= 1);
-        assert_eq!(profile.threads.ort_inter, 1);
-        assert!(profile.threads.rayon >= 1);
+        assert!(profile.threads.ort_intra.is_some_and(|value| value >= 1));
+        assert_eq!(profile.threads.ort_inter, Some(1));
+        assert!(profile.threads.rayon.is_some_and(|value| value >= 1));
     }
 
     /// `session_runtime()` 是三个阶段的唯一来源：auto_tune 必须关闭，线程数必须来自 plan。
@@ -274,9 +384,9 @@ mod tests {
         };
         let profile = RuntimeProfile::plan(&runtime, false);
         let session = profile.session_runtime();
-        assert_eq!(session.intra_threads, Some(profile.threads.ort_intra));
+        assert_eq!(session.intra_threads, Some(5));
         assert_eq!(session.inter_threads, Some(1));
-        assert_eq!(session.rayon_threads, Some(profile.threads.rayon));
+        assert_eq!(session.rayon_threads, profile.threads.rayon);
         assert!(
             !session.auto_tune_threads,
             "ORT must not re-derive threads after the plan was resolved"
@@ -287,15 +397,16 @@ mod tests {
         assert_eq!(session.formula_batch, 9);
     }
 
-    /// 线程 plan 必须能直接内嵌进基准报告。
+    /// 线程 plan 必须能直接内嵌进基准报告，并且“未配置”必须序列化成 `null`
+    /// （而不是 0 或缺失字段），否则报告会说谎。
     #[test]
     fn thread_plan_serialises_for_reports() {
         let plan = ThreadPlan {
             source: ThreadSource::Auto,
             budget: 14,
-            ort_intra: 14,
-            ort_inter: 1,
-            rayon: 3,
+            ort_intra: Some(14),
+            ort_inter: Some(1),
+            rayon: Some(3),
             sessions: 2,
         };
         let value = serde_json::to_value(&plan).expect("thread plan must serialise");
@@ -305,6 +416,19 @@ mod tests {
         let round_trip: ThreadPlan =
             serde_json::from_value(value).expect("thread plan must deserialise");
         assert_eq!(round_trip, plan);
+
+        let unconfigured = ThreadPlan {
+            source: ThreadSource::Auto,
+            budget: 14,
+            ort_intra: None,
+            ort_inter: None,
+            rayon: None,
+            sessions: 2,
+        };
+        let value = serde_json::to_value(&unconfigured).expect("thread plan must serialise");
+        assert_eq!(value["ort_intra"], serde_json::Value::Null);
+        assert_eq!(value["ort_inter"], serde_json::Value::Null);
+        assert_eq!(value["rayon"], serde_json::Value::Null);
 
         let explicit = serde_json::to_value(ThreadSource::Explicit).expect("source serialises");
         assert_eq!(explicit, serde_json::json!("explicit"));
@@ -350,12 +474,12 @@ mod tests {
             .expect("the auto plan must tolerate an existing global pool");
         assert_eq!(
             profile.threads.rayon,
-            rayon::current_num_threads(),
+            Some(rayon::current_num_threads()),
             "the reported Rayon value must be the effective one"
         );
         assert_eq!(
             profile.session_runtime().rayon_threads,
-            Some(profile.threads.rayon)
+            profile.threads.rayon
         );
     }
 
@@ -376,7 +500,7 @@ mod tests {
         let profile = RuntimeProfile::resolve(&runtime, false)
             .expect("an explicit request equal to the live pool size must be accepted");
         assert_eq!(profile.threads.source, ThreadSource::Explicit);
-        assert_eq!(profile.threads.rayon, actual);
+        assert_eq!(profile.threads.rayon, Some(actual));
         assert_eq!(profile.session_runtime().rayon_threads, Some(actual));
     }
 }

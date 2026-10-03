@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::thread;
 
 use ndarray::{Array2, ArrayView2, ArrayView3, ArrayViewD, Ix2, Ix3, Ix4};
 use ort::{
@@ -205,37 +204,18 @@ impl OrtSession {
     }
 }
 
-fn derive_runtime_threads(runtime_cfg: &RuntimeConfig) -> (Option<usize>, Option<usize>) {
-    let mut intra = runtime_cfg.intra_threads.filter(|value| *value > 0);
-    let mut inter = runtime_cfg.inter_threads.filter(|value| *value > 0);
-
-    if runtime_cfg.auto_tune_threads {
-        let available = auto_tuned_thread_budget();
-        if intra.is_none() {
-            intra = Some(available.max(1));
-        }
-        if inter.is_none() {
-            inter = Some(1);
-        }
-    }
-
-    (intra, inter)
-}
-
-/// 自动调优时的线程预算：`min(逻辑核数, 物理核数)`，至少 1。
+/// 打开一个 ORT 会话。
 ///
-/// 唯一定义处：`runtime::profile` 用它推导统一的 `ThreadPlan`，`derive_runtime_threads`
-/// 用它处理仍然走 `auto_tune_threads` 的调用方（公式基准等）。任何第二次实现都会让
-/// “这个进程用了多少线程”重新失去单一解释处。
-pub(crate) fn auto_tuned_thread_budget() -> usize {
-    let physical_cores = num_cpus::get_physical().max(1);
-    let available = thread::available_parallelism()
-        .ok()
-        .map(|value| value.get())
-        .unwrap_or(1);
-    available.clamp(1, physical_cores)
-}
-
+/// 线程设置**不做任何解析**：`RuntimeConfig` 里写了什么就传什么，`None` 表示不调用
+/// `with_intra_threads` / `with_inter_threads`，由 ONNX Runtime 使用自己的默认值。
+///
+/// 这里刻意**没有**第二份线程推导逻辑。历史实现有一个
+/// `derive_runtime_threads`，它认为 `auto_tune_threads = false` 表示“不要自动配置”，
+/// 而 `runtime::profile` 当时在同样的输入下无条件算出 `budget` 并当成显式值下发 ——
+/// 同一份 `RuntimeConfig` 通过 `RapidOcrEngine` 与通过 `FormulaSession` /
+/// `formula_bench` / `formula_eval` 会得到不同线程行为。统一之后只有
+/// [`crate::runtime::profile::RuntimeProfile::plan`] 会推导线程数；直接构造
+/// `RuntimeConfig` 的调用方（公式工具）得到的就是它自己写下的值。
 fn open_session(
     model_path: &Path,
     runtime_cfg: &RuntimeConfig,
@@ -246,11 +226,10 @@ fn open_session(
     builder = builder
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(ort_error)?;
-    let (intra_threads, inter_threads) = derive_runtime_threads(runtime_cfg);
-    if let Some(intra) = intra_threads {
+    if let Some(intra) = runtime_cfg.intra_threads.filter(|value| *value > 0) {
         builder = builder.with_intra_threads(intra).map_err(ort_error)?;
     }
-    if let Some(inter) = inter_threads {
+    if let Some(inter) = runtime_cfg.inter_threads.filter(|value| *value > 0) {
         builder = builder.with_inter_threads(inter).map_err(ort_error)?;
     }
 

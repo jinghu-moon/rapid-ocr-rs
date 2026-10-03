@@ -200,7 +200,7 @@ mod tests {
         let session = FormulaSession::new(&fixture("formula_ok.onnx"), &runtime)
             .expect("explicit CPU must be accepted");
         assert_eq!(
-            session.provider_resolution().resolved,
+            session.provider_resolution().selected_ep,
             crate::runtime::provider::ResolvedExecutionProvider::Cpu
         );
     }

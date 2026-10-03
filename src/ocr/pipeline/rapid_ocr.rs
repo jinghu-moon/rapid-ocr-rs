@@ -564,7 +564,7 @@ impl RapidOcrEngine {
                     crate::api::ProviderPreference::Cuda { device_id }
                 }
             },
-            resolved: match resolution.resolved {
+            selected_ep: match resolution.selected_ep {
                 crate::runtime::provider::ResolvedExecutionProvider::Cpu => {
                     crate::api::ResolvedProvider::Cpu
                 }
@@ -2280,5 +2280,41 @@ rec:
             1,
             "the explicit region must still be recognized as a formula"
         );
+    }
+
+    /// **P1-2 引擎级根因回归**：`runtime.auto_tune_threads = false` 必须真的让引擎
+    /// “什么都不配置”，而不是被 `RuntimeProfile` 悄悄替换成自动策略的数字。
+    ///
+    /// 旧行为：`RapidOcrEngine::new` 得到
+    /// `ort_intra = Some(budget)` / `ort_inter = Some(1)` / `rayon = Some(clamp(budget/4,1,8))`，
+    /// 于是公开字段 `auto_tune_threads = false` 在引擎路径上被完全忽略
+    /// （公式路径的 `FormulaSession` 却按 `false` 理解，同一份配置两种行为）。
+    ///
+    /// 需要真实 OCR 模型，因此沿用同一套外部资产定位：缺失时显式 skip。
+    #[test]
+    fn engine_honours_auto_tune_threads_disabled() {
+        let Some(model_root) = crate::test_support::ocr_model_root() else {
+            return;
+        };
+        let mut config = engine_config(&model_root);
+        config.runtime.auto_tune_threads = false;
+        config.runtime.intra_threads = None;
+        config.runtime.inter_threads = None;
+        config.runtime.rayon_threads = None;
+
+        let engine = RapidOcrEngine::new(config).expect("engine should load");
+        let threads = &engine.runtime_profile().threads;
+        assert_eq!(threads.ort_intra, None);
+        assert_eq!(threads.ort_inter, None);
+        assert_eq!(threads.rayon, None);
+        assert_eq!(threads.source, crate::runtime::profile::ThreadSource::Auto);
+        assert_eq!(threads.sessions, 2, "det + rec = two sessions");
+
+        // plan 与“真正下发给 ORT 的配置”必须一致：引擎不再自己造线程数。
+        let session = engine.runtime_profile().session_runtime();
+        assert_eq!(session.intra_threads, None);
+        assert_eq!(session.inter_threads, None);
+        assert_eq!(session.rayon_threads, None);
+        assert!(!session.auto_tune_threads);
     }
 }

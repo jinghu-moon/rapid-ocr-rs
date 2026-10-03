@@ -1084,14 +1084,15 @@ where
         })
 }
 
-/// 实际交给 ONNX Runtime 的加速提供者。
+/// 交给 ONNX Runtime 的加速提供者（**EP 链的头部**，不是逐节点执行证据）。
 ///
 /// Windows-only 之后只剩 CPU / DirectML / CUDA；CANN 已整体删除。
 ///
-/// **重要**：`Resolved` 表示“EP 链已按请求建立且 `is_available()` 自报可用”，
+/// **重要**：`selected_ep` 表示“EP 链已按请求建立且 `is_available()` 自报可用”，
 /// **不代表**模型真的在该 EP 上逐节点执行（ORT 不通过该 API 暴露逐节点分配）。
-/// 任何加速结论都必须有实测耗时支撑，见 `runtime::provider` 与
-/// `docs/04-windows-phase-reports.md` 的阶段 0 记录。
+/// 字段名刻意不用 `resolved`：那读起来像“已证明在该 EP 上运行”，而本 API 只能证明
+/// “这条链被选中并交给了 ORT”。任何加速结论都必须有实测耗时支撑，见
+/// [`crate::runtime::provider`] 与 `docs/04-windows-phase-reports.md` 的阶段 0/2 记录。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolvedProvider {
     Cpu,
@@ -1107,7 +1108,10 @@ pub enum ProviderPreference {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderResolutionInfo {
     pub requested: ProviderPreference,
-    pub resolved: ResolvedProvider,
+    /// 交给 ONNX Runtime 的 EP 链头部；`fallback_to_cpu = true` 时为 `Cpu`。
+    ///
+    /// 逐节点分配不可观测，因此该字段不能作为加速证据（见 [`ResolvedProvider`]）。
+    pub selected_ep: ResolvedProvider,
     pub fallback_to_cpu: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1375,6 +1379,87 @@ mod tests {
             fixture.expected,
             "reading order mismatch for {}",
             fixture.source
+        );
+    }
+
+    /// **阶段分解恒等式**：每个阶段的 `preprocess + infer + postprocess == *_ms`。
+    ///
+    /// `runtime::timing::TimingLedger` 把阶段分解当成“模型侧”的完整刻画，因此这条
+    /// 恒等式必须成立——实现里若只改了其中一个字段（例如新增了一段不计入 `*_ms` 的
+    /// 工作），账本就会静默漂移。
+    ///
+    /// **页面级不变量不在这里断言**：实测（12 张真实页面，`tests/baseline` 的账本）
+    /// `total_ms` 与“页面级分项之和”之间存在系统性差额（默认配置下残差
+    /// −43 到 −73 ms/页，均值 −54.8 ms），因此账本把差额显式报告为
+    /// `unattributed_ms` + `conservation.conserved = false`，而不是在这里假装它恒为 0。
+    /// 详见 `src/runtime/timing.rs` 的模块文档与
+    /// `real_world_outer_window_does_not_conserve_the_reported_total` 测试。
+    #[test]
+    fn ocr_timings_stage_breakdown_sums_to_each_stage_total() {
+        let timings = OcrTimings {
+            decode_ms: 4.0,
+            resize_ms: 5.0,
+            crop_ms: 1.0,
+            preprocess_ms: 12.0,
+            detector_preprocess_ms: 3.0,
+            detector_infer_ms: 400.0,
+            detector_postprocess_ms: 17.0,
+            detect_ms: 420.0,
+            classifier_preprocess_ms: 1.0,
+            classifier_infer_ms: 2.0,
+            classifier_postprocess_ms: 1.0,
+            classify_ms: 4.0,
+            recognizer_preprocess_ms: 4.0,
+            recognizer_infer_ms: 200.0,
+            recognizer_postprocess_ms: 30.0,
+            recognize_ms: 234.0,
+            formula_ms: 9.0,
+            postprocess_ms: 6.0,
+            total_ms: 12.0 + 420.0 + 4.0 + 234.0 + 6.0 + 9.0,
+        };
+        for (name, parts, total) in [
+            (
+                "detector",
+                [
+                    timings.detector_preprocess_ms,
+                    timings.detector_infer_ms,
+                    timings.detector_postprocess_ms,
+                ],
+                timings.detect_ms,
+            ),
+            (
+                "classifier",
+                [
+                    timings.classifier_preprocess_ms,
+                    timings.classifier_infer_ms,
+                    timings.classifier_postprocess_ms,
+                ],
+                timings.classify_ms,
+            ),
+            (
+                "recognizer",
+                [
+                    timings.recognizer_preprocess_ms,
+                    timings.recognizer_infer_ms,
+                    timings.recognizer_postprocess_ms,
+                ],
+                timings.recognize_ms,
+            ),
+        ] {
+            let sum: f32 = parts.iter().sum();
+            assert!(
+                (sum - total).abs() < 1e-3,
+                "{name} stage breakdown ({sum}) must equal its stage total ({total})"
+            );
+        }
+
+        // 输入侧恒等式（账本按它计算 `input_other_ms`）：
+        // 外层窗口的每一项都不得为负，且未知余量由减法定义。
+        let named_input = f64::from(timings.decode_ms) + f64::from(timings.resize_ms);
+        let outer = f64::from(timings.preprocess_ms);
+        assert!(
+            named_input <= outer + 1e-3,
+            "decode + resize must fit inside the outer preprocess window: {named_input} vs {outer}"
         );
     }
 }

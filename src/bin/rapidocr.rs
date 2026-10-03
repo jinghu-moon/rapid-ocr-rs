@@ -274,8 +274,11 @@ fn evaluate_cmd(
         });
     }
     let summary = EvaluationSummary::from_cases(reports);
-    // 评估报告本身只描述质量指标；进程级峰值工作集由 CLI 附加（口径与库内一致），
-    // 不把平台内存信息塞进纯算法的报告类型。
+    // 评估报告本身只描述质量指标；进程级峰值工作集与 ONNX Runtime 指纹由 CLI 附加
+    // （口径与库内一致），不把平台/运行时信息塞进纯算法的报告类型。
+    //
+    // ORT 指纹必须随质量报告一起落地：没有它就无法证明两份评估跑在同一份运行库上，
+    // 而阶段 0 的报告正是因为没有版本/路径/哈希而无法被严格比较。
     let mut report = serde_json::to_value(&summary)?;
     if let Some(object) = report.as_object_mut() {
         object.insert(
@@ -285,6 +288,14 @@ fn evaluate_cmd(
         object.insert(
             "memory_source".to_string(),
             serde_json::json!(rapid_ocr_rs::peak_memory_source()),
+        );
+        object.insert(
+            "ort_runtime".to_string(),
+            serde_json::to_value(rapid_ocr_rs::ort_runtime_fingerprint())?,
+        );
+        object.insert(
+            "ort_runtime_version".to_string(),
+            serde_json::json!(rapid_ocr_rs::ort_runtime_version()),
         );
     }
     let text = serde_json::to_string_pretty(&report)?;

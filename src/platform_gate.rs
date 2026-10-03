@@ -4,15 +4,21 @@
 //!
 //! ```text
 //! rustc --edition 2024 --crate-type lib --emit=metadata --target x86_64-linux-android src/platform_gate.rs
+//! rustc --edition 2024 --crate-type lib --emit=metadata --target x86_64-pc-windows-gnu src/platform_gate.rs
 //! ```
 //!
-//! 预期只输出下面这条 `compile_error!`。`tools/check_platform_gate.ps1` 就是这个命令的
-//! 可执行封装，用来证明“非 Windows 命中的是我们自己的错误”，而不是依赖项的模糊失败。
+//! 预期只输出下面这条 `compile_error!`。`tools/check_platform_gate.ps1` 就是这两个命令的
+//! 可执行封装，用来证明“非支持目标命中的是我们自己的错误”，而不是依赖项的模糊失败。
+//!
+//! **谓词必须包含 `target_env = "msvc"`。** 只写 `all(windows, target_arch = "x86_64")`
+//! 会把 `x86_64-pc-windows-gnu` 也放进来（它同样是 Windows + x86_64），而本 crate 只在
+//! MSVC ABI 上构建与验证：导入库名、`#[link(name = "psapi")]` 之类的原生链接约定、
+//! 以及 ort 预编译运行库都是 MSVC 产物。GNU ABI 需要另一套链接配置，属于明确非目标。
 //!
 //! 明确的非目标：`aarch64-pc-windows-msvc`、`x86_64-pc-windows-gnu`、Wine、WSL、
 //! Linux、macOS。
 
-#[cfg(not(all(windows, target_arch = "x86_64")))]
+#[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
 compile_error!(
     "rapid-ocr-rs only supports x86_64-pc-windows-msvc; other targets (Windows ARM64, GNU ABI, \
      Wine/WSL, Linux, macOS) are explicit non-goals. See the crate documentation for the platform \

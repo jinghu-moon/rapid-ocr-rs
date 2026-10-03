@@ -66,11 +66,16 @@ pub use crate::runtime::contracts::{ModelIoProbe, TensorSpec};
 pub use crate::runtime::memory::{
     PEAK_MEMORY_SOURCE, peak_memory_failure_reason, peak_memory_source, peak_working_set_bytes,
 };
+pub use crate::runtime::ort_runtime::{
+    LoadedModule, OrtRuntimeFingerprint, PROVIDER_DLL_NAMES, ProviderDll, is_sha256_hex,
+    ort_runtime_fingerprint,
+};
 pub use crate::runtime::profile::{RuntimeProfile, ThreadPlan, ThreadSource};
 pub use crate::runtime::provider::{
     ProviderResolution, ResolvedExecutionProvider, ort_runtime_version,
 };
 pub use crate::runtime::session::OrtSession;
+pub use crate::runtime::timing::{LedgerConservation, LedgerShares, TimingLedger};
 
 /// 四边形（左上、右上、右下、左下）。
 pub type Quad = [[f32; 2]; 4];

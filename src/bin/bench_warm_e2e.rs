@@ -2,7 +2,7 @@ use clap::Parser;
 use rapid_ocr_rs::{
     ClassifierPlan, ClassifierPolicy, DetectionPolicy, EngineConfig, ImageInput, OcrEngine,
     OcrRequest, OutputPolicy, PreprocessPolicy, RapidOcrEngine, RecognitionPolicy, StagePlan,
-    WordOutputMode,
+    TimingLedger, WordOutputMode,
 };
 use serde_json::json;
 use std::{fs, path::PathBuf, sync::Arc, time::Instant};
@@ -122,6 +122,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 互相加减。检测器/分类器/识别器各自的 preprocess / infer / postprocess 分开收集，
     // 使报告能直接回答“时间花在 ORT 推理上还是 Rust 前后处理上”。
     let mut stages = StageSamples::default();
+    // 时间账本：每个样本各自算一份（每一项只算一次），最后按字段求均值，
+    // 再在均值账本上做守恒检查。`timing_ledger.conservation` 是守恒判据本身。
+    let mut ledgers: Vec<TimingLedger> = Vec::new();
     // 记录实际解析到的 provider 与是否发生 CPU fallback：GPU 基准不得把
     // fallback 当加速成功（阶段 0/2/5 的证据要求）。
     let mut provider_resolution = None;
@@ -133,11 +136,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             total.push(out.timings.total_ms as f64);
             regions.push(out.regions.len() as f64);
             stages.push(&out);
+            ledgers.push(TimingLedger::from_timings(&out.timings));
             if provider_resolution.is_none() {
                 let describe = |info: &rapid_ocr_rs::ProviderResolutionInfo| {
                     serde_json::json!({
                         "requested": format!("{:?}", info.requested),
-                        "resolved": format!("{:?}", info.resolved),
+                        // `selected_ep` 只表示“交给 ORT 的 EP 链头部”，不是逐节点执行证据。
+                        "selected_ep": format!("{:?}", info.selected_ep),
                         "fallback_to_cpu": info.fallback_to_cpu,
                     })
                 };
@@ -157,7 +162,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         total.iter().sum::<f64>() / total.len() as f64
     };
-    let timing_split = inference_share(&stage_report, total_avg);
+    let ledger_report = ledger_report(&ledgers);
+    let timing_split = inference_share(&ledgers, total_avg);
     let report = json!({
         "meta": {
             "images_dir": cli.images_dir,
@@ -168,10 +174,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "init_ms": init_ms,
             "benchmark": benchmark_meta,
             // 引擎解析出的线程分配（生效值；三个阶段共享同一个 plan）。
+            // `null` 表示该值未被配置（交给 ORT / Rayon 自己的默认值）。
             "thread_plan": thread_plan,
             "provider_resolution": provider_resolution,
-            // 实际加载的 ONNX Runtime 版本：本 crate 链接导入库，运行时可能加载系统
-            // 自带的 `onnxruntime.dll`，这决定了哪些加速 provider 真正可用。
+            // 实际使用的 ONNX Runtime 指纹：API 版本字符串 + 运行库文件（路径/体积/SHA-256）
+            // + provider DLL。本 crate 用 `rustc-link-lib=static=onnxruntime` 链接，
+            // 进程里没有 onnxruntime.dll 模块，因此指纹来自静态库或 exe（见
+            // `runtime::ort_runtime`）。没有指纹的报告不可与其它报告严格比较。
+            "ort_runtime": rapid_ocr_rs::ort_runtime_fingerprint(),
+            // 版本字符串仍然单独保留（旧报告里叫 `ort_runtime_version`），
+            // 让“版本”这一项可以直接被 grep 到，不必先理解整个指纹结构。
             "ort_runtime_version": rapid_ocr_rs::ort_runtime_version(),
         },
         "stats": {
@@ -182,7 +194,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // 分阶段统计：每个指标都带 count / min / max / avg / p50 / p90，口径与
         // `stats.wall_ms` / `stats.ocr_total_ms` 完全一致（同一个 `stats()` helper）。
         "stages": stage_report,
-        // ONNX Runtime 推理 vs Rust 前后处理的时间占比（阶段 6 门槛证据）。
+        // 守恒时间账本：每一项只算一次，未归属余量显式列出，并给出守恒判定。
+        "timing_ledger": ledger_report,
+        // ORT 推理 vs Rust 前后处理的时间占比（阶段 6 门槛证据）；
+        // 数值与 `timing_ledger` 一致，保留这个键是为了让旧的对比方式仍然可用。
         "timing_split": timing_split,
         // 峰值工作集口径与库内一致：`windows:GetProcessMemoryInfo.PeakWorkingSetSize`。
         "memory": {
@@ -321,48 +336,92 @@ impl StageSamples {
     }
 }
 
+/// 守恒时间账本报告。
+///
+/// 每个样本各算一份账（[`TimingLedger::from_timings`]，每一项只算一次），再按字段求
+/// 均值。**守恒检查建立在均值账本上**（而不是把已经平均过的数字重新拼一遍）：
+/// 均值账本与每个样本账本满足同一套恒等式，因此它的余量也必须是 0。
+fn ledger_report(ledgers: &[TimingLedger]) -> serde_json::Value {
+    if ledgers.is_empty() {
+        return json!({
+            "unit": "ms",
+            "samples": 0,
+            "error": "no timing samples were collected",
+        });
+    }
+    let mean = TimingLedger::mean(ledgers);
+    let conservation = mean.conservation();
+    let shares = mean.shares();
+    json!({
+        "unit": "ms",
+        "samples": ledgers.len(),
+        "basis": "per-sample ledger, then per-field mean (each component counted exactly once)",
+        "components": mean,
+        "totals": {
+            "input_ms": mean.input_ms(),
+            "model_preprocess_ms": mean.model_preprocess_ms(),
+            "inference_ms": mean.inference_ms(),
+            "model_postprocess_ms": mean.model_postprocess_ms(),
+            "page_postprocess_ms": mean.page_postprocess_ms,
+            "formula_ms": mean.formula_ms,
+            "rust_ms": mean.rust_ms(),
+            "attributed_ms": mean.attributed_ms(),
+            "unattributed_ms": mean.unattributed_ms,
+        },
+        "shares": shares,
+        // 守恒判据：attributed_ms 与 total_ms 的差必须落在容差内。
+        // 不守恒说明账本漏项或双计，报告不得被当成有效证据。
+        "conservation": conservation,
+        // 每个样本各自的余量：用来看“均值守恒”是不是掩盖了单样本的大偏差。
+        "per_sample_unattributed_ms": stats(
+            &ledgers.iter().map(|ledger| ledger.unattributed_ms).collect::<Vec<_>>()
+        ),
+        "per_sample_residual_ms": stats(
+            &ledgers
+                .iter()
+                .map(|ledger| ledger.conservation().residual_ms)
+                .collect::<Vec<_>>()
+        ),
+    })
+}
+
 /// ONNX Runtime 推理 vs Rust 前后处理的时间占比。
 ///
-/// 分子/分母都取自 `stats.ocr_total_ms.avg`（同一个口径，来自 `OcrTimings::total_ms`），
-/// 而不是把分阶段均值相加——阶段均值相加会丢失阶段间的重叠或未计部分。
-fn inference_share(stages: &serde_json::Value, total_avg: f64) -> serde_json::Value {
-    let avg = |path: &[&str]| -> f64 {
-        let mut cursor = stages;
-        for key in path {
-            cursor = match cursor.get(*key) {
-                Some(value) => value,
-                None => return 0.0,
-            };
-        }
-        cursor
-            .get("avg")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0)
-    };
+/// 分子来自守恒账本的均值，分母是 `stats.ocr_total_ms.avg`（同一个口径，来自
+/// `OcrTimings::total_ms`），因此 `inference + rust + unattributed == total`。
+fn inference_share(ledgers: &[TimingLedger], total_avg: f64) -> serde_json::Value {
+    if ledgers.is_empty() {
+        return json!({"error": "no timing samples were collected"});
+    }
     if total_avg <= 0.0 {
         return json!({"error": "ocr_total_ms.avg is zero; cannot compute shares"});
     }
-    let detector_infer = avg(&["detector", "infer_ms"]);
-    let classifier_infer = avg(&["classifier", "infer_ms"]);
-    let recognizer_infer = avg(&["recognizer", "infer_ms"]);
-    let inference = detector_infer + classifier_infer + recognizer_infer;
-    let preprocess = avg(&["page_total", "preprocess_ms"]);
-    let postprocess = avg(&["page_total", "postprocess_ms"]);
+    let mean = TimingLedger::mean(ledgers);
+    let inference = mean.inference_ms();
+    let rust = mean.rust_ms();
     let share = |value: f64| value / total_avg;
     json!({
-        "basis": "mean (avg) of the same samples used by stats.ocr_total_ms",
+        "basis": "per-sample ledger mean; the same samples back stats.ocr_total_ms",
         "denominator_ms": total_avg,
         "ort_inference_ms": inference,
         "ort_inference_share": share(inference),
-        "detector_infer_share": share(detector_infer),
-        "classifier_infer_share": share(classifier_infer),
-        "recognizer_infer_share": share(recognizer_infer),
-        "rust_preprocess_ms": preprocess,
-        "rust_preprocess_share": share(preprocess),
-        "rust_postprocess_ms": postprocess,
-        "rust_postprocess_share": share(postprocess),
-        "rust_total_share": share(preprocess + postprocess),
-        "unattributed_ms": total_avg - inference - preprocess - postprocess,
-        "unattributed_share": share(total_avg - inference - preprocess - postprocess),
+        "detector_infer_share": share(mean.detector_infer_ms),
+        "classifier_infer_share": share(mean.classifier_infer_ms),
+        "recognizer_infer_share": share(mean.recognizer_infer_ms),
+        "rust_ms": rust,
+        "rust_share": share(rust),
+        // 兼容旧的字段名：以前把“页面级 preprocess + postprocess”称作 rust_preprocess /
+        // rust_postprocess。这两个数字现在**不再是**那两项（那两项本身漏项且重复），
+        // 而是守恒账本里的输入侧与后处理侧，读旧字段名的人必须知道这一点。
+        "rust_input_ms": mean.input_ms(),
+        "rust_input_share": share(mean.input_ms()),
+        "rust_model_preprocess_ms": mean.model_preprocess_ms(),
+        "rust_model_preprocess_share": share(mean.model_preprocess_ms()),
+        "rust_model_postprocess_ms": mean.model_postprocess_ms(),
+        "rust_model_postprocess_share": share(mean.model_postprocess_ms()),
+        "rust_page_postprocess_ms": mean.page_postprocess_ms,
+        "rust_page_postprocess_share": share(mean.page_postprocess_ms),
+        "unattributed_ms": mean.unattributed_ms,
+        "unattributed_share": share(mean.unattributed_ms),
     })
 }

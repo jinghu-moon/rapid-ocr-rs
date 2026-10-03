@@ -12,11 +12,15 @@
 //! - [`session`]：`OrtSession`，模型加载、契约探测与实际推理调用；
 //! - [`contracts`]：模型输入/输出张量契约的类型与探测结果；
 //! - [`provider`]：执行提供者解析与错误语义；
+//! - [`ort_runtime`]：已加载 ONNX Runtime 运行库的指纹（版本/路径/体积/SHA-256/provider DLL）；
+//! - [`timing`]：把 [`crate::api::OcrTimings`] 拆成显式命名项 + 显式未归属余量的守恒账本；
 //! - [`profile`]：provider + 线程 + arena + 公式批大小的统一画像；
 //! - [`memory`]：进程峰值工作集采集（Windows-only）。
 
 pub mod contracts;
 pub mod memory;
+pub mod ort_runtime;
 pub mod profile;
 pub mod provider;
 pub mod session;
+pub mod timing;

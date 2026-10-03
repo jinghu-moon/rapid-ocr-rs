@@ -1346,7 +1346,7 @@ mod tests {
             "class names must come from the `names` metadata"
         );
         assert!(matches!(
-            detector.provider_resolution().resolved,
+            detector.provider_resolution().selected_ep,
             crate::runtime::provider::ResolvedExecutionProvider::Cpu
         ));
 

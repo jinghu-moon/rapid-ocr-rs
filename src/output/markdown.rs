@@ -307,7 +307,7 @@ mod tests {
     fn output_with_regions(regions: Vec<OcrRegion>) -> OcrOutput {
         let resolution = ProviderResolutionInfo {
             requested: ProviderPreference::Cpu,
-            resolved: ResolvedProvider::Cpu,
+            selected_ep: ResolvedProvider::Cpu,
             fallback_to_cpu: false,
         };
         OcrOutput {

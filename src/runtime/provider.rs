@@ -21,11 +21,15 @@
 //! 3. **严格模式拒绝回退**：`require_requested_provider` 在 `fallback_used` 时返回
 //!    `UnsupportedProvider`，与进程级 `fail_if_provider_unavailable` 无关。
 //!
-//! # 关于“已解析”的准确含义
+//! # 关于 `selected_ep` 的准确含义
 //!
-//! [`ProviderResolution::resolved`] 表示**交给 ONNX Runtime 的 EP 链**以及
+//! [`ProviderResolution::selected_ep`] 表示**交给 ONNX Runtime 的 EP 链**以及
 //! `is_available()` 的自报结果，它**不等于**“模型真的在该 EP 上执行”：
 //! ORT 会把单个节点回退到下一个 EP（通常是 CPU），这个逐节点分配不通过本 API 暴露。
+//!
+//! 之所以叫 `selected_ep` 而不是 `resolved`：`resolved` 读起来像“已证明在该 EP 上运行”，
+//! 而本 API 能证明的只有“这条 EP 链被选中并交给了 ORT”。**任何加速结论都必须来自
+//! 实测**（见下方阶段 0/2 的证据），不得由本字段推出。
 //!
 //! 阶段 0/2 在本机复现了这种现象，并定位到根因：
 //!
@@ -46,9 +50,10 @@
 //! cuDNN 时它无法真正执行模型，节点全部落在 CPU 上，而本 API 无法察觉。
 //!
 //! 因此本 crate 的规则是：**任何加速结论都必须来自实测（P50/P90 对比），
-//! 不得仅凭 `resolved` 宣称加速**；benchmark 与评测报告都会同时记录 provider 解析结果、
-//! 实测耗时与 `ort_runtime_version()`。在装上与 ORT 版本匹配的 cuDNN 之前，
-//! 本机的 CUDA 一律记为“未验证”，不作为可用 provider 声明。
+//! 不得仅凭 `selected_ep` 宣称加速**；benchmark 与评测报告都会同时记录 provider 解析结果、
+//! 实测耗时与 ORT 运行时指纹（[`crate::runtime::ort_runtime::ort_runtime_fingerprint`]）。
+//! 在装上与 ORT 版本匹配的 cuDNN 之前，本机的 CUDA 一律记为“未验证”，不作为可用
+//! provider 声明。
 
 #[cfg(feature = "cuda-provider")]
 use ort::ep::CUDA;
@@ -73,10 +78,12 @@ pub enum ResolvedExecutionProvider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderResolution {
     pub requested: ProviderPreference,
-    /// 交给 ONNX Runtime 的加速 EP；发生回退时为 `Cpu`。
+    /// **交给 ONNX Runtime 的 EP 链的头部**；发生回退时为 `Cpu`。
     ///
-    /// 注意：这**不代表**模型真的在该 EP 上逐节点执行，见模块文档。
-    pub resolved: ResolvedExecutionProvider,
+    /// “selected”只描述“我们把哪条链交给了 ORT”，**不描述**模型逐节点实际在哪个 EP 上
+    /// 执行：ORT 可以在链内把单个节点放回 CPU，而这个分配不通过本 API 暴露。
+    /// 因此本字段不能作为加速证据，加速结论必须来自实测耗时。
+    pub selected_ep: ResolvedExecutionProvider,
     /// 是否因为 `is_available()` 报告不可用而替换成 CPU。
     pub fallback_used: bool,
 }
@@ -153,7 +160,7 @@ pub fn resolve_execution_providers(
             providers: vec![cpu_provider()],
             resolution: ProviderResolution {
                 requested: ProviderPreference::Cpu,
-                resolved: ResolvedExecutionProvider::Cpu,
+                selected_ep: ResolvedExecutionProvider::Cpu,
                 fallback_used: false,
             },
         }),
@@ -272,7 +279,7 @@ fn decide_provider_resolution(
     if preferred_is_available {
         return Ok(ProviderResolution {
             requested,
-            resolved: preferred,
+            selected_ep: preferred,
             fallback_used: false,
         });
     }
@@ -283,7 +290,7 @@ fn decide_provider_resolution(
 
     Ok(ProviderResolution {
         requested,
-        resolved: ResolvedExecutionProvider::Cpu,
+        selected_ep: ResolvedExecutionProvider::Cpu,
         fallback_used: true,
     })
 }
@@ -382,7 +389,7 @@ mod tests {
     fn require_requested_provider_rejects_silent_cpu_fallback() {
         let resolution = ProviderResolution {
             requested: ProviderPreference::Cuda { device_id: 0 },
-            resolved: ResolvedExecutionProvider::Cpu,
+            selected_ep: ResolvedExecutionProvider::Cpu,
             fallback_used: true,
         };
         let error = require_requested_provider(resolution)
@@ -398,22 +405,22 @@ mod tests {
     }
 
     #[test]
-    fn require_requested_provider_accepts_resolved_accelerator_and_cpu() {
+    fn require_requested_provider_accepts_selected_accelerator_and_cpu() {
         let accelerated = ProviderResolution {
             requested: ProviderPreference::DirectMl { device_id: 1 },
-            resolved: ResolvedExecutionProvider::DirectMl,
+            selected_ep: ResolvedExecutionProvider::DirectMl,
             fallback_used: false,
         };
         assert_eq!(
             require_requested_provider(accelerated)
-                .expect("resolved provider must pass")
-                .resolved,
+                .expect("a selected accelerator must pass")
+                .selected_ep,
             ResolvedExecutionProvider::DirectMl
         );
 
         let cpu = ProviderResolution {
             requested: ProviderPreference::Cpu,
-            resolved: ResolvedExecutionProvider::Cpu,
+            selected_ep: ResolvedExecutionProvider::Cpu,
             fallback_used: false,
         };
         assert!(

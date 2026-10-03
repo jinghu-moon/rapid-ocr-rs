@@ -138,7 +138,8 @@ struct ThreadReport {
 struct Report {
     tool: &'static str,
     provider_requested: String,
-    provider_resolved: String,
+    /// 交给 ORT 的 EP 链头部（`selected_ep`）；**不是**逐节点执行证据。
+    provider_selected_ep: String,
     provider_fallback_used: bool,
     rounds: usize,
     warmup: usize,
@@ -399,7 +400,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let report = Report {
         tool: "formula_bench",
         provider_requested: format!("{:?}", cli.provider),
-        provider_resolved: format!("{:?}", resolution.resolved),
+        provider_selected_ep: format!("{:?}", resolution.selected_ep),
         provider_fallback_used: resolution.fallback_used,
         rounds: cli.rounds,
         warmup: cli.warmup,

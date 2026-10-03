@@ -26,14 +26,29 @@
 
 | 项目 | 值 |
 | --- | --- |
-| target | `x86_64-pc-windows-msvc`（本阶段冻结） |
+| target | `x86_64-pc-windows-msvc`（本阶段冻结；谓词必须含 `target_env = "msvc"`） |
 | 明确非目标 | `aarch64-pc-windows-msvc`、`x86_64-pc-windows-gnu`、Wine、WSL、Linux、macOS |
 | OS | Microsoft Windows 11 IoT 企业版 LTSC 10.0.26100（Build 26100，x64） |
 | CPU | 13th Gen Intel Core i5-13600KF，14 物理核 / 20 逻辑核，3.5 GHz |
 | GPU | NVIDIA GeForce RTX 4070 Ti SUPER，驱动 32.0.15.9186（591.86） |
 | 工具链 | rustc 1.98.1 (48a229cea 2026-09-01)，cargo 1.98.1 |
 | ort crate | `=2.0.0-rc.13` |
-| 实际加载的 ORT 运行库 | `C:\Windows\system32\onnxruntime.dll`，10,572,960 字节，版本 `1.17.260311-1434.1.os-germanium`（Microsoft Windows 内置） |
+| ORT 链接方式 | `rustc-link-lib=static=onnxruntime`：**ONNX Runtime 被静态链接进可执行文件**，进程里没有 `onnxruntime.dll` 模块 |
+| 被链接的 ORT 静态库 | `…/ort.pyke.io/dfbin/x86_64-pc-windows-msvc/f7c654b3…/onnxruntime.lib`，341,152,186 字节，SHA-256 `c3f5bb80…6cdd0` |
+| ORT API 版本（运行库自报） | `1.28.0`（`OrtGetApiBase()->GetVersionString()`） |
+
+> **勘误（终审修复，详见文末「终审修复」）**：本节原文写的是“实际加载的 ORT 运行库
+> `C:\Windows\system32\onnxruntime.dll`，10,572,960 字节，版本 `1.17.260311-1434.1.os-germanium`
+> （Microsoft Windows 内置）”，这是**两处误读的叠加**：
+>
+> 1. 那份 DLL **从未被加载**（`GetModuleHandleW("onnxruntime.dll")` 返回 0，
+>    `GetLastError = 126`），它只是 Windows 自带的同名文件；
+> 2. 它的 `VersionInfo.FileVersion` 是 **文件版本** 1.17.x，而运行库自报的
+>    **ORT API 版本**是 `1.28.0` —— 两者本来就不是一个东西。
+>
+> 真正决定行为的是被静态链接进 exe 的那份 `onnxruntime.lib`（见上表）。
+> `1.17` 这个数字因此不能作为阶段 0 的运行时标识；阶段 0/8 两次基线实际上跑在
+> **同一份 ORT 1.28.0** 上。
 
 ### 12 图普通 OCR 基线（release，`test-config-small.yaml`，warmup 1 / rounds 3）
 
@@ -67,12 +82,15 @@
 
 **P1 发现（阶段 2 必须处理）**：CUDA 的 p50 与 CPU 逐位相同（1013.5 ms），
 而同一 workload 上 DirectML 快 2 倍，说明 CUDA EP 并没有真正执行模型。
-根因是本机加载的是 Windows 内置 ORT 1.17（仅 CPU/DirectML 方向），
-`System32` 下不存在 `onnxruntime_providers_cuda.dll`；
-`cuda-provider` 构建配合 `download-binaries`/`copy-dylibs` 在本机没有下载到任何运行库，
-只在 `target/release` 留下 5 个**零字节**占位 DLL（已删除）。
 
-因此当前 API 会给出 `resolved = Cuda, fallback_used = false` 的“成功”结论，
+> **根因勘误（终审修复）**：本节原文把根因写成“本机加载的是 Windows 内置 ORT 1.17
+> （仅 CPU/DirectML 方向），`System32` 下不存在 `onnxruntime_providers_cuda.dll`”。
+> 这两句都不成立：`System32\onnxruntime.dll` 从未被加载（也不是本 crate 的运行库），
+> 而 `onnxruntime_providers_cuda.dll` 恰恰**存在**（就在 exe 旁边，62 MB，来自 ort 缓存）。
+> 真正的根因是 **cuDNN 缺失**：CUDA EP 的 provider 库能加载、`is_available()` 返回 true，
+> 但没有 cuDNN 时它无法执行模型，节点全部落在 CPU上 —— 而 API 层看不到这一点。
+
+因此当前 API 会给出 `selected_ep = Cuda, fallback_used = false` 的“成功”结论，
 违反任务文档「不得把 CPU fallback 当加速成功」。阶段 2 必须让 provider 报告诚实：
 要么能观测到 ORT 的逐节点回退，要么明确区分“EP 已注册/自报可用”与“实测加速”。
 
@@ -238,9 +256,9 @@ cargo clippy --all-targets -- -D warnings
 | **cuDNN** | **缺失**（`cudnn*.dll` 不存在） |
 
 结论：CUDA EP 的 provider 库能被加载、`is_available()` 返回 true，但缺少 cuDNN 时
-它无法真正执行模型，节点全部落在 CPU —— 而 `resolved = Cuda, fallback_used = false`
+它无法真正执行模型，节点全部落在 CPU —— 而 `selected_ep = Cuda, fallback_used = false`
 会让调用方以为加速已生效。
-因此 crate 明确写入规则：**加速结论必须来自实测 P50/P90，不得仅凭 `resolved` 宣称加速**；
+因此 crate 明确写入规则：**加速结论必须来自实测 P50/P90，不得仅凭 `selected_ep` 宣称加速**；
 在装上与 ORT 版本匹配的 cuDNN 之前，本机 CUDA 记为**未验证**，不作为可用 provider 声明。
 报告字段同时记录 provider 解析结果、实测耗时与 ORT 版本，便于审查时一眼看出矛盾。
 
@@ -259,7 +277,7 @@ cargo clippy --all-targets -- -D warnings
 
 - CUDA 在本机仍**无法验证**：缺 cuDNN。装上与 ORT 1.28 匹配的 cuDNN 后必须重跑
   本阶段的 provider 矩阵，才能改变“未验证”的结论。
-- DirectML 只在一台机器上验证；`resolved = DirectMl` + 实测 2× 收益目前一致，
+- DirectML 只在一台机器上验证；`selected_ep = DirectMl` + 实测 2× 收益目前一致，
   但仍需在目标机器上复测（README 保留“不得假设 GPU 更快”的说明）。
 - `is_available()` 与实际执行之间的落差是 ORT 的行为，本 crate 无法在 API 层消除，
   只能通过文档规则 + 报告字段暴露；阶段 6 会加入“声称加速但实测与 CPU 无差异”的检查工具。
@@ -460,6 +478,16 @@ tokenizer、postprocess、batch/EOS 或指标实现；普通 OCR 的预处理数
 `meta.thread_plan` 示例（auto 配置）：
 `{"source":"auto","budget":14,"ort_intra":14,"ort_inter":1,"rayon":3,"sessions":2}`
 
+> **勘误（终审修复，P1-2）**：`ThreadPlan` 的三个线程字段是**无条件**算出来的，
+> 完全没有看 `auto_tune_threads`——本阶段文档里“`ort_intra = budget`”这条规则因此
+> 在 `auto_tune_threads = false` 时是**错的**：它把“不要自动配置”变成了“按预算配置”，
+> 而 `runtime/session.rs::derive_runtime_threads` 又按字段名把 `false` 理解成“不配置”。
+> 同一份 `RuntimeConfig` 于是在引擎路径与公式路径上行为不同。
+> 终审把三个字段改成 `Option<usize>`（`None` = 不配置），删除了 `derive_runtime_threads`，
+> 并新增了 profile 级与引擎级回归测试。现在的示例（auto 配置）不变，但
+> `auto_tune_threads = false` 时报告里会写
+> `{"source":"auto","budget":14,"ort_intra":null,"ort_inter":null,"rayon":null,"sessions":2}`。
+
 **未覆盖风险**：
 
 - **没有加速**：本阶段的收益是结构简化与可解释策略。矩阵显示 intra/rayon 选择在本机是噪声，
@@ -488,7 +516,7 @@ tokenizer、postprocess、batch/EOS 或指标实现；普通 OCR 的预处理数
 **变更摘要**：
 
 - **crate metadata**（`Cargo.toml`）：`repository` 改为实际仓库
-  `https://github.com/jinghu-moon/rapid-ocr-rs`；补 `rust-version = "1.85"`、
+  `https://github.com/jinghu-moon/rapid-ocr-rs`；补 `rust-version = "1.88"`（当时写的 1.85 是错的，见终审修复）、
   `categories`（computer-vision / multimedia::images / api-bindings）、
   keywords 与 description 改为反映 Windows-only + PP-OCRv6/PP-FormulaNet；
   新增 `exclude = ["tests/baseline/**"]`。
@@ -523,15 +551,21 @@ tokenizer、postprocess、batch/EOS 或指标实现；普通 OCR 的预处理数
 | 正则误报 | `cann` 命中 `cannot`；`macos` 命中注释里的历史措辞 | 无需处理 |
 
 **`RuntimeConfig` 字段复核**：逐字段确认仍有调用方 ——
-`auto_tune_threads` 仍被 `runtime/session.rs::derive_runtime_threads` 使用
-（公式 benchmark/eval 工具直接构造 `RuntimeConfig`，不经过 profile），
+`auto_tune_threads` 由 `runtime/profile.rs::RuntimeProfile::plan` 消费（`false` 时三个线程
+字段保持 `None`＝不配置），**不再**存在第二份推导逻辑；
 `rayon_threads` / `enable_cpu_mem_arena` / `fail_provider_unavailable` / `formula_batch`
 都由 `RuntimeProfile` 消费。**没有发现无调用方字段**，因此未删除任何字段
 （删除没有依据的“清理”同样是错误方向）。
 
+> **勘误（终审修复）**：本节原文写“`auto_tune_threads` 仍被
+> `runtime/session.rs::derive_runtime_threads` 使用（公式 benchmark/eval 工具直接构造
+> `RuntimeConfig`，不经过 profile）”。那个函数正是 P1-2 的根因——它与 profile 对同一个
+> 公开字段给出**相反**的解释，已在终审修复中删除：现在只有 `RuntimeProfile::plan`
+> 推导线程数，`OrtSession` 只做透传。
+
 **未覆盖风险**：
 
-- `rust-version = "1.85"` 是保守声明（edition 2024 的最低要求），未在本机验证更低版本；
+- `rust-version = "1.88"` 是**实测下限**，不是保守估计：代码使用了 `as_chunks`/`as_chunks_mut`（1.88 稳定），声明得更低会让 `cargo clippy` 的 `incompatible_msrv` 直接失败；
   本机工具链是 1.98。
 - `exclude = ["tests/baseline/**"]` 意味着**从 crates.io 安装的源码包不含基线 JSON**；
   基线仍随仓库提供。如果将来希望发布时也带证据，应改为把基线放进 `docs/` 或单独仓库。
@@ -589,13 +623,22 @@ crop 1.66 ms（0.17%），输入 resize 6.85 ms（0.70%）。
 **阶段门槛按“瓶颈是 ORT 而不是 Rust 热路径”达成**：即使把 image_ops/resize/preprocess 全部降为零成本，
 也无法把页面 p50 改变超过约 1.5%，小于本机噪声。
 
+> **口径勘误（终审修复，P2-1）**：上面这段用的是
+> `page_total.preprocess_ms + page_total.postprocess_ms` 作为“Rust 成本”，它**漏项且口径不对**：
+> 三个模型各自的 preprocess/postprocess、输入 decode/resize/crop 都没有进账，
+> 而外层 `preprocess_ms` 与阶段计时根本不在同一层。终审把它换成守恒账本
+> （`src/runtime/timing.rs`，报告字段 `timing_ledger`），重算后的结果见文末「终审修复」：
+> **ORT 推理 85.63%、被命名的 Rust 侧 13.69%（其中输入窗口 8.60%、识别后处理 4.19%）、
+> 未归属 0.69%**。也就是说原文的 “0.58%” 低估了约 23 倍，而 “86.03%” 本身量级正确
+> （换口径后为 85.63%）。阶段结论（瓶颈在 ORT、Rust 热路径没有可测量空间）不变。
+
 `-C target-cpu=x86-64-v3`（同 commit、独立 scratch target 目录、5 组交错 A/B）：
 默认 p50 中位 999.05 ms vs v3 970.68 ms → 中位差 **−2.84%**（4/5 组支持 v3，其中一组 +19.35%）。
 **结论：不写入本库的 Cargo.toml**（已遵守）；可作为消费方应用 release profile 的可选设置，
-但落在噪声范围内，不得当作保证收益 —— 且 86% 页面时间在预编译的 `onnxruntime.dll` 内，
-该 flag 够不到主要成本。
+但落在噪声范围内，不得当作保证收益 —— 且约 86% 页面时间在**静态链接进来的预编译
+ONNX Runtime**（`onnxruntime.lib`）内，该 flag 够不到主要成本。
 
-公式 batch 1/2/4/8/16（CPU，`resolved=Cpu`，无回退）：
+公式 batch 1/2/4/8/16（CPU，`selected_ep=Cpu`，无回退）：
 单图延迟 p50 = 207.8 / 186.0 / 312.6 / 244.1 / 216.5 ms，**不单调且基本持平**；
 专用单图路径 p50 = 196.08 ms；`session.run` 随 batch 近似线性（195.8 → 3287.9 ms），
 即**该模型在 CPU 上批处理买不到吞吐**。全部 batch 输出一致且 `deterministic_tokens=True`，
@@ -615,6 +658,9 @@ bench-cuda.json      Cuda           no       1,013.47 -0.0%    1.00x   FAIL
 FAIL: bench-cuda.json - claims Cuda but p50 is within +/-10% of the CPU reference
 NOTE: 这是本机（ORT 1.28.0、缺 cuDNN）的**预期**结论，不是工具缺陷。
 ```
+
+> 上面是阶段 6 当时的三份报告（旧字段名 `resolved`，且没有 ORT 指纹）。
+> 终审重采后同样三份文件的输出见文末「终审修复」（CUDA 仍然 FAIL，DirectML 仍然约 2×）。
 
 **没有改动的东西（以及支撑该决定的数字）**：`image_ops.rs` 未改 ——
 crop 0.17%、resize 0.70%、detector/recognizer preprocess 0.23%/0.35%，每项都远低于 1%，
@@ -662,11 +708,16 @@ crop 0.17%、resize 0.70%、detector/recognizer preprocess 0.23%/0.35%，每项�
 **Windows 运行环境要求（记录，不做隐式假设）**：
 
 - **VC 运行库**：MSVC 目标需要 VC++ 2015-2022 x64 运行库（本机已具备）。
-- **ONNX Runtime DLL 搜索路径**：本 crate 链接 `onnxruntime` 导入库，运行期加载顺序为
-  可执行文件目录 → System32 → PATH。本机实际加载 `C:\Windows\system32\onnxruntime.dll`
-  （`ort_runtime_version()` 报 `1.28.0`）。应用若要绑定特定 ORT，应把 DLL 放在 exe 旁。
-- **provider 运行库**：`directml-provider` 需要 `DirectML.dll`；`cuda-provider` 需要
-  匹配版本的 `onnxruntime_providers_cuda.dll` **加 cuDNN**（本机缺 cuDNN）。
+- **ONNX Runtime 的链接方式（勘误）**：本节原文写“本 crate 链接 `onnxruntime` **导入库**，
+  运行期加载顺序为 exe 目录 → System32 → PATH，本机实际加载
+  `C:\Windows\system32\onnxruntime.dll`”。实际构建输出是
+  `cargo:rustc-link-lib=static=onnxruntime`：**ORT 被静态链接进可执行文件**，
+  运行期不会去找 `System32\onnxruntime.dll`（`GetModuleHandleW` 对该名字返回 0）。
+  应用若要绑定特定 ORT，需要替换 ort 缓存里的静态库并重新链接（或用 `load-dynamic`），
+  把 DLL 放在 exe 旁并不能改变已静态链接的版本。`ort_runtime_version()` 报的 `1.28.0`
+  来自被链接的那份库；`meta.ort_runtime` 记录它的路径/体积/SHA-256。
+- **provider 运行库**：`directml-provider` 需要 `DirectML.dll`（ort 缓存里随分发提供）；
+  `cuda-provider` 需要匹配版本的 `onnxruntime_providers_cuda.dll` **加 cuDNN**（本机缺 cuDNN）。
 - **模型目录**：模型与字典不随 crate 分发；默认 `allow_download: false`，
   配置文件中的 `model_path`/`rec_keys_path` 必须是本机可读路径。
 - **Defender/SmartScreen**：未签名二进制首次运行可能触发 SmartScreen 提示；
@@ -681,7 +732,7 @@ crop 0.17%、resize 0.70%、detector/recognizer preprocess 0.23%/0.35%，每项�
 | 普通 OCR 输入 | `Encoded` / `File` / `Pixels` / `Image` / `Url`（含超时、响应体上限、header 像素探测、EXIF 方向）——`input::image_loader` 测试 |
 | 公式 OCR | 独立识别、页面 route、显式区域、懒加载、批处理分块、`JSON`/`Markdown`/`HTML` 输出、公式关闭时普通文本路径不变 ——`formula_integration_tests`（真实模型，10 passed）与 `formula::*` 测试 |
 | 输出 | 阅读顺序、多栏、空区域、非有限/退化检测框、超大输入、模型契约错误 |
-| provider | CPU / DirectML / CUDA 的 resolved / fallback / strict 语义（阶段 2 的穷举测试） |
+| provider | CPU / DirectML / CUDA 的 `selected_ep` / `fallback_to_cpu` / strict 语义（阶段 2 的穷举测试） |
 
 ### 8.3 最终指标（基线 vs 现在）
 
@@ -709,7 +760,7 @@ tokenizer、postprocess、EOS 语义与指标实现未改动，故未重跑 val-
 
 ### 8.4 未实现或环境相关限制（写入 README Known limitations）
 
-- **CUDA 未验证**：本机缺 cuDNN，`resolved=Cuda` 但实测与 CPU 无差异；
+- **CUDA 未验证**：本机缺 cuDNN，`selected_ep=Cuda` 但实测与 CPU 无差异；
   `tools/check_provider_claims.ps1` 会把这类声明判为 FAIL。
 - **DirectML 只在一台机器上验证**（RTX 4070 Ti SUPER / 驱动 591.86）：约 2× OCR 加速。
 - **OpenCV 与 turbojpeg 已删除**：前者在本机无法构建，后者实测更慢；
@@ -720,6 +771,202 @@ tokenizer、postprocess、EOS 语义与指标实现未改动，故未重跑 val-
 
 **未覆盖风险**：见各阶段记录；整体上最大的两个是“CUDA 未验证”与“延迟噪声导致的
 优化空间无法被可靠测量”。
+
+---
+
+## 终审修复
+
+**日期**：2026-10-03
+**范围**：阶段 8 之后的最终评审提出 3 个 P1 与 4 个 P2；本节记录修复、证据与仍然存在的
+限制。**没有**放宽任何硬门槛：12 图 mean CER 仍是 `0.44765135645866394`，
+区域数均值仍是 `34.833333333333336`（逐位相同）。
+
+### 修复清单
+
+| 编号 | 问题 | 根因 | 修复 |
+| --- | --- | --- | --- |
+| P1-1 | 平台门槛把 Windows GNU 也放进来 | 谓词只有 `all(windows, target_arch = "x86_64")`，`x86_64-pc-windows-gnu` 同样满足 | `src/platform_gate.rs` 与 `src/lib.rs` 的**每一个** `#[cfg]` 加上 `target_env = "msvc"`；`tools/check_platform_gate.ps1` 增加 GNU 用例（std 缺失时打印 “target not installed -> this case is NOT verified” 并 exit 3）；`lib.rs` 增加编译期 `const` 断言 + 运行期 target 测试 |
+| P1-2 | `auto_tune_threads = false` 被 profile 静默忽略 | `ThreadPlan` 的三个字段是无条件算出的 `usize`；`runtime/session.rs::derive_runtime_threads` 却把同一字段解释成“不配置”，两份实现互相矛盾 | `ThreadPlan.ort_intra/ort_inter/rayon` 改为 `Option<usize>`（`None` = 不配置）；`plan()` 遵守 `auto_tune_threads`；删除 `derive_runtime_threads`，`OrtSession` 只做透传；新增 profile 级、Rayon 级与**引擎级**回归测试 |
+| P1-3 | 阶段 0 与阶段 8 的 ORT 版本不可比 | 阶段 0 报告既没有版本也没有路径/体积/哈希，而且把 Windows 自带 DLL 的**文件版本** 1.17.x 当成了运行时版本；实际 ORT 是**静态链接**的 `onnxruntime.lib`（API 1.28.0） | 新增 `src/runtime/ort_runtime.rs`（+ `build.rs` 捕获链接信息）；bench 报告字段 `meta.ort_runtime`；用带指纹的报告重采基线；本节统一在 ORT 1.28.0 下比较 |
+| P2-1 | `timing_split` 不是完整账本 | 只把 `page_total.preprocess/postprocess` 当 Rust 成本，漏掉三阶段前后处理与输入项 | 新增 `src/runtime/timing.rs`：守恒账本（每项只算一次 + 显式 `unattributed`），报告字段 `timing_ledger`；`timing_split` 改为从账本派生；86.03%/0.58% 两个数字按新口径重算 |
+| P2-2 | `resolved` 夸大了已证事实 | 该字段只说明“EP 链已交给 ORT 且 `is_available()` 为真”，逐节点分配不可观测 | `ProviderResolution::resolved` → `selected_ep`，`ProviderResolutionInfo::resolved` → `selected_ep`；类型文档写明“selected 只指交给 ORT 的 EP 链”；所有调用方/报告字段名/检查器同步 |
+| P2-3 | 检查器太宽松 | 只要求两个字段，缺失当默认值，不校验可比性，也不校验 `-Reference` 真的是全 CPU | `tools/check_provider_claims.ps1` 重写：必需字段（三阶段 `selected_ep`/`fallback_to_cpu`、p50/p90、image_count、rounds、max_side、ORT 指纹）逐项校验；不可比一律 exit 2；`-Reference` 非全 CPU exit 2；新增 `tools/test_provider_claims.ps1` 覆盖 14 个用例 |
+| P2-4 | 文档里的 `rust-version` 过期 | 文档写 1.85，`Cargo.toml` 是 1.88 | 阶段 7 的两处改为 `1.88` 并写明依据（`as_chunks` 需要 1.88，`clippy::incompatible_msrv` 是可执行证据） |
+
+### P1-3：ORT 运行库指纹与阶段 0/8 的可比性
+
+**指纹来源**（`src/runtime/ort_runtime.rs`）：
+
+| 字段 | 值 |
+| --- | --- |
+| `api_version` | `1.28.0` |
+| `runtime_source` | `static_link` |
+| `runtime_module.path` | `C:\Users\seeyuer\AppData\Local\ort.pyke.io\dfbin\x86_64-pc-windows-msvc\f7c654b3729cb9e5ad2a36a0c38e5b48e63bf4eed22968931aed33a0ad0b527d\onnxruntime.lib` |
+| `runtime_module.size_bytes` | `341152186` |
+| `runtime_module.sha256` | `c3f5bb800fd19c05d3bd13614654f0c37ea3db1fbfba4d10963fa678cdb6cdd0` |
+| `link.base_dir` | `…\ort.pyke.io\dfbin\x86_64-pc-windows-msvc`（编译期由 `build.rs` 记录） |
+| `provider_dlls` | `DirectML.dll`（18,527,776 B，`loaded=true`）；CUDA 构建下另有 `onnxruntime_providers_cuda.dll`（62,276,096 B） |
+
+`runtime_source = static_link` 是因为构建输出是
+`cargo:rustc-link-lib=static=onnxruntime`：**ORT 被静态链接进 exe**，
+`GetModuleHandleW("onnxruntime.dll")` 返回 0（`GetLastError = 126`）。
+指纹因此按“加载的 DLL → 编译期记录的静态库 → exe 自身”的顺序确定，
+每一步都可复核；任何一步读不到都会在 `link_reason` 里给出可定位原因，**不编造哈希**。
+
+`C:\Windows\system32\onnxruntime.dll`（10,572,960 B，
+SHA-256 `a9d3e0e13cadb011209013eee40ccbd6255d8a45090c7a12b635b7dde487934b`，
+`FileVersion 1.17.260311-1434.1.os-germanium`）**从未被本进程加载**，
+它只是 Windows 自带的同名文件。阶段 0 报告的 “ORT 1.17” 就是这个文件的**文件版本**，
+而不是运行库的 API 版本。
+
+**阶段 0 与阶段 8 的比较（修正后）**：两次基线实际上都跑在
+**同一份 ORT（API `1.28.0`，`onnxruntime.lib` SHA-256 `c3f5bb80…`）**上，
+所以“1.17 vs 1.28 导致基线不可比”这个判断本身是错的；真正的问题是**当时没有记录指纹**，
+无法证明它们可比。本次重采后，`bench-cpu.json` / `bench-direct_ml.json` /
+`bench-cuda.json` / `evaluation-cpu-ortfp.json` 都带同一指纹，
+`tools/check_provider_claims.ps1` 会把指纹不一致直接拒绝（exit 2）。
+
+**关于更早的已提交文件**：`tests/baseline/windows-baseline/bench-cpu-2000.json`、
+`bench-cpu-1280.json`、`evaluation-cpu.json` **保留原样**——它们**早于指纹化**，
+没有 `meta.ort_runtime`，因此属于历史证据而不是可比基线。
+`bench-cpu.json` / `bench-direct_ml.json` / `bench-cuda.json` 已就地升级为新字段
+（`selected_ep` + `meta.ort_runtime` + `timing_ledger`），另存
+`bench-cpu-ortfp.json`（与 `bench-cpu.json` 逐字节相同，同一次运行）。
+
+### P2-1：重算后的守恒账本（12 图，max_side_len 2000，CPU）
+
+来源：`tests/baseline/windows-baseline/bench-cpu.json` 的 `timing_ledger`。
+
+| 项目 | 均值 (ms) | 占 `total_ms` |
+| --- | ---: | ---: |
+| **total_ms（报告值）** | 985.79 | 100% |
+| ONNX Runtime 推理（det 570.57 + rec 273.53） | 844.10 | **85.63%** |
+| 输入侧（decode + resize + crop + 外层窗口其余部分） | 84.81 | 8.60% |
+| — 其中 resize | 3.82 | 0.39% |
+| — 其中 crop | 1.14 | 0.12% |
+| — 其中 decode | 0.001 | 0.0001% |
+| — 其中外层其余部分（`input_other_ms`） | 79.85 | 8.10% |
+| 模型侧 preprocess（det + rec） | 4.27 | 0.43% |
+| 模型侧 postprocess（det + rec；含 CTC 解码与 word boxes） | 45.82 | 4.65% |
+| 页面级 postprocess | 0.02 | 0.002% |
+| **被命名分量合计（`attributed_ms`）** | 979.03 | 99.31% |
+| **未归属（`unattributed_ms`）** | 6.75 | **0.69%** |
+| 其中 Rust 侧合计（输入 + 模型前后处理 + 页面后处理） | 134.93 | **13.69%** |
+
+**守恒检查**：`conservation = { attributed_ms: 979.03, total_ms: 985.79,
+residual_ms: −6.75, tolerance_ms: 0.00099, conserved: false }`。
+也就是说：账本**没有**把差额藏起来——它显式报出 6.75 ms／0.69% 的残差，
+并给出 `conserved = false`。36 个样本各自的残差落在 −9.74 … −5.28 ms（p50 −6.63 ms），
+所以它不是个别样本的抖动。根因是外层 `preprocess_ms` 与阶段计时跨越了
+`recognize_text` → `inner.run()` 的边界，两者并非严格互斥（`src/runtime/timing.rs`
+的模块文档与 `real_world_outer_window_does_not_conserve_the_reported_total` 测试
+记录了这一点；debug 构建下同一残差会放大到约 −55 ms/页）。
+
+**与原文对比**：
+
+| 口径 | 原文（阶段 6） | 终审重算 | 说明 |
+| --- | ---: | ---: | --- |
+| “ORT 推理占比” | 86.03% | **85.63%** | 量级一致（差异来自重采与分母口径） |
+| “被命名的 Rust 前后处理” | 0.58% | **13.69%**（Rust 侧合计） | 原文漏掉了输入窗口与三阶段前后处理；**低估约 23 倍** |
+| 未归属 | 未报告 | **0.69%** | 显式报出 |
+
+阶段门槛的结论**不变**：瓶颈仍在 ORT（≈85.6%），Rust 侧总量约 13.7%，
+因此“Rust 热路径没有可测量的优化空间”这一判断成立；
+但原文的具体百分比是不可用的，本节的数字才是守恒账本给出的值。
+
+### P2-2 / P2-3：`selected_ep` 与加固后的检查器
+
+**重命名**：`ProviderResolution::selected_ep`、`ProviderResolutionInfo::selected_ep`；
+`bench_warm_e2e` 的 `meta.provider_resolution.<stage>.selected_ep`；
+`formula_bench` 的 `provider_selected_ep`；`formula_eval` 的 `provider.selected_ep`。
+`ResolvedExecutionProvider` / `ResolvedProvider` 枚举名**未改**（它们描述的是“解析出的
+EP 值”，不是“已证明执行”），但文档已明确 `selected_ep` 只代表交给 ORT 的 EP 链头部。
+
+**重采后的检查器输出**（对三份新报告；退出码 1 = 存在 FAIL，是预期结果）：
+
+```text
+Provider claim check
+Rule: a non-CPU `selected_ep` with fallback_to_cpu=false must show p50 at least 10% better than the CPU reference; fallback_to_cpu=true is always a FAIL.
+Metric: stats.ocr_total_ms.p50 (same p50 field the committed baseline reports use).
+Comparability: same images_dir/image_count/rounds/max_side_len/model and the same ORT fingerprint (api + runtime sha256).
+
+Reference (CPU): bench-cpu.json  p50=990.11 ms  p90=1,136.14 ms
+ORT runtime:     api=1.28.0 sha256=c3f5bb800fd19c05d3bd13614654f0c37ea3db1fbfba4d10963fa678cdb6cdd0
+
+Report               Claimed        Fallback P50ms    P90ms    DeltaPct Speedup Verdict
+bench-cpu.json       (CPU baseline) n/a      990.11   1,136.14                  REFERENCE
+bench-direct_ml.json DirectMl       no       495.28   659.41   -50.0%   2.00x   PASS
+bench-cuda.json      Cuda           no       1,042.33 1,164.74 5.3%     0.95x   FAIL
+
+FAIL: bench-cuda.json - claims Cuda but p50 (1,042.33 ms) is within +/-10% of the CPU reference (990.11 ms): acceleration claim without measured evidence
+```
+
+**退出码矩阵**（由 `tools/test_provider_claims.ps1` 逐条执行验证，14/14 通过）：
+
+| 用例 | 退出码 | 定位信息 |
+| --- | ---: | --- |
+| 合法：仅 CPU 参考 | 0 | `PASS` |
+| 合法：CPU + DirectML（约 2×） | 0 | `PASS` |
+| 合法：CPU + CUDA（p50 相同） | 1 | `acceleration claim without measured evidence` |
+| 合法：显式 `-Reference <cpu>` | 0 | `PASS` |
+| JSON 非法 | 2 | `report is not valid JSON` |
+| 缺 `meta.thread_plan` | 2 | `missing required field 'meta.thread_plan'` |
+| 旧字段名（只有 `resolved`，无 `selected_ep`） | 2 | `selected_ep` |
+| `max_side_len` 不一致 | 2 | `used max_side_len … but the reference` |
+| `image_count` 不一致 | 2 | `measured … images but the reference` |
+| `rounds` 不一致 | 2 | `ran … rounds but the reference` |
+| `images_dir` 不一致 | 2 | `used images_dir … but the reference` |
+| 模型不一致 | 2 | `used model … but the reference` |
+| ORT 指纹不一致 | 2 | `ran on a different ONNX Runtime than the reference` |
+| `-Reference` 不是全 CPU | 2 | `is not all-CPU` |
+
+### 终审后的 12 图硬门槛（新基线）
+
+**命令**：
+
+```powershell
+target\release\bench_warm_e2e.exe --config <OCR-Model>\test-config-small.yaml `
+    --images-dir <OCR-test-image> --warmup-rounds 1 --rounds 3 --max-side-len 2000 `
+    --intra-threads 16 --output tests\baseline\windows-baseline\bench-cpu.json
+target\release\rapidocr.exe evaluate --manifest <OCR-test-image>\golden-manifest.json `
+    --config <OCR-Model>\test-config-small.yaml `
+    --output tests\baseline\windows-baseline\evaluation-cpu-ortfp.json
+```
+
+| 指标 | 硬门槛 | 终审实测 | 判定 |
+| --- | ---: | ---: | --- |
+| 12 图 mean CER | 0.44765135645866394 | **0.44765135645866394** | 逐位相同 |
+| 12 图区域数均值 | 34.833333333333336 | **34.833333333333336** | 逐位相同（三份报告都是 34.83） |
+| OCR p50（CPU，max_side 2000） | 观察值 | 990.11 ms | 噪声范围内 |
+| OCR p90（CPU） | 观察值 | 1,136.14 ms | 噪声范围内 |
+| DirectML p50 | 观察值 | 495.28 ms（2.00×） | 与本机历史一致 |
+| CUDA p50 | 观察值 | 1,042.33 ms（0.95×） | **仍记为未验证**（缺 cuDNN） |
+
+三份 provider 报告与评估报告的 `meta.ort_runtime` / `ort_runtime`
+指纹完全一致（`api_version = 1.28.0`，`sha256 = c3f5bb80…`），因此这次比较是**严格可比**的。
+
+### 终审仍然存在的限制
+
+- **`total_ms` 与分量之和不完全守恒**（本机 release 下残差 −6.75 ms／页，约占 0.69%）：
+  外层 `preprocess_ms` 与阶段计时跨越 `inner.run()`，本 crate 没有在不改动计时语义的
+  前提下消除它。账本显式报告该残差，因此引用占比前必须先看
+  `timing_ledger.conservation.conserved`。**未做**任何“让数字好看”的调整。
+- **ORT 指纹依赖编译期记录的缓存路径**：若 ort 缓存被清理或换机，
+  `runtime_module` 会退回 exe 自身并在 `link_reason` 里说明；此时
+  `runtime_source = "executable"`，报告的跨机器可比性下降（但仍能标识二进制）。
+- **`x86_64-pc-windows-gnu` 用例需要安装 GNU target**：本次为取得证据安装了
+  `rustup target add x86_64-pc-windows-gnu`；若目标机未安装，检查器会明确
+  打印 “target not installed -> this case is NOT verified” 并 exit 3，**不静默通过**。
+- **CUDA 仍然未验证**：本机缺 cuDNN，`selected_ep = Cuda` 但实测与 CPU 无差异；
+  这是 provider 的真实结论，不是工具缺陷。
+- **计时噪声**（同二进制 p50 波动可达 39%）意味着所有延迟数字只能按量级解读。
+- **公式工具现在把线程留给 ORT 自己决定**：`formula_bench` / `formula_eval` 直接构造
+  `RuntimeConfig`（`--threads` 未给时 `intra_threads = None`、`auto_tune_threads = true`），
+  而删除 `derive_runtime_threads` 之后 `OrtSession` 只做透传，因此这两个工具**不再**
+  显式设置 ORT 线程数（实测报告的 `provider.intra_threads = null`、`inter_threads = null`，
+  而修复前是 `budget` = 14）。引擎路径仍然按 plan 显式设置。
+  两者都落在 ORT 自动调优的默认线程数附近，但这是**行为变化**，公式链路的延迟数字
+  在严格对比前必须重测；本节的公式指标（CER/精确匹配）不受线程数影响。
 
 ---
 

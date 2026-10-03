@@ -175,7 +175,9 @@ struct ModelInfo {
 #[derive(Debug, Serialize, Deserialize)]
 struct ProviderInfo {
     requested: String,
-    resolved: String,
+    /// 交给 ORT 的 EP 链头部（`selected_ep`）；**不是**逐节点执行证据，
+    /// 加速结论必须来自实测指标。
+    selected_ep: String,
     fallback_used: bool,
     intra_threads: Option<usize>,
     inter_threads: Option<usize>,
@@ -535,7 +537,7 @@ fn merge_shard_reports(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
         if report.provider.requested != first.provider.requested
-            || report.provider.resolved != first.provider.resolved
+            || report.provider.selected_ep != first.provider.selected_ep
             || report.provider.fallback_used != first.provider.fallback_used
         {
             return Err(format!(
@@ -543,10 +545,10 @@ fn merge_shard_reports(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                  ({:?}/{:?}/fallback={})",
                 path.display(),
                 report.provider.requested,
-                report.provider.resolved,
+                report.provider.selected_ep,
                 report.provider.fallback_used,
                 first.provider.requested,
-                first.provider.resolved,
+                first.provider.selected_ep,
                 first.provider.fallback_used
             )
             .into());
@@ -655,7 +657,7 @@ fn merge_shard_reports(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
         provider: ProviderInfo {
             requested: first.provider.requested.clone(),
-            resolved: first.provider.resolved.clone(),
+            selected_ep: first.provider.selected_ep.clone(),
             fallback_used: first.provider.fallback_used,
             intra_threads: first.provider.intra_threads,
             inter_threads: first.provider.inter_threads,
@@ -1022,7 +1024,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
         provider: ProviderInfo {
             requested: format!("{:?}", resolution.requested),
-            resolved: format!("{:?}", resolution.resolved),
+            selected_ep: format!("{:?}", resolution.selected_ep),
             fallback_used: resolution.fallback_used,
             intra_threads: runtime.intra_threads,
             inter_threads: runtime.inter_threads,
@@ -1277,7 +1279,7 @@ mod tests {
             },
             provider: super::ProviderInfo {
                 requested: provider.to_string(),
-                resolved: provider.to_string(),
+                selected_ep: provider.to_string(),
                 fallback_used: false,
                 intra_threads: None,
                 inter_threads: None,
