@@ -1234,3 +1234,57 @@ mod tests {
         assert!(mean.shares().is_none());
     }
 }
+
+#[cfg(test)]
+mod baseline_schema_tests {
+    use std::{fs, path::PathBuf};
+
+    /// 已提交的 provider baseline 必须能区分「当前 schema」与「历史 schema」。
+    ///
+    /// 规则：任何带 `timing_split` 的报告，要么含守恒恒等式字段（当前 schema），
+    /// 要么带机器可读的历史标记（`historical = true` + `timing_split_schema`）。
+    /// 存在未标注的旧 `timing_split` 时测试失败，避免再次出现无法判断口径的报告。
+    #[test]
+    fn committed_provider_reports_are_schema_labelled() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/baseline/windows-baseline");
+        let mut checked = 0usize;
+        let mut unlabelled: Vec<String> = Vec::new();
+        for entry in fs::read_dir(&dir).expect("baseline directory must exist") {
+            let path = entry.expect("readable directory entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("baseline report must be readable UTF-8");
+            let value: serde_json::Value = match serde_json::from_str(&text) {
+                Ok(value) => value,
+                Err(error) => panic!("{} is not valid JSON: {error}", path.display()),
+            };
+            let Some(split) = value.get("timing_split") else {
+                continue;
+            };
+            checked += 1;
+            let current =
+                split.get("identity").is_some() && split.get("identity_residual_ms").is_some();
+            if current {
+                continue;
+            }
+            let historical = value.get("historical").and_then(|v| v.as_bool()) == Some(true)
+                && value
+                    .get("timing_split_schema")
+                    .and_then(|v| v.as_u64())
+                    .is_some();
+            if !historical {
+                unlabelled.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+        assert!(
+            checked > 0,
+            "no committed report carried a timing_split section, so this scan proves nothing"
+        );
+        assert!(
+            unlabelled.is_empty(),
+            "these committed reports carry an unlabelled pre-identity timing_split: {unlabelled:?}; \
+             regenerate them or mark them historical (historical: true + timing_split_schema)"
+        );
+    }
+}

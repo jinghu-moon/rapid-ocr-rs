@@ -316,5 +316,9 @@
     "unattributed_ms": 8.599452018517898,
     "unattributed_share": 0.01680027213236804
   },
-  "timing_split_schema_note": "历史证据：本文件生成于 timing_split 守恒恒等式变更之前，不含 identity / identity_residual_ms / input_overflow_ms / input_overflow_share / attributed_ms / attributed_share 等键；其中已记录的数值仍然有效，但该分解的守恒性不由本文件证明，当前 schema 见 docs/04-windows-phase-reports.md 的阶段 6 记录。"
+  "schema_version": 1,
+  "schema_epoch": "timing_split_pre_identity",
+  "timing_split_schema": 1,
+  "historical": true,
+  "historical_reason": "collected before timing_split identity fields"
 }
