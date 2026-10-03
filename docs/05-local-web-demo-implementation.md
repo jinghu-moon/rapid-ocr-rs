@@ -112,16 +112,18 @@ rapidocr serve [OPTIONS]
   --allow-provider-fallback  允许 provider 不可用时回退 CPU（默认不允许）
   --max-side <N>             覆盖 max_side_len
   --allow-download           允许下载模型（仍需 token，§7）
+  --allow-download-host <H>  追加一个允许下载的 host（可重复；默认仅编译期白名单，§6.1）
   --open                     启动后打开系统默认浏览器
 
   # 资源上限
   --max-body-mb <N>          请求体上限，默认 32
   --max-result-mb <N>        单个结果序列化上限，默认 8（§4.6）
+  --max-export-mb <N>        单个导出文档上限（含内嵌图片），默认 32（§9.5）
   --max-download-mb <N>      单文件下载上限，默认 1024（必须 > 566 MB 公式模型，§6.2）
   --max-queue-text <N>       普通 OCR 队列上限，默认 4
   --max-queue-formula <N>    公式 OCR 队列上限，默认 2
-  --max-consecutive-formula <N> 连续处理公式任务的次数上限，默认 1（保普通 OCR 不被饿死，§8.3）
-  --ocr-workers <N>          OCR worker 数，M1 固定 1（引擎 `&mut self`，§8.2）
+  --max-consecutive-text <N>    普通任务连续处理上限，默认 4（保公式不被饿死，§8.3）
+  --max-consecutive-formula <N> 公式任务连续处理上限，默认 1（保普通 OCR 不被饿死，§8.3）
   --max-retained <N>         终态任务保留数上限，默认 32
   --max-retained-mb <N>      终态任务占用字节上限，默认 64
   --max-tombstones <N>       已淘汰任务 ID 记录上限，默认 256（§4.5）
@@ -153,6 +155,7 @@ OCR（尤其公式路径）单图可达数秒至数十秒，**不得长期占用
 | `GET` | `/api/jobs/{id}/annotated.png` | 叠加检测框 PNG（原图淘汰 → 410 `original_evicted`） |
 | `GET` | `/api/jobs/{id}/export?format=json\|md\|html` | 导出（HTML 走静态模式 + 独立 CSP，§9.5） |
 | `POST` | `/api/jobs/{id}/cancel` | 取消（§4.3） |
+| `POST` | `/api/engine/reload` | 显式创建/重建引擎（`BlockedModelsMissing` 或 `Failed` 时使用，§7.6） |
 
 ### 4.3 状态机与取消语义
 
@@ -308,7 +311,7 @@ pub fn download_verified(req: &DownloadRequest<'_>) -> Result<PathBuf>;
 
 1. **仅 HTTPS**；否则 `SchemeRejected`；
 2. **禁止自动重定向**（`redirect(Policy::none())`），收到 3xx → `RedirectRejected`（未来若要支持必须逐跳校验 host/path）；
-3. **host 允许列表**（来自 `ModelSet` 声明）→ 否则 `HostRejected`；
+3. **host 允许列表必须来自可信配置，不得来自模型清单**：默认是**编译期固定**白名单（当前为 `www.modelscope.cn`）；本地 `manifest.json` 可以提供 URL，但**不能扩大**该白名单，越界即 `HostRejected`；确需其他来源时必须显式传 `--allow-download-host <HOST>` 并打印高风险警告（OWASP：allowlist 必须来自可信配置，而不是资源描述自身）；
 4. **`Content-Length` 预检**：超过 `max_bytes` 在写入前拒绝；
 5. **流式上限**：无长度时 `take(max_bytes + 1)`，超限失败并删除临时文件；
 6. **唯一临时文件名**（`.part-<pid>-<seq>`）；
@@ -363,7 +366,7 @@ pub fn download_verified(req: &DownloadRequest<'_>) -> Result<PathBuf>;
 
 上一版的 `--host` 与 Host/Origin 校验自相矛盾（绑定 `192.168.x.x` 后，正常浏览器请求会被自己的校验拒掉），因此整条路径删除，**而不是**加一个警告了事。
 
-- Host/Origin 允许集合 = `{127.0.0.1, localhost, [::1]}` 与**实际绑定端口**；
+- **只监听 IPv4**：绑定 `127.0.0.1`，**不监听 IPv6**；因此 Host/Origin 允许集合 = `{127.0.0.1, localhost}` 与**实际绑定端口**，**不含 `[::1]`**（没有监听就不放行）；
 - 启动时**断言**实际监听地址属于 loopback 集合，否则立即退出并报可定位错误（防御将来被误改）；
 - 启动日志打印实际监听地址与允许的 Host/Origin 集合，便于排查；
 - 该限制是**永久设计**，不是本轮临时收敛。
@@ -396,9 +399,40 @@ pub fn download_verified(req: &DownloadRequest<'_>) -> Result<PathBuf>;
 
 - `serve --provider directml|cuda` → **默认强制 `fail_if_provider_unavailable = true`**；
 - 需要回退时显式加 `--allow-provider-fallback`（此时才沿用 `false`）；
-- **在引擎启动阶段解析并创建会话**（不是首次 OCR 才失败）；失败则进程以非零码退出并给出可定位错误；
+- **配置错误在启动期失败**：provider 名称非法、或对应 feature 未编译进来（如 `--provider directml` 但没启用 `directml-provider`）→ 立即退出并给可定位错误，**不进入服务**；
+- **provider 可用性在引擎创建期判定**：EP 是否真的可用只能通过建立会话得知，因此在 `Loading → Ready|Failed` 转换处暴露（§7.6），**不会**在首次 OCR 时才悄悄失败；
 - `/api/status` **始终**同时给出 `requested` / `selected_ep` / `fallback_to_cpu`；
 - 前端展示 provider 时必须显示实测耗时，**不得**用"已选择 DirectML"暗示性能结论（已知：DirectML 对公式模型反而慢约 2.3×）。
+
+### 7.6 服务状态与引擎状态（解决启动期建引擎与模型缺失仍可访问的矛盾）
+
+服务可用性**不依赖模型**，只有引擎依赖模型与 provider：
+
+```rust
+pub enum ServiceState { Starting, Ready }          // 监听成功即为 Ready
+
+pub enum EngineState {
+    BlockedModelsMissing { missing: Vec<String> }, // 模型缺失，尚未创建
+    Loading,                                       // 正在创建会话
+    Ready { requested: String, selected_ep: String, fallback_to_cpu: bool },
+    Failed { reason: String },                     // 创建失败（含 provider 不可用）
+    Rebuilding,                                    // 运行期切换 provider（M3）
+}
+```
+
+启动顺序（**取代上一版启动期创建 engine 的表述**）：
+
+1. 绑定硬编码的 `127.0.0.1`（§7.1）→ 失败即退出；
+2. **校验运行配置**：provider 名称、对应 feature 是否编译进来、各资源上限取值合法 → 任一非法立即退出；
+3. 检查模型集状态（§5）：
+   - **不齐备** → 服务**正常启动**，`EngineState::BlockedModelsMissing`；`/api/models`、`/api/status` 可用；`POST /api/ocr` 返回 **409 `models_missing`**（字段与 `/api/models` 一致）；
+   - **齐备** → **预加载**：`Loading` → `Ready`（provider 不可用则 `Failed`，原因写入 `/api/status`）。
+
+运行期转换：
+
+- 模型下载完成（M2）后**不自动**重建引擎；在下一次 `POST /api/ocr` 或显式 `POST /api/engine/reload` 时创建（避免后台突然占用数百 MB）；
+- `POST /api/engine/reload`：`Ready → Loading → Ready|Failed`；`Loading` 期间新 OCR 请求排队（不拒绝）；`Failed` 时 OCR 返回 **503 `engine_unavailable`** 并附 `reason`；
+- 引擎 `Failed` 必须让 `/api/status` 明确显示原因，**不得**退化成模型不可用这种模糊状态。
 
 ---
 
@@ -418,16 +452,21 @@ pub fn download_verified(req: &DownloadRequest<'_>) -> Result<PathBuf>;
 
 ### 8.2 worker 数
 
-- M1 固定 `--ocr-workers 1`（引擎 `&mut self`，多 worker 需要引擎池，属后续工作）；
+- M1 **固定 1 个 OCR worker**（引擎 `&mut self`，多 worker 需要引擎池，属后续工作）；因此 **M1 不暴露 `--ocr-workers`**——不提供设了不生效的选项，等引擎池落地后再引入；
 - 队列满 → **立即 503**，不阻塞等待；
 - 推理**绝不在 accept 线程**执行。
 
 ### 8.3 公平调度（对应"分队列"的可验收定义）
 
-- 两个**独立容量**（`--max-queue-text` / `--max-queue-formula`），公式洪水无法占用普通队列的槽位；
-- worker 取任务顺序：**普通队列优先**；当普通队列为空而公式队列非空时取公式；
-- 连续处理公式任务的次数上限 `--max-consecutive-formula`（默认 1）——保证普通任务一旦到达即可在有限时间内被处理；
-- 验收测试：持续灌入公式任务时，普通 OCR 任务的等待时间有上界（不得饿死）。
+上一版只限制连续公式任务数，普通任务持续到达时**公式队列会被永久饿死**。改为**双向配额**：
+
+- 两个**独立容量**（`--max-queue-text` / `--max-queue-formula`）；公式洪水无法占用普通队列槽位；
+- 调度按轮进行：每轮先取最多 `--max-consecutive-text`（默认 **4**）个普通任务，再取最多 `--max-consecutive-formula`（默认 **1**）个公式任务；
+- **保底规则**：只要公式队列非空，每轮**至少**执行 1 个公式任务（即使普通队列一直非空）；同理只要普通队列非空，每轮**至少**执行 1 个普通任务；
+- 某一队列为空时，另一队列可自由连续处理（不浪费空闲额度）；
+- 验收测试**两个方向都要**：
+  1. 持续灌入公式任务 → 普通 OCR 等待时间有上界；
+  2. 持续灌入普通任务 → 公式任务等待时间有上界（**新增**，上一版会失败）。
 
 ### 8.4 结果存储
 
@@ -489,6 +528,11 @@ img-src 'self' blob: data:; connect-src 'self'; base-uri 'none'; form-action 'no
 ```
 
 4. **M3 自动化测试**：`export?format=html` 的响应含 `Content-Disposition: attachment`、含上述导出 CSP、且**正文不含 `<script`**；主页面的 CSP 含 nonce 且**不含 `unsafe-inline`**。
+5. **导出的 HTML 必须是真正可离线使用的单文件**：`render_report` 的 `image_href` 是**相对路径**（注释即写明依赖与 HTML 同目录故可离线，这只在 CLI 场景成立），而导出 CSP 又是 `img-src data:`——因此当前设计**并不成立**。
+   - **决策：Web 导出把图片以 `data:image/png;base64,…` 内嵌**（`image_href` 传 data URL），导出后脱离服务仍可查看；
+   - 新增 `--max-export-mb`（默认 **32**）：3200×2000 的标注 PNG 可能远超 `--max-result-mb`（默认 8），二者是**不同预算**；
+   - 超过上限 → **413 `export_too_large`**，错误信息指向可直接下载的 `annotated.png`（**不得**返回一个图片链接失效的 HTML）；
+   - **不选** HTML 加图片打 zip：本 crate **当前没有 zip 依赖**，为此新增依赖不划算；**也不选**只提供在线查看：那就失去导出的意义。
 
 ### 9.6 CSP 兼容约束
 
@@ -520,10 +564,11 @@ img-src 'self' blob: data:; connect-src 'self'; base-uri 'none'; form-action 'no
 - [ ] `ModelManifest` 通用化（`schema_version` + `files: Vec<ManifestFile>`）+ **单一来源选择规则**（§5.3）
 - [ ] 字典补 SHA-256；无哈希不得 `complete`（§1.2、§5.2）
 - [ ] 加固下载器 + `--max-download-mb` + `MoveFileExW` 原子替换 + 迁移 CLI 调用方（§6）
-- [ ] provider 回退语义 + 启动期解析 + `/api/status` 三字段（§7.5）
-- [ ] `ServeError` 与状态码映射（§11.1）
+- [ ] provider 回退语义 + **启动期配置校验** + 引擎创建期可用性判定 + `/api/status` 三字段（§7.5）
+- [ ] `ServiceState` / `EngineState` 状态机与全部转换（§7.6）
+- [ ] `ServeError` 与状态码映射（§11.1，含 `engine_unavailable` / `export_too_large`）
 - [ ] 准入顺序（§4.4）与 `--max-result-mb`（§4.6）
-- [ ] 双队列容量与公平调度参数（§8.3）
+- [ ] 双队列容量与**双向**公平调度参数（`--max-consecutive-text` / `--max-consecutive-formula`，§8.3）
 
 **M0 验收**：以上每项都有单元测试；`cargo test` 全绿；文档与实现一致。
 
@@ -563,7 +608,7 @@ pub enum ServeError {
 - [ ] 模型缺失提示（消费 `ModelSetStatus`；**不含下载动作**）
 - [ ] 测试：状态机、tombstone（容量+TTL）、双队列 503、公平调度、准入顺序、Host/Origin/token、安全头与 nonce CSP
 
-**M1 验收**：真实 12 图经 HTTP 的 `regions` 数量与文本与 `rapidocr run --json` **逐张一致**；空 `--model-dir` 下 `/api/models` 与 `/api/ocr` 的缺失字段一致；公式洪水下普通 OCR 不被饿死；CLI 参数列表中不存在任何可改变监听地址的选项。
+**M1 验收**：真实 12 图经 HTTP 的 `regions` 数量与文本与 `rapidocr run --json` **逐张一致**；空 `--model-dir` 下 `/api/models` 与 `/api/ocr` 的缺失字段一致；公式洪水下普通 OCR 不被饿死、普通洪水下公式也不被饿死；空模型目录下服务仍为 `Ready` 且 `EngineState::BlockedModelsMissing`（OCR 409，字段与 `/api/models` 一致）；CLI 中不存在任何可改变监听地址的选项，也不存在 `--ocr-workers`。
 
 ### M2：模型管理
 
@@ -592,7 +637,7 @@ pub enum ServeError {
 
 | 类别 | 内容 |
 | --- | --- |
-| 静态检查 | `cargo fmt --all -- --check`；`cargo clippy --all-targets --all-features -- -D warnings` |
+| 静态检查与 **feature 矩阵** | `cargo fmt --all -- --check`；`cargo test --all-targets`（默认 feature，**不覆盖 serve 代码**）；**`cargo test --features serve --all-targets`**；**`cargo clippy --features serve --all-targets -- -D warnings`**；`cargo clippy --all-targets -- -D warnings` |
 | 依赖隔离 | 默认构建不含 `tiny_http`（`cargo tree -e normal --no-default-features` + `cargo package --list` 对比） |
 | 协议 | 202→queued→running→succeeded；未完成 `/result` 409；**tombstone 命中 410 且 TTL/容量淘汰后回 404** |
 | 准入参数边界 | `--max-body-mb=0`；超大整数；字节换算**溢出**；`Content-Length` 与实际不符 |
@@ -601,6 +646,11 @@ pub enum ServeError {
 | 结果 | `--max-result-mb` 超限 → 413 `result_too_large`（序列化即中止，不先建大 String） |
 | 安全 | 缺 token→401；错 `Origin`→403；错 `Host`→421；安全头齐备；主页面 CSP 含 nonce 且无 `unsafe-inline` |
 | 仅本机 | 监听地址硬编码 `127.0.0.1`：对 CLI 参数做**枚举断言**（不存在任何地址类选项）；启动断言监听地址属 loopback；绑定非 loopback 的路径在代码中不存在 |
+| IPv6 | 服务不监听 IPv6（`[::1]` 不被接受为 Host/Origin，返回 421/403）；只监听 `127.0.0.1` |
+| 引擎状态 | 空模型目录 → 服务 `Ready` + `EngineState::BlockedModelsMissing`，OCR 409 且字段与 `/api/models` 一致；模型齐备 → 预加载 `Ready`；`POST /api/engine/reload` → `Loading`→`Ready`/`Failed`；`Failed` 时 OCR 503 `engine_unavailable` 且带 `reason` |
+| 公平性（双向） | 公式洪水下普通 OCR 等待有上界；**普通洪水下公式任务等待有上界** |
+| 导出可用性 | 导出 HTML **不含任何外部引用**（无相对 `src`、无 `/api` 链接），图片为 `data:`；超 `--max-export-mb` → 413 `export_too_large` |
+| 下载白名单来源 | manifest 声明白名单外的 host → `HostRejected`；加 `--allow-download-host` 后才放行并打印警告 |
 | 下载 | 重定向拒绝、非 https 拒绝、host 白名单拒绝、`Content-Length` 超限拒绝、无长度流式超限拒绝、哈希失败删临时文件、单飞只下一份、磁盘不足 507、**目标已损坏时原子替换成功** |
 | Provider | 请求 directml/cuda 但实际回退 → 默认启动即失败；加 `--allow-provider-fallback` 时 `/api/status` 三字段如实反映 |
 | 模型集 | 字典缺哈希 → `complete=false`；损坏 → `Corrupt`；manifest 缺 role → 报错列出缺失 role；旧 schema manifest → 可定位错误 |
@@ -665,7 +715,8 @@ curl.exe -s -D - "http://127.0.0.1:8760/api/jobs/<id>/export?format=html" -H "X-
 2. 默认模型集：只提供 `PP-OCRv6`，还是同时提供 `PP-OCRv4/v5` 切换？
 3. `--max-download-mb` 默认 1024 MB 是否合适（公式模型 566 MB + 普通模型约 40 MB + 余量）？
 4. 结果上限默认 8 MB / 保留 32 个 64 MB 是否合适？
-5. 公式队列默认 2、`--max-consecutive-formula` 默认 1 是否合适？
+5. 队列默认（text 4 / formula 2）与配额（text 连续 4 / formula 连续 1）是否合适？
+6. `--max-export-mb` 默认 32 MB 是否够（3200×2000 标注 PNG base64 后约为原文件的 1.33 倍）？
 
 ---
 
