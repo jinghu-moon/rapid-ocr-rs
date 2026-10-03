@@ -774,7 +774,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         subset.as_deref(),
         strategy,
         cli.limit,
-        &fixture.root,
         &selected,
     );
     if let Some(path) = &cli.expect_manifest {

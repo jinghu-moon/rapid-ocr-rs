@@ -385,7 +385,8 @@ The current small/medium comparison is inside these thresholds.
 ## Formula benchmark and evaluation
 
 `formula_eval` is the phase-9 evaluation tool for all three datasets. It writes a
-stable sampling manifest (content-hash sampling, not "first N"), per-sample
+stable sampling manifest (a stable hash of the dataset-relative path plus the
+ground truth — **not** "first N", and not the image bytes), per-sample
 records, failure classification, exact/normalized match, CER, EOS/truncated
 counts, throughput with P50/P95, peak working set, and provider/thread settings.
 

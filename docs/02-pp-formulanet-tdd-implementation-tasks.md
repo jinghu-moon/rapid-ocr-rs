@@ -753,10 +753,14 @@ im2latex_formulas.norm.lst
 
 - 新增 `src/bin/formula_eval.rs`（取代只支持一个数据集的 `formula_compare`），
   支持 `im2latex` / `latexocr` / `unimer` 三个数据集；
-- 抽样使用**内容哈希排序**而不是“取前 N 张”：同一数据集/切分/子集/数量在任何
-  机器上得到同一子集，且顺序与文件系统无关；`--sample first` 仅用于复现历史结果；
-- `--manifest-output` 写出每个样本的相对路径与真值 SHA-256 及整体 manifest 哈希；
-  `--expect-manifest` 在哈希不一致时直接失败，避免“换了一批样本却照常出报告”；
+- 抽样使用**数据集相对路径 + 真值的稳定哈希排序**而不是“取前 N 张”：同一数据集/
+  切分/子集/数量在任何机器、任何绝对根目录下得到同一子集，且顺序与文件系统无关；
+  图像**内容不参与选择**（内容摘要单独记录，见 §29.11.6 与 §29.12.3）；
+  `--sample first` 仅用于复现历史结果；
+- `--manifest-output` 写出每个样本的相对路径、真值 SHA-256、图像内容 SHA-256 及
+  三级摘要（`manifest_sha256` 含顺序、`sample_set_sha256` 与 `content_sha256`
+  顺序无关）；`--expect-manifest` 在样本选择或图像内容不一致时直接失败，
+  避免“换了一批样本或换了像素却照常出报告”；
 - `--python-reference` 内建 Rust/Python 对比：完整 token 行、EOS 前 token 序列、
   EOS index、truncated、LaTeX 一致数，以及双方都错的样本数（模型识别错误）与
   逐条列出的链路差异；
@@ -1693,7 +1697,8 @@ cargo test --all-targets        # 不设置任何模型/测试集环境变量
 
 ### 29.4 P1 阶段 9 主评测未完成
 
-**处理**：`formula_compare` 被 `formula_eval` 取代，支持三个数据集、内容哈希抽样与
+**处理**：`formula_compare` 被 `formula_eval` 取代，支持三个数据集、
+“相对路径 + 真值”哈希抽样（图像内容只进 `content_sha256`，见 §29.12.3）与
 稳定 manifest、失败分类、吞吐/P50/P95/峰值内存，以及内建的 Rust/Python 对比；
 Python 参考改为 manifest 驱动（`tools/formula_reference.py --manifest`），
 不再重复实现抽样。
@@ -2062,7 +2067,49 @@ tokenizer 与后处理 / 模型与解码 / 发布验收），并明确
 新增“同路径、同条数、不同摘要必须判为不同来源”的断言；
 真实数据上 val-501 的报告记录了 `reference_sha256 = 2f49a993a4ce6bda…`。
 
-### 29.13 提交
+### 29.13 第五轮审核修复（P2 边界输入与术语）
+
+#### 29.13.1 P2 绝对路径仍可能泄漏到 `relative_path`
+
+**根因**：`dataset_relative_path` 在 `strip_prefix(root)` 失败时 `unwrap_or(path)`
+把**绝对路径**当成相对路径返回，而 `load_latex_ocr_example` 允许清单里写绝对路径。
+根目录之外的图像因此会把机器相关的绝对路径带进抽样键与 manifest，
+跨机器稳定性再次失效。
+
+**处理**（选择“要求数据集自包含”这一根因方案，而不是为外部路径发明不稳定命名）：
+`dataset_relative_path` 改为返回 `Result`——图像必须位于数据集根目录之下，
+否则返回可定位错误；Windows 上大小写/短名/`..` 导致前缀比较失败时会先
+`canonicalize` 再比较一次。同时：
+
+- `FormulaSample::relative_path` 改为**私有字段 + 访问器**，
+  并在 `FormulaSample::new` 中拒绝空值、绝对路径与 `/` 开头；
+- `build_manifest` 直接使用样本自带相对路径，删除“按 root 兜底剥离”的死分支，
+  同时**移除已无用途的 `root` 参数**（少一个可能写错的入口）。
+
+**为什么不为外部绝对路径定义命名规则**：稳定的相对名要么依赖绝对路径本身
+（换机器即失效），要么依赖图像内容哈希（会把抽样重新绑回图像字节，
+破坏“内容变化可被单独观测”的设计）。
+
+**验证**：新增
+`evaluation::formula::sampling::dataset_relative_path_rejects_images_outside_the_root`
+——根目录内的图像得到 `images/a.png`（根的写法带 `.` 也一致）；根目录之外的
+绝对路径必须报 `outside the dataset root`；裸相对路径同样拒绝；
+`FormulaSample::new` 拒绝绝对路径与空路径。
+另外对全部 7 个真实数据集重新生成 manifest：**全部通过自包含检查**，
+且 `manifest_sha256` / `content_sha256` 与改动前逐字一致
+（说明真实数据集本来就都在根目录之内，本次只收紧了越界行为）。
+
+#### 29.13.2 P2 文档残留“内容哈希抽样”
+
+`README.md`（原 388 行）与任务文档（原 756、1696 行）仍写作
+“content-hash sampling / 内容哈希抽样”，会被理解成图像字节参与样本选择。
+
+**处理**：统一改为“数据集相对路径 + 真值的稳定哈希”，并明确写出图像内容
+只进入 `content_sha256`、不参与选择。
+**验证**：全仓库检索 `content-hash` / `内容哈希`，除本节这种引用审核原文的
+说明外无残留。
+
+### 29.14 提交
 | 内容 | 提交 | 说明 |
 | --- | --- | --- |
 | 第二轮审核修复 | `9db5dda` | `fix(formula): close the review gaps in the PP-FormulaNet integration` |
@@ -2075,3 +2122,4 @@ tokenizer 与后处理 / 模型与解码 / 发布验收），并明确
 | 阶段 9/10 全部结果 | 见本节表格 | 提交在 `tests/baseline/formula-evaluation-2026-10-03.json` |
 | 第三轮审核修复 | 见 §29.11 | 删除无效参数、内存输入像素限制、benchmark 口径、分片身份校验与对比聚合、manifest 内容摘要、检测器有限性校验、测试资产定位去重 |
 | 第四轮审核修复 | 见 §29.12 | 分片校验 `content_sha256`、公式阶段计数改为 `formula_count()`、抽样键改为数据集相对路径、reference 比较内容摘要 |
+| 第五轮审核修复 | 见 §29.13 | 数据集自包含约束（拒绝根目录之外的图像）、统一“相对路径 + 真值哈希”术语 |

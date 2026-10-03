@@ -11,8 +11,6 @@
 //! - manifest 记录每个样本的相对路径与真值 SHA-256，并给出整体哈希，
 //!   重跑必须得到同一个哈希。
 
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -42,7 +40,7 @@ impl SampleStrategy {
 /// **不含绝对路径**，因此数据集被复制到别处不会改变样本选择。
 /// 也不含图像内容，理由见模块文档。
 fn sample_key(sample: &FormulaSample) -> String {
-    format!("{}\u{1f}{}", sample.relative_path, sample.ground_truth)
+    format!("{}\u{1f}{}", sample.relative_path(), sample.ground_truth)
 }
 
 fn digest_hex(bytes: &[u8]) -> String {
@@ -124,15 +122,10 @@ pub struct Manifest {
     pub entries: Vec<ManifestEntry>,
 }
 
-fn relative_path(root: &Path, path: &Path) -> String {
-    crate::evaluation::formula::fixture::dataset_relative_path(root, path)
-}
-
 /// 构建 manifest 并计算稳定哈希。
 ///
-/// `relative_path` 直接取样本在加载时计算好的数据集相对路径（与抽样键同源），
-/// 因此 manifest 与实际选择的样本不会因为传入的 `root` 写法不同而分叉。
-/// `root` 仅用于兜底：样本未记录相对路径时（理论上不会发生）按它剥离前缀。
+/// `relative_path` 直接取样本在加载时校验过的数据集相对路径（与抽样键同源）：
+/// manifest 与实际选择的样本不会分叉，也不需要再次剥离根目录。
 ///
 /// 会为每个样本计算图像文件 SHA-256（`content_sha256` 用），文件不可读时该条目
 /// 的图像摘要为 `None`，并且不写入 `content_sha256`（避免给出“已校验”的假象）。
@@ -142,17 +135,12 @@ pub fn build_manifest(
     subset: Option<&str>,
     strategy: SampleStrategy,
     limit: usize,
-    root: &Path,
     samples: &[&FormulaSample],
 ) -> Manifest {
     let entries: Vec<ManifestEntry> = samples
         .iter()
         .map(|sample| ManifestEntry {
-            relative_path: if sample.relative_path.is_empty() {
-                relative_path(root, &sample.image_path)
-            } else {
-                sample.relative_path.clone()
-            },
+            relative_path: sample.relative_path().to_string(),
             ground_truth_sha256: digest_hex(sample.ground_truth.as_bytes()),
             has_ground_truth: sample.has_ground_truth(),
             image_sha256: crate::model_store::sha256_file(&sample.image_path).ok(),
@@ -250,10 +238,12 @@ pub fn build_manifest(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::evaluation::formula::fixture::{FormulaDataset, FormulaSample, FormulaSplit};
+    use crate::evaluation::formula::fixture::{
+        FormulaDataset, FormulaSample, FormulaSplit, dataset_relative_path,
+    };
 
     fn samples(count: usize) -> Vec<FormulaSample> {
         (0..count)
@@ -269,6 +259,76 @@ mod tests {
                 .expect("sample")
             })
             .collect()
+    }
+
+    /// 数据集必须自包含：清单里指向根目录之外的图像必须**报错**，
+    /// 而不是把绝对路径当成“相对路径”泄漏进抽样键与 manifest。
+    #[test]
+    fn dataset_relative_path_rejects_images_outside_the_root() {
+        let root =
+            std::env::temp_dir().join(format!("rapid-ocr-rs-rootcheck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let inner = root.join("images");
+        std::fs::create_dir_all(&inner).expect("root");
+        let inside = inner.join("a.png");
+        std::fs::write(&inside, b"x").expect("write");
+
+        // 根目录之内：得到 `/` 分隔的相对路径，且与根的写法无关。
+        assert_eq!(
+            dataset_relative_path(&root, &inside).expect("inside root"),
+            "images/a.png"
+        );
+        assert_eq!(
+            dataset_relative_path(&root.join("."), &inside).expect("normalized root"),
+            "images/a.png"
+        );
+
+        // 根目录之外：必须失败，并且错误信息能定位到图像与数据集根。
+        let outside = std::env::temp_dir().join("rapid-ocr-rs-outside.png");
+        std::fs::write(&outside, b"x").expect("write outside");
+        let error = dataset_relative_path(&root, &outside)
+            .expect_err("images outside the dataset root must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("outside the dataset root"),
+            "error: {message}"
+        );
+
+        // 调用方必须传入已 join 到根目录的绝对路径；裸相对路径在这里没有明确含义，
+        // 因此同样被拒绝（而不是被猜测成“已经是相对路径”）。
+        assert!(
+            dataset_relative_path(&root, Path::new("images/a.png")).is_err(),
+            "a bare relative path has no defined meaning and must be rejected"
+        );
+
+        // `FormulaSample::new` 拒绝绝对路径与空路径（双保险）。
+        assert!(
+            FormulaSample::new(
+                "D:/elsewhere/a.png".to_string(),
+                inside.clone(),
+                "x".to_string(),
+                FormulaDataset::Im2Latex,
+                FormulaSplit::Test,
+                None,
+            )
+            .is_err(),
+            "absolute relative_path must be rejected"
+        );
+        assert!(
+            FormulaSample::new(
+                String::new(),
+                inside,
+                "x".to_string(),
+                FormulaDataset::Im2Latex,
+                FormulaSplit::Test,
+                None,
+            )
+            .is_err(),
+            "empty relative_path must be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&outside);
     }
 
     #[test]
@@ -312,8 +372,8 @@ mod tests {
 
         let first = select_samples(&original, SampleStrategy::Hash, 12);
         let second = select_samples(&moved, SampleStrategy::Hash, 12);
-        let first_keys: Vec<&str> = first.iter().map(|s| s.relative_path.as_str()).collect();
-        let second_keys: Vec<&str> = second.iter().map(|s| s.relative_path.as_str()).collect();
+        let first_keys: Vec<&str> = first.iter().map(|s| s.relative_path()).collect();
+        let second_keys: Vec<&str> = second.iter().map(|s| s.relative_path()).collect();
         assert_eq!(
             first_keys, second_keys,
             "sample selection must not depend on the absolute dataset root"
@@ -322,17 +382,15 @@ mod tests {
         // 全量抽样（limit = 0）下集合相同、顺序也必须相同。
         let all_first: Vec<&str> = select_samples(&original, SampleStrategy::Hash, 0)
             .iter()
-            .map(|s| s.relative_path.as_str())
+            .map(|s| s.relative_path())
             .collect();
         let all_second: Vec<&str> = select_samples(&moved, SampleStrategy::Hash, 0)
             .iter()
-            .map(|s| s.relative_path.as_str())
+            .map(|s| s.relative_path())
             .collect();
         assert_eq!(all_first, all_second);
 
         // manifest 也必须一致（相对路径同源，内容相同）。
-        let root_a = Path::new("D:/datasets/Formula-TestSet");
-        let root_b = Path::new("C:/other/place/Formula-TestSet");
         let selected_a: Vec<&FormulaSample> = select_samples(&original, SampleStrategy::Hash, 0);
         let selected_b: Vec<&FormulaSample> = select_samples(&moved, SampleStrategy::Hash, 0);
         let manifest_a = build_manifest(
@@ -341,7 +399,6 @@ mod tests {
             None,
             SampleStrategy::Hash,
             0,
-            root_a,
             &selected_a,
         );
         let manifest_b = build_manifest(
@@ -350,7 +407,6 @@ mod tests {
             None,
             SampleStrategy::Hash,
             0,
-            root_b,
             &selected_b,
         );
         assert_eq!(
@@ -401,15 +457,7 @@ mod tests {
         )
         .expect("sample");
         let selected = [&sample];
-        let before = build_manifest(
-            "im2latex",
-            "test",
-            None,
-            SampleStrategy::Hash,
-            0,
-            &workspace,
-            &selected,
-        );
+        let before = build_manifest("im2latex", "test", None, SampleStrategy::Hash, 0, &selected);
         assert!(
             before.content_sha256.is_some(),
             "readable images must produce a content digest"
@@ -424,15 +472,7 @@ mod tests {
 
         // 路径与标签不变，只替换文件内容。
         std::fs::write(&image, b"second-bytes").expect("rewrite image");
-        let after = build_manifest(
-            "im2latex",
-            "test",
-            None,
-            SampleStrategy::Hash,
-            0,
-            &workspace,
-            &selected,
-        );
+        let after = build_manifest("im2latex", "test", None, SampleStrategy::Hash, 0, &selected);
 
         assert_eq!(
             before.manifest_sha256, after.manifest_sha256,
@@ -468,7 +508,6 @@ mod tests {
             None,
             SampleStrategy::First,
             0,
-            Path::new("root"),
             &[&sample],
         );
         assert!(manifest.entries[0].image_sha256.is_none());
@@ -482,25 +521,8 @@ mod tests {
     fn manifest_hash_is_stable_and_sensitive_to_content() {
         let all = samples(8);
         let selected = select_samples(&all, SampleStrategy::Hash, 0);
-        let root = PathBuf::from("root");
-        let first = build_manifest(
-            "im2latex",
-            "test",
-            None,
-            SampleStrategy::Hash,
-            0,
-            &root,
-            &selected,
-        );
-        let second = build_manifest(
-            "im2latex",
-            "test",
-            None,
-            SampleStrategy::Hash,
-            0,
-            &root,
-            &selected,
-        );
+        let first = build_manifest("im2latex", "test", None, SampleStrategy::Hash, 0, &selected);
+        let second = build_manifest("im2latex", "test", None, SampleStrategy::Hash, 0, &selected);
         assert_eq!(first.manifest_sha256, second.manifest_sha256);
         assert_eq!(first.entry_count, 8);
         let paths: std::collections::BTreeSet<&str> = first
@@ -527,7 +549,6 @@ mod tests {
             None,
             SampleStrategy::Hash,
             0,
-            &root,
             &mutated_refs,
         );
         assert_ne!(
@@ -553,7 +574,6 @@ mod tests {
             None,
             SampleStrategy::First,
             0,
-            Path::new("root"),
             &[&sample],
         );
         assert_eq!(manifest.entries[0].relative_path, "sub/image.png");
