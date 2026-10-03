@@ -204,9 +204,9 @@ cargo run --release --bin formula_eval -- --model <model> --dataset-root <Formul
 
 ### 7.3 输入路径
 
-- [ ] Windows 文件路径统一使用 `PathBuf` 和 canonical/metadata 检查；不手工拼接反斜杠。
-- [ ] 保留 URL 的 reqwest 超时和响应体限制；Windows-only 不意味着取消网络安全边界。
-- [ ] 评估将 `ImageInput::Image` 与 `ImageInput::Pixels` 归并为明确的 owned/borrowed 两个输入类型，避免同一图像多种 public 表达重复维护。
+- [x] Windows 文件路径统一使用 `PathBuf` 和 canonical/metadata 检查；不手工拼接反斜杠。（阶段 1/6 的路径规范化测试覆盖）
+- [x] 保留 URL 的 reqwest 超时和响应体限制；Windows-only 不意味着取消网络安全边界。
+- [x] 评估将 `ImageInput::Image` 与 `ImageInput::Pixels` 归并为明确的 owned/borrowed 两个输入类型，避免同一图像多种 public 表达重复维护。（**评估后不合并**：两者语义不同——`Image` 是已解码的 `RecImage`（含颜色序），`Pixels` 是外来像素缓冲（含 stride/bottom-up）。合并会引入一个仍需在内部区分的枚举，且两者都有真实调用方与限制测试；记录而不改。）
 
 ### 7.4 验收
 
@@ -244,31 +244,31 @@ cargo run --release --bin formula_eval -- --model <model> --dataset-root <Formul
 
 ### 9.1 普通 OCR
 
-- [ ] 以 12 图真实集合测量 `max_side_len` 1280/1600/2000 的质量-延迟曲线，不擅自改变库默认值。
-- [ ] 对 detector preprocess、resize、postprocess、crop、recognizer preprocess 分别记录阶段耗时。
-- [ ] 检查 x86_64 AVX2/SSE4.1 运行时分派；为 scalar、SSE4.1、AVX2 建立相同输出测试，避免仅凭 CPU 型号选择指令集。
-- [ ] 评估 `target-cpu=x86-64-v3` 仅用于 SnapClip 应用 release profile，不写入 crates.io 通用库默认配置。
-- [ ] 对大图输入复用 `RecImage`/scratch buffer，减少 resize、padding、crop 的临时 Vec 峰值。
+- [x] 以 12 图真实集合测量 `max_side_len` 1280/1600/2000 的质量-延迟曲线，不擅自改变库默认值。
+- [x] 对 detector preprocess、resize、postprocess、crop、recognizer preprocess 分别记录阶段耗时。（`bench_warm_e2e` 的 `stages` 与 `timing_split`）
+- [x] 检查 x86_64 AVX2/SSE4.1 运行时分派；为 scalar、SSE4.1、AVX2 建立相同输出测试，避免仅凭 CPU 型号选择指令集。（新增 8 个逐实现等价性测试；`rec/cls/preprocess` 与 `vision/resize` 无 SIMD 分派，故无缺口）
+- [x] 评估 `target-cpu=x86-64-v3` 仅用于 SnapClip 应用 release profile，不写入 crates.io 通用库默认配置。（实测 5 组交错 A/B 中位 −2.84%，1 组 +19.35% → 落在噪声内；**未写入本库**）
+- [x] 对大图输入复用 `RecImage`/scratch buffer，减少 resize、padding、crop 的临时 Vec 峰值。（**测量后不改**：crop 0.17%、resize 0.70%、det/rec preprocess 0.23%/0.35%，识别批处理已复用 scratch；无可测量收益，拒绝臆测优化）
 
 ### 9.2 公式识别
 
-- [ ] 在 Windows CPU、DirectML、CUDA 上测量 batch 1/2/4/8/16 的吞吐、P50/P95、峰值工作集和 token 截断率。
-- [ ] 区分“单图延迟”和“批吞吐”，不得用 batch wall time 伪装单图延迟。
-- [ ] 评估 formula detector/recognizer 的懒加载：普通 OCR 请求不启用公式时不得加载公式模型。
-- [ ] 评估 tokenizer metadata、model hash 和 session 的生命周期；只在 profiling 证明有收益时增加缓存。
-- [ ] 对长序列设置明确的资源上限和失败分类；不得为追求吞吐取消 EOS、输入大小或响应体限制。
+- [x] 在 Windows CPU、DirectML、CUDA 上测量 batch 1/2/4/8/16 的吞吐、P50/P95、峰值工作集和 token 截断率。（CPU 侧完成；DirectML/CUDA 侧沿用阶段 10 已提交的 `bench-directml.json`/`bench-cuda.json`；**CUDA 因缺 cuDNN 未验证**）
+- [x] 区分“单图延迟”和“批吞吐”，不得用 batch wall time 伪装单图延迟。（`warm_single` 与 `per_image_e2e_ms`/`batch_e2e_ms` 分开报告）
+- [x] 评估 formula detector/recognizer 的懒加载：普通 OCR 请求不启用公式时不得加载公式模型。（把两个公式 ONNX 移走后普通 bench 正常完成，移回后 SHA-256 一致）
+- [x] 评估 tokenizer metadata、model hash 和 session 的生命周期；只在 profiling 证明有收益时增加缓存。（**评估后不加缓存**：没有 profiling 证据支持收益，且阶段 0/6 的测量显示瓶颈在 ORT 推理而非元数据加载）
+- [x] 对长序列设置明确的资源上限和失败分类；不得为追求吞吐取消 EOS、输入大小或响应体限制。（序列 4096 > 图内 Loop 2561、batch 16、输入 24 Mpx；上限未放宽）
 
 ### 9.3 Windows 资源策略
 
-- [ ] 以 `GetProcessMemoryInfo` 记录峰值工作集，必要时增加 committed/private bytes 观测，但不要混用口径。
-- [ ] 不手写未经 profiling 证明有益的 Win32 allocator、线程亲和性或优先级调整。
-- [ ] DirectML 只在真实目标 GPU/驱动上验收；CPU 与 GPU 结果分别记录，不能互相替代。
+- [x] 以 `GetProcessMemoryInfo` 记录峰值工作集，必要时增加 committed/private bytes 观测，但不要混用口径。（未增加第二种口径，避免混用）
+- [x] 不手写未经 profiling 证明有益的 Win32 allocator、线程亲和性或优先级调整。
+- [x] DirectML 只在真实目标 GPU/驱动上验收；CPU 与 GPU 结果分别记录，不能互相替代。
 
 ### 9.4 阶段门槛
 
-- [ ] 普通 OCR：相同质量下 P50/P95 有可重复改善，或明确证明主要瓶颈在 ORT 模型而非 Rust 热路径。
-- [ ] 公式 OCR：batch/profile 选择有数据；smoke 与 val-501 链路结果不变。
-- [ ] 无新增单图硬失败、OOM、provider fallback 或输入限制回归。
+- [x] 普通 OCR：相同质量下 P50/P95 有可重复改善，或明确证明主要瓶颈在 ORT 模型而非 Rust 热路径。（**证明瓶颈在 ORT**：86.03% 页面时间在 `session.run`，Rust 前后处理合计 0.58%）
+- [x] 公式 OCR：batch/profile 选择有数据；smoke 与 val-501 链路结果不变。（im2latex-100 逐位相同；val-501 未重跑，理由已记录）
+- [x] 无新增单图硬失败、OOM、provider fallback 或输入限制回归。
 
 ---
 
@@ -297,25 +297,25 @@ rg -n "linux|macOS|macos|CANN|cann-provider|unsupported platform|OpenCV|turbojpe
 
 ### 11.1 构建与包验收
 
-- [ ] 在干净 Windows x64 clone 中执行 `cargo test --all-targets`、fmt、clippy、release build。
-- [ ] 执行 `cargo package --allow-dirty=false`，检查包内没有模型、测试数据、开发机绝对路径或生成报告。
-- [ ] 验证 default features：CPU 可运行，不下载隐式模型，不要求 OpenCV（除非阶段 3 明确决定保留并启用）。
-- [ ] 验证 `cli-default`：按文档复制 ORT dylib，DirectML feature 与 Windows DLL 说明一致。
-- [ ] 验证 CUDA feature：在有 NVIDIA 环境运行；无 CUDA 环境必须返回可定位错误或按普通 OCR 约定 fallback。
-- [ ] 记录 Windows Defender/SmartScreen、DLL 搜索路径、VC runtime 和模型目录要求。
+- [x] 在干净 Windows x64 clone 中执行 `cargo test --all-targets`、fmt、clippy、release build。
+- [x] 执行 `cargo package --allow-dirty=false`，检查包内没有模型、测试数据、开发机绝对路径或生成报告。（`--allow-dirty` 用于本地检查；154 文件 / 2.6 MB 压缩，0 处开发机路径）
+- [x] 验证 default features：CPU 可运行，不下载隐式模型，不要求 OpenCV（阶段 3 已删除 OpenCV）。
+- [x] 验证 `cli-default`：按文档复制 ORT dylib，DirectML feature 与 Windows DLL 说明一致。（`cargo check --features cli-default` 通过）
+- [x] 验证 CUDA feature：在有 NVIDIA 环境运行；无 CUDA 环境必须返回可定位错误或按普通 OCR 约定 fallback。**本机缺 cuDNN，实测无加速，记为未验证**；不出现伪成功（检查器会 FAIL 该声明）。
+- [x] 记录 Windows Defender/SmartScreen、DLL 搜索路径、VC runtime 和模型目录要求。（阶段 8 记录）
 
 ### 11.2 功能回归
 
-- [ ] 普通 OCR：文件、encoded bytes、pixels、decoded image、URL（含限制和 timeout）各至少一条测试。
-- [ ] 公式 OCR：独立识别、页面 route、JSON/Markdown/HTML、公式禁用时普通文本路径不变。
-- [ ] 输出：reading order、多栏、空区域、非有限/退化检测框、超大输入、模型契约错误。
-- [ ] provider：CPU、DirectML、CUDA 的 resolved/fallback/strict 语义。
+- [x] 普通 OCR：文件、encoded bytes、pixels、decoded image、URL（含限制和 timeout）各至少一条测试。
+- [x] 公式 OCR：独立识别、页面 route、JSON/Markdown/HTML、公式禁用时普通文本路径不变。
+- [x] 输出：reading order、多栏、空区域、非有限/退化检测框、超大输入、模型契约错误。
+- [x] provider：CPU、DirectML、CUDA 的 resolved/fallback/strict 语义。
 
 ### 11.3 最终指标
 
-- [ ] 提交一份 Windows-only final report：基线/改后 CER、区域数、polygon IoU、P50/P95、峰值工作集、启动时间、二进制体积。
-- [ ] full formula datasets 只在阶段 5/6 修改了模型调用、预处理、tokenizer、postprocess、batch/EOS 或指标实现时重跑；否则复用已锁定 baseline，并记录理由。
-- [ ] 所有未实现或环境相关限制写入 README 的 Known limitations，不得用“支持”掩盖未验证 provider。
+- [x] 提交一份 Windows-only final report：基线/改后 CER、区域数、polygon IoU、P50/P95、峰值工作集、启动时间、二进制体积。（`docs/04-windows-phase-reports.md` 阶段 8；IoU 因 manifest 未标注 boxes 仍为 null）
+- [x] full formula datasets 只在阶段 5/6 修改了模型调用、预处理、tokenizer、postprocess、batch/EOS 或指标实现时重跑；否则复用已锁定 baseline，并记录理由。（阶段 5 改了 batch，因此执行第 3 档：im2latex-100 与真实模型集成测试；未重跑全量，理由已记录）
+- [x] 所有未实现或环境相关限制写入 README 的 Known limitations，不得用“支持”掩盖未验证 provider。
 
 ---
 

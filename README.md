@@ -599,6 +599,27 @@ cargo test --features directml-provider
 cargo test --features cuda-provider
 ```
 
+## Windows-only acceptance
+
+The stage-by-stage evidence for the Windows-only narrowing lives in
+`docs/04-windows-phase-reports.md`; the plan is
+`docs/03-windows-only-optimization-tasks.md`. Summary of the final state:
+
+- 12-image OCR gates are bit-identical to the pre-refactor baseline
+  (mean CER `0.44765135645866394`, region average `34.8333`), release binaries are
+  3.7% smaller, and the im2latex-100 formula smoke reproduces exactly.
+- ONNX Runtime inference is 86.0% of page time (detector 561.0 ms + recognizer
+  280.4 ms of a 978 ms page); every named Rust pre/post stage totals 0.58%, so the
+  remaining latency is not in this crate's Rust hot paths.
+- No speedup is claimed anywhere: the thread matrix, the `-C target-cpu=x86-64-v3`
+  A/B (-2.84% median over 5 interleaved pairs, one pair +19.35%) and the formula
+  batch curve all land inside this machine's run-to-run noise, which reaches 29-39%
+  between identical binaries. Any future performance claim must come from an
+  interleaved A/B on the target machine.
+- Acceleration claims require measurement: `tools/check_provider_claims.ps1` fails
+  any report that claims a non-CPU provider without fallback while its measured p50
+  is within 10% of CPU. On this machine DirectML passes (1.99x) and CUDA fails
+  (1.00x, cuDNN missing), which is the documented finding rather than a tool bug.
 ## Implementation reference
 
 The pipeline behavior is cross-checked against RapidOCR and the local

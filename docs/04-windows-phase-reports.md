@@ -637,6 +637,92 @@ crop 0.17%、resize 0.70%、detector/recognizer preprocess 0.23%/0.35%，每项�
 
 ---
 
+## 阶段 8：Windows 发布与最终验收
+
+**阶段**：8
+**日期**：2026-10-03
+**提交**：`（本阶段提交）`
+**变更摘要**：不新增功能，只做验收与最终报告。
+
+### 8.1 构建与包验收
+
+| 检查 | 命令 | 结果 |
+| --- | --- | --- |
+| 干净 clone 的二进制 fixture | `python tools/verify_committed_binaries.py` | 35 个 fixture 与工作区逐字节一致 |
+| 干净 clone 默认测试（无外部资产） | `cargo test --all-targets` | lib 280 + bin 18 passed / 0 failed |
+| 干净 clone fmt / clippy | `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings` | 均通过（0 warning） |
+| 干净 clone release 构建 | `cargo build --release --bins` | 通过 |
+| 真实资产测试（`RAPID_OCR_REQUIRE_EXTERNAL_ASSETS=1`，禁止静默跳过） | `cargo test --all-targets` | lib 280 passed / 32.3 s |
+| 打包内容 | `cargo package --list --allow-dirty` / `cargo package --allow-dirty --no-verify` | 154 文件，`12.0MiB (2.6MiB compressed)`；**包内没有模型权重、没有 `Formula-TestSet`/`OCR-Model`、没有开发机绝对路径、没有生成报告** |
+| default features | 上表测试与 `rapidocr` CLI 运行 | CPU 可运行；不下载隐式模型（`allow_download: false`）；不需要 OpenCV（已删除） |
+| `cli-default` | `cargo check --features cli-default` | 通过（该 feature 现在只影响 ORT dylib 下载/复制与 DirectML） |
+| `cuda-provider` | 阶段 0/2 的 provider 矩阵 + `tools/check_provider_claims.ps1` | **本机无 CUDA 加速能力（缺 cuDNN），记为未验证**；不出现“伪成功” |
+| `cann-provider` | `cargo check --features cann-provider` | 明确失败：`does not contain this feature` |
+
+**Windows 运行环境要求（记录，不做隐式假设）**：
+
+- **VC 运行库**：MSVC 目标需要 VC++ 2015-2022 x64 运行库（本机已具备）。
+- **ONNX Runtime DLL 搜索路径**：本 crate 链接 `onnxruntime` 导入库，运行期加载顺序为
+  可执行文件目录 → System32 → PATH。本机实际加载 `C:\Windows\system32\onnxruntime.dll`
+  （`ort_runtime_version()` 报 `1.28.0`）。应用若要绑定特定 ORT，应把 DLL 放在 exe 旁。
+- **provider 运行库**：`directml-provider` 需要 `DirectML.dll`；`cuda-provider` 需要
+  匹配版本的 `onnxruntime_providers_cuda.dll` **加 cuDNN**（本机缺 cuDNN）。
+- **模型目录**：模型与字典不随 crate 分发；默认 `allow_download: false`，
+  配置文件中的 `model_path`/`rec_keys_path` 必须是本机可读路径。
+- **Defender/SmartScreen**：未签名二进制首次运行可能触发 SmartScreen 提示；
+  本阶段未做签名，也未做任何注册表/allocator/亲和性调优（无 profiling 依据）。
+
+### 8.2 功能回归
+
+功能矩阵由测试套件覆盖（真实资产下 0 跳过）：
+
+| 区域 | 覆盖 |
+| --- | --- |
+| 普通 OCR 输入 | `Encoded` / `File` / `Pixels` / `Image` / `Url`（含超时、响应体上限、header 像素探测、EXIF 方向）——`input::image_loader` 测试 |
+| 公式 OCR | 独立识别、页面 route、显式区域、懒加载、批处理分块、`JSON`/`Markdown`/`HTML` 输出、公式关闭时普通文本路径不变 ——`formula_integration_tests`（真实模型，10 passed）与 `formula::*` 测试 |
+| 输出 | 阅读顺序、多栏、空区域、非有限/退化检测框、超大输入、模型契约错误 |
+| provider | CPU / DirectML / CUDA 的 resolved / fallback / strict 语义（阶段 2 的穷举测试） |
+
+### 8.3 最终指标（基线 vs 现在）
+
+| 指标 | 阶段 0 基线 | 阶段 8 | 说明 |
+| --- | ---: | ---: | --- |
+| 12 图 mean CER | 0.44765135645866394 | **0.44765135645866394** | 逐位相同（硬门槛） |
+| 12 图区域数均值 | 34.833333333333336 | **34.833333333333336** | 逐位相同（硬门槛） |
+| 12 图 OCR p50 | 1001.1 ms | 981–1098 ms（多次） | 落在本机噪声内 |
+| 12 图 P90 | 1153.6 ms | 1109–1230 ms | 同上 |
+| 启动时间 | 143.6 ms | 127–140 ms | 未退化 |
+| 12 图峰值工作集 | 1284 MB | 1283–1342 MB | 未退化 |
+| `rapidocr.exe` | 34.6 MB | 33.3 MB | −3.7% |
+| `bench_warm_e2e.exe` | 34.4 MB | 33.1 MB | −3.7% |
+| `target/` 体积 | 18.6 GB | （见下） | 非发布指标 |
+| 公式 smoke（im2latex-100） | exact 24.00% / CER 0.0863 / 失败 0 | **完全相同** | 阶段 5 改了批处理，故重跑 |
+| polygon IoU | null | null | golden manifest 未标注 boxes，无法作为门槛（已记录） |
+
+**全量公式集是否重跑**：**否**。理由（按 §0.3 与 §11.3 的规则）：
+阶段 5 修改了公式**批处理分组**（分块而非一次性传入）与 `formula_batch` 配置，
+属于“batch 逻辑”范畴，因此执行了**第 3 档**验证：im2latex-100 smoke（结果与基线逐位相同）
++ 真实模型集成测试（10 passed）+ batch 1/2/4/8/16 的 `deterministic_tokens=True` 断言。
+tokenizer、postprocess、EOS 语义与指标实现未改动，故未重跑 val-501 与全量集。
+`tests/baseline/formula-evaluation-2026-10-03.json` 中 501/10,355/UniMER 的结果仍然有效，
+其 `sample_set_sha256` 与 `content_sha256` 可复核。
+
+### 8.4 未实现或环境相关限制（写入 README Known limitations）
+
+- **CUDA 未验证**：本机缺 cuDNN，`resolved=Cuda` 但实测与 CPU 无差异；
+  `tools/check_provider_claims.ps1` 会把这类声明判为 FAIL。
+- **DirectML 只在一台机器上验证**（RTX 4070 Ti SUPER / 驱动 591.86）：约 2× OCR 加速。
+- **OpenCV 与 turbojpeg 已删除**：前者在本机无法构建，后者实测更慢；
+  两者都没有测量依据支持保留。
+- **本机计时噪声大**（同二进制 p50 波动 29–39%）：任何延迟结论只能按量级解读，
+  且必须用交错 A/B 或多次运行。
+- **polygon IoU 无门槛**：golden manifest 的 `boxes` 为空。
+
+**未覆盖风险**：见各阶段记录；整体上最大的两个是“CUDA 未验证”与“延迟噪声导致的
+优化空间无法被可靠测量”。
+
+---
+
 ## 阶段完成记录模板（后续阶段沿用）
 
 ```text
