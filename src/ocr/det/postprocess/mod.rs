@@ -4,7 +4,6 @@ use geo_types::{Coord, LineString, Polygon};
 use ndarray::Array2;
 use ndarray::ArrayView2;
 use rayon::prelude::*;
-#[cfg(target_arch = "x86_64")]
 use std::sync::OnceLock;
 
 use crate::Quad;
@@ -234,22 +233,19 @@ fn threshold_slice_to_bitmap(src: &[f32], thresh: f32, dst: &mut [u8]) {
 fn threshold_chunk_dispatch(src: &[f32], thresh: f32, dst: &mut [u8]) {
     debug_assert_eq!(src.len(), dst.len());
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // Safety: AVX2 path is gated by runtime feature detection and slice bounds.
-            unsafe {
-                threshold_chunk_avx2(src, thresh, dst);
-            }
-            return;
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // Safety: AVX2 path is gated by runtime feature detection and slice bounds.
+        unsafe {
+            threshold_chunk_avx2(src, thresh, dst);
         }
-        if std::arch::is_x86_feature_detected!("sse4.1") {
-            // Safety: SSE4.1 path is gated by runtime feature detection and slice bounds.
-            unsafe {
-                threshold_chunk_sse41(src, thresh, dst);
-            }
-            return;
+        return;
+    }
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        // Safety: SSE4.1 path is gated by runtime feature detection and slice bounds.
+        unsafe {
+            threshold_chunk_sse41(src, thresh, dst);
         }
+        return;
     }
 
     threshold_chunk_scalar(src, thresh, dst);
@@ -266,7 +262,6 @@ fn threshold_chunk_scalar(src: &[f32], thresh: f32, dst: &mut [u8]) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 fn threshold_mask_lut8() -> &'static [u64; 256] {
     static LUT: OnceLock<[u64; 256]> = OnceLock::new();
     LUT.get_or_init(|| {
@@ -288,7 +283,6 @@ fn threshold_mask_lut8() -> &'static [u64; 256] {
     })
 }
 
-#[cfg(target_arch = "x86_64")]
 fn threshold_mask_lut4() -> &'static [u32; 16] {
     static LUT: OnceLock<[u32; 16]> = OnceLock::new();
     LUT.get_or_init(|| {
@@ -310,7 +304,6 @@ fn threshold_mask_lut4() -> &'static [u32; 16] {
     })
 }
 
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn threshold_chunk_avx2(src: &[f32], thresh: f32, dst: &mut [u8]) {
     use std::arch::x86_64::{
@@ -341,7 +334,6 @@ unsafe fn threshold_chunk_avx2(src: &[f32], thresh: f32, dst: &mut [u8]) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 unsafe fn threshold_chunk_sse41(src: &[f32], thresh: f32, dst: &mut [u8]) {
     use std::arch::x86_64::{__m128, _mm_cmpgt_ps, _mm_loadu_ps, _mm_movemask_ps, _mm_set1_ps};
@@ -660,7 +652,6 @@ fn dilate_mask_2x2(mask: &[u8], width: usize, height: usize) -> Vec<u8> {
     }
 
     let mut out = vec![0_u8; width * height];
-    #[cfg(target_arch = "x86_64")]
     let use_avx2 = std::arch::is_x86_feature_detected!("avx2");
     out.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
         let row_start = y * width;
@@ -671,7 +662,6 @@ fn dilate_mask_2x2(mask: &[u8], width: usize, height: usize) -> Vec<u8> {
             Some(&mask[row_start - width..row_start])
         };
 
-        #[cfg(target_arch = "x86_64")]
         if use_avx2 {
             // Safety: AVX2 path is guarded by runtime feature detection and slice bounds.
             unsafe {
@@ -711,7 +701,6 @@ fn dilate_row_2x2_scalar(cur: &[u8], prev: Option<&[u8]>, out: &mut [u8]) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dilate_row_2x2_avx2(cur: &[u8], prev: Option<&[u8]>, out: &mut [u8]) {
     use std::arch::x86_64::{
@@ -1131,7 +1120,6 @@ fn masked_mean_in_roi_contiguous(
 
 #[inline]
 unsafe fn sum_f32_slice(ptr: *const f32, len: usize) -> f64 {
-    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") {
         return unsafe { sum_f32_slice_avx2(ptr, len) };
     }
@@ -1147,7 +1135,6 @@ unsafe fn sum_f32_slice(ptr: *const f32, len: usize) -> f64 {
     sum
 }
 
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn sum_f32_slice_avx2(ptr: *const f32, len: usize) -> f64 {
     use std::arch::x86_64::{_mm256_add_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps};
@@ -2021,8 +2008,10 @@ fn l2(a: [f32; 2], b: [f32; 2]) -> f32 {
 mod tests {
     use super::{
         DbPostProcess, box_score_fast_pure, build_threshold_bitmap, contour_score_pure,
-        dilate_mask_2x2, fill_polygon_mask, masked_mean_in_roi, min_area_rect_from_points,
-        sort_boxes_like_python, unclip_polygon_reference,
+        dilate_mask_2x2, dilate_row_2x2_avx2, dilate_row_2x2_scalar, fill_polygon_mask,
+        masked_mean_in_roi, min_area_rect_from_points, sort_boxes_like_python, sum_f32_slice,
+        sum_f32_slice_avx2, threshold_chunk_avx2, threshold_chunk_scalar, threshold_chunk_sse41,
+        unclip_polygon_reference,
     };
     use ndarray::Array2;
 
@@ -2222,5 +2211,128 @@ mod tests {
         assert!(boxes[0][0][0] <= boxes[1][0][0]);
         assert_eq!(boxes[2][0][0], 100.0);
         assert_eq!(scores.len(), boxes.len());
+    }
+
+    /// 指令集分派必须靠**输出相等**证明，不能靠 CPU 型号推断。
+    ///
+    /// 直接调用三条实现（scalar / SSE4.1 / AVX2）而不是 `threshold_chunk_dispatch`，
+    /// 因为在本机（支持 AVX2）分派只会走到 AVX2 一条路径，无法覆盖 SSE4.1 与
+    /// scalar 分支。
+    #[test]
+    fn threshold_chunk_implementations_agree_bitwise() {
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        let sse41 = std::arch::is_x86_feature_detected!("sse4.1");
+        assert!(
+            avx2 || sse41,
+            "this build targets x86_64 and the test machine must expose at least SSE4.1"
+        );
+
+        // 长度覆盖：0 / 短于一条向量 / 恰好一条向量 / 向量 + 尾巴 / 多条向量 + 尾巴。
+        for len in [
+            0usize, 1, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 65, 127,
+        ] {
+            // 阈值取样本本身，制造 `>` 与 `>=` 的边界：实现必须都是严格大于。
+            let mut values: Vec<f32> = (0..len).map(|i| (i % 5) as f32 * 0.25).collect();
+            for thresh in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+                let mut scalar = vec![0_u8; len];
+                threshold_chunk_scalar(&values, thresh, &mut scalar);
+
+                // Safety: AVX2/SSE4.1 helpers require the feature to be present.
+                if avx2 {
+                    let mut via_avx2 = vec![0_u8; len];
+                    unsafe { threshold_chunk_avx2(&values, thresh, &mut via_avx2) };
+                    assert_eq!(
+                        scalar, via_avx2,
+                        "AVX2 threshold mismatch len={len} thresh={thresh}"
+                    );
+                }
+                if sse41 {
+                    let mut via_sse41 = vec![0_u8; len];
+                    unsafe { threshold_chunk_sse41(&values, thresh, &mut via_sse41) };
+                    assert_eq!(
+                        scalar, via_sse41,
+                        "SSE4.1 threshold mismatch len={len} thresh={thresh}"
+                    );
+                }
+            }
+
+            // 显式含 NaN 的样本：比较语义必须一致（NaN 一律不通过阈值）。
+            values.push(f32::NAN);
+            values.push(f32::INFINITY);
+            values.push(f32::NEG_INFINITY);
+            let len = values.len();
+            let mut scalar = vec![0_u8; len];
+            threshold_chunk_scalar(&values, 0.5, &mut scalar);
+            if avx2 {
+                let mut via_avx2 = vec![0_u8; len];
+                unsafe { threshold_chunk_avx2(&values, 0.5, &mut via_avx2) };
+                assert_eq!(
+                    scalar, via_avx2,
+                    "AVX2 NaN/inf threshold mismatch len={len}"
+                );
+            }
+            if sse41 {
+                let mut via_sse41 = vec![0_u8; len];
+                unsafe { threshold_chunk_sse41(&values, 0.5, &mut via_sse41) };
+                assert_eq!(
+                    scalar, via_sse41,
+                    "SSE4.1 NaN/inf threshold mismatch len={len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dilate_row_avx2_matches_scalar_for_all_alignment_classes() {
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        assert!(avx2, "this x86_64 test machine must expose AVX2");
+
+        // 宽度覆盖 AVX2 主循环（x < width - 31）与标量尾巴的每一种边界：
+        // 1、31、32、33、63、64、65、96。
+        for width in [1usize, 2, 31, 32, 33, 62, 63, 64, 65, 96, 129] {
+            for use_prev in [false, true] {
+                let cur: Vec<u8> = (0..width)
+                    .map(|x| if (x * 7 + 3) % 5 == 0 { 255 } else { 0 })
+                    .collect();
+                let prev: Vec<u8> = (0..width)
+                    .map(|x| if (x * 3 + 1) % 4 == 0 { 255 } else { 0 })
+                    .collect();
+                let prev_ref = use_prev.then_some(prev.as_slice());
+
+                let mut scalar = vec![0_u8; width];
+                dilate_row_2x2_scalar(&cur, prev_ref, &mut scalar);
+                let mut via_avx2 = vec![0_u8; width];
+                // Safety: AVX2 is verified above; all slices have identical length.
+                unsafe { dilate_row_2x2_avx2(&cur, prev_ref, &mut via_avx2) };
+                assert_eq!(
+                    scalar, via_avx2,
+                    "AVX2 dilate mismatch width={width} use_prev={use_prev}"
+                );
+            }
+        }
+    }
+
+    /// 求和路径是浮点归约，两条实现的加法顺序不同，因此只能要求数值一致而不能
+    /// 逐位相同；这里同时钉死标量参考值与容差。
+    #[test]
+    fn sum_f32_slice_avx2_matches_scalar_reference() {
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        assert!(avx2, "this x86_64 test machine must expose AVX2");
+
+        for len in [0usize, 1, 7, 8, 9, 63, 64, 65, 1000] {
+            let values: Vec<f32> = (0..len).map(|i| ((i * 17) % 251) as f32 / 251.0).collect();
+            let expected: f64 = values.iter().map(|v| f64::from(*v)).sum();
+            // Safety: AVX2 verified above and `values` holds `len` elements.
+            let via_avx2 = unsafe { sum_f32_slice_avx2(values.as_ptr(), len) };
+            let via_dispatch = unsafe { sum_f32_slice(values.as_ptr(), len) };
+            assert!(
+                (via_avx2 - expected).abs() <= 1e-4,
+                "AVX2 sum mismatch len={len}: {via_avx2} vs {expected}"
+            );
+            assert!(
+                (via_dispatch - expected).abs() <= 1e-4,
+                "dispatched sum mismatch len={len}: {via_dispatch} vs {expected}"
+            );
+        }
     }
 }

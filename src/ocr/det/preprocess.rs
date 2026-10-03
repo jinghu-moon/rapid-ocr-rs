@@ -138,10 +138,7 @@ impl DetPreProcess {
             -self.mean[1] / self.std[1],
             -self.mean[2] / self.std[2],
         ];
-        #[cfg(target_arch = "x86_64")]
         let use_avx2 = std::arch::is_x86_feature_detected!("avx2");
-        #[cfg(not(target_arch = "x86_64"))]
-        let use_avx2 = false;
 
         if row_parallel {
             let out_addr = out_slice.as_mut_ptr() as usize;
@@ -155,7 +152,6 @@ impl DetPreProcess {
                 // - `src_ptr` points to a contiguous BGR buffer of size `3 * width * height`.
                 unsafe {
                     let row_ptr = src_ptr.add(y * row_src_stride);
-                    #[cfg(target_arch = "x86_64")]
                     if use_avx2 {
                         write_normalized_row_avx2(
                             row_ptr,
@@ -177,16 +173,6 @@ impl DetPreProcess {
                             norm_add,
                         );
                     }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    write_normalized_row_scalar(
-                        row_ptr,
-                        out_ptr,
-                        y,
-                        width,
-                        plane_stride,
-                        norm_mul,
-                        norm_add,
-                    );
                 }
             });
         } else {
@@ -196,7 +182,6 @@ impl DetPreProcess {
                 // - Source and destination pointers are derived from validated contiguous buffers.
                 unsafe {
                     let row_ptr = src.as_ptr().add(y * row_src_stride);
-                    #[cfg(target_arch = "x86_64")]
                     if use_avx2 {
                         write_normalized_row_avx2(
                             row_ptr,
@@ -218,16 +203,6 @@ impl DetPreProcess {
                             norm_add,
                         );
                     }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    write_normalized_row_scalar(
-                        row_ptr,
-                        out_slice.as_mut_ptr(),
-                        y,
-                        width,
-                        plane_stride,
-                        norm_mul,
-                        norm_add,
-                    );
                 }
             }
         }
@@ -272,7 +247,6 @@ unsafe fn write_normalized_row_scalar(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn write_normalized_row_avx2(
     src_row_ptr: *const u8,
@@ -352,5 +326,265 @@ unsafe fn write_normalized_row_avx2(
                 src_px = src_px.add(3);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DetPreProcess, write_normalized_row_avx2, write_normalized_row_scalar};
+
+    /// 运行时检查 AVX2 可用性；不可用时测试**必须**明确跳过而不是假装通过。
+    fn avx2_available() -> bool {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            true
+        } else {
+            eprintln!("skipping AVX2 parity assertion: this CPU reports no AVX2 support");
+            false
+        }
+    }
+
+    /// 归一化系数。
+    ///
+    /// 数值刻意取成：三通道互不相同（否则“通道串位”无法被发现）、且都不等于 1.0
+    /// （否则平凡乘法会掩盖 `mul`/`add` 顺序错误）。用 `f32` 字面量而不是算术表达式，
+    /// 是为了避免 clippy 的 `eq_op` 误报，同时让常量本身一眼可读。
+    const NORM_MUL: [f32; 3] = [2.0, 1.0, 4.0];
+    const NORM_ADD: [f32; 3] = [-1.6, -1.0, -4.8];
+
+    fn synthetic_bgr(width: usize, height: usize) -> Vec<u8> {
+        // 伪随机但确定：三个通道必须互不相同，否则通道串位无法被发现。
+        (0..width * height * 3)
+            .map(|i| ((i * 37 + i / 7 + 11) % 256) as u8)
+            .collect()
+    }
+
+    /// 未写入位置的哨兵值。
+    ///
+    /// 刻意使用一个**唯一位模式**的 NaN，而不是 `f32::NAN`：`f32::NAN != f32::NAN`，
+    /// 直接用 `assert_eq!` 比较带未写入位置的缓冲区会因为“NaN 不等于自己”而假失败，
+    /// 把真正的实现差异淹掉。改用位比较后，未写入位置与任何真实输出都不相等。
+    const SENTINEL: f32 = f32::from_bits(0x7FC0_1234);
+
+    fn assert_bits_equal(a: &[f32], b: &[f32], context: &str) {
+        assert_eq!(a.len(), b.len(), "{context}: length mismatch");
+        for (index, (left, right)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(
+                left.to_bits(),
+                right.to_bits(),
+                "{context}: bit-exact mismatch at index {index}: {left} vs {right}"
+            );
+        }
+    }
+
+    /// 用 AVX2 与 scalar 两条实现写同一张图，逐位比较整个 CHW 输出。
+    fn assert_row_writers_agree(width: usize, height: usize, extra_plane_stride: usize) {
+        if !avx2_available() {
+            return;
+        }
+        let src = synthetic_bgr(width, height);
+        let plane_stride = width * height + extra_plane_stride;
+        let total = plane_stride * 2 + width * height;
+
+        let mut scalar_out = vec![SENTINEL; total];
+        let mut avx2_out = vec![SENTINEL; total];
+
+        for y in 0..height {
+            // Safety: both functions are called with the exact contract used by
+            // `normalize_bgr_into_slice`: `src` holds `width * height * 3` bytes and
+            // each destination buffer holds at least `2 * plane_stride + width * height`
+            // f32 values, so every channel row write stays in bounds.
+            unsafe {
+                let row_ptr = src.as_ptr().add(y * width * 3);
+                write_normalized_row_scalar(
+                    row_ptr,
+                    scalar_out.as_mut_ptr(),
+                    y,
+                    width,
+                    plane_stride,
+                    NORM_MUL,
+                    NORM_ADD,
+                );
+                write_normalized_row_avx2(
+                    row_ptr,
+                    avx2_out.as_mut_ptr(),
+                    y,
+                    width,
+                    plane_stride,
+                    NORM_MUL,
+                    NORM_ADD,
+                );
+            }
+        }
+
+        assert_bits_equal(
+            &scalar_out,
+            &avx2_out,
+            &format!(
+                "AVX2 and scalar normalization disagree for width={width} height={height} \
+                 extra_plane_stride={extra_plane_stride}"
+            ),
+        );
+    }
+
+    #[test]
+    fn avx2_and_scalar_row_writers_agree_on_block_and_tail_widths() {
+        // 8 的倍数走纯向量路径；其余宽度必定走向量 + 标量尾巴两条路径混合。
+        for width in [1usize, 2, 7, 8, 9, 15, 16, 17, 23, 24, 31, 33, 64, 65] {
+            for height in [1usize, 3, 8] {
+                assert_row_writers_agree(width, height, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn avx2_and_scalar_row_writers_agree_across_plane_strides() {
+        // `plane_stride` 决定三个通道平面之间的偏移；非紧凑 stride 用来证明
+        // 两条实现使用同一个 `plane_stride`，而不是各自硬编码的紧凑布局。
+        for extra in [0usize, 1, 7, 8, 33] {
+            for width in [5usize, 8, 11, 19] {
+                assert_row_writers_agree(width, 4, extra);
+            }
+        }
+    }
+
+    #[test]
+    fn avx2_and_scalar_row_writers_agree_with_row_offset_path() {
+        // `normalize_bgr_into_slice` 的并行分支把 `out_slice.as_mut_ptr()` 作为
+        // 行基准传入，行位置由 `y * width` 计算。这里用带前缀偏移的缓冲区复现该
+        // 调用形态，证明“out_ptr 行偏移”路径同样一致。
+        if !avx2_available() {
+            return;
+        }
+        const PREFIX: usize = 13;
+        for width in [7usize, 8, 13, 16, 21] {
+            let height = 5usize;
+            let src = synthetic_bgr(width, height);
+            let plane_stride = width * height;
+            let total = PREFIX + plane_stride * 2 + width * height;
+
+            let mut scalar_buf = vec![SENTINEL; total];
+            let mut avx2_buf = vec![SENTINEL; total];
+
+            for y in 0..height {
+                // Safety: pointers start `PREFIX` floats into a buffer that is
+                // `PREFIX` floats larger than the row-writer contract requires.
+                unsafe {
+                    let row_ptr = src.as_ptr().add(y * width * 3);
+                    write_normalized_row_scalar(
+                        row_ptr,
+                        scalar_buf.as_mut_ptr().add(PREFIX),
+                        y,
+                        width,
+                        plane_stride,
+                        NORM_MUL,
+                        NORM_ADD,
+                    );
+                    write_normalized_row_avx2(
+                        row_ptr,
+                        avx2_buf.as_mut_ptr().add(PREFIX),
+                        y,
+                        width,
+                        plane_stride,
+                        NORM_MUL,
+                        NORM_ADD,
+                    );
+                }
+            }
+
+            assert_bits_equal(
+                &scalar_buf,
+                &avx2_buf,
+                &format!("row-offset path disagree for width={width}"),
+            );
+            // 前缀必须未被写入：证明行偏移恰好是 `y * width`，没有越界回写。
+            assert!(
+                scalar_buf[..PREFIX]
+                    .iter()
+                    .all(|v| v.to_bits() == SENTINEL.to_bits()),
+                "scalar writer wrote before the row base for width={width}"
+            );
+            assert!(
+                avx2_buf[..PREFIX]
+                    .iter()
+                    .all(|v| v.to_bits() == SENTINEL.to_bits()),
+                "avx2 writer wrote before the row base for width={width}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_bgr_into_slice_matches_naive_reference() {
+        // 端到端（含 `is_x86_feature_detected` 分派）对照一份不依赖任何 SIMD 的
+        // 朴素参考实现，锁死数值与 CHW 布局。
+        let prep = DetPreProcess {
+            limit_side_len: 32,
+            limit_type: "max".to_string(),
+            mean: [0.4, 0.5, 0.6],
+            std: [0.25, 0.5, 0.125],
+        };
+
+        for (width, height) in [(1usize, 1usize), (7, 3), (8, 4), (13, 5), (40, 12)] {
+            let src = synthetic_bgr(width, height);
+            let plane_stride = width * height;
+            let mut out = vec![SENTINEL; plane_stride * 3];
+            prep.normalize_bgr_into_slice(&src, width, height, &mut out)
+                .expect("normalization must succeed");
+
+            // 参考实现用与生产代码**相同的算子顺序**（先乘后加，系数分别预计算），
+            // 因此这里可以要求逐位相同；布局断言则独立于浮点误差。
+            let mul = [
+                (1.0_f32 / 255.0) / prep.std[0],
+                (1.0_f32 / 255.0) / prep.std[1],
+                (1.0_f32 / 255.0) / prep.std[2],
+            ];
+            let add = [
+                -prep.mean[0] / prep.std[0],
+                -prep.mean[1] / prep.std[1],
+                -prep.mean[2] / prep.std[2],
+            ];
+
+            for y in 0..height {
+                for x in 0..width {
+                    let row_offset = y * width + x;
+                    let pixel = (y * width + x) * 3;
+                    let expected = [
+                        src[pixel] as f32 * mul[0] + add[0],
+                        src[pixel + 1] as f32 * mul[1] + add[1],
+                        src[pixel + 2] as f32 * mul[2] + add[2],
+                    ];
+                    for (channel, want) in expected.iter().enumerate() {
+                        let got = out[plane_stride * channel + row_offset];
+                        assert_eq!(
+                            got.to_bits(),
+                            want.to_bits(),
+                            "channel {channel} mismatch at ({x},{y}) for {width}x{height}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_bgr_into_slice_rejects_size_mismatch() {
+        let prep = DetPreProcess::default();
+        let src = synthetic_bgr(4, 4);
+        let mut out = vec![0.0_f32; 4 * 4 * 3 - 1];
+        let err = prep
+            .normalize_bgr_into_slice(&src, 4, 4, &mut out)
+            .expect_err("short destination must be rejected");
+        assert!(
+            err.to_string().contains("output buffer size mismatch"),
+            "{err}"
+        );
+
+        let mut ok = vec![0.0_f32; 4 * 4 * 3];
+        let err = prep
+            .normalize_bgr_into_slice(&src[..src.len() - 1], 4, 4, &mut ok)
+            .expect_err("short source must be rejected");
+        assert!(
+            err.to_string().contains("source BGR size mismatch"),
+            "{err}"
+        );
     }
 }

@@ -274,14 +274,14 @@ cargo run --release --bin formula_eval -- --model <model> --dataset-root <Formul
 
 ## 10. 阶段 7：API、模块和文档清理
 
-- [ ] 删除 `RuntimeBackend`（若阶段 2 确认只有 ONNX Runtime）。
-- [ ] 删除 CANN 的配置、序列化、输出和文档残留。
-- [ ] 根据阶段 3 决策删除或收敛 `VisionBackend`；删除无效的 `resolve_backend_or_pure_rust` fallback，核心路径使用严格错误。
-- [ ] 清理 `RuntimeConfig` 中重复字段、无调用方字段和只为旧 API 保留的名字。
-- [ ] 将普通 OCR、公式 OCR、共享输入/模型/runtime 的模块边界写入 `src/*/mod.rs` 和 README，避免再次把两条 pipeline 复制出来。
-- [ ] 更新 crate metadata：repository 改为 `https://github.com/jinghu-moon/rapid-ocr-rs`，补齐 `rust-version`、categories/description，并检查 `cargo package --list`。
-- [ ] README 只写 Windows 支持、CPU/DirectML/CUDA provider、OpenCV/turbojpeg 最终决策和准确验证命令。
-- [ ] 增加 `CHANGELOG` 或开发期变更记录，明确这是破坏性平台收窄，不承诺 Linux/macOS。
+- [x] 删除 `RuntimeBackend`（若阶段 2 确认只有 ONNX Runtime）。（阶段 2 完成）
+- [x] 删除 CANN 的配置、序列化、输出和文档残留。（阶段 2 完成；文档历史记录按“历史”归类保留）
+- [x] 根据阶段 3 决策删除或收敛 `VisionBackend`；删除无效的 `resolve_backend_or_pure_rust` fallback，核心路径使用严格错误。（阶段 4 完成）
+- [x] 清理 `RuntimeConfig` 中重复字段、无调用方字段和只为旧 API 保留的名字。（逐字段复核：无无调用方字段，未做无依据删除）
+- [x] 将普通 OCR、公式 OCR、共享输入/模型/runtime 的模块边界写入 `src/*/mod.rs` 和 README，避免再次把两条 pipeline 复制出来。
+- [x] 更新 crate metadata：repository 改为 `https://github.com/jinghu-moon/rapid-ocr-rs`，补齐 `rust-version`、categories/description，并检查 `cargo package --list`。
+- [x] README 只写 Windows 支持、CPU/DirectML/CUDA provider、OpenCV/turbojpeg 最终决策和准确验证命令。
+- [x] 增加 `CHANGELOG` 或开发期变更记录，明确这是破坏性平台收窄，不承诺 Linux/macOS。
 
 ### 7.1 静态清理门槛
 

@@ -117,6 +117,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut wall = Vec::new();
     let mut total = Vec::new();
     let mut regions = Vec::new();
+    // 分阶段耗时：每个样本的 `OcrOutput::timings` / `OcrOutput::stages` 都是**同一次
+    // 请求内**的分阶段计时，因此这些样本可以独立统计，不需要把一次请求的内部阶段
+    // 互相加减。检测器/分类器/识别器各自的 preprocess / infer / postprocess 分开收集，
+    // 使报告能直接回答“时间花在 ORT 推理上还是 Rust 前后处理上”。
+    let mut stages = StageSamples::default();
     // 记录实际解析到的 provider 与是否发生 CPU fallback：GPU 基准不得把
     // fallback 当加速成功（阶段 0/2/5 的证据要求）。
     let mut provider_resolution = None;
@@ -127,6 +132,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             wall.push(start.elapsed().as_secs_f64() * 1000.0);
             total.push(out.timings.total_ms as f64);
             regions.push(out.regions.len() as f64);
+            stages.push(&out);
             if provider_resolution.is_none() {
                 let describe = |info: &rapid_ocr_rs::ProviderResolutionInfo| {
                     serde_json::json!({
@@ -144,6 +150,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    let stage_report = stages.into_report(total.len());
+    // 总耗时均值与分阶段均值来自同一批样本，因此可以安全相除得到时间占比。
+    let total_avg = if total.is_empty() {
+        0.0
+    } else {
+        total.iter().sum::<f64>() / total.len() as f64
+    };
+    let timing_split = inference_share(&stage_report, total_avg);
     let report = json!({
         "meta": {
             "images_dir": cli.images_dir,
@@ -165,6 +179,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "ocr_total_ms": stats(&total),
             "regions": stats(&regions),
         },
+        // 分阶段统计：每个指标都带 count / min / max / avg / p50 / p90，口径与
+        // `stats.wall_ms` / `stats.ocr_total_ms` 完全一致（同一个 `stats()` helper）。
+        "stages": stage_report,
+        // ONNX Runtime 推理 vs Rust 前后处理的时间占比（阶段 6 门槛证据）。
+        "timing_split": timing_split,
         // 峰值工作集口径与库内一致：`windows:GetProcessMemoryInfo.PeakWorkingSetSize`。
         "memory": {
             "peak_working_set_bytes": rapid_ocr_rs::peak_working_set_bytes(),
@@ -186,4 +205,164 @@ fn stats(v: &[f64]) -> serde_json::Value {
     s.sort_by(|a, b| a.total_cmp(b));
     let avg = s.iter().sum::<f64>() / s.len() as f64;
     json!({"count":s.len(),"avg":avg,"p50":s[(s.len()-1)/2],"p90":s[((s.len()-1) as f64*0.9).round() as usize],"min":s[0],"max":s[s.len()-1]})
+}
+
+/// `None` 计时（某个阶段没有运行）不得被当成 0 ms 混进统计。
+///
+/// `OcrOutput` 用 `Option<f32>` 表达“该阶段没有执行”，例如关闭分类器后
+/// `classifier_infer_ms` 为 `None`。把 `None` 折算成 `0.0` 会把“未运行”和
+/// “运行了但耗时为零”混为一谈，从而系统性拉低均值。
+#[derive(Default)]
+struct StageSamples {
+    input_decode_ms: Vec<f64>,
+    input_resize_ms: Vec<f64>,
+    input_crop_ms: Vec<f64>,
+    detector_preprocess_ms: Vec<f64>,
+    detector_infer_ms: Vec<f64>,
+    detector_postprocess_ms: Vec<f64>,
+    classifier_preprocess_ms: Vec<f64>,
+    classifier_infer_ms: Vec<f64>,
+    classifier_postprocess_ms: Vec<f64>,
+    recognizer_preprocess_ms: Vec<f64>,
+    recognizer_infer_ms: Vec<f64>,
+    recognizer_postprocess_ms: Vec<f64>,
+    preprocess_ms: Vec<f64>,
+    postprocess_ms: Vec<f64>,
+}
+
+impl StageSamples {
+    fn push(&mut self, out: &rapid_ocr_rs::OcrOutput) {
+        let push_opt = |dst: &mut Vec<f64>, value: Option<f32>| {
+            if let Some(value) = value {
+                dst.push(f64::from(value));
+            }
+        };
+        push_opt(&mut self.input_decode_ms, Some(out.timings.decode_ms));
+        push_opt(&mut self.input_resize_ms, Some(out.timings.resize_ms));
+        push_opt(&mut self.input_crop_ms, Some(out.timings.crop_ms));
+
+        push_opt(
+            &mut self.detector_preprocess_ms,
+            out.stages.detector.timing.map(|t| t.preprocess_ms),
+        );
+        push_opt(
+            &mut self.detector_infer_ms,
+            out.stages.detector.timing.map(|t| t.infer_ms),
+        );
+        push_opt(
+            &mut self.detector_postprocess_ms,
+            out.stages.detector.timing.map(|t| t.postprocess_ms),
+        );
+
+        push_opt(
+            &mut self.classifier_preprocess_ms,
+            out.stages.classifier.timing.map(|t| t.preprocess_ms),
+        );
+        push_opt(
+            &mut self.classifier_infer_ms,
+            out.stages.classifier.timing.map(|t| t.infer_ms),
+        );
+        push_opt(
+            &mut self.classifier_postprocess_ms,
+            out.stages.classifier.timing.map(|t| t.postprocess_ms),
+        );
+
+        push_opt(
+            &mut self.recognizer_preprocess_ms,
+            out.stages.recognizer.timing.map(|t| t.preprocess_ms),
+        );
+        push_opt(
+            &mut self.recognizer_infer_ms,
+            out.stages.recognizer.timing.map(|t| t.infer_ms),
+        );
+        push_opt(
+            &mut self.recognizer_postprocess_ms,
+            out.stages.recognizer.timing.map(|t| t.postprocess_ms),
+        );
+
+        // 顶层 preprocess_ms / postprocess_ms 已经跨阶段求和，是“Rust 侧”总账。
+        self.preprocess_ms
+            .push(f64::from(out.timings.preprocess_ms));
+        self.postprocess_ms
+            .push(f64::from(out.timings.postprocess_ms));
+    }
+
+    fn into_report(self, samples: usize) -> serde_json::Value {
+        json!({
+            "unit": "ms",
+            "samples": samples,
+            "input": {
+                "decode_ms": stats(&self.input_decode_ms),
+                "resize_ms": stats(&self.input_resize_ms),
+                "crop_ms": stats(&self.input_crop_ms),
+            },
+            "detector": {
+                "preprocess_ms": stats(&self.detector_preprocess_ms),
+                "infer_ms": stats(&self.detector_infer_ms),
+                "postprocess_ms": stats(&self.detector_postprocess_ms),
+            },
+            "classifier": {
+                "preprocess_ms": stats(&self.classifier_preprocess_ms),
+                "infer_ms": stats(&self.classifier_infer_ms),
+                "postprocess_ms": stats(&self.classifier_postprocess_ms),
+            },
+            "recognizer": {
+                "preprocess_ms": stats(&self.recognizer_preprocess_ms),
+                "infer_ms": stats(&self.recognizer_infer_ms),
+                "postprocess_ms": stats(&self.recognizer_postprocess_ms),
+            },
+            // 跨阶段总账：`preprocess_ms` 是三个阶段的 preprocess 之和，
+            // `postprocess_ms` 同理。两者都不包含 ORT 推理时间。
+            "page_total": {
+                "preprocess_ms": stats(&self.preprocess_ms),
+                "postprocess_ms": stats(&self.postprocess_ms),
+            },
+        })
+    }
+}
+
+/// ONNX Runtime 推理 vs Rust 前后处理的时间占比。
+///
+/// 分子/分母都取自 `stats.ocr_total_ms.avg`（同一个口径，来自 `OcrTimings::total_ms`），
+/// 而不是把分阶段均值相加——阶段均值相加会丢失阶段间的重叠或未计部分。
+fn inference_share(stages: &serde_json::Value, total_avg: f64) -> serde_json::Value {
+    let avg = |path: &[&str]| -> f64 {
+        let mut cursor = stages;
+        for key in path {
+            cursor = match cursor.get(*key) {
+                Some(value) => value,
+                None => return 0.0,
+            };
+        }
+        cursor
+            .get("avg")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+    };
+    if total_avg <= 0.0 {
+        return json!({"error": "ocr_total_ms.avg is zero; cannot compute shares"});
+    }
+    let detector_infer = avg(&["detector", "infer_ms"]);
+    let classifier_infer = avg(&["classifier", "infer_ms"]);
+    let recognizer_infer = avg(&["recognizer", "infer_ms"]);
+    let inference = detector_infer + classifier_infer + recognizer_infer;
+    let preprocess = avg(&["page_total", "preprocess_ms"]);
+    let postprocess = avg(&["page_total", "postprocess_ms"]);
+    let share = |value: f64| value / total_avg;
+    json!({
+        "basis": "mean (avg) of the same samples used by stats.ocr_total_ms",
+        "denominator_ms": total_avg,
+        "ort_inference_ms": inference,
+        "ort_inference_share": share(inference),
+        "detector_infer_share": share(detector_infer),
+        "classifier_infer_share": share(classifier_infer),
+        "recognizer_infer_share": share(recognizer_infer),
+        "rust_preprocess_ms": preprocess,
+        "rust_preprocess_share": share(preprocess),
+        "rust_postprocess_ms": postprocess,
+        "rust_postprocess_share": share(postprocess),
+        "rust_total_share": share(preprocess + postprocess),
+        "unattributed_ms": total_avg - inference - preprocess - postprocess,
+        "unattributed_share": share(total_avg - inference - preprocess - postprocess),
+    })
 }

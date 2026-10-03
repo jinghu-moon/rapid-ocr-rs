@@ -480,6 +480,163 @@ tokenizer、postprocess、batch/EOS 或指标实现；普通 OCR 的预处理数
 
 ---
 
+## 阶段 7：API、模块和文档清理
+
+**阶段**：7
+**日期**：2026-10-03
+**提交**：`（本阶段提交）`
+**变更摘要**：
+
+- **crate metadata**（`Cargo.toml`）：`repository` 改为实际仓库
+  `https://github.com/jinghu-moon/rapid-ocr-rs`；补 `rust-version = "1.85"`、
+  `categories`（computer-vision / multimedia::images / api-bindings）、
+  keywords 与 description 改为反映 Windows-only + PP-OCRv6/PP-FormulaNet；
+  新增 `exclude = ["tests/baseline/**"]`。
+- **新增 `CHANGELOG.md`（开发期变更记录）**：明确这是破坏性平台收窄、不承诺
+  Linux/macOS，并逐项列出删除的公开 API 与原因。
+- **模块边界写入 `mod.rs`**：`runtime`、`input`、`vision`、`output` 补齐模块文档，
+  说明共享层角色与依赖方向（都不依赖 `ocr` / `formula`），与既有的
+  `ocr/mod.rs`、`formula/mod.rs` 一起构成“两条 pipeline 不再被复制”的边界说明。
+- **`cargo package` 自包含**：`tests/baseline/**` 是我方证据（记录了采集机器的绝对路径
+  与 benchmark 结果），属于生成产物而不是 crate 内容，因此排除；`tests/fixtures/**`
+  必须保留，因为契约 fixture 是干净 clone 能跑测试的前提。
+- **静态清理门槛分类**（`rg` 命中项逐条归类，见下）。
+
+**执行命令与关键结果**：
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --all-targets` | lib 272 + bin 18 passed / 0 failed |
+| `cargo package --list --allow-dirty` | 154 个文件（排除 baseline 前为 171） |
+| `cargo package --allow-dirty --no-verify` | `Packaged 154 files, 12.0MiB (2.6MiB compressed)` → 压缩后 2.6 MB，远低于 crates.io 10 MB 上限 |
+| 包内容检查 | 包内**没有任何**开发机绝对路径（`[A-Z]:\100_Projects` / `[A-Z]:\Users` 命中 0），没有模型权重，没有 `Formula-TestSet`/`OCR-Model`，没有生成报告 |
+
+**静态清理门槛**（`rg -n "linux|macOS|macos|CANN|cann-provider|unsupported platform|OpenCV|turbojpeg|RuntimeBackend"`）：
+
+| 归类 | 命中示例 | 处理 |
+| --- | --- | --- |
+| 当前支持声明（非目标） | `lib.rs`、`platform_gate.rs`、`README.md` 的 “Linux/macOS 是明确非目标” | 保留：这是**当前**、正确的平台声明 |
+| 当前支持声明（已删除能力） | `api.rs`/`config.rs`/`provider.rs`/`session.rs` 的 “CANN 已删除”“`RuntimeBackend` 是伪抽象” | 保留：说明为什么现在没有该能力 |
+| 负向测试 | `config.rs` 断言 `provider_preference: cann` 与 `vision_backend` 被拒绝 | 保留：这就是期望行为 |
+| 第三方说明 | `THIRD_PARTY_NOTES.md`、`docs/01`、`docs/02` 的历史记录 | 保留：历史记录，不作为当前支持声明 |
+| 数值一致性注释 | `det/preprocess.rs:720`、`vision/resize.rs:232`、`vision/rotate_crop.rs:289` 记录“与 Pillow/OpenCV 的数值对齐要求” | 保留：删除依赖不等于放弃数值契约 |
+| 正则误报 | `cann` 命中 `cannot`；`macos` 命中注释里的历史措辞 | 无需处理 |
+
+**`RuntimeConfig` 字段复核**：逐字段确认仍有调用方 ——
+`auto_tune_threads` 仍被 `runtime/session.rs::derive_runtime_threads` 使用
+（公式 benchmark/eval 工具直接构造 `RuntimeConfig`，不经过 profile），
+`rayon_threads` / `enable_cpu_mem_arena` / `fail_provider_unavailable` / `formula_batch`
+都由 `RuntimeProfile` 消费。**没有发现无调用方字段**，因此未删除任何字段
+（删除没有依据的“清理”同样是错误方向）。
+
+**未覆盖风险**：
+
+- `rust-version = "1.85"` 是保守声明（edition 2024 的最低要求），未在本机验证更低版本；
+  本机工具链是 1.98。
+- `exclude = ["tests/baseline/**"]` 意味着**从 crates.io 安装的源码包不含基线 JSON**；
+  基线仍随仓库提供。如果将来希望发布时也带证据，应改为把基线放进 `docs/` 或单独仓库。
+- 交叉引用：`docs/03` 里的 `rg` 门槛命令仍会命中上述“保留”项，这是预期的，
+  分类表就是它的判据。
+
+**是否触发公式 smoke / val-501 / 全量评测**：未触发。本阶段只改 metadata、文档、
+模块注释与打包范围，不改任何代码路径。
+
+---
+
+## 阶段 6：Windows 性能优化（测量优先）
+
+**阶段**：6
+**日期**：2026-10-03
+**提交**：`（本阶段提交）`
+**变更摘要**：只增加测量与“关掉死分支/补上缺失的等价性测试”，**没有做任何未测量的优化**。
+
+- **补齐 SIMD 等价性测试（发现的真实缺口）**：`det/preprocess.rs` 按
+  `is_x86_feature_detected!("avx2")` 在 AVX2 与 scalar 行写入之间分派，却**没有任何测试**证明两者一致；
+  `det/postprocess/mod.rs` 的 `threshold_chunk_{scalar,sse41,avx2}` 与
+  `dilate_row_2x2_{scalar,avx2}` / `sum_f32_slice_avx2` 同样只有间接覆盖。新增 8 个测试直接调用各实现：
+  宽度 1/2/7/8/9/15/16/17/23/24/31/33/64/65（8 的倍数走纯向量路径，其余强制向量+标量尾部混合）、
+  plane_stride 0/1/7/8/33、并行分支的 `out_ptr` 行偏移形式（并断言 13 个 float 前缀未被改写）、
+  以及 NaN/±inf 与 0..127 长度。比较用 `to_bits()` 而不是 `==`（缓冲区哨兵是 NaN，`==` 会假失败）。
+  同时删除 `src/ocr/det/` 下已死的 `#[cfg(not(target_arch = "x86_64"))]` 分支。
+  `rec/cls/preprocess.rs` 与 `vision/resize.rs` **没有** SIMD 分派（标量 + LUT），因此没有缺口，
+  也没有添加任何推测性的 SIMD。
+- **`bench_warm_e2e` 增加逐阶段耗时**：`stages`（输入 decode/resize/crop、detector/classifier/
+  recognizer 的 preprocess/infer/postprocess、page_total 的 count/min/max/avg/p50/p90，
+  复用既有 `stats()` 口径）与 `timing_split`（ORT vs Rust 占比）。
+  `Option<f32>` 只在 `Some` 时入样，分类器关闭时报 `count:0` 而不是伪造 0 ms。
+- **新增 `tools/check_provider_claims.ps1`**：读取多份 bench 报告，凡“声称非 CPU provider 且
+  `fallback_to_cpu=false`”而实测 p50 未比 CPU 参考好 10% 的，判 FAIL 并给出说明。
+  这把“加速必须有实测依据”变成可执行检查。
+
+**关键测量结果**：
+
+`max_side_len` 质量-延迟曲线（12 图，交错 6 轮，取每轮 p50 的中位数）：
+
+| max_side | p50 中位 (ms) | p90 中位 (ms) | mean CER | 区域数均值 | 峰值 (MB) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 960 | —（只测 CER） | — | 0.45248 | — | 756 |
+| 1280 | 550.57 | 793.21 | 0.43547 | 33.4167 | 801 |
+| 1600 | **715.41** | 1011.18 | **0.43693** | 33.4167 | 1159 |
+| 2000 | 981.25 | 1208.53 | **0.44765**（= 硬门槛） | **34.8333**（= 硬门槛） | 1219 |
+
+同一设置的同一二进制最坏相差 1.29×（1600 侧 840.87 vs 652.77），这就是必须交错测量的原因。
+1600 在两个轴上都不差于 2000，但**库默认值未改**（任务明确要求只测不改）。
+
+ORT vs Rust 时间分布（max_side_len 2000）：**ORT 推理 841.44 ms = 86.03%**
+（detector 561.0 / recognizer 280.4）；所有被命名的 Rust 前后处理合计
+**5.70 ms = 0.58%**；最大的单项 Rust 成本是识别后处理（CTC 解码 + word boxes）41.67 ms = 4.26%，
+crop 1.66 ms（0.17%），输入 resize 6.85 ms（0.70%）。
+**阶段门槛按“瓶颈是 ORT 而不是 Rust 热路径”达成**：即使把 image_ops/resize/preprocess 全部降为零成本，
+也无法把页面 p50 改变超过约 1.5%，小于本机噪声。
+
+`-C target-cpu=x86-64-v3`（同 commit、独立 scratch target 目录、5 组交错 A/B）：
+默认 p50 中位 999.05 ms vs v3 970.68 ms → 中位差 **−2.84%**（4/5 组支持 v3，其中一组 +19.35%）。
+**结论：不写入本库的 Cargo.toml**（已遵守）；可作为消费方应用 release profile 的可选设置，
+但落在噪声范围内，不得当作保证收益 —— 且 86% 页面时间在预编译的 `onnxruntime.dll` 内，
+该 flag 够不到主要成本。
+
+公式 batch 1/2/4/8/16（CPU，`resolved=Cpu`，无回退）：
+单图延迟 p50 = 207.8 / 186.0 / 312.6 / 244.1 / 216.5 ms，**不单调且基本持平**；
+专用单图路径 p50 = 196.08 ms；`session.run` 随 batch 近似线性（195.8 → 3287.9 ms），
+即**该模型在 CPU 上批处理买不到吞吐**。全部 batch 输出一致且 `deterministic_tokens=True`，
+无截断；峰值工作集 2.89 GiB。
+**公式模型懒加载已证明**：把两个公式 ONNX 移走后普通 12 图 bench 正常完成
+（exit 0、区域数不变），移回后 SHA-256 与移动前一致。
+**公式资源上限未放宽**：序列 4096（> 实测图内 Loop 宽度 2561）、batch 上限 16、
+输入 24 Mpx + 共享加载层限制、detector 768/300/max_regions。
+
+**Provider 声明检查器输出**（`tools/check_provider_claims.ps1`，对已提交的三份报告）：
+
+```text
+Report               Claimed        Fallback P50ms    DeltaPct Speedup Verdict
+bench-cpu.json       (CPU baseline) n/a      1,013.50                  REFERENCE
+bench-direct_ml.json DirectMl       no       508.65   -49.8%   1.99x   PASS
+bench-cuda.json      Cuda           no       1,013.47 -0.0%    1.00x   FAIL
+FAIL: bench-cuda.json - claims Cuda but p50 is within +/-10% of the CPU reference
+NOTE: 这是本机（ORT 1.28.0、缺 cuDNN）的**预期**结论，不是工具缺陷。
+```
+
+**没有改动的东西（以及支撑该决定的数字）**：`image_ops.rs` 未改 ——
+crop 0.17%、resize 0.70%、detector/recognizer preprocess 0.23%/0.35%，每项都远低于 1%，
+没有可测量的收益，识别批处理路径已经在复用 `tmp_bgr` + `LinearResizeScratch`。
+未加 SIMD、未加缓存、未改任何库默认值、未放宽任何上限。
+
+**未覆盖风险**：
+
+- **本阶段没有产生加速**：结论是“瓶颈在 ORT，Rust 侧无可测量空间”。这是任务允许的结论，
+  但意味着普通 OCR 的延迟改善只能来自换模型/换 provider/降分辨率（见曲线），而不是改 Rust。
+- `target-cpu=x86-64-v3` 的 −2.84% 落在噪声内，5 组里有 1 组明显反向（+19.35%）；
+  若应用侧要启用，必须在目标机器上按同一交错方法复测。
+- 逐阶段计时来自一次 `--rounds 3` 采样；`Option<f32>` 缺项按“不入样”处理，
+  因此分类器关闭时不会污染均值，但分类器开启时的数据本次未单独统计。
+- 本机噪声（同二进制 p50 波动可达 29–39%）意味着**所有延迟结论都只能按量级解读**。
+
+**是否触发公式 smoke / val-501 / 全量评测**：触发了**公式 batch 基准**与**公式懒加载验证**
+（本阶段确实动到了公式调用的可观测行为），但**未触发 im2latex-100 / val-501 / 全量集**：
+没有修改 tokenizer、postprocess、EOS 或指标实现，公式单图输出与 batch 确定性均未变化。
+
+---
+
 ## 阶段完成记录模板（后续阶段沿用）
 
 ```text
