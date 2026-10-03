@@ -476,6 +476,17 @@ TTL + 数量 + 字节三重上限 + tombstone（§4.5），**不允许**无界 `
 
 ## 9. 前端（单文件内联）
 
+> **原型已选定（2026-10-03）**：Temp/demo3-v2.html（1658 行）作为 include_str! 内联页的起点。
+> 它由 Temp/demo3.html 派生，包含三处移植与一处统一：
+> 1. 移植 demo2.html 的缩放组（zoomOut/zoomLbl/zoomIn/zoomFit + 1:1）与剪贴板粘贴按钮；
+> 2. 移植 demo1.html 的三字段 EP 展示（pRequested/pSelected/pFallback，§7.5 要求三者始终同时给出，未知态不得伪装成 alse）；
+> 3. 占位符统一为 __CSP_NONCE__（×4）/ __SRV_TOKEN__（×3），服务端只做这两处替换，替换后必须重新扫描并在残留时**失败退出**。
+>
+> 已知缺陷（**不要**直接把 demo3.html 当作内联页）：demo3.html 的 IIFE 提前闭合
+> （(function(){ 1 处、})(); 2 处），整段脚本 
+ode --check 报 Unexpected token '}'，
+> 页面 JS 完全不执行。demo3-v2.html 已修正为 1:1。
+
 ### 9.1 上传与进度
 
 - 上传使用 **`XMLHttpRequest`**：`xhr.upload.onprogress` 显示进度，`xhr.abort()` 取消上传（`fetch` 没有稳定的上传进度事件）；
