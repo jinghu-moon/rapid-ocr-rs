@@ -1097,7 +1097,8 @@ target\release\rapidocr.exe evaluate --manifest <OCR-test-image>\golden-manifest
   directml-provider`：304 passed；`cargo check --features directml-provider,cuda-provider`
   与 `cargo build --release --bins` 通过；`cargo fmt --all -- --check` 与
   `cargo clippy --all-targets -- -D warnings` 干净。
-  （**本轮（复审第三轮）之后**：lib 306 + bin 18，仍全绿；见文末「复审第三轮」。）
+  （**复审第三轮之后**：lib 306 + bin 18，仍全绿；**复审第四轮之后**：lib 307 + bin 20，
+  见文末「复审第四轮」。）
 
 ### 仍然存在的限制
 
@@ -1242,6 +1243,90 @@ target\release\rapidocr.exe evaluate --manifest <OCR-test-image>\golden-manifest
   由合成样本测试锁定，本机真实数据尚未命中该分支。
 - **随仓库提交的公式 baseline 仍是历史 schema**（已显式标注）。若要新的 provider 字段，
   必须在当前二进制上重跑 `formula_bench` 并重新生成 baseline，本轮未做。
+
+---
+
+## 复审第四轮：`timing_split` 恒等式与残留的口径陈述
+
+**范围**：1 个 P1（`timing_split` 的 `inference + rust + unattributed == total` 缺了守恒项
+`input_overflow_ms`）与 3 个 P2（`README.md` 与 `src/runtime/mod.rs` 仍写“计时窗口重叠”；
+`src/runtime/timing.rs` 的模块公式在溢出分支与实现矛盾）。**没有**放宽任何硬门槛，也没有改动
+任何计时语义（`total_ms` / `preprocess_ms` / `postprocess_ms` 与账本字段的含义一字未改）。
+
+### P1：`timing_split` 的恒等式补上 `input_overflow_ms`
+
+账本事实（第三轮已确立，本轮只是把它如实写进报告）：`rust_ms()` 用**截断到外层
+`preprocess_ms` 窗口内**的 `input_ms()`（`input_ms() <= preprocess_ms` 按构造成立），而
+`attributed_ms()` 计入**完整**的输入三项（`input_named_within_ms + input_overflow_ms`），因此
+
+```text
+attributed_ms() - (rust_ms() + inference_ms()) == input_overflow_ms
+```
+
+旧文档写的 `inference + rust + unattributed == total` 只在 `input_overflow_ms == 0` 时成立；
+溢出分支下它会少掉这一项（`rust + inference + unattributed == total - input_overflow_ms`）。
+现在报告出来的恒等式是
+
+```text
+ort_inference_ms + rust_ms + input_overflow_ms + unattributed_ms == denominator_ms
+```
+
+并连同实测残差一起写进 JSON（`timing_split.identity` / `timing_split.identity_residual_ms`），
+因此读到报告的人不必先相信文档就能验证它。新增键（**已有键名与含义未变**）：
+`input_overflow_ms`、`input_overflow_share`、`attributed_ms`、`attributed_share`、`identity`、
+`identity_residual_ms`。溢出量**不**折进 `rust_ms`（否则它就不再是“外层窗口内的 Rust 成本”，
+与 `input_ms() <= preprocess_ms` 的定义矛盾），也**不**折进 `unattributed_ms`（否则已命名的
+分量会被藏进残差）——第三轮“超出量必须留在残差里可见”的决定被保留。
+
+测试（**`bench_warm_e2e` 级别**，新增 2 条；此前只有 `TimingLedger` 级别的溢出测试，那正是缺口）：
+
+- `timing_split_identity_holds_without_input_overflow`（`input_overflow_ms == 0`）；
+- `timing_split_identity_keeps_input_overflow_explicit`（外层窗口 5 ms、命名三项 12 ms 的合成样本，
+  断言旧恒等式为假、新恒等式为真、`attributed_ms - (rust_ms + ort_inference_ms) == input_overflow_ms`，
+  且四项占比之和为 1）。
+
+### P2-a / P2-b / P2-c：残留的“重叠”陈述与输入侧公式
+
+| 位置 | 修改前 | 修改后 |
+| --- | --- | --- |
+| `README.md`（Windows x64 acceptance） | “the timing ledger's windows overlap across `inner.run()`” | “named components are measured over different (sequential) ranges than `total_ms` — the outer `preprocess_ms` window ends before `inner.run()` is entered, so no wall-clock interval is counted twice — and it therefore does not form a strict partition” |
+| `src/runtime/mod.rs`（模块清单） | “分量来自互相重叠的计时窗口” | “各分量与 `total_ms` 量的是**不同（串行）范围**的墙钟——外层 `preprocess_ms` 窗口在 `inner.run()` 之前结束，没有一段墙钟被算两次——因此它不是 `total_ms` 的严格划分” |
+| `src/runtime/timing.rs`（模块公式） | `input_decode_ms + input_resize_ms + input_crop_ms + input_other_ms == input_ms()` | `input_named_within_ms + input_other_ms == input_ms()`，加桥接式 `input_decode_ms + input_resize_ms + input_crop_ms == input_named_within_ms + input_overflow_ms` |
+| 同上（公式后的说明段） | 无 | 明确写出旧式**只在 `input_overflow_ms == 0` 时**成立、溢出分支下 `input_ms()` 由外层窗口决定，并点名钉住它的测试 |
+| `CHANGELOG.md`（计时账本条目） | “负残差表示计时窗口重叠（外层 `preprocess_ms` 与阶段计时跨越 `inner.run()`）”、字段名 `overlap_ms` | 改为“残差是两个**串行**窗口之间的**口径差异**，不是重叠”、字段名 `excess_ms`（`overlap_ms` 标注为已废弃的临时名），并记录 `timing_split` 的新键与恒等式 |
+
+测试（`src/runtime/timing.rs`，新增 1 条）：
+`documented_input_formula_holds_in_both_branches` 在溢出与不溢出两个分支上钉住文档定义式、
+桥接式与 `input_ms() <= input_preprocess_ms`，并断言**被更正掉的旧式在溢出分支为假**
+（否则这条测试就没有钉住这次文档修改）。
+
+**全仓 grep**（`README.md` / `src/` / `docs/` / `tools/` / `CHANGELOG.md`，关键词
+`overlap` / `重叠` / `duplicat` / `重复计时` / `counted twice`）：除上表三处外，其余命中分两类——
+(a) **正确的否定表述**（“两个窗口串行、不是重叠”“do not overlap”“No wall-clock interval is
+therefore counted twice”）；(b) `docs/04` 里**显式标注为历史**的更正记录（例如“本节曾在终审时
+把它写成……已按代码更正”）。二者都保留。`tools/` 目录不读 `timing_split`，只读
+`timing_ledger.conservation.conserved` / `residual_ms`（未改名，不受影响）。
+
+### 证据
+
+- `cargo test --all-targets`：lib **307**（原 306 + `documented_input_formula_holds_in_both_branches`）
+  + bin **20**（原 18 + 2 条 `timing_split` 恒等式测试），0 failed。
+- `cargo fmt --all` / `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`：
+  干净；`cargo build --release --bins` 通过。
+- 12 图硬门槛（`bench_warm_e2e` + `rapidocr evaluate`，输出写 `target/gate-verify/`，**未覆盖**
+  `tests/baseline/` 里已提交的基线）：mean CER `0.44765135645866394`、区域数均值
+  `34.833333333333336`，与上一轮**逐位相同**。本次 `target/gate-verify/bench-cpu.json` 的
+  `timing_split`：`ort_inference_ms = 859.8794653150769`、`rust_ms = 134.18974405276177`、
+  `input_overflow_ms = 0.0`、`unattributed_ms = 6.9260773617619025`、
+  `denominator_ms = 1000.9952867296007`，四项之和逐位回到分母，
+  `identity_residual_ms = 1.14e-13`（浮点噪声）。
+
+### 仍然存在的限制
+
+- **口径残差没有被消除**：本轮只修恒等式的**表达**与文档陈述，没有改动
+  `total_ms` / `preprocess_ms` / `postprocess_ms` 的语义，也没有重采基线。
+- **`input_overflow_ms` 在本机 12 图 release 基线上仍为 0**（`decode + resize + crop ≈ 5 ms`
+  远小于外层窗口 ≈ 85 ms）；溢出分支仍只由合成样本测试覆盖，本机真实数据尚未命中。
 
 ---
 

@@ -615,12 +615,15 @@ Summary of the final state:
   (mean CER `0.44765135645866394`, region average `34.8333`), release binaries are
   3.7% smaller, and the im2latex-100 formula smoke reproduces exactly.
 - ONNX Runtime inference is about 85.6% of page time and the named Rust side about
-  13.7%, **with a stated residual of -6.75 ms/page (0.69%)**: the timing ledger's
-  windows overlap across `inner.run()`, so it is a diagnostic instrument, not a strict
-  partition and not the acceptance basis for any performance claim. The stage-6
-  conclusion (the bottleneck is ONNX Runtime, not Rust hot paths) rests on the
-  inference share being an order of magnitude larger than every Rust component, which
-  a residual of that size cannot overturn. See `docs/04-windows-phase-reports.md`.
+  13.7%, **with a stated residual of -6.75 ms/page (0.69%)**: the timing ledger is a
+  diagnostic instrument whose named components are measured over different (sequential)
+  ranges than `total_ms` — the outer `OcrTimings::preprocess_ms` window ends before
+  `inner.run()` is entered, so no wall-clock interval is counted twice — and it
+  therefore does not form a strict partition of `total_ms`. It is not the acceptance
+  basis for any performance claim. The stage-6 conclusion (the bottleneck is ONNX
+  Runtime, not Rust hot paths) rests on the inference share being an order of magnitude
+  larger than every Rust component, which a residual of that size cannot overturn. See
+  `docs/04-windows-phase-reports.md`.
 - No speedup is claimed anywhere: the thread matrix, the `-C target-cpu=x86-64-v3`
   A/B (-2.84% median over 5 interleaved pairs, one pair +19.35%) and the formula
   batch curve all land inside this machine's run-to-run noise, which reaches 29-39%

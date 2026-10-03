@@ -32,12 +32,21 @@
 //! 每一项**只算一次**，并且区分“输入侧”与“模型侧”：
 //!
 //! ```text
-//! input_decode_ms + input_resize_ms + input_crop_ms + input_other_ms == input_ms()
-//! input_ms() <= preprocess_ms                       （按构造，见下）
+//! input_named_within_ms + input_other_ms == input_ms()
+//! input_decode_ms + input_resize_ms + input_crop_ms
+//!     == input_named_within_ms + input_overflow_ms      （两个口径之间的桥接式）
+//! input_ms() <= input_preprocess_ms == preprocess_ms    （按构造，见下）
 //! detector_ms  == detector_preprocess_ms  + detector_infer_ms  + detector_postprocess_ms
 //! classifier_ms == ...                        （同上）
 //! recognizer_ms == ...                        （同上）
 //! ```
+//!
+//! 注意第一行**不是** `decode + resize + crop + input_other_ms == input_ms()`：那条式子在
+//! 溢出分支（`decode + resize + crop > preprocess_ms`）为假，因为此时 `input_ms()` 由外层
+//! 窗口决定（`input_named_within_ms = preprocess_ms`、`input_other_ms = 0`），而
+//! `input_named_within_ms` 只是原始三项中被外层窗口覆盖到的那部分。原始三项要先用第二行的
+//! 桥接式换成 `input_named_within_ms + input_overflow_ms` 才能与 `input_ms()` 对上。
+//! 这两行由 `documented_input_formula_holds_in_both_branches` 在两个分支上分别钉住。
 //!
 //! 其中 `input_other_ms = max(0, preprocess_ms - decode - resize - crop)`，是外层窗口里
 //! **没有**被单独命名的那部分（输入读出、EXIF/增强、BGR 转换、ROI 裁剪等）。实测在 12 张
@@ -983,6 +992,83 @@ mod tests {
                 .abs()
                 < 1e-9,
             "the only difference between rust + inference and attributed must be the overflow"
+        );
+    }
+
+    /// **文档公式锁定**：模块文档里的输入侧公式必须与实现一致，两个分支都不能漂移。
+    ///
+    /// 文档曾经写 `decode + resize + crop + input_other_ms == input_ms()`，它在溢出分支
+    /// （`decode + resize + crop > preprocess_ms`）为假——此时 `input_ms()` 由外层窗口决定。
+    /// 这里在两个分支上分别钉住实现真正保证的三件事：
+    ///
+    /// - `input_named_within_ms + input_other_ms == input_ms()`（定义式）；
+    /// - `decode + resize + crop == input_named_within_ms + input_overflow_ms`（桥接式）；
+    /// - `input_ms() <= input_preprocess_ms`（按构造成立的不变量）。
+    #[test]
+    fn documented_input_formula_holds_in_both_branches() {
+        // 分支 1：命名三项落在外层窗口内。
+        let fits = OcrTimings {
+            decode_ms: 4.0,
+            resize_ms: 5.0,
+            crop_ms: 1.0,
+            preprocess_ms: 12.0,
+            ..OcrTimings::default()
+        };
+        // 分支 2：命名三项之和 12 ms 超过外层窗口 5 ms。
+        let overflows = OcrTimings {
+            decode_ms: 2.0,
+            resize_ms: 7.0,
+            crop_ms: 3.0,
+            preprocess_ms: 5.0,
+            ..OcrTimings::default()
+        };
+        let fits_ledger = TimingLedger::from_timings(&fits);
+        let overflow_ledger = TimingLedger::from_timings(&overflows);
+        assert_eq!(
+            fits_ledger.input_overflow_ms, 0.0,
+            "branch 1 must not overflow: {fits_ledger:?}"
+        );
+        assert_eq!(
+            overflow_ledger.input_overflow_ms, 7.0,
+            "branch 2 must overflow: {overflow_ledger:?}"
+        );
+
+        for ledger in [fits_ledger, overflow_ledger] {
+            let raw = ledger.input_decode_ms + ledger.input_resize_ms + ledger.input_crop_ms;
+            assert!(
+                (ledger.input_named_within_ms + ledger.input_other_ms - ledger.input_ms()).abs()
+                    < 1e-9,
+                "the documented definition must hold: input_named_within + input_other == \
+                 input_ms(), got {ledger:?}"
+            );
+            assert!(
+                (raw - (ledger.input_named_within_ms + ledger.input_overflow_ms)).abs() < 1e-9,
+                "the three raw input fields must reconcile to input_named_within_ms + \
+                 input_overflow_ms, got {ledger:?}"
+            );
+            assert!(
+                ledger.input_ms() <= ledger.input_preprocess_ms,
+                "the input invariant must hold by construction: {} <= {}, got {ledger:?}",
+                ledger.input_ms(),
+                ledger.input_preprocess_ms
+            );
+        }
+
+        // 被更正掉的旧公式：无溢出时与定义式等价，溢出分支下必须为假。
+        let raw_fits =
+            fits_ledger.input_decode_ms + fits_ledger.input_resize_ms + fits_ledger.input_crop_ms;
+        assert!(
+            (raw_fits + fits_ledger.input_other_ms - fits_ledger.input_ms()).abs() < 1e-9,
+            "without overflow the retracted formula is equivalent to the definition"
+        );
+        let raw_overflow = overflow_ledger.input_decode_ms
+            + overflow_ledger.input_resize_ms
+            + overflow_ledger.input_crop_ms;
+        assert!(
+            (raw_overflow + overflow_ledger.input_other_ms - overflow_ledger.input_ms()).abs()
+                > 1.0,
+            "with overflow the retracted formula must be false, otherwise this test would not \
+             pin the documented change: {overflow_ledger:?}"
         );
     }
 

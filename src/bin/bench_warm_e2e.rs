@@ -202,6 +202,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "timing_ledger": ledger_report,
         // ORT 推理 vs Rust 前后处理的时间占比（阶段 6 门槛证据的来源之一）；
         // 数值与 `timing_ledger` 一致，保留这个键是为了让旧的对比方式仍然可用。
+        // 报告的恒等式是
+        // `ort_inference_ms + rust_ms + input_overflow_ms + unattributed_ms == denominator_ms`
+        // （`identity` / `identity_residual_ms` 两个键把它写进了报告本身）。
         // 与 `timing_ledger` 一样带着残差量级，读取时必须一起看。
         "timing_split": timing_split,
         // 峰值工作集口径与库内一致：`windows:GetProcessMemoryInfo.PeakWorkingSetSize`。
@@ -405,7 +408,33 @@ fn ledger_report(ledgers: &[TimingLedger]) -> serde_json::Value {
 /// ONNX Runtime 推理 vs Rust 前后处理的时间占比。
 ///
 /// 分子来自时间账本的均值，分母是 `stats.ocr_total_ms.avg`（同一个口径，来自
-/// `OcrTimings::total_ms`），因此 `inference + rust + unattributed == total` 按构造成立。
+/// `OcrTimings::total_ms`）。
+///
+/// # 报告出来的恒等式
+///
+/// ```text
+/// ort_inference_ms + rust_ms + input_overflow_ms + unattributed_ms == denominator_ms
+/// ```
+///
+/// 各项都是时间账本（`timing_ledger.components` / `timing_ledger.totals`）里的同名量：
+///
+/// - `ort_inference_ms` = `TimingLedger::inference_ms()`（三个阶段 ORT 推理之和）；
+/// - `rust_ms` = `TimingLedger::rust_ms()`：输入侧用的是**被截断到外层 `preprocess_ms`
+///   窗口内**的 `input_ms()`（= `input_named_within_ms + input_other_ms`）。选这个定义
+///   是为了与账本按构造成立的不变量 `input_ms() <= input_preprocess_ms` 一致：账本不得
+///   声称比它唯一能观测输入时间的那个窗口更多的输入时间，因此 `rust_ms` 只代表“外层窗口
+///   内的 Rust 成本”；
+/// - `input_overflow_ms` = `TimingLedger::input_overflow_ms`：`decode + resize + crop`
+///   超出外层窗口、因此**不在** `rust_ms` 里的那部分输入时间；
+/// - `unattributed_ms` = `total_ms - attributed_ms()`。
+///
+/// 账本的 `attributed_ms()` 计入**完整**的输入三项
+/// （`input_named_within_ms + input_overflow_ms`），所以
+/// `attributed_ms() - (rust_ms() + inference_ms()) == input_overflow_ms`：溢出项必须作为
+/// 独立项出现在恒等式里。旧文档写的 `inference + rust + unattributed == total` 只在
+/// `input_overflow_ms == 0` 时成立，溢出分支下它会少掉这个量。这一项**不**折进 `rust_ms`
+/// （否则 `rust_ms` 就不再是“外层窗口内的 Rust 成本”，与 `input_ms() <= preprocess_ms`
+/// 的定义矛盾），也**不**折进余量（否则已命名的分量会被藏进“未归属”）。
 ///
 /// 按构造成立**不等于**这些占比是精确划分：账本的各个分量与 `total_ms` 的口径不同
 /// （见 `timing_ledger.conservation`），所以每一项占比只在
@@ -421,9 +450,17 @@ fn inference_share(ledgers: &[TimingLedger], total_avg: f64) -> serde_json::Valu
     let mean = TimingLedger::mean(ledgers);
     let inference = mean.inference_ms();
     let rust = mean.rust_ms();
+    let input_overflow = mean.input_overflow_ms;
+    let unattributed = mean.unattributed_ms;
     let share = |value: f64| value / total_avg;
+    // 恒等式的实测残差：按构造只应是浮点累加差（`total_avg` 与均值账本的 `total_ms`
+    // 是同一批 `OcrTimings::total_ms` 的两种求和顺序）。把它一起报出来，读到这份 JSON 的
+    // 人不必先去核对文档就能验证恒等式。
+    let identity_sum = inference + rust + input_overflow + unattributed;
     json!({
         "basis": "per-sample ledger mean; the same samples back stats.ocr_total_ms",
+        "identity": "ort_inference_ms + rust_ms + input_overflow_ms + unattributed_ms == denominator_ms",
+        "identity_residual_ms": total_avg - identity_sum,
         "denominator_ms": total_avg,
         "ort_inference_ms": inference,
         "ort_inference_share": share(inference),
@@ -443,7 +480,153 @@ fn inference_share(ledgers: &[TimingLedger], total_avg: f64) -> serde_json::Valu
         "rust_model_postprocess_share": share(mean.model_postprocess_ms()),
         "rust_page_postprocess_ms": mean.page_postprocess_ms,
         "rust_page_postprocess_share": share(mean.page_postprocess_ms),
-        "unattributed_ms": mean.unattributed_ms,
-        "unattributed_share": share(mean.unattributed_ms),
+        // 输入侧溢出：`decode + resize + crop` 超出外层 `preprocess_ms` 窗口的量。
+        // `rust_ms` 用的是截断后的 `input_ms()`，所以这一项是恒等式里不可省略的独立项。
+        "input_overflow_ms": input_overflow,
+        "input_overflow_share": share(input_overflow),
+        // 被命名分量之和；`attributed_ms - (rust_ms + ort_inference_ms) == input_overflow_ms`。
+        "attributed_ms": mean.attributed_ms(),
+        "attributed_share": share(mean.attributed_ms()),
+        "unattributed_ms": unattributed,
+        "unattributed_share": share(unattributed),
     })
+}
+
+/// `timing_split` 的守恒回归：**`bench_warm_e2e` 级别**的恒等式测试。
+///
+/// `src/runtime/timing.rs` 的测试只覆盖账本自身（`TimingLedger`）。这里覆盖的是报告层：
+/// `timing_split` 报出来的分解必须真的能加回 `denominator_ms`，包括
+/// `input_overflow_ms > 0` 的分支——旧文档的 `inference + rust + unattributed == total`
+/// 正是在那个分支上少掉溢出项。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 手工构造账本：只填恒等式用到的分量，其余为 0；
+    /// `unattributed_ms` 与 `from_timings` 一样等于 `total_ms - attributed_ms()`。
+    fn ledger(
+        total_ms: f64,
+        infer_ms: f64,
+        input_named_within_ms: f64,
+        input_overflow_ms: f64,
+    ) -> TimingLedger {
+        let mut ledger = TimingLedger {
+            total_ms,
+            input_preprocess_ms: input_named_within_ms,
+            input_named_within_ms,
+            input_overflow_ms,
+            detector_infer_ms: infer_ms,
+            ..TimingLedger::default()
+        };
+        ledger.unattributed_ms = ledger.total_ms - ledger.attributed_ms();
+        ledger
+    }
+
+    fn number(split: &serde_json::Value, key: &str) -> f64 {
+        split[key]
+            .as_f64()
+            .unwrap_or_else(|| panic!("`timing_split.{key}` must be a number: {split}"))
+    }
+
+    /// 四项之和必须精确回到分母；占比之和必须回到 1。
+    fn assert_split_identity(split: &serde_json::Value) {
+        let total = number(split, "denominator_ms");
+        let sum = number(split, "ort_inference_ms")
+            + number(split, "rust_ms")
+            + number(split, "input_overflow_ms")
+            + number(split, "unattributed_ms");
+        assert!(
+            (sum - total).abs() < 1e-9,
+            "the reported identity must hold: {sum} != {total}: {split}"
+        );
+        assert!(
+            number(split, "identity_residual_ms").abs() < 1e-9,
+            "the report must carry a zero identity residual: {split}"
+        );
+        let share_sum = number(split, "ort_inference_share")
+            + number(split, "rust_share")
+            + number(split, "input_overflow_share")
+            + number(split, "unattributed_share");
+        assert!(
+            (share_sum - 1.0).abs() < 1e-9,
+            "the reported shares must sum to 1: {share_sum}: {split}"
+        );
+        assert!(
+            split["identity"]
+                .as_str()
+                .is_some_and(|value| value.contains("input_overflow_ms")),
+            "the report must name `input_overflow_ms` as part of the identity: {split}"
+        );
+    }
+
+    /// `input_overflow_ms == 0`：恒等式成立（旧文档在这里是对的）。
+    #[test]
+    fn timing_split_identity_holds_without_input_overflow() {
+        let sample = ledger(1000.0, 800.0, 100.0, 0.0);
+        assert_eq!(sample.unattributed_ms, 100.0);
+        let split = inference_share(&[sample], sample.total_ms);
+        assert_eq!(number(&split, "denominator_ms"), 1000.0);
+        assert_eq!(number(&split, "ort_inference_ms"), 800.0);
+        assert_eq!(number(&split, "rust_ms"), 100.0);
+        assert_eq!(number(&split, "input_overflow_ms"), 0.0);
+        assert_eq!(number(&split, "unattributed_ms"), 100.0);
+        assert_split_identity(&split);
+    }
+
+    /// `input_overflow_ms > 0`：`decode + resize + crop` 超出外层窗口时，旧恒等式
+    /// （缺 `input_overflow_ms`）会少掉这一项，新恒等式必须仍然成立，并且溢出项
+    /// 必须**显式**出现在报告里（既不折进 `rust_ms`，也不折进 `unattributed_ms`）。
+    #[test]
+    fn timing_split_identity_keeps_input_overflow_explicit() {
+        // 与 `src/runtime/timing.rs::input_overflow_keeps_the_input_invariant_by_construction`
+        // 同一口径：外层窗口 5 ms，命名三项之和 12 ms → 溢出 7 ms。
+        let timings = rapid_ocr_rs::OcrTimings {
+            decode_ms: 2.0,
+            resize_ms: 7.0,
+            crop_ms: 3.0,
+            preprocess_ms: 5.0,
+            detector_preprocess_ms: 1.0,
+            detector_infer_ms: 10.0,
+            detector_postprocess_ms: 1.0,
+            detect_ms: 12.0,
+            classifier_preprocess_ms: 0.0,
+            classifier_infer_ms: 0.0,
+            classifier_postprocess_ms: 0.0,
+            classify_ms: 0.0,
+            recognizer_preprocess_ms: 1.0,
+            recognizer_infer_ms: 20.0,
+            recognizer_postprocess_ms: 2.0,
+            recognize_ms: 23.0,
+            formula_ms: 0.0,
+            postprocess_ms: 3.0,
+            total_ms: 43.0,
+        };
+        let sample = TimingLedger::from_timings(&timings);
+        assert_eq!(sample.input_overflow_ms, 7.0);
+        assert_eq!(sample.total_ms, 43.0);
+
+        let split = inference_share(&[sample], sample.total_ms);
+        assert_eq!(number(&split, "ort_inference_ms"), 30.0);
+        assert_eq!(number(&split, "rust_ms"), 13.0);
+        assert_eq!(number(&split, "input_overflow_ms"), 7.0);
+        assert_eq!(number(&split, "unattributed_ms"), -7.0);
+        // 被命名分量之和比 `rust + inference` 多的部分恰好是溢出量。
+        assert!(
+            (number(&split, "attributed_ms")
+                - (number(&split, "rust_ms") + number(&split, "ort_inference_ms"))
+                - number(&split, "input_overflow_ms"))
+            .abs()
+                < 1e-9,
+            "the overflow must be the only gap between rust+inference and attributed: {split}"
+        );
+        // 旧恒等式（缺 `input_overflow_ms`）在这个样本上不成立——这正是被修掉的缺陷。
+        let stale = number(&split, "ort_inference_ms")
+            + number(&split, "rust_ms")
+            + number(&split, "unattributed_ms");
+        assert!(
+            (stale - number(&split, "denominator_ms")).abs() > 1.0,
+            "this sample must really exercise the overflow branch: {split}"
+        );
+        assert_split_identity(&split);
+    }
 }

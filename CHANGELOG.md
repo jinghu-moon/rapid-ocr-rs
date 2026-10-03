@@ -65,10 +65,29 @@
   `(intra, inter)`（`None` = 未配置）。
 - `formula_bench` / `formula_eval` 报告新增 `effective_intra_threads` /
   `effective_inter_threads`（前者在 `threads` 下，后者在 `provider` 下）。
-- `LedgerConservation` 新增 `overlap_ms`（= `max(0, -residual_ms)`，占比成立的上界）与
-  `interpretation`（进入 JSON 的读法说明）。时间账本是**诊断**工具：负残差表示计时窗口
-  重叠（外层 `preprocess_ms` 与阶段计时跨越 `inner.run()`），**不是** `total_ms` 算错了，
-  也不能作为性能验收依据。
+- `LedgerConservation` 新增 `excess_ms`（= `max(0, -residual_ms)`，占比成立的上界；该字段
+  终审时曾临时叫 `overlap_ms`，名字与语义均已废弃）与 `interpretation`（进入 JSON 的读法
+  说明）。时间账本是**诊断**工具：残差是 `total_ms`（总窗口）与命名分量之和之间的
+  **口径差异**——外层 `preprocess_ms` 窗口（`rapid_ocr.rs:619-719`）与 `inner.run()` 的
+  e2e 窗口（`:106-130`）**串行、不重叠**，没有任何一段墙钟被算两次——**不是** `total_ms`
+  算错了，也不能作为性能验收依据。
+
+### 计时账本的口径陈述与 `timing_split` 恒等式（复审）
+
+- `timing_split` 新增 `identity` / `identity_residual_ms` / `input_overflow_ms` /
+  `input_overflow_share` / `attributed_ms` / `attributed_share`。报告的恒等式是
+  `ort_inference_ms + rust_ms + input_overflow_ms + unattributed_ms == denominator_ms`
+  （与恒等式的实测残差一起报出）。此前文档写的
+  `inference + rust + unattributed == total` 只在 `input_overflow_ms == 0` 时成立：`rust_ms`
+  用的是被截断到外层窗口内的 `input_ms()`，而 `attributed_ms` 计入完整的输入三项
+  （`input_named_within_ms + input_overflow_ms`），溢出量必须显式留在恒等式里。已有键名
+  未变。
+- 修正残留的因果陈述：`README.md` 与 `src/runtime/mod.rs` 不再说计时窗口“重叠”，统一为
+  “分量与 `total_ms` 量的是不同（串行）范围的墙钟，因此不是严格划分”；
+  `src/runtime/timing.rs` 的模块公式不再写
+  `decode + resize + crop + input_other_ms == input_ms()`（溢出分支为假），改为
+  `input_named_within_ms + input_other_ms == input_ms()` 加桥接式
+  `decode + resize + crop == input_named_within_ms + input_overflow_ms`。
 
 ## 已知限制
 

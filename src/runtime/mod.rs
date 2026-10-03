@@ -14,7 +14,9 @@
 //! - [`provider`]：执行提供者解析与错误语义；
 //! - [`ort_runtime`]：已加载 ONNX Runtime 运行库的指纹（版本/路径/体积/SHA-256/provider DLL）；
 //! - [`timing`]：把 [`crate::api::OcrTimings`] 拆成显式命名项 + 显式余量的时间账本
-//!   （**诊断**工具：分量来自互相重叠的计时窗口，占比只在残差量级内成立）；
+//!   （**诊断**工具：各分量与 `total_ms` 量的是**不同（串行）范围**的墙钟——外层
+//!   `preprocess_ms` 窗口在 `inner.run()` 之前结束，没有一段墙钟被算两次——因此它不是
+//!   `total_ms` 的严格划分，占比只在残差量级内成立）；
 //! - [`profile`]：provider + 线程 + arena + 公式批大小的统一画像；
 //! - [`memory`]：进程峰值工作集采集（Windows x64）。
 
