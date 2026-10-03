@@ -230,6 +230,12 @@ struct EvaluationReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReferenceComparison {
     reference_path: String,
+    /// 参考文件内容的 SHA-256。
+    ///
+    /// 只比较路径与记录数不足以说明“同一份参考数据”：文件可以被同路径、同条数的
+    /// 新内容替换。分片合并前必须比较该摘要。
+    #[serde(default)]
+    reference_sha256: String,
     /// 参考文件中的记录总数；分片运行时用于把 `missing_in_rust` 还原为全局口径。
     #[serde(default)]
     reference_total: usize,
@@ -263,6 +269,7 @@ impl ReferenceComparison {
         let first = shards.first()?;
         let mut merged = Self {
             reference_path: first.reference_path.clone(),
+            reference_sha256: first.reference_sha256.clone(),
             reference_total: first.reference_total,
             compared: 0,
             missing_in_reference: 0,
@@ -297,9 +304,10 @@ impl ReferenceComparison {
         Some(merged)
     }
 
-    /// 分片之间必须引用同一份参考文件，否则聚合没有意义。
+    /// 分片之间必须引用**内容相同**的参考文件，否则聚合没有意义。
     fn same_source(&self, other: &Self) -> bool {
-        self.reference_path == other.reference_path && self.reference_total == other.reference_total
+        self.reference_sha256 == other.reference_sha256
+            && self.reference_total == other.reference_total
     }
 }
 
@@ -466,6 +474,31 @@ fn merge_shard_reports(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 manifest_hash
             )
             .into());
+        }
+        // 样本选择摘要相同不代表图像内容相同：路径与标签不变、文件被替换时分片报告
+        // 仍会“看起来一致”。内容摘要必须完全一致才允许合并。
+        match (
+            first.manifest.content_sha256.as_deref(),
+            report.manifest.content_sha256.as_deref(),
+        ) {
+            (Some(expected), Some(actual)) if expected == actual => {}
+            (Some(expected), Some(actual)) => {
+                return Err(format!(
+                    "{} was evaluated on different image content ({} vs {})",
+                    path.display(),
+                    actual,
+                    expected
+                )
+                .into());
+            }
+            _ => {
+                return Err(format!(
+                    "{} does not carry a manifest `content_sha256`; regenerate every shard with a \
+                     manifest that records image content before merging",
+                    path.display()
+                )
+                .into());
+            }
         }
         if report.records.is_none() {
             return Err(format!("{} has no per-sample records", path.display()).into());
@@ -1078,6 +1111,13 @@ fn compare_with_reference(
     records: &mut [SampleRecord],
 ) -> Result<ReferenceComparison, Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(path)?;
+    // 参考文件的**内容**摘要（不是路径）：分片合并必须靠它判断是否为同一份数据。
+    let reference_sha256 = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(raw.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
     let reference: PythonReference = serde_json::from_str(&raw)?;
     let by_image: HashMap<String, PythonRecord> = reference
         .records
@@ -1087,6 +1127,7 @@ fn compare_with_reference(
 
     let mut comparison = ReferenceComparison {
         reference_path: path.display().to_string(),
+        reference_sha256,
         reference_total: by_image.len(),
         compared: 0,
         missing_in_reference: 0,
@@ -1175,6 +1216,7 @@ mod tests {
         reference: Option<super::ReferenceComparison>,
         manifest_entries: &[&str],
         records: &[&str],
+        content_sha256: Option<&str>,
     ) -> super::EvaluationReport {
         use rapid_ocr_rs::evaluation::formula::{
             report::{FailureKind, SampleRecord},
@@ -1199,7 +1241,8 @@ mod tests {
             entry_count: manifest_entries.len(),
             scored_count: manifest_entries.len(),
             manifest_sha256: "manifest-hash".to_string(),
-            content_sha256: Some("content-hash".to_string()),
+            sample_set_sha256: "sample-set-hash".to_string(),
+            content_sha256: content_sha256.map(str::to_string),
             entries: manifest_entries,
         };
         let records: Vec<SampleRecord> = records
@@ -1267,14 +1310,17 @@ mod tests {
         }
     }
 
-    fn reference(
+    /// 构造参考对比；`digest` 是参考文件的内容摘要（合并时必须一致）。
+    fn reference_with_digest(
         path: &str,
+        digest: &str,
         total: usize,
         compared: usize,
         links: &[&str],
     ) -> super::ReferenceComparison {
         super::ReferenceComparison {
             reference_path: path.to_string(),
+            reference_sha256: digest.to_string(),
             reference_total: total,
             compared,
             missing_in_reference: 0,
@@ -1340,6 +1386,7 @@ mod tests {
                 None,
                 &["a.png", "b.png", "c.png", "d.png"],
                 &["a.png", "b.png"],
+                Some("content-a"),
             ),
         );
         let other_model = write_report(
@@ -1352,6 +1399,7 @@ mod tests {
                 None,
                 &["a.png", "b.png", "c.png", "d.png"],
                 &["c.png", "d.png"],
+                Some("content-a"),
             ),
         );
         let error = super::merge_shard_reports(&merge_cli(vec![first, other_model]))
@@ -1376,6 +1424,7 @@ mod tests {
                 None,
                 &["a.png", "b.png", "c.png", "d.png"],
                 &["a.png", "b.png"],
+                Some("content-a"),
             ),
         );
         let other_provider = write_report(
@@ -1388,6 +1437,7 @@ mod tests {
                 None,
                 &["a.png", "b.png", "c.png", "d.png"],
                 &["c.png", "d.png"],
+                Some("content-a"),
             ),
         );
         let error = super::merge_shard_reports(&merge_cli(vec![first, other_provider]))
@@ -1404,6 +1454,7 @@ mod tests {
                 None,
                 &["a.png", "b.png", "c.png", "d.png"],
                 &["a.png", "b.png"],
+                Some("content-a"),
             ),
         );
         let other_batch = write_report(
@@ -1416,6 +1467,7 @@ mod tests {
                 None,
                 &["a.png", "b.png", "c.png", "d.png"],
                 &["c.png", "d.png"],
+                Some("content-a"),
             ),
         );
         let error = super::merge_shard_reports(&merge_cli(vec![first, other_batch]))
@@ -1427,8 +1479,8 @@ mod tests {
     /// 参考对比必须做全局聚合，而不是沿用第一个分片的部分结果。
     #[test]
     fn reference_comparison_aggregates_across_shards() {
-        let first = reference("python.json", 4, 2, &["a.png"]);
-        let second = reference("python.json", 4, 2, &["c.png"]);
+        let first = reference_with_digest("python.json", "digest-a", 4, 2, &["a.png"]);
+        let second = reference_with_digest("python.json", "digest-a", 4, 2, &["c.png"]);
         let merged = super::ReferenceComparison::aggregate(&[&first, &second])
             .expect("aggregate must produce a value");
         assert_eq!(merged.compared, 4);
@@ -1453,10 +1505,66 @@ mod tests {
 
     #[test]
     fn reference_comparison_rejects_a_partial_reference_source() {
-        let first = reference("python.json", 4, 2, &[]);
-        let other = reference("other.json", 4, 2, &[]);
-        assert!(!first.same_source(&other));
+        let first = reference_with_digest("python.json", "digest-a", 4, 2, &[]);
+        // 同路径、同条数但内容不同（摘要不同）必须被判为不同来源。
+        let same_path_new_content = reference_with_digest("python.json", "digest-c", 4, 2, &[]);
+        let other_path = reference_with_digest("other.json", "digest-b", 4, 2, &[]);
+        assert!(!first.same_source(&same_path_new_content));
+        assert!(!first.same_source(&other_path));
         assert!(first.same_source(&first));
+    }
+
+    /// 样本选择摘要相同但图像内容不同的分片不得合并。
+    #[test]
+    fn merge_rejects_mismatched_image_content() {
+        let dir = temp_dir("merge-content");
+        let entries = ["a.png", "b.png", "c.png", "d.png"];
+        let first = write_report(
+            &dir,
+            "a.json",
+            &shard_report(
+                "sha-A",
+                "Cpu",
+                8,
+                None,
+                &entries,
+                &["a.png", "b.png"],
+                Some("content-a"),
+            ),
+        );
+        let other_content = write_report(
+            &dir,
+            "b.json",
+            &shard_report(
+                "sha-A",
+                "Cpu",
+                8,
+                None,
+                &entries,
+                &["c.png", "d.png"],
+                Some("content-b"),
+            ),
+        );
+        let error = super::merge_shard_reports(&merge_cli(vec![first.clone(), other_content]))
+            .expect_err("different image content must not merge");
+        assert!(
+            error.to_string().contains("different image content"),
+            "error: {error}"
+        );
+
+        // 一个分片没有内容摘要时同样拒绝：无法证明两边是同一批像素。
+        let without_digest = write_report(
+            &dir,
+            "c.json",
+            &shard_report("sha-A", "Cpu", 8, None, &entries, &["c.png", "d.png"], None),
+        );
+        let error = super::merge_shard_reports(&merge_cli(vec![first, without_digest]))
+            .expect_err("a missing content digest must not merge");
+        assert!(
+            error.to_string().contains("content_sha256"),
+            "error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 合并结果必须与串行结果一致：指标、记录顺序与状态。
@@ -1473,6 +1581,7 @@ mod tests {
                 None,
                 &["a.png", "b.png", "c.png", "d.png"],
                 &["a.png", "b.png"],
+                Some("content-a"),
             ),
         );
         let second = write_report(
@@ -1485,6 +1594,7 @@ mod tests {
                 None,
                 &["a.png", "b.png", "c.png", "d.png"],
                 &["c.png", "d.png"],
+                Some("content-a"),
             ),
         );
         super::merge_shard_reports(&merge_cli(vec![second.clone(), first.clone()]))

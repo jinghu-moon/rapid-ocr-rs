@@ -1993,7 +1993,76 @@ tokenizer 与后处理 / 模型与解码 / 发布验收），并明确
 六项都未变时才可以复用。本轮全部修复都属于代码逻辑问题，
 因此按第 1–3 档验证，**没有重跑全量评测**；全量结果是复用既有基线的。
 
-### 29.12 提交
+### 29.12 第四轮审核修复（P1/P2 逐项）
+
+第四轮审核提出 4 项问题，全部处理如下。
+
+#### 29.12.1 P1 分片合并未校验 `content_sha256`
+
+**根因**：合并只比较 `manifest_sha256`（样本路径 + 标签）。路径与标签相同、
+图像文件被替换时该值不变，因此不同像素的分片仍会被合并。
+
+**处理**：合并时要求所有分片的 `manifest.content_sha256` **完全一致**；
+任一分片缺少该字段（例如第三轮之前生成的报告）也直接拒绝，并给出
+“重新生成每个分片”的可定位错误。
+**验证**：单元测试 `merge_rejects_mismatched_image_content`（内容不同拒绝、
+缺摘要拒绝）；真实数据上把某个分片的 `content_sha256` 改为全 0 后 CLI 报错退出且不写文件；
+用旧分片（无内容摘要）尝试合并时得到
+`does not carry a manifest 'content_sha256'; regenerate every shard …`。
+
+#### 29.12.2 P2 公式阶段计数错误
+
+**根因**：`StageState::Completed { items }` 写的是 `output.regions.len()`
+（文本 + 公式），不是公式阶段处理的公式数量。
+**处理**：改为 `output.formula_count()`；集成测试的预期同步修正，并增加
+`formula_count() < regions.len()` 的断言，确保两者确实不同（否则测试无法发现该缺陷）。
+**验证**：`formula_integration_tests::detected_formula_regions_are_typed_and_carry_latex`
+在真实页面上通过（该页 50 区域 / 8 公式）。
+
+#### 29.12.3 P2 抽样声称“内容哈希”但实际使用绝对路径 + 标签
+
+**根因**：抽样键是 `sample.image_path`（**绝对路径**）+ 真值。数据集复制到其它
+根目录后键值改变，样本选择随之改变，“跨机器稳定抽样”不成立。
+
+**处理**（根因修复，而不是改文档措辞）：
+
+- `FormulaSample` 新增 `relative_path`，由 `dataset_relative_path(root, path)`
+  在加载时计算，绝对路径被彻底剥离；
+- 抽样键改为 `relative_path + ground_truth`；
+- `build_manifest` 直接使用样本自带的相对路径（不再二次剥离），
+  并在 `FormulaSample::new` 里拒绝空相对路径；
+- 文档与策略注释改为准确表述：抽样是“相对路径 + 真值的稳定哈希”，
+  **图像内容不参与选择**（内容摘要单独记录，否则数据一改动就无法区分
+  “换的是内容”还是“选的样本”）。
+
+**影响与验证**（这一点必须诚实记录）：抽样键改变会改变**评测顺序**，因此
+`manifest_sha256`（含顺序）对所有数据集都变了。为此新增**顺序无关**的
+`Manifest::sample_set_sha256`（按 `relative_path` 排序后哈希），并用它证明：
+
+| 数据集 | 样本数 | 集合是否变化 | 处理 |
+| --- | ---: | --- | --- |
+| im2latex-full | 10,355 | 否（仅顺序） | 指标不变，直接复用 |
+| val-501 | 501 | 否（该集恰好全量） | Rust 与 Python 侧均按新 manifest 重跑，结果逐项一致（501/501、both_wrong 311、链路差异 0） |
+| UniMER spe/sce/cpe/hwe | 6,762 / 4,742 / 5,921 / 6,332 | 否（仅顺序） | 指标不变，直接复用 |
+| **im2latex-100** | 100 | **是（99/100 不同）** | **已重跑**：exact 24.00% / normalized 25.00% / CER 0.0863 / 失败 0 |
+
+另外 `content_sha256` 也改成顺序无关（同样按路径排序），
+因此内容校验不再受抽样键或执行顺序影响。
+单元测试 `hash_sampling_is_independent_of_the_absolute_root`
+用两个不同绝对根目录下的同一数据集断言：选择顺序、全量顺序与 manifest 哈希都一致。
+
+#### 29.12.4 P2 Python reference 一致性校验不是内容校验
+
+**根因**：`same_source()` 只比较 `reference_path` 与 `reference_total`，
+同路径、同条数但内容被替换的参考文件会被当成同一份数据。
+
+**处理**：读取参考文件时计算其内容 SHA-256（`reference_sha256`），
+`same_source()` 改为比较该摘要与记录数。
+**验证**：`reference_comparison_rejects_a_partial_reference_source`
+新增“同路径、同条数、不同摘要必须判为不同来源”的断言；
+真实数据上 val-501 的报告记录了 `reference_sha256 = 2f49a993a4ce6bda…`。
+
+### 29.13 提交
 | 内容 | 提交 | 说明 |
 | --- | --- | --- |
 | 第二轮审核修复 | `9db5dda` | `fix(formula): close the review gaps in the PP-FormulaNet integration` |
@@ -2005,3 +2074,4 @@ tokenizer 与后处理 / 模型与解码 / 发布验收），并明确
 | CPE 分片执行与文档 | `5322a53` | `docs(formula): record the CPE sharding approach and its verified equivalence` |
 | 阶段 9/10 全部结果 | 见本节表格 | 提交在 `tests/baseline/formula-evaluation-2026-10-03.json` |
 | 第三轮审核修复 | 见 §29.11 | 删除无效参数、内存输入像素限制、benchmark 口径、分片身份校验与对比聚合、manifest 内容摘要、检测器有限性校验、测试资产定位去重 |
+| 第四轮审核修复 | 见 §29.12 | 分片校验 `content_sha256`、公式阶段计数改为 `formula_count()`、抽样键改为数据集相对路径、reference 比较内容摘要 |

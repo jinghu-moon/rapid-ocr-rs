@@ -3,8 +3,11 @@
 //! 公式主评测必须“测试顺序稳定、可重复生成相同 manifest/hash”，并且不能只报告
 //! 对模型有利的样本。因此：
 //!
-//! - 抽样使用 **内容哈希排序**，而不是“取前 N 张”或时间戳随机；
-//! - 同一数据集/切分/子集/数量在任何机器上产生同一子集；
+//! - 抽样使用**数据集相对路径 + 真值的稳定哈希排序**，而不是“取前 N 张”、
+//!   时间戳随机或绝对路径：同一数据集在任何机器、任何绝对路径下都选出同一子集；
+//! - 图像**内容**摘要单独记录在 `content_sha256` / `ManifestEntry::image_sha256`，
+//!   用于检测“路径与标签不变但文件被替换”。内容不参与样本选择，
+//!   否则数据一改动就无法再用既有 manifest 判断“换的是内容还是选的样本”。
 //! - manifest 记录每个样本的相对路径与真值 SHA-256，并给出整体哈希，
 //!   重跑必须得到同一个哈希。
 
@@ -19,7 +22,7 @@ use crate::evaluation::formula::fixture::FormulaSample;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SampleStrategy {
-    /// 按内容哈希排序后取前 N 条：稳定、与文件系统顺序无关。
+    /// 按 `相对路径 + 真值` 的稳定哈希排序后取前 N 条：与文件系统顺序、绝对路径无关。
     Hash,
     /// 文件/标签的原始顺序取前 N 条（仅用于复现历史 smoke 结果）。
     First,
@@ -34,12 +37,12 @@ impl SampleStrategy {
     }
 }
 
+/// 抽样键：数据集相对路径 + 真值。
+///
+/// **不含绝对路径**，因此数据集被复制到别处不会改变样本选择。
+/// 也不含图像内容，理由见模块文档。
 fn sample_key(sample: &FormulaSample) -> String {
-    format!(
-        "{}\u{1f}{}",
-        sample.image_path.to_string_lossy(),
-        sample.ground_truth
-    )
+    format!("{}\u{1f}{}", sample.relative_path, sample.ground_truth)
 }
 
 fn digest_hex(bytes: &[u8]) -> String {
@@ -94,15 +97,26 @@ pub struct Manifest {
     pub entry_count: usize,
     pub scored_count: usize,
     /// 样本选择摘要：数据集 / 切分 / 子集 / 抽样策略 / 数量 + 每个样本的
-    /// `relative_path` 与真值摘要。
+    /// `relative_path` 与真值摘要**（按评测顺序）**。
     ///
-    /// 该值只取决于“选了哪些样本”，与图像文件内容无关，因此可以用它固定子集、
-    /// 复现历史结果。
+    /// 它只取决于“选了哪些样本、以什么顺序评测”，与图像文件内容无关。
+    /// 注意它**包含顺序**：改变抽样键（例如从绝对路径改为相对路径）会改变该值，
+    /// 即使选出的样本集合完全相同。判断“是不是同一批样本”应使用
+    /// [`Manifest::sample_set_sha256`]。
     pub manifest_sha256: String,
-    /// 图像内容摘要：在 `manifest_sha256` 的基础上再纳入每个样本的图像文件
-    /// SHA-256。
+    /// **顺序无关**的样本集合摘要：把 `relative_path` + 真值摘要排序后再哈希。
     ///
-    /// 路径与标签不变、但图像文件被替换时，`manifest_sha256` 不变而本字段变化，
+    /// 抽样键或执行顺序变化时该值不变，因此历史报告可以用它对齐到重新生成的
+    /// manifest，从而区分“换了一批样本”和“只是换了顺序”。
+    ///
+    /// `default`：该字段是后来加入的，旧 manifest 里没有；读取旧报告时留空，
+    /// 由合并逻辑给出「需要重新生成」的可定位错误，而不是反序列化失败。
+    #[serde(default)]
+    pub sample_set_sha256: String,
+    /// 图像内容摘要：在样本集合摘要之上再纳入每个样本的图像文件 SHA-256
+    /// （同样按 `relative_path` 排序，因此与评测顺序无关）。
+    ///
+    /// 路径与标签不变、但图像文件被替换时，`sample_set_sha256` 不变而本字段变化，
     /// 因此 `--expect-manifest` 能发现数据被改动。旧 manifest（本字段为 `None`）
     /// 仍可用来固定样本集合，只是不校验内容。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,13 +125,14 @@ pub struct Manifest {
 }
 
 fn relative_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    crate::evaluation::formula::fixture::dataset_relative_path(root, path)
 }
 
 /// 构建 manifest 并计算稳定哈希。
+///
+/// `relative_path` 直接取样本在加载时计算好的数据集相对路径（与抽样键同源），
+/// 因此 manifest 与实际选择的样本不会因为传入的 `root` 写法不同而分叉。
+/// `root` 仅用于兜底：样本未记录相对路径时（理论上不会发生）按它剥离前缀。
 ///
 /// 会为每个样本计算图像文件 SHA-256（`content_sha256` 用），文件不可读时该条目
 /// 的图像摘要为 `None`，并且不写入 `content_sha256`（避免给出“已校验”的假象）。
@@ -133,7 +148,11 @@ pub fn build_manifest(
     let entries: Vec<ManifestEntry> = samples
         .iter()
         .map(|sample| ManifestEntry {
-            relative_path: relative_path(root, &sample.image_path),
+            relative_path: if sample.relative_path.is_empty() {
+                relative_path(root, &sample.image_path)
+            } else {
+                sample.relative_path.clone()
+            },
             ground_truth_sha256: digest_hex(sample.ground_truth.as_bytes()),
             has_ground_truth: sample.has_ground_truth(),
             image_sha256: crate::model_store::sha256_file(&sample.image_path).ok(),
@@ -157,15 +176,56 @@ pub fn build_manifest(
         canonical.push_str(&entry.ground_truth_sha256);
     }
 
-    // 内容摘要复用同一份 canonical 前缀，再追加图像摘要，便于审查“只差图像内容”。
+    // 顺序无关的样本集合摘要：先按 `relative_path` 排序，再哈希。
+    let mut sorted_paths: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.relative_path.as_str(),
+                entry.ground_truth_sha256.as_str(),
+            )
+        })
+        .collect();
+    sorted_paths.sort_unstable();
+    let mut set_canonical = String::new();
+    set_canonical.push_str(dataset);
+    set_canonical.push('\u{1f}');
+    set_canonical.push_str(split);
+    set_canonical.push('\u{1f}');
+    set_canonical.push_str(subset.unwrap_or(""));
+    set_canonical.push('\u{1f}');
+    set_canonical.push_str(strategy.as_str());
+    set_canonical.push('\u{1f}');
+    set_canonical.push_str(&limit.to_string());
+    for (path, truth) in &sorted_paths {
+        set_canonical.push('\u{1e}');
+        set_canonical.push_str(path);
+        set_canonical.push('\u{1f}');
+        set_canonical.push_str(truth);
+    }
+    let sample_set_sha256 = digest_hex(set_canonical.as_bytes());
+
+    // 内容摘要复用集合摘要，再按同一排序追加图像摘要，便于审查“只差图像内容”。
     let content_sha256 = entries
         .iter()
         .all(|entry| entry.image_sha256.is_some())
         .then(|| {
-            let mut content = canonical.clone();
-            for entry in &entries {
+            let mut sorted_images: Vec<(&str, &str)> = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.relative_path.as_str(),
+                        entry.image_sha256.as_deref().unwrap_or(""),
+                    )
+                })
+                .collect();
+            sorted_images.sort_unstable();
+            let mut content = set_canonical.clone();
+            for (path, image) in &sorted_images {
                 content.push('\u{1e}');
-                content.push_str(entry.image_sha256.as_deref().unwrap_or(""));
+                content.push_str(path);
+                content.push('\u{1f}');
+                content.push_str(image);
             }
             digest_hex(content.as_bytes())
         });
@@ -182,6 +242,7 @@ pub fn build_manifest(
             .filter(|entry| entry.has_ground_truth)
             .count(),
         manifest_sha256: digest_hex(canonical.as_bytes()),
+        sample_set_sha256,
         content_sha256,
         entries,
     }
@@ -198,6 +259,7 @@ mod tests {
         (0..count)
             .map(|index| {
                 FormulaSample::new(
+                    format!("image_{index}.png"),
                     PathBuf::from(format!("root/image_{index}.png")),
                     format!("x_{index}"),
                     FormulaDataset::Im2Latex,
@@ -224,6 +286,77 @@ mod tests {
             "hash sampling must be order independent"
         );
         assert_eq!(first_paths.len(), 10);
+    }
+
+    /// 抽样键必须只依赖数据集相对路径与真值：把数据集搬到别的绝对路径下，
+    /// 选出的样本与顺序都不能变（跨机器复现的前提）。
+    #[test]
+    fn hash_sampling_is_independent_of_the_absolute_root() {
+        let relocate = |prefix: &str| -> Vec<FormulaSample> {
+            (0..40)
+                .map(|index| {
+                    FormulaSample::new(
+                        format!("images/image_{index}.png"),
+                        PathBuf::from(format!("{prefix}/images/image_{index}.png")),
+                        format!("x_{index}"),
+                        FormulaDataset::Im2Latex,
+                        FormulaSplit::Test,
+                        Some(index),
+                    )
+                    .expect("sample")
+                })
+                .collect()
+        };
+        let original = relocate("D:/datasets/Formula-TestSet");
+        let moved = relocate("C:/other/place/Formula-TestSet");
+
+        let first = select_samples(&original, SampleStrategy::Hash, 12);
+        let second = select_samples(&moved, SampleStrategy::Hash, 12);
+        let first_keys: Vec<&str> = first.iter().map(|s| s.relative_path.as_str()).collect();
+        let second_keys: Vec<&str> = second.iter().map(|s| s.relative_path.as_str()).collect();
+        assert_eq!(
+            first_keys, second_keys,
+            "sample selection must not depend on the absolute dataset root"
+        );
+
+        // 全量抽样（limit = 0）下集合相同、顺序也必须相同。
+        let all_first: Vec<&str> = select_samples(&original, SampleStrategy::Hash, 0)
+            .iter()
+            .map(|s| s.relative_path.as_str())
+            .collect();
+        let all_second: Vec<&str> = select_samples(&moved, SampleStrategy::Hash, 0)
+            .iter()
+            .map(|s| s.relative_path.as_str())
+            .collect();
+        assert_eq!(all_first, all_second);
+
+        // manifest 也必须一致（相对路径同源，内容相同）。
+        let root_a = Path::new("D:/datasets/Formula-TestSet");
+        let root_b = Path::new("C:/other/place/Formula-TestSet");
+        let selected_a: Vec<&FormulaSample> = select_samples(&original, SampleStrategy::Hash, 0);
+        let selected_b: Vec<&FormulaSample> = select_samples(&moved, SampleStrategy::Hash, 0);
+        let manifest_a = build_manifest(
+            "im2latex",
+            "test",
+            None,
+            SampleStrategy::Hash,
+            0,
+            root_a,
+            &selected_a,
+        );
+        let manifest_b = build_manifest(
+            "im2latex",
+            "test",
+            None,
+            SampleStrategy::Hash,
+            0,
+            root_b,
+            &selected_b,
+        );
+        assert_eq!(
+            manifest_a.manifest_sha256, manifest_b.manifest_sha256,
+            "manifest hash must be root independent"
+        );
     }
 
     #[test]
@@ -259,6 +392,7 @@ mod tests {
         std::fs::write(&image, b"first-bytes").expect("write image");
 
         let sample = FormulaSample::new(
+            "image.png".to_string(),
             image.clone(),
             "x".to_string(),
             FormulaDataset::Im2Latex,
@@ -320,6 +454,7 @@ mod tests {
     #[test]
     fn missing_images_do_not_produce_a_content_digest() {
         let sample = FormulaSample::new(
+            "does-not-exist.png".to_string(),
             PathBuf::from("root/does-not-exist.png"),
             "x".to_string(),
             FormulaDataset::Im2Latex,
@@ -404,6 +539,7 @@ mod tests {
     #[test]
     fn manifest_uses_forward_slashes_on_windows_paths() {
         let sample = FormulaSample::new(
+            "sub/image.png".to_string(),
             PathBuf::from(r"root\sub\image.png"),
             "x".to_string(),
             FormulaDataset::Im2Latex,

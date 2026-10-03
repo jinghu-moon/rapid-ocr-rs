@@ -1166,9 +1166,11 @@ impl RapidOcrEngine {
             });
         }
 
+        // `items` 是**公式阶段处理的公式数量**，不是页面区域总数：
+        // 一页 20 个文本区域 + 2 个公式区域时必须报告 2。
         output.stages.formula = crate::api::StageReport {
             state: crate::api::StageState::Completed {
-                items: output.regions.len(),
+                items: output.formula_count(),
             },
             timing: Some(crate::api::StageTiming {
                 preprocess_ms: formula_ms,
@@ -1991,8 +1993,13 @@ rec:
         assert_eq!(
             output.stages.formula.state,
             StageState::Completed {
-                items: output.regions.len()
-            }
+                items: output.formula_count()
+            },
+            "the formula stage must count formula regions, not all regions"
+        );
+        assert!(
+            output.formula_count() < output.regions.len(),
+            "this page has text regions too, so the two counts must differ"
         );
         for region in output
             .regions

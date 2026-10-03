@@ -389,6 +389,21 @@ stable sampling manifest (content-hash sampling, not "first N"), per-sample
 records, failure classification, exact/normalized match, CER, EOS/truncated
 counts, throughput with P50/P95, peak working set, and provider/thread settings.
 
+Sampling is a stable hash of **dataset-relative path + ground truth**: the same
+dataset selects the same samples on any machine and under any absolute root, and
+`SampleStrategy::Hash` never degenerates into "first N". Image *content* is
+deliberately **not** part of the sampling key — it is recorded separately as
+`content_sha256`, so a data change is reported as a content change instead of
+silently re-selecting a different subset.
+
+Manifests carry three digests:
+
+| field | covers | changes when |
+| --- | --- | --- |
+| `manifest_sha256` | dataset/split/subset/strategy/limit + entries **in evaluation order** | the sample set *or* the evaluation order changes |
+| `sample_set_sha256` | the same, **sorted by path** (order-independent) | the set of samples or their labels changes |
+| `content_sha256` | the above plus every image file's SHA-256 (order-independent, `null` if any image is unreadable) | an image file's bytes change |
+
 ```powershell
 $Model = "<pp_formulanet_plus_m.onnx>"
 $TestSet = "../../Formula-TestSet"   # collection root
@@ -448,9 +463,9 @@ cargo run --release --bin formula_eval -- --merge-shards target/formula-eval/uni
 ```
 
 The merge refuses to combine reports whose `model.sha256`, provider, `batch_size`,
-dataset/split/subset, manifest, or Python reference disagree, and it aggregates a
-Python comparison across all shards rather than keeping the first shard's partial
-counts.
+dataset/split/subset, manifest, image content digest, or Python reference digest
+disagree, and it aggregates a Python comparison across all shards rather than
+keeping the first shard's partial counts.
 
 Benchmark:
 
@@ -543,11 +558,13 @@ Two properties make the cheap tiers meaningful:
   image content hashes) **without loading the model**, so a data-integrity check
   costs seconds instead of hours:
   `formula_eval --manifest-only --dataset-root $TestSet --dataset latexocr --split validate --expect-manifest <manifest.json>`
-- `--expect-manifest` verifies both the sample-selection digest (`manifest_sha256`)
+- `--expect-manifest` verifies the sample-selection digest (`manifest_sha256`)
   and the image-content digest (`content_sha256`), so replacing an image file
-  without changing its path or label is detected. Manifests recorded before
-  `content_sha256` existed still pin the sample set, and `--expect-manifest` says
-  so explicitly instead of pretending to verify content.
+  without changing its path or label is detected. `sample_set_sha256`
+  distinguishes "a different set of samples" from "the same samples in a
+  different order". Manifests recorded before `content_sha256` existed still pin
+  the sample set, and `--expect-manifest` says so explicitly instead of
+  pretending to verify content.
 
 Long datasets can be sharded across processes when a full run is genuinely
 required (`--shard INDEX/COUNT` + `--merge-shards`); the manifest still covers the

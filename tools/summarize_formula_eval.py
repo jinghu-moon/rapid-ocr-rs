@@ -95,6 +95,7 @@ def compact_entry(report: dict) -> dict:
         "subset": report.get("subset"),
         "batch_size": report["batch_size"],
         "manifest_sha256": report["manifest"]["manifest_sha256"],
+        "sample_set_sha256": report["manifest"].get("sample_set_sha256"),
         "limit": report["manifest"]["limit"],
         "strategy": report["manifest"]["strategy"],
         "samples": summary["total"],
@@ -154,6 +155,7 @@ def compact_manifest(path: Path) -> dict:
         "limit": manifest["limit"],
         "entry_count": manifest["entry_count"],
         "manifest_sha256": manifest["manifest_sha256"],
+        "sample_set_sha256": manifest.get("sample_set_sha256"),
         "content_sha256": manifest.get("content_sha256"),
         "source": path.name,
     }

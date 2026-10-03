@@ -66,6 +66,11 @@ impl FormulaSplit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormulaSample {
+    /// 数据集内的相对路径，`/` 分隔。
+    ///
+    /// 抽样键与 manifest 都基于它，而不是绝对路径：把数据集复制到别的根目录
+    /// （或换一台机器）不会改变样本选择与 manifest 哈希。
+    pub relative_path: String,
     pub image_path: PathBuf,
     pub ground_truth: String,
     pub dataset: FormulaDataset,
@@ -75,14 +80,22 @@ pub struct FormulaSample {
 }
 
 impl FormulaSample {
+    /// `relative_path` 必须由调用方根据数据集根目录计算（见 [`dataset_relative_path`]）。
     pub fn new(
+        relative_path: String,
         image_path: PathBuf,
         ground_truth: String,
         dataset: FormulaDataset,
         split: FormulaSplit,
         source_index: Option<usize>,
     ) -> Result<Self> {
+        if relative_path.is_empty() {
+            return Err(err_format(
+                "formula sample relative path must not be empty".to_string(),
+            ));
+        }
         Ok(Self {
+            relative_path,
             image_path,
             ground_truth,
             dataset,
@@ -95,6 +108,17 @@ impl FormulaSample {
     pub fn has_ground_truth(&self) -> bool {
         !self.ground_truth.trim().is_empty()
     }
+}
+
+/// 计算数据集内的相对路径（`/` 分隔）。
+///
+/// 抽样与 manifest 都依赖它，因此绝对路径必须在这里被彻底剥离：数据集被复制到
+/// 别的根目录后，同一张图必须仍然得到同一个键。
+pub fn dataset_relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +261,7 @@ pub fn load_im2latex(root: &Path, split: FormulaSplit) -> Result<FormulaFixture>
             .trim_end_matches('\r')
             .to_string();
         samples.push(FormulaSample::new(
+            dataset_relative_path(root, &image_path),
             image_path,
             ground_truth,
             FormulaDataset::Im2Latex,
@@ -295,6 +320,7 @@ pub fn load_latex_ocr_example(root: &Path, split: FormulaSplit) -> Result<Formul
             return Err(err_missing_file(&image_path));
         }
         samples.push(FormulaSample::new(
+            dataset_relative_path(root, &image_path),
             image_path,
             latex.trim().to_string(),
             FormulaDataset::LatexOcrExample,
@@ -355,6 +381,7 @@ pub fn load_unimer(root: &Path, subset: UniMerSubset) -> Result<FormulaFixture> 
         }
         let ground_truth = label_lines[idx].trim_end_matches('\r').to_string();
         samples.push(FormulaSample::new(
+            dataset_relative_path(root, &image_path),
             image_path,
             ground_truth,
             FormulaDataset::UniMer(subset),
