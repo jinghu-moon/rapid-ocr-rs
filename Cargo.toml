@@ -3,11 +3,20 @@ name = "rapid-ocr-rs"
 version = "0.7.0"
 edition = "2024"
 readme = "README.md"
-keywords = ["rapid", "ocr", "onnx"]
+# 平台收窄：crate 只在 x86_64-pc-windows-msvc 上编译（见 src/platform_gate.rs）。
+# 1.88 是实测下限：代码使用了 `as_chunks`/`as_chunks_mut`（1.88 稳定），
+# 声明得更低会让 `cargo clippy` 的 incompatible_msrv 检查直接失败。
+rust-version = "1.88"
+keywords = ["rapid", "ocr", "onnx", "paddleocr", "windows"]
+categories = ["computer-vision", "multimedia::images", "api-bindings"]
 license = "Apache-2.0"
-description = "Use Rust to call Paddle OCR models via ONNX Runtime for image text recognition."
-repository = "https://github.com/mg-chao/rapid-ocr-rs"
+description = "Rust OCR for PaddleOCR-family ONNX models (PP-OCRv6, PP-FormulaNet) on Windows x64 via ONNX Runtime."
+repository = "https://github.com/jinghu-moon/rapid-ocr-rs"
 authors = ["mg-chao <chao@mgchao.top>"]
+# 打进 crate 包的内容必须自包含：`tests/baseline/**` 是仓库证据（记录了采集机器的
+# 绝对路径与 benchmark 结果），属于生成产物而不是 crate 内容，因此排除。
+# `tests/fixtures/**` 反之必须保留：契约 fixture 是干净 clone 能跑测试的前提。
+exclude = ["tests/baseline/**"]
 
 [dependencies]
 geo-clipper = "0.9.0"
