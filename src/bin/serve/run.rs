@@ -25,6 +25,7 @@ use std::net::SocketAddr;
 use std::process::Command;
 
 use super::cli::ServeArgs;
+use super::download;
 use super::http::{BoundServer, ServeHandle};
 use super::limits::{DEFAULT_ALLOW_DOWNLOAD, DEFAULT_ALLOW_PROVIDER_FALLBACK, DEFAULT_PROVIDER};
 use super::model_plan::{ModelPlan, ModelPlanError, ModelSnapshot};
@@ -153,6 +154,10 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
         args.max_side,
         args.allow_provider_fallback(),
     )?;
+    // §6.1 第 3 条：`--allow-download-host` 是**显式**的可信配置扩展，必须自我一致
+    // （裸主机名）并且必须打印高风险警告。
+    let allow_download_hosts = download::validate_extra_hosts(&args.allow_download_host)
+        .map_err(StartupConfigError::Limit)?;
 
     // §7.6 第 3 步：模型集（单一来源规则）与就绪判定。
     //
@@ -168,6 +173,7 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
         &startup,
         &local,
         &snapshot,
+        &allow_download_hosts,
         yaml_provider_is_overridden(&args),
         yaml_max_side,
         yaml_provider,
@@ -184,9 +190,12 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
         page,
         nonce,
         allow_download: args.allow_download,
+        allow_download_hosts,
         // §10.8：M1 的公式路由固定关闭（M4 才会接上真实来源）。
         routing: OcrRouting::text_only(),
         engine_factory: super::engine::real_engine_factory(),
+        downloader: super::download::real_downloader_factory(),
+        free_space: super::server::real_free_space(),
     };
 
     let mut service = ServeHandle::start(bound, context)?;
@@ -271,11 +280,13 @@ fn args_max_side_is_overridden(args: &ServeArgs) -> bool {
 }
 
 /// 启动日志：实际监听地址、允许的 Host/Origin 集合、生效的取值与被覆盖的取值（§3、§7.1）。
+#[allow(clippy::too_many_arguments)]
 fn log_startup(
     args: &ServeArgs,
     startup: &ServeStartup,
     local: &super::security::LocalOrigin,
     snapshot: &ModelSnapshot,
+    allow_download_hosts: &[String],
     provider_overridden: bool,
     yaml_max_side: usize,
     yaml_provider: rapid_ocr_rs::ProviderPreference,
@@ -349,6 +360,35 @@ fn log_startup(
             "disabled"
         }
     );
+    println!(
+        "serve: trusted download hosts {}",
+        effective_hosts(allow_download_hosts).join(", ")
+    );
+    if !allow_download_hosts.is_empty() {
+        // §6.1 第 3 条要求的**高风险警告**：白名单必须来自可信配置，而不是资源描述自身
+        // （OWASP SSRF Prevention）。把理由与后果都写出来，而不是一句"已启用"。
+        eprintln!(
+            "serve: WARNING --allow-download-host extends the trusted download allow-list beyond \
+             the compiled-in set [{}]: [{}]. The compiled-in constant is what makes a local \
+             manifest.json unable to point downloads at arbitrary hosts: a manifest is a \
+             *resource description*, and docs/05 §6.1 item 3 (OWASP SSRF prevention) requires the \
+             allow-list to come from trusted configuration instead. Every host you add here is \
+             accepted for model downloads; add only hosts you control or trust, and remove the \
+             flag when you no longer need it.",
+            rapid_ocr_rs::ALLOWED_DOWNLOAD_HOSTS.join(", "),
+            allow_download_hosts.join(", ")
+        );
+    }
+}
+
+/// 编译期白名单 ∪ `--allow-download-host`（启动日志用；库常量本身不变）。
+fn effective_hosts(extra: &[String]) -> Vec<String> {
+    let mut hosts: Vec<String> = rapid_ocr_rs::ALLOWED_DOWNLOAD_HOSTS
+        .iter()
+        .map(|host| (*host).to_string())
+        .collect();
+    hosts.extend(extra.iter().cloned());
+    hosts
 }
 
 /// 引擎状态的一行摘要（§7.5/§7.6：`Failed` 的原因必须可见）。

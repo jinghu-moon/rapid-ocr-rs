@@ -57,13 +57,14 @@ pub(super) fn page_csp(nonce: &str) -> String {
     )
 }
 
-/// 路由表（§4.2 的 M1 子集）。
+/// 路由表（§4.2 的 M1 子集 + M2 的 `POST /api/engine/reload`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Route {
     Page,
     Status,
     Models,
     ModelsDownload,
+    EngineReload,
     Ocr,
     Job(String),
     JobResult(String),
@@ -76,7 +77,9 @@ impl Route {
             Self::Page | Self::Status | Self::Models | Self::Job(_) | Self::JobResult(_) => {
                 HttpMethod::Get
             }
-            Self::ModelsDownload | Self::Ocr | Self::JobCancel(_) => HttpMethod::Post,
+            Self::ModelsDownload | Self::EngineReload | Self::Ocr | Self::JobCancel(_) => {
+                HttpMethod::Post
+            }
         }
     }
 
@@ -328,6 +331,10 @@ fn dispatch(
             let value = shared.submit_download(&set_id)?;
             Ok((json_body(202, value)?, Vec::new()))
         }
+        Route::EngineReload => {
+            // 显式创建/重建引擎（§4.2、§7.6）。没有请求体，也不读 body。
+            Ok((json_body(200, shared.reload_engine())?, Vec::new()))
+        }
         Route::Job(id) => Ok((json_body(200, shared.job_view(id)?)?, Vec::new())),
         Route::JobResult(id) => Ok((shared.job_result(id)?, Vec::new())),
         Route::JobCancel(id) => Ok((json_body(200, shared.cancel_job(id)?)?, Vec::new())),
@@ -480,6 +487,7 @@ fn route_of(method: HttpMethod, path: &str) -> (RouteDecision, Option<Route>) {
         "/api/status" => Some(Route::Status),
         "/api/models" => Some(Route::Models),
         "/api/models/download" => Some(Route::ModelsDownload),
+        "/api/engine/reload" => Some(Route::EngineReload),
         "/api/ocr" => Some(Route::Ocr),
         _ => job_route(path),
     };
@@ -581,6 +589,7 @@ mod tests {
                 "/api/models/download",
                 Route::ModelsDownload,
             ),
+            (HttpMethod::Post, "/api/engine/reload", Route::EngineReload),
             (HttpMethod::Post, "/api/ocr", Route::Ocr),
             (
                 HttpMethod::Get,
@@ -608,7 +617,6 @@ mod tests {
         for path in [
             "/api/jobs/job-1/annotated.png",
             "/api/jobs/job-1/export",
-            "/api/engine/reload",
             "/api/models/download/cancel",
             "/favicon.ico",
             "/api",

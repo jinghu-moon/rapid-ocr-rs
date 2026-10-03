@@ -1996,3 +1996,599 @@ target\release\rapidocr.exe evaluate --manifest <OCR-test-image>\golden-manifest
 3. 页面的公式开关目前只影响展示（原型不发送该开关）：M4 需要给 `POST /api/ocr` 一个
    明确的选中方式（查询参数或 JSON 字段），这会是一个**协议新增**，需要先改 `docs/05`；
 4. 评估（CER/精确匹配）复用库的 `evaluation`，不另写指标。
+
+---
+
+## M2：模型管理（真实下载 + 进度 + 文件边界取消 + host opt-in + 惰性建引擎）
+
+**阶段**：M2 —— `docs/05` §11「M2」的全部条目 + §4.2/§4.3/§4.6/§5.4/§6/§7.4–§7.6 里与本
+里程碑相关的冻结契约。M1 记录里"留给 M2"的 5 条接缝（下载 worker 处理体、进度、
+`--allow-download-host` 接线、惰性建引擎、中性队列类别）逐条收口。
+**开工基线**：`06bd0af`（M0 `1144ddb` + M0b `dbab12e` + M1 `06bd0af` 已提交，工作树干净）。
+**日期**：2026-10-03（接在 M1 记录之后）
+**提交**：`（未提交：按要求不 commit）`
+
+### 环境
+
+| 项目 | 值 |
+| --- | --- |
+| target | Windows x64 + MSVC ABI：`x86_64-pc-windows-msvc` |
+| 工具链 | rustc 1.98.1 / cargo 1.98.1 |
+| crate | `rapid-ocr-rs` 0.7.0（独立 git 仓库，本阶段未提交） |
+| 真实资产 | `OCR-Model/small/`、`OCR-Model/test-config-small.yaml`、`OCR-test-image/`（12 图 + golden） |
+| 真实网络（opt-in） | ModelScope（`www.modelscope.cn`）：字典直连 200；ONNX 权重 **302 → CDN** |
+
+**变更规模**（`git diff --stat`，15 个跟踪文件：+3739 / −198，其中本记录的追加 `docs/06` 为 +590、`docs/05` 为 +38）：
+
+| 文件 | 行数 | 改动 |
+| --- | --- | --- |
+| `src/model_store.rs` | 2251 → 2749 (+498) | 显式 host 参数、观察者（进度/取消）、`available_disk_bytes` |
+| `src/bin/serve/download.rs` | 72 → 405 (+333) | 真实下载 worker + 可注入执行体 + host 校验 |
+| `src/bin/serve/jobs.rs` | 956 → 1322 (+366) | 中性队列、进度、结构化失败、`CancelOutcome`、`finish_cancelled` |
+| `src/bin/serve/server.rs` | 1025 → 1413 (+388) | 真实下载端点、惰性建引擎、reload、两次同步拒绝、worker 收尾 |
+| `src/bin/serve/tests.rs` | 1409 → 2533 (+1124) | 17 个新 HTTP 测试 + 脚本化下载器 + 闸门 |
+| `src/bin/serve/error.rs` | 925 → 1005 (+80) | `ModelSetNotFound`(404)、`InsufficientDiskSpace` 带两个数值 |
+| `src/bin/serve/model_plan.rs` | 504 → 558 (+54) | `set_by_id`/`set_ids`/`model_dir`、`pending_download` |
+| `src/bin/serve/run.rs` | 469 → 509 (+40) | `--allow-download-host` 校验、启动警告、注入运行期 |
+| `src/bin/serve/http.rs` | 706 → 714 (+8) | `POST /api/engine/reload` 路由与分发 |
+| `src/bin/serve/{state,mod,limits}.rs`、`src/exports.rs` | +1/+8/+0/+1 | 生产者已到（去掉两处 `allow(dead_code)`）、文档、导出 |
+| `src/bin/web/index.html` | 2100 → 2118 (+18) | 两处：错误文案与**真实下载进度**（见交付物 7） |
+| `docs/05-local-web-demo-implementation.md` | +38 | §4.2 作业形状、§4.3 下载取消语义、§13 参考命令 |
+
+**没有新增依赖**：`Cargo.toml` 未改（§2.1 的硬约束）。
+
+---
+
+### 交付物 1：把真实下载接到 HTTP 上（§4.2、§6）
+
+**库侧**（`src/model_store.rs`）：
+
+```rust
+pub const DEFAULT_ALLOWED_HOSTS: &[&str] = &ALLOWED_DOWNLOAD_HOSTS;
+
+pub struct DownloadRequest<'a> {
+    pub url: &'a str, pub expected_sha256: &'a str, pub save_dir: &'a Path,
+    pub max_bytes: u64, pub connect_timeout: Duration, pub read_timeout: Duration,
+    /// §6.1 第 3 条的 opt-in：**显式参数**，库常量一个字都不改。
+    pub allowed_hosts: &'a [&'a str],
+}
+impl<'a> DownloadRequest<'a> {
+    pub fn new(url: &'a str, expected_sha256: &'a str, save_dir: &'a Path) -> Self; // allowed_hosts = 编译期白名单
+}
+
+/// 进度与取消（§6.6）：`file_started` 是**唯一**的取消检查点。
+pub trait DownloadObserver {
+    fn file_started(&mut self, file: &ModelFileSpec, index: usize, total: usize,
+                    declared_bytes: Option<u64>) -> bool;
+    fn bytes_written(&mut self, written_bytes: u64);
+    fn file_finished(&mut self, file: &ModelFileSpec, index: usize, bytes: u64);
+}
+pub struct NoObserver;                                    // 库内调用方的默认：不取消、不报进度
+pub fn download_model_set_observed(
+    set: &ModelSet, root: &Path, budget: &mut DownloadBudget,
+    connect_timeout: Duration, read_timeout: Duration,
+    allowed_hosts: &[&str], observer: &mut dyn DownloadObserver) -> Result<Vec<PathBuf>>;
+pub fn download_model_set(/* 未变 */) -> Result<Vec<PathBuf>>;   // = _observed(DEFAULT_ALLOWED_HOSTS, &mut NoObserver)
+```
+
+- **双权威被消除**：`DownloadPolicy` 里原来的 `allowed_hosts` 字段**删除**了。可信 host 列表
+  现在只属于 `DownloadRequest`（"请求的契约"），策略只剩"可注入的运行环境"（磁盘空间探测 +
+  测试用的明文口子）。`allowed_hosts` 参数经 `download_model_set_observed` → 每个文件的
+  `DownloadRequest` 单向流入，构成唯一来源。
+- 集合下载的进度口径：`index`（1 基）/`total`/`declared_bytes` 只统计**需要下载**的文件
+  （缺失 ∪ 损坏；`Present` 的文件不计数、不发请求、也不触发取消检查点）。
+
+**serve 侧**（`src/bin/serve/download.rs` 重写，405 行）：
+
+```rust
+pub(super) struct DownloadCommand { pub job_id: String, pub set_id: String }   // 形状未变
+pub(super) struct DownloadJob<'a> {
+    pub set: &'a ModelSet, pub root: &'a Path, pub budget_bytes: u64,
+    pub connect_timeout: Duration, pub read_timeout: Duration,
+    pub allowed_hosts: Vec<String>,                     // 编译期白名单 ∪ --allow-download-host
+}
+pub(super) trait DownloadSink { /* file_started / bytes_written / file_finished */ }
+pub(super) trait ModelDownloader: Send {                // 镜像 EngineFactory 的注入缝
+    fn download(&mut self, job: &DownloadJob<'_>, sink: &mut dyn DownloadSink)
+        -> Result<Vec<PathBuf>, RapidOcrError>;
+}
+pub(super) type DownloaderFactory = Arc<dyn Fn() -> Box<dyn ModelDownloader> + Send + Sync>;
+pub(super) fn real_downloader_factory() -> DownloaderFactory;   // 生产路径
+pub(super) fn worker(runtime: Arc<ServeShared>, inbox: Receiver<DownloadCommand>,
+                     factory: DownloaderFactory);
+```
+
+`POST /api/models/download`（`server.rs::submit_download`）按顺序做四件事：
+
+1. `--allow-download` 未开 → **403 `downloads_disabled`**（M1 已有，未改动）；
+2. `set_id` 严格解析（`ModelPlan::set_by_id`）：未知 → **404 `model_set_not_found`**，
+   `detail` 给出请求的 id 与**已知集合**；**全仓库没有 `sets[0]` 回落**
+   （`grep -n 'sets\[0\]' src/bin/serve/*.rs` 只命中测试里的 JSON 断言）；
+3. 预算预检（§6.2）与磁盘预检（§6.5）→ 见交付物 6；
+4. 建任务（`JobQueue::Download` + 初始进度）→ 有界 channel（满 → 503 `busy`，并回收任务）。
+
+**修改前后行为对比（交付物 1）**
+
+| 项目 | 修改前（M1） | 修改后 |
+| --- | --- | --- |
+| `POST /api/models/download`（开 `--allow-download`） | 建真实任务，worker 立即判失败并写"未实现、无网络 I/O" | **真实下载**：按集合逐文件走库的加固下载器（HTTPS/拒绝重定向/host 白名单/体积上限/唯一临时名/`MoveFileExW`/单飞/空间预检） |
+| 未知 `set_id` | 400 `bad_request`（不说明已知集合） | 404 `model_set_not_found` + `detail.{set_id, known_sets}` |
+| 集合解析 | 在响应里现查 status，但 worker 只拿到 id 不解析 | 提交与执行**都用** `set_by_id`；执行期集合消失 → 同一个 404（可定位），不换集合 |
+| 下载完成后的集合状态 | 交付物不存在 | `/api/models` 立刻看到 `present`（每次重新读盘+哈希，M1 已记录该设计） |
+
+---
+
+### 交付物 2：进度与文件边界取消（§4.3、§6.6）
+
+**任务层**（`src/bin/serve/jobs.rs`）：
+
+```rust
+pub struct DownloadProgress {           // 序列化进 JobView.download（仅 model_download 非 null）
+    pub files_done: usize, pub files_total: usize,
+    pub bytes_done: u64, pub bytes_total: Option<u64>,
+    pub current_file: Option<String>,
+}
+impl DownloadProgress { pub fn planned(files_total: usize, bytes_total: Option<u64>) -> Self }
+
+pub struct JobFailure {                      // 失败分类：与 ServeError 的 HTTP 映射同源
+    pub status: u16, pub code: &'static str, pub message: String,
+    pub detail: serde_json::Value,
+}
+impl JobFailure { pub fn new(..) -> Self; pub fn from_body(status: u16, body: &ErrorBody) -> Self }
+impl From<&ServeError> for JobFailure { .. }
+
+pub enum CancelOutcome { Cancelled, CancelRequested }
+
+impl JobStore {
+    pub fn set_download_progress(&mut self, id: &str, progress: DownloadProgress) -> Result<(), ServeError>;
+    pub fn is_cancel_requested(&self, id: &str) -> bool;
+    pub fn fail_classified(&mut self, id: &str, failure: JobFailure, now: Millis) -> Result<(), ServeError>;
+    pub fn cancel(&mut self, id: &str, now: Millis) -> Result<CancelOutcome, ServeError>;
+    pub fn finish_cancelled(&mut self, id: &str, now: Millis) -> Result<(), ServeError>;  // worker 专用
+}
+```
+
+- `JobView` 追加 `failure` / `download` / `cancel_requested`（`error` 仍是同一份文本，旧客户端不受影响）；
+- **取消语义按任务类型区分**（这是 M1 接缝第 5 条的根因修法，而不是给下载"特批"）：
+  - `Queued`（任何类型）→ 立即 `Cancelled`，可靠（§4.3 原文）；
+  - `Running` 且是**下载** → 登记 `cancel_requested`，**状态不变**，返回 200 + 视图
+    （客户端看到的是事实：当前文件还在下）；
+  - `Running` 的 **OCR** 与全部终态 → 409 `not_cancellable`（M1 语义一字未改）；
+- **`Running → Cancelled` 的生产者**：库只在观察者于文件边界返回 `false` 时产生
+  `DownloadError::Cancelled`，worker 用它调用 `finish_cancelled`；若出现"取消结论先到、请求登记
+  后到"的竞态，`ServeShared::finish_download_cancelled` 会把请求补登记——任务**绝不**停在 `running`；
+- 取消后：当前文件**下载完并原子替换**（已校验的文件保留），后续文件在 `file_started`
+  处被拒（不开始、不发请求），临时文件由库的 `PartFile::Drop` 保证不残留。
+
+**如实声明做不到的事**：取消**不能中断正在进行的那个文件**。`reqwest` 的阻塞读取一旦发起就没有
+安全的中断语义，因此取消的延迟上界是"当前文件的剩余下载时间"；HTTP 响应与此一致
+（200 + `state:"running"` + `cancel_requested:true`，而不是假装已停止）。库里的
+`DownloadObserver` 文档逐字写了这一条。
+
+**修改前后行为对比（交付物 2）**
+
+| 项目 | 修改前（M1） | 修改后 |
+| --- | --- | --- |
+| `/api/jobs/{id}` 的进度 | 无（只有 `elapsed_ms`） | `download{files_done, files_total, bytes_done, bytes_total, current_file}` |
+| 失败的机器可读分类 | 只有 `error` 文本（客户端只能字符串匹配） | `failure{status, code, message, detail}`，与 `/result` 上重放的错误体同源 |
+| 运行中的下载取消 | 409 `not_cancellable`（与 OCR 一样） | 200 + `cancel_requested`，文件边界兑现后 `state=cancelled` |
+| 排队中的下载取消 | 200 `cancelled`（可靠） | 同（未变），并新增"取消后 worker 的 `start` 必须失败"的断言 |
+| 关闭时未开始的下载任务 | `fail()` 被存储拒绝（`Queued → Failed` 非法）→ 任务永远停在 `queued` | `abandon_download`：按"排队中取消"收尾为 `cancelled` |
+
+---
+
+### 交付物 3：`--allow-download-host` 的显式 opt-in（§6.1 第 3 条）
+
+```rust
+// src/bin/serve/download.rs
+pub(super) fn validate_extra_hosts(hosts: &[String]) -> Result<Vec<String>, ServeConfigError>;
+```
+
+- 只接受**裸主机名**：带 scheme/端口/路径/userinfo/通配符/空白/非 ASCII 一律拒绝，错误里带
+  开关名与原值（可定位），并按大小写不敏感去重；
+- `run.rs` 启动期调用它，失败即**拒绝启动**（实测：`invalid --allow-download-host=https://evil.example:
+  the host must be a bare host name (no scheme, port, path, userinfo or wildcard)`，exit 1）；
+- 启动时打印**生效列表**并 stderr 打印**高风险警告**（实测输出，逐字）：
+
+```text
+serve: trusted download hosts www.modelscope.cn, evil.example, mirror.example.com
+serve: WARNING --allow-download-host extends the trusted download allow-list beyond the compiled-in
+set [www.modelscope.cn]: [evil.example, mirror.example.com]. The compiled-in constant is what makes a
+local manifest.json unable to point downloads at arbitrary hosts: a manifest is a *resource
+description*, and docs/05 §6.1 item 3 (OWASP SSRF prevention) requires the allow-list to come from
+trusted configuration instead. Every host you add here is accepted for model downloads; add only
+hosts you control or trust, and remove the flag when you no longer need it.
+```
+
+- **库常量没有被改**：`ALLOWED_DOWNLOAD_HOSTS` 仍是 `["www.modelscope.cn"]`，扩展只经
+  `DownloadRequest::allowed_hosts` / `download_model_set_observed(.., allowed_hosts, ..)` 传入；
+- `/api/status` 新增 `download_hosts`（只读诊断，值 = 编译期白名单 ∪ opt-in）。
+
+**"本地 manifest 不能自己扩大白名单"的两层证据**：
+
+1. **库级**（`model_store::tests::a_local_manifest_cannot_widen_the_download_host_allow_list`，M0b 起就在）：
+   `manifest.json` 声明 `https://evil.example/...` → 走**公开**入口（默认 = 编译期白名单）得到
+   `HostRejected{host:"evil.example"}`；
+2. **库级（新增）** `an_explicit_host_allow_list_extends_the_compiled_in_one`：同一请求，
+   `allowed_hosts` 传 `DEFAULT_ALLOWED_HOSTS` → 拒绝且**零请求**；传 `["127.0.0.1"]`（fixture）
+   → 放行并落盘；同时断言 `ALLOWED_DOWNLOAD_HOSTS == ["www.modelscope.cn"]`、`DEFAULT_ALLOWED_HOSTS == ALLOWED_DOWNLOAD_HOSTS`；
+3. **HTTP 级（新增）** `the_download_host_opt_in_is_passed_as_an_explicit_parameter`：脚本化下载器
+   记录每次任务收到的列表——不带开关是 `["www.modelscope.cn"]`，带 `--allow-download-host evil.example`
+   是 `["www.modelscope.cn","evil.example"]`。
+
+---
+
+### 交付物 4：`POST /api/engine/reload` 与**惰性**建引擎（§7.6）
+
+**HTTP**：新增路由 `Route::EngineReload`（`http.rs`），无请求体，响应 200：
+
+```json
+{ "outcome": "ready|blocked_models_missing|failed",
+  "engine": { …与 /api/status 的 engine 同一形状（冻结的 EngineState）… },
+  "missing": [...], "corrupt": [...], "source": "default_table", "model_dir": "<redacted>",
+  "load_ms": 42 }
+```
+
+`server.rs::ensure_engine_loaded(force: bool) -> EngineLoad{Ready,BlockedModelsMissing,Failed}` 是
+`EngineStateMachine::{begin_loading, models_still_missing}` 的**唯一生产者**：
+
+1. 模型齐备 → `begin_loading()`（`Blocked`/`Ready`/`Failed` 都合法）→ **释放状态锁**建立会话
+   → `load_succeeded(requested, selected_ep, fallback_to_cpu)` 或 `load_failed(reason)`；
+2. 模型仍缺失且状态是 `BlockedModelsMissing` → `models_still_missing(missing)`（刷新清单，状态不变）；
+3. 模型仍缺失但状态是 `Ready`/`Failed` → **不进入** `Loading`（§7.6 的转换表里
+   `Ready|Failed → BlockedModelsMissing` 不存在），改为 `Loading → Failed` 并在 reason 里**点名**
+   缺哪些文件（实测响应 `outcome:"failed"`、`engine.reason` 含文件名）；
+4. `force=false`（`POST /api/ocr` 的惰性路径）在"已 Ready 且引擎在场"时立即返回，不重建；
+   `force=true`（reload）即使已 Ready 也重建会话（用户的显式意图是"按磁盘当前文件重新加载"）；
+5. 加载全程**不持有** `engine_state` 锁（否则 `/api/status` 在加载期间被阻塞、也看不到
+   `loading`），只用一把独立的 `engine_load` 互斥串行化两个加载者；
+6. 会话创建耗时进 `/api/status.engine_load_ms`（`null` = 还没建立过）与 reload 的 `load_ms`
+   （本次调用的墙钟耗时）。
+
+**惰性创建**（M1 接缝第 4 条）：`submit_ocr` 的准入在 `BlockedModelsMissing` 时**先看磁盘**：
+模型已经齐备（典型场景是刚下载完）→ `begin_loading()` 并把会话创建留给 worker（accept 线程
+绝不建会话，§8.2 的同一理由）；仍然缺失 → 409 + 与 `/api/models` 同源同值的清单。
+`ocr_worker` 取出任务后调用 `ensure_engine_loaded(false)`，失败时任务以**同一份**错误映射失败
+（409 `models_missing` 带清单 / 503 `engine_unavailable` 带 reason）。
+
+**实测证据**（HTTP 测试）：
+`the_engine_is_created_lazily_on_the_next_ocr_request_and_loading_is_visible`：
+启动时不齐备 → `engine.state == "blocked_models_missing"`、工厂调用 0 次；把缺失文件写到磁盘
+（等价于下载完成）→ **仍然** `blocked_models_missing`、工厂 0 次（证明没有后台建引擎）；
+`POST /api/ocr` → 202，闸门停在会话创建处 → `/api/status.engine.state == "loading"`、工厂 1 次；
+放行 → 任务 `succeeded`、`engine.state == "ready"`、`engine_load_ms` 非 null。
+
+一条边界（如实记录）：`Failed` 状态下 `POST /api/ocr` 会在**准入**就返回 503（不建任务），因此
+worker 的惰性路径不会对着 `Failed` 反复重试；唯一会"重试"的情形是"任务在 `Loading` 期间被准入、
+随后这次加载失败"——那时已准入的任务会各自触发一次新的加载尝试，失败即以 `Loading → Failed`
+收尾并给该任务 503 `engine_unavailable`（不假装成功）。`an_engine_that_fails_to_load_is_failed_with_a_reason_and_503`
+覆盖的是准入即 503 的那条主路径。
+
+---
+
+### 交付物 5：中性队列类别（M1 接缝第 5 条）
+
+```rust
+pub enum JobQueue { Text, Formula, Download }
+impl JobQueue { pub fn name(self) -> &'static str; pub fn class(self) -> Option<QueueClass>; pub fn from_class(c: QueueClass) -> Self }
+```
+
+`JobRecord.queue` / `JobView.queue` 的类型从 `QueueClass` 换成 `JobQueue`。根因是**两个概念被
+混用**：`QueueClass` 是"双队列调度器的类别"（有容量/配额/等待上界），下载任务走 §8.1 的
+独立有界 channel，从不进调度器、`position` 永远是 `null`。M1 借用 `QueueClass::Text` 会让任何
+按 `queue` 聚合的诊断报告"一个从未排队的下载任务属于文本队列"。
+
+- `server.rs::sync_positions` 用 `view.queue.class()` 过滤：下载任务不参与 `position` 计算；
+- `/api/status.queues` 的 `text`/`formula` 计数**本来**就不含下载（它们数调度器），未改动；
+- `/api/jobs/{id}` 的 `queue` 对下载任务是 `"download"`；OCR 任务仍是 `"text"`（未变）。
+
+---
+
+### 交付物 6：M1 的两处诚实缺口（507/413 的两个数值、`Cancelled` 生产者）
+
+| 缺口 | 修法 | 证据 |
+| --- | --- | --- |
+| `ServeError::InsufficientDiskSpace` 无生产者（507 只在映射表里） | 变体带两个数值（`required_bytes`/`available_bytes`），`submit_download` 用**可注入**的空间探测（生产 = 库的 `available_disk_bytes`，即下载器内部同一个 `GetDiskFreeSpaceExW`）做任务级预检；`detail` 字段名与库侧 `DownloadError::InsufficientSpace` 逐字相同 | 新增 HTTP 测试 `a_disk_space_refusal_is_a_507_with_both_numbers`（注入 10 B → 507，`required_bytes`/`available_bytes` 两个数值都断言）；`error::tests::download_details_carry_the_numbers` 断言同步预检与任务内预检字段同名 |
+| 预算拒绝没有两个数值（M1 只回 413 `payload_too_large`） | 改用库的分类 `ServeError::Download(DownloadError::TooLarge{limit_bytes, observed_bytes})` → 413 `payload_too_large`，`detail` 两个数值 | `a_download_budget_refusal_is_a_413_with_both_numbers`（1 MiB 预算 vs 2×10 MiB 声明 → `limit_bytes=1048576`、`observed_bytes=20971520`，且下载器**零调用**） |
+| `DownloadError::Cancelled` 没有生产者 | 库：观察者在文件边界返回 `false` → `Cancelled`（新增库测试）；serve：worker 映射为 `finish_download_cancelled`，并在"脚本化下载器自己报 Cancelled"时不把任务留在 `running` | 库 `cancelling_at_a_file_boundary_keeps_verified_files_and_leaves_no_temp_file`、`a_cancel_requested_before_the_first_file_writes_nothing`；HTTP `a_running_download_is_cancelled_at_a_file_boundary`、`a_download_error_cancelled_lands_on_cancelled_not_running` |
+
+**新增的协议项**：`ServeError::ModelSetNotFound{set_id, known}` → **404 `model_set_not_found`**。
+§11.1 的清单里没有能产生它的变体，但 §4.2 的请求体只有 `set_id`，"未知集合"必须可定位、
+**绝不**回落 `sets[0]`；它与"请求体畸形"的 400 `bad_request` 是两件事。已在 `docs/05` §4.2 记录。
+
+---
+
+### 交付物 7：页面（`src/bin/web/index.html`，2 处最小改动）
+
+1. `ERR_TEXT.payload_too_large` 的文案：`'图像超出请求体上限（--max-body-mb）'` →
+   `'请求体或下载总量超出上限（--max-body-mb / --max-download-mb）'`。
+   原因：M2 起 413 `payload_too_large` 也可能是**下载预算**拒绝（§6.2），旧文案会主动误导。
+2. 横幅里的真实下载进度：`state.dlJob.download` 的
+   `bytes_done/bytes_total`（未知时退回 `files_done/files_total`）算出百分比，写上
+   `当前 <file> · n/m 个文件`，并把进度条从"不确定态"（`bar ind`）换成真实宽度。
+   原因：§9.2 要求横幅给出**下载进度**，而 M1 的实模式只有一个不确定的滚动条；进度字段是
+   M2 才有的（交付物 2）。改动只在 `renderBanner` 的 `state.dlJob` 分支内（新元素 id
+   `dlJobBar`，沿用既有 `.bar` 样式；无内联 `onclick`、无外部资源、nonce/token 字面量未动）。
+
+`Temp/demo3-v2.html` **未被触碰**（见"证据：未触碰的文件"）。脚本语法用 `node --check` 复核
+（真实 IIFE 块 67,143 字符 → exit 0；模板里 `nonce="` 仍 4 处、`__SRV_TOKEN__` 仍 3 处，
+与 M1 的注入契约一致）。
+
+---
+
+### 验证 1：静态检查、feature 矩阵与依赖隔离
+
+日志：`target/m2-verify/m2-gates.log`（1–7 号单次连续执行）、`target/m2-verify/tree-*.txt`。
+
+| # | 命令 | 结果 | 退出码 |
+| --- | --- | --- | --- |
+| 1 | `cargo fmt --all -- --check` | 无输出 | 0 |
+| 2 | `cargo clippy --all-targets -- -D warnings` | 无 warning | 0 |
+| 3 | `cargo clippy --features serve --all-targets -- -D warnings` | 无 warning | 0 |
+| 4 | `cargo test --all-targets` | 374 + 2 + 4 + 14 = **394 passed, 0 failed** | 0 |
+| 5 | `cargo test --features serve --all-targets` | 394 + **176** = **570 passed, 0 failed** | 0 |
+| 6 | `cargo build --release --bins` | `rapidocr.exe` **34,522,112 B**（M1: 34,446,336 B） | 0 |
+| 7 | `cargo build --release --bins --features serve` | 同一二进制即可跑 serve | 0 |
+
+**默认依赖图逐字节未变**（§2.1 的硬约束）：
+
+| 证据 | 值 |
+| --- | --- |
+| `cargo tree -e normal -p rapid-ocr-rs` | 606 行，SHA-256 `BD2AB5E41B1A6D649E2F80B0D3D3E55327B96EB7C6F861E55DFC7C8501C3F6FC` |
+| 与 M0c（`tiny_http` 引入**之前**）的快照 `target/m0c-tree-default.txt` 逐行比较 | **0 处差异** |
+| 默认树 / `--no-default-features` 里的 `tiny_http` | 0 / 0 次 |
+| `cargo tree -e normal -p rapid-ocr-rs --features serve` | 611 行，`tiny_http` 1 次 |
+| `Cargo.toml` | **未改**（无新依赖） |
+
+**测试增量与基线对比（AGENTS.md §6）**
+
+| 项目 | 修改前（M1 完成） | 修改后 | 说明 |
+| --- | --- | --- | --- |
+| `cargo test --all-targets` | 369+2+4+14 = 389 | **374+2+4+14 = 394** | +5（`model_store` 35 → 40） |
+| `cargo test --features serve --all-targets` | 389+156 = 545 | **394+176 = 570** | +25 净增（库 +5、serve 二进制 +20） |
+| serve 各文件测试数 | `download` 0 / `jobs` 20 / `tests` 24 | **1 / 22 / 41** | +1 / +2 / +17 |
+| 删除/跳过/弱化的测试 | — | **0** | 2 个 M1 测试按**新行为**改写（见下），其余为纯新增 |
+| 默认构建依赖图 | 606 行 | 606 行，与 M0c 快照 0 差异 | 未变 |
+
+**两个按新行为改写的 M1 测试（不是弱化，是期望变更）**：
+
+1. `the_download_endpoint_degrades_visibly` → 更名并改写为
+   `the_download_endpoint_refuses_disabled_unknown_and_url_bearing_requests`：
+   M1 断言"worker 判失败并写明未实现"，M2 的处理体是真的，所以现在断言
+   **403 / 404 + 已知集合 / 400（带 URL 的请求体）**，以及"集合已齐备时任务成功且 0 个文件要下"；
+2. `unknown_paths_are_404_and_wrong_methods_are_405`：`/api/engine/reload` 从"不存在的 M3 端点"
+   变成真实路由，因此从 404 列表移到 405 断言（并断言 `Allow: POST`）。
+
+---
+
+### 验证 2：12 图硬门槛（`target/m2-gate/`，**没有**覆盖 `tests/baseline/`）
+
+```powershell
+target\release\bench_warm_e2e.exe --config <OCR-Model>\test-config-small.yaml --images-dir <OCR-test-image> `
+  --warmup-rounds 1 --rounds 3 --max-side-len 2000 --intra-threads 16 --output target\m2-gate\bench-cpu-2000.json
+target\release\rapidocr.exe evaluate --manifest <OCR-test-image>\golden-manifest.json `
+  --config <OCR-Model>\test-config-small.yaml --output target\m2-gate\evaluation-cpu.json
+```
+
+| 门槛 | 文档要求 | 本次实测（release） | 比较方式 | 结论 |
+| --- | --- | --- | --- | --- |
+| 12 图区域数均值 | `34.833333333333336` | **`34.833333333333336`** | 原始 JSON 的数字**字面量**字符串精确比较 | 逐位相同 |
+| 12 图 mean CER | `0.44765135645866394` | **`0.44765135645866394`** | 同上 | 逐位相同 |
+
+**是否重跑、为什么**：**重跑了**。M2 **没有**改动推理链路（`ImageInput → OcrRequest → OcrOutput`
+一行未动；库侧改动全部在 `model_store` 的下载/空间探测与 `exports.rs` 的导出面），因此按
+M0a/M1 记录的口径这属于"明知不会变"的一类；但仍然重跑，因为 M2 在**二进制侧**动过共享状态
+（`ServeRuntime` 的线程与共享状态、任务存储）且 12 图门槛是发布前的唯一数值关卡——
+"没跑"与"跑了且逐位相同"是两种证据强度。`git status --porcelain -- tests/baseline` 为空。
+
+---
+
+### 验证 3：12 图 HTTP-vs-CLI 逐张对照（重跑，`target/m2-e2e/`）
+
+**为什么重跑**：M2 改了页面消费的响应形状（`/api/jobs/{id}` 新增
+`failure`/`download`/`cancel_requested`；下载任务的 `queue` 值改为 `download`），因此按要求
+重跑判据（脚本是 M1 的 `run-e2e.ps1` 原样复制到 `target/m2-e2e/`，只改输出目录）。
+
+```text
+ALL_12_MATCH=True
+region counts: serve=418 cli=418
+```
+
+| # | 图片 | serve `regions` | CLI `regions` | 区域数相同 | `text` 逐字节相同 | 逐区域文本序列相同 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 01基础多位置文本.png | 42 | 42 | ✅ | ✅ | ✅ |
+| 2 | 02多语言与RTL混排.png | 21 | 21 | ✅ | ✅ | ✅ |
+| 3 | 03旋转与倾斜.png | 13 | 13 | ✅ | ✅ | ✅ |
+| 4 | 04表格与键值对.png | 61 | 61 | ✅ | ✅ | ✅ |
+| 5 | 05代码与等宽字体.png | 38 | 38 | ✅ | ✅ | ✅ |
+| 6 | 06低对比度与深色背景.png | 21 | 21 | ✅ | ✅ | ✅ |
+| 7 | 07小字号与密集排版.png | 37 | 37 | ✅ | ✅ | ✅ |
+| 8 | 08数字公式与符号.png | 51 | 51 | ✅ | ✅ | ✅ |
+| 9 | 09竖排文本.png | 14 | 14 | ✅ | ✅ | ✅ |
+| 10 | 10长段落与分栏.png | 37 | 37 | ✅ | ✅ | ✅ |
+| 11 | 11文字样式与特效.png | 22 | 22 | ✅ | ✅ | ✅ |
+| 12 | 12综合压力测试.png | 61 | 61 | ✅ | ✅ | ✅ |
+| — | **合计** | **418** | **418** | **12/12** | **12/12** | **12/12** |
+
+空模型目录（§7.6 的回归，M1 判据原样重跑）：
+
+```text
+service.state=ready engine.state=blocked_models_missing model_dir=<redacted> source=default_table
+models.missing=[PP-OCRv6_det_small.onnx, PP-OCRv6_rec_small.onnx, ppocrv6_dict.txt]
+ocr http=409 code=models_missing
+ocr detail missing=[PP-OCRv6_det_small.onnx, PP-OCRv6_rec_small.onnx, ppocrv6_dict.txt] corrupt=[] source=default_table model_dir=<redacted>
+FIELDS_MATCH_API_MODELS=True     engine.state equals blocked_models_missing: True     service ready: True
+```
+
+---
+
+### 验证 4：真实网络（opt-in，`RAPID_OCR_ALLOW_NETWORK=1`）与一条**未解决**的发现
+
+日志：`target/m2-verify/network-test.log`（命令
+`$env:RAPID_OCR_ALLOW_NETWORK='1'; cargo test --features serve --bin rapidocr a_real_network -- --nocapture --test-threads=1`）。
+
+**(a) 成功路径**（`a_real_network_download_of_the_default_table_dictionary_lands_and_verifies`）：
+临时模型目录 + 本地 manifest（一个待下载的真实字典 + 两个已就位的夹具文件以满足三个 role），
+经 `POST /api/models/download` 走**生产**下载器：
+
+```text
+real network download: files_done=1 files_total=1 bytes_done=74947 bytes_total=74947 elapsed_ms=614
+real network download: ppocrv6_dict.txt = 74947 bytes, sha256 b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d
+test serve::tests::a_real_network_download_of_the_default_table_dictionary_lands_and_verifies ... ok
+```
+
+断言全过：任务 `succeeded`；`ppocrv6_dict.txt` 落盘，**SHA-256 与默认表声明的哈希逐位相同**；
+`/api/models` 从 `complete:false` 变为 `complete:true`、`missing:[]`。
+
+**(b) 一条真实发现：默认表的 ONNX 权重在 ModelScope 上是 302，而 §6.1 第 2 条要求拒绝重定向。**
+
+第一次尝试直接下载默认表的 v6-tiny 文本集合（6,346,587 B）时，任务在**第一个文件**就失败：
+
+```text
+state=failed  failure.code=download_failed  failure.detail.kind=redirect  status=502
+error: the model host answered with a redirect to
+  `https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/f4/2c/0fbd…?filename=PP-OCRv6_det_tiny.onnx…`;
+  automatic redirects are disabled
+```
+
+独立复核（`curl.exe`，不带 `-L`）：
+
+| URL | 结果 |
+| --- | --- |
+| `…/onnx/PP-OCRv6/det/PP-OCRv6_det_tiny.onnx` | **302**（345 B 的跳转体）→ `cdn-lfs-cn-1.modelscope.cn` |
+| `…/paddle/PP-OCRv6/rec/PP-OCRv6_rec_tiny/ppocrv6_tiny_dict.txt` | 200，27,156 B，`num_redirects=0` |
+| `…/paddle/PP-OCRv6/rec/PP-OCRv6_rec_small/ppocrv6_dict.txt` | 200，74,947 B，`num_redirects=0` |
+| `…/paddle/PP-OCRv4/rec/arabic_PP-OCRv4_rec_infer/arabic_dict.txt` | 200，405 B，`num_redirects=0` |
+
+即：**字典/词表类来源是直连的，ONNX 权重走 LFS 的 302 跳转**。加固下载器按冻结契约拒绝它
+（`a_real_network_weight_download_is_rejected_because_the_host_redirects` 就是这条结论的
+opt-in 回归测试：真实主机 302 → 502 `download_failed`/`redirect`，目录里一个字节都没落）。
+后果必须如实写清：**今天 `POST /api/models/download` 对"含权重的默认表集合"必然失败**，
+用户看到的是一条可定位的 `redirect` 错误；这不是 M2 的接线缺陷，而是"默认表来源 + 拒绝重定向"
+两条冻结决策的合成结果。两条出路（都需要先改 `docs/05` §6.1 第 2 条）：
+① 逐跳校验 host/path 后放行重定向（§6.1 已经写明这是"未来若要支持"的方式，需要新增
+`cdn-lfs-*.modelscope.cn` 之类的**逐跳**校验与固定 host 集合）；② 把 CDN 直链写进默认表
+（auth_key 会过期，不可行）。**M2 不做这个决定**，把它作为 M3/发布前的阻塞项上报。
+
+---
+
+### 覆盖分工（哪一层证了什么）
+
+**只在库层**（`model_store.rs` 单测，本机 fixture，零公网）：仅 HTTPS/拒绝 302/编译期白名单与
+显式参数/`Content-Length` 预检/流式上限/唯一 `.part` 名与 `Drop` 清理/**单飞**（2 线程 → 1 次请求）/
+磁盘空间预检（注入探针）/**`MoveFileExW` 原子替换**（含"目标已损坏 → 覆盖"与"替换失败保留原文件"）/
+缓存命中不发请求/预算记账/观察者的下标·字节·顺序/**文件边界取消**（已校验文件保留、无 `.part`）/
+"第一个文件前取消则零请求零写入"/`available_disk_bytes`。
+
+**只在 HTTP 层**（`serve::tests`，脚本化下载器，零公网）：403/404/400 的拒绝形状/
+**413 与 507 的同步拒绝（两个数值）**/202→queued→running→succeeded·failed·cancelled 的完整生命周期/
+**运行中可观测的进度**（闸门保证确定性）/逐文件失败后已校验文件保留/**运行中下载的文件边界取消**
+（200 + `cancel_requested` → `cancelled`，第二个文件从未开始）/排队中取消立即生效/
+`failure`+`download`+`cancel_requested` 的 JSON 形状/`--allow-download-host` 作为显式参数传入/
+`POST /api/engine/reload` 的三种结论/**惰性建引擎**与 `loading` 可见/集合齐备后任务成功且 `/api/models` 变 `complete`。
+
+**两层都覆盖**：真实网络（opt-in）里，生产下载器经 HTTP 端点下载真实字典（成功 + 哈希 + complete），
+以及真实主机的 302 → 结构化 `redirect` 失败。
+
+**未覆盖（如实）**：
+
+1. **单飞与原子替换只在库层验证**：HTTP 层没有"两个并发请求下载同一文件"的测试（下载 worker 只有
+   一个、有界 channel 也是串行的，因此这条在 serve 里不是主要风险，但没有断言）；
+2. **§6.3 的"目标已损坏时重新下载"在 HTTP 层未覆盖**：脚本化下载器只写新文件、不做替换；
+   库层的 `an_existing_corrupt_target_is_replaced` 覆盖了它；
+3. **逐 64 KiB 的进度粒度未在 HTTP 层断言**：脚本化下载器每文件报两个块；真实下载器的分块
+   回调只在真实网络运行中被隐式走过；
+4. **真实网络的多文件成功路径未跑通**：第一次尝试在第二个文件遇到 10 s `connect_timeout`
+   （504），因此成功路径的夹具改成"一次真实往返"（其余两个 role 由已就位夹具满足）。
+   多文件真实下载的网络稳定性由使用者承担，本阶段不假装它已验证；
+5. **未验证真实浏览器里的手工闭环**（下载按钮、进度条、取消按钮的视觉行为）：§12 的"手工"一行
+   仍需人工操作浏览器；本阶段只做了 HTTP 层与页面注入的自动验证 + `node --check`；
+6. **`--allow-download-host` 只在启动期校验**（`validate_extra_hosts` 单测 + 启动实测），
+   没有"运行期不接受任何 host 变更"的测试（本来也没有这种入口）。
+
+---
+
+### 关键行为对比（AGENTS.md §9）
+
+| 项目 | 修改前（M1） | 修改后 | 预期结果 |
+| --- | --- | --- | --- |
+| 下载端点（原有功能） | 占位处理体，必失败并写明未实现 | 真实下载（库的加固路径），失败给结构化分类 | §4.2/§6 |
+| 下载进度（新增） | 不存在（`elapsed_ms` 而已） | `download{files_done,files_total,bytes_done,bytes_total,current_file}` | §4.3 的作业形状 |
+| 下载取消（修改功能） | 运行中 409（与 OCR 一样） | 运行中 200 + `cancel_requested`，**文件边界**兑现；排队中仍立即取消 | §6.6，且不假装能中断当前文件 |
+| 失败分类（修改功能） | 只有 `error` 文本 | `failure{status,code,message,detail}`（与 `/result` 的错误体同源） | 客户端不必字符串匹配 |
+| host opt-in（新增） | `--allow-download-host` 只被解析、无作用 | 显式参数接入 `download_model_set_observed` + 启动打印高风险警告 + 启动期校验 | §6.1 第 3 条 |
+| 库常量 | 编译期白名单 | **未改**（`ALLOWED_DOWNLOAD_HOSTS` 仍是 1 项，单测锁死） | 清单永远不能自己扩大白名单 |
+| 引擎状态（修改功能） | 启动期一次性判定，`begin_loading`/`models_still_missing` 无生产者 | `POST /api/engine/reload` + `POST /api/ocr` 的惰性路径是它们的生产者；`loading` 可见、`Failed` 带 reason | §7.6 |
+| 下载完成后的引擎 | 不存在该路径 | **不**在后台创建；下一次 `POST /api/ocr` 或显式 reload 才创建 | §7.6 原文 |
+| 队列诊断（修改功能） | 下载任务借用 `QueueClass::Text`，`position:null` | 中性 `JobQueue::Download`；`position` 仍为 `null` 但不再是"文本队列" | 诊断不再说谎 |
+| 磁盘/预算拒绝（修改功能） | 507 无生产者；413 无两个数值 | 同步 507/413，`detail` 里两个数值；任务内同一组字段名 | §6.2/§6.5/§11.1 |
+| 页面（修改功能） | 实模式下载进度是不确定条；413 文案只提图片 | 真实百分比 + 当前文件名；413 文案覆盖两种预算 | §9.2 |
+| 性能表现 | — | 推理链路一行未动；12 图两个硬门槛逐位相同；新增的只有下载线程与 HTTP 路径 | 无退化 |
+| 依赖 | — | `Cargo.toml` 未改；默认依赖图与 M0c 快照 0 差异 | §2.1 |
+
+**证据：未触碰的文件**（在 `crates/rapid-ocr-rs` 与父仓库分别检查）：
+
+- `Temp/demo3-v2.html`：父仓库 `git status --porcelain -- Temp/demo3-v2.html` 为空；
+- `docs/03-windows-only-optimization-tasks.md`：`git status --porcelain` 为空；
+- `tests/baseline/`：`git status --porcelain -- tests/baseline` 为空（门槛输出写在 `target/m2-gate/`）。
+
+---
+
+### 与 `docs/05` §11「M2」验收清单的对照
+
+| §11 M2 条目 | 本阶段 | 证据 |
+| --- | --- | --- |
+| `GET /api/models`、`POST /api/models/download`、下载任务进度 | ✅ 完成 | 交付物 1/2；`/api/models` 未改形状（M1 已有），下载端点真实化 + `download` 进度字段 |
+| 单飞、空间检查、强制 SHA-256、失败清理、`MoveFileExW` 原子替换、重定向拒绝 | ✅ 完成（库层为唯一实现，M0b 起；M2 把前四条经 HTTP 真实驱动） | 库层 40 个 `model_store` 测试 + HTTP 层 413/507/哈希失败/重定向（真实主机） |
+| 下载取消（文件边界）与"目标已损坏时重新下载"（§6.3） | ✅ 取消（库 + HTTP 两层）；⚠️ §6.3 的替换只在库层 | 交付物 2；库 `an_existing_corrupt_target_is_replaced` |
+| 模型齐备后惰性创建 engine 并显示耗时 | ✅ 完成 | 交付物 4；`/api/status.engine_load_ms` + reload 的 `load_ms` |
+| **M2 验收**：无网络可验证的接缝 + 一个 opt-in 真实网络测试 | ✅ 完成 | 20 个 serve 测试（脚本化下载器 + 注入空间探测 + 闸门）与 2 个 opt-in 网络测试 |
+| M3/M4 的条目（`annotated.png`、`export`、provider 运行期切换、公式模型） | ⛔ 不在 M2 | 见下表接缝 |
+
+---
+
+### 接缝（留给 M3 / M4 / 发布前）
+
+1. **【发布前阻塞项】默认表的 ONNX 权重不可下载**（本阶段的真实发现，见验证 4b）：ModelScope
+   对 `onnx/**` 返回 302 到 `cdn-lfs-cn-*.modelscope.cn`，而 §6.1 第 2 条禁止自动重定向。要打通
+   "点下载 → 模型齐备 → 识别"这条主线，必须先改 `docs/05` §6.1 第 2 条并实现**逐跳** host/path
+   校验（或给出另一个可信的直连来源）。M2 不擅自放宽这条冻结契约。
+2. **M3 的 provider 运行期切换**：`EngineState::Rebuilding` 与 `begin_rebuild` 仍无生产者；
+   M2 的 `POST /api/engine/reload` **故意不经过它**（显式 reload = "按磁盘当前文件重建会话"，
+   与"切换 provider"是两件事）。M3 需要"暂停新任务 → 排空 → 销毁旧 engine → 创建新 engine"，
+   并把 `Rebuilding` 接到 `/api/status`。
+3. **reload 会阻塞 accept 线程直到会话建好**（实测 `load_ms` 在毫秒级；真实模型几百毫秒到数秒）。
+   M3 若要让 reload 异步化，应给出 `Loading` 期间的可轮询语义（现在是同步返回最终状态）；
+   当前实现已保证 `/api/status` 在加载期间仍可读（不持有状态锁）。
+4. **`GET /api/jobs/{id}/annotated.png` / `export`**（M3）与它们对原图编码字节的保留需求。
+5. **公式模型集（M4）**：`ModelPlan` 固定 `ModelRequest::text_only`；下载层对公式集合已经可用
+   （库的 `download_model_set_observed` 与集合无关），但 566 MB 的进度/体积提示、`?queue=formula`
+   的生产来源仍未接线。
+6. **下载 channel 容量是编译期常量**（`DOWNLOAD_QUEUE_CAPACITY = 4`）。若将来要暴露
+   `--max-queue-download`，按 §3 的方式加参数与校验（当前不提供设了不生效的选项）。
+7. **`/api/status` 的 `download_hosts` / `engine_load_ms`** 是本阶段新增的**诊断字段**（页面不读）；
+   若 M3 的导出/诊断面板要用它们，需在 `docs/05` §4.2 的 `/api/status` 一栏登记。
+8. **`JobView.failure` 与 `/result` 的错误体是两份序列化**（内容同源、形状不同：前者多了 `status`）。
+   M4 若要统一（例如给 `/result` 也加 `status`），需先改 §4.2。
+
+---
+
+### 未覆盖风险（如实）
+
+1. **未提交、未在干净 clone 上验证**：按要求不 commit；`crates/` 在父仓库被 `.gitignore` 忽略，
+   证据来自当前工作树（`06bd0af` + 本阶段改动）。
+2. **真实网络测试是 opt-in 且依赖上游内容**：`a_real_network_*` 只有设置
+   `RAPID_OCR_ALLOW_NETWORK=1` 才联网；不设置时打印 `skipping`。上游若替换同名文件，
+   哈希校验会**失败**（这正是期望行为），届时该测试会红——这是网络测试的正常语义，不是 flaky。
+3. **多文件真实下载未跑通**：见"覆盖分工"第 4 条（第一次尝试在第二个文件遇到 10 s
+   `connect_timeout`）。因此"逐文件递减预算在真实多文件场景下"只有本机 fixture（库层）与
+   脚本化（HTTP 层）两层证据。
+4. **页面改动只有 `node --check` 与注入测试**：真实浏览器里的进度条/取消按钮行为未人工复核。
+5. **`--allow-download-host` 的高风险警告是 stderr 文本**（不是交互确认）：加了它就等于放行，
+   没有"二次确认"这种机制（本机单用户工具，且 §6.1 只要求"打印高风险警告"）。
+6. **`ServeError::InsufficientDiskSpace` 的"需求"是估算**：`download_bytes_total` 只统计
+   `Missing` 且任一未知体积即 `None`，因此 serve 侧的任务级预检用
+   `pending_download`（缺失 ∪ 损坏）并在有未知体积时按 `--max-download-mb` 计。这是保守估计，
+   真正的逐文件判定仍在库侧（§6.5 的原文）。
+7. **并发工作流**：父仓库工作树里还有其它工作流的未提交改动（`src-tauri/**` 等），与本阶段
+   无关；本阶段的验证全部在 `crates/rapid-ocr-rs` 内取得。

@@ -22,6 +22,7 @@
 //! | `RequestTimeout` | 408 | `request_timeout` | §4.4 第 6 步（读取超时） |
 //! | `BadHost` | 421 | `bad_host` | §7.2 |
 //! | `JobNotFound` | 404 | `job_not_found` | §4.5 |
+//! | `ModelSetNotFound` | 404 | `model_set_not_found` | §4.2（M2 新增，见下） |
 //! | `Busy` | 503 | `busy` | §4.5 / §8.2 |
 //! | `ModelsMissing` | 409 | `models_missing` | §11.1 |
 //! | `ModelsCorrupt` | 409 | `models_corrupt` | §11.1 |
@@ -29,19 +30,22 @@
 //! | `JobEvicted` | 410 | `job_evicted` | §4.5 |
 //! | `NotCancellable` | 409 | `not_cancellable` | §4.3 |
 //! | `EngineUnavailable` | 503 | `engine_unavailable` | §7.6 |
-//! | `InsufficientDiskSpace` | 507 | `insufficient_disk_space` | §11.1 |
+//! | `InsufficientDiskSpace` | 507 | `insufficient_disk_space` | §11.1 / §6.5（`detail` 带两个数值） |
 //! | `UnsupportedInput` | 422 | `unsupported_input` | §11.1 |
 //! | `Download(..)` | 502/504/507/413/409 | 见 [`DownloadErrorMapping`] | §6.1 |
 //! | `Ocr(..)` | 见 [`classify_ocr_error`] | 见 [`classify_ocr_error`] | §11.1 |
 //! | `Internal` | 500 | `internal` | §11.1 |
 //!
-//! # 与 §11.1 变体清单的两处偏离（都是文档别处明确要求的行为）
+//! # 与 §11.1 变体清单的三处偏离（都是文档别处明确要求的行为）
 //!
 //! - [`ServeError::ExportTooLarge`]：§9.5 要求导出超过 `--max-export-mb` 时返回
 //!   **413 `export_too_large`**，而 §11.1 的枚举清单里没有任何变体能产生这个 `code`
 //!   （`ResultTooLarge` 的 `code` 是 `result_too_large`，两者是**不同预算**、不同原因）；
 //! - [`ServeError::RequestTimeout`]：§4.4 第 6 步要求"有界流式读取 + **读取超时**"，
 //!   而 §11.1 的清单里没有能表达 408 的变体；把它降级成 400 会掩盖真实原因。
+//! - [`ServeError::ModelSetNotFound`]（M2）：§4.2 的下载请求体里**只有** `set_id`，
+//!   而"未知集合"必须可定位（**绝不**回落到 `sets[0]`）。它与"请求体不合法"的 400 是
+//!   两件不同的事，因此不复用 `bad_request`；`detail` 给出请求的 id 与已知集合。
 //!
 //! 其余变体与 §11.1 逐项一致。`engine_unavailable` 的 `reason` 字段来自 §7.6。
 //!
@@ -206,18 +210,16 @@ impl DownloadErrorMapping for DownloadError {
 
 /// serve 层的统一错误（§11.1）。
 ///
-/// # 三个"协议已冻结、生产者还没到"的变体
+/// # 协议变体与生产者
 ///
-/// [`Self::ExportTooLarge`]（§9.5 的 `--max-export-mb`）、
-/// [`Self::InsufficientDiskSpace`]（§6.5 的磁盘预检）与 [`Self::UnsupportedInput`]
-/// （§11.1 的 422；当前所有 `unsupported_input` 都经由 `Ocr(..)` 分类产生，
-/// 因此**保留了库侧的错误文本**，见接缝第 5 条）目前没有构造点：它们的状态码与 `code`
-/// 由 §11.1 冻结，生产者分别在 M2/M3 与解析层落地。
+/// [`Self::ExportTooLarge`]（§9.5 的 `--max-export-mb`）目前没有构造点：它的状态码与 `code`
+/// 由 §9.5 冻结，生产者在 M3 落地。删除它会让 §11.1 的契约失去覆盖
+/// （`every_variant_has_the_documented_status_and_code` 逐项断言了这张表），因此用
+/// **逐变体**的 `allow` 标明"协议项、生产者未到"——这与 M0c 那条覆盖整个子树的
+/// `#![allow(dead_code)]` 不是一回事。
 ///
-/// 删除它们会让 §11.1 的契约失去覆盖（`every_variant_has_the_documented_status_and_code`
-/// 逐项断言了这张表），因此这里用**逐变体**的 `allow` 标明"协议项、生产者未到"——
-/// 这与 M0c 那条覆盖整个子树的 `#![allow(dead_code)]` 不是一回事：那条会同时隐藏真正的
-/// 未接线代码，这条只作用于三个已冻结的协议变体。
+/// [`Self::ModelsMissing`] 与 [`Self::ModelsCorrupt`] 的关系：两者都由
+/// `/api/models` 的同一份状态决定（有损坏文件就是 `models_corrupt`）。
 #[derive(Debug)]
 pub enum ServeError {
     BadRequest,
@@ -239,9 +241,24 @@ pub enum ServeError {
     ModelsMissing,
     ModelsCorrupt,
     DownloadsDisabled,
-    /// §6.5：下载前的磁盘空间预检。**生产者：M2。**
-    #[allow(dead_code)]
-    InsufficientDiskSpace,
+    /// §6.5：下载前的**任务级**磁盘空间预检。**生产者：M2**（`submit_download`）。
+    ///
+    /// 它带两个数值（需求与可用），因为"空间不足"这条错误的价值全在这两个数上；
+    /// 库内部对**每个文件**的同类预检走 [`DownloadError::InsufficientSpace`]
+    /// （507，`detail` 字段名相同），两者是同一事实在不同粒度上的判定。
+    InsufficientDiskSpace {
+        required_bytes: u64,
+        available_bytes: u64,
+    },
+    /// §4.2：`POST /api/models/download` 的 `set_id` 在模型集里不存在。
+    ///
+    /// **M2 新增的变体**（§11.1 的清单里没有能产生它的项）：§4.2 的请求体只带 `set_id`，
+    /// 而"未知集合"必须有可定位的答复、**绝不**回落到 `sets[0]`。404 与"请求体不合法"的
+    /// 400 是两件事，因此不共用 `bad_request`。`detail` 里给出请求的 id 与已知集合。
+    ModelSetNotFound {
+        set_id: String,
+        known: Vec<String>,
+    },
     /// §11.1 的 422。当前由 `Ocr(RapidOcrError::InvalidImage | InvalidInput | Decode)`
     /// 分类产生（保留库侧原文），因此该变体本身没有构造点。
     #[allow(dead_code)]
@@ -385,6 +402,7 @@ impl ServeError {
             Self::BadOrigin | Self::DownloadsDisabled => 403,
             Self::RequestTimeout => 408,
             Self::JobNotFound => 404,
+            Self::ModelSetNotFound { .. } => 404,
             Self::JobNotFinished
             | Self::NotCancellable
             | Self::ModelsMissing
@@ -394,7 +412,7 @@ impl ServeError {
             Self::BadHost => 421,
             Self::UnsupportedInput => 422,
             Self::Busy | Self::EngineUnavailable { .. } => 503,
-            Self::InsufficientDiskSpace => 507,
+            Self::InsufficientDiskSpace { .. } => 507,
             Self::Download(error) => error.status_code(),
             Self::Ocr(error) => classify_ocr_error(error).status,
             Self::Internal => 500,
@@ -410,6 +428,7 @@ impl ServeError {
             Self::DownloadsDisabled => "downloads_disabled",
             Self::RequestTimeout => "request_timeout",
             Self::JobNotFound => "job_not_found",
+            Self::ModelSetNotFound { .. } => "model_set_not_found",
             Self::JobNotFinished => "job_not_finished",
             Self::JobEvicted => "job_evicted",
             Self::NotCancellable => "not_cancellable",
@@ -422,7 +441,7 @@ impl ServeError {
             Self::UnsupportedInput => "unsupported_input",
             Self::Busy => "busy",
             Self::EngineUnavailable { .. } => "engine_unavailable",
-            Self::InsufficientDiskSpace => "insufficient_disk_space",
+            Self::InsufficientDiskSpace { .. } => "insufficient_disk_space",
             Self::Download(error) => error.code(),
             Self::Ocr(error) => classify_ocr_error(error).code,
             Self::Internal => "internal",
@@ -471,7 +490,21 @@ impl ServeError {
             Self::EngineUnavailable { reason } => {
                 format!("the OCR engine is not available: {reason}")
             }
-            Self::InsufficientDiskSpace => "not enough disk space for the download".to_string(),
+            Self::InsufficientDiskSpace {
+                required_bytes,
+                available_bytes,
+            } => format!(
+                "insufficient disk space for the download: {required_bytes} bytes required, \
+                 {available_bytes} bytes available"
+            ),
+            Self::ModelSetNotFound { set_id, known } => format!(
+                "no model set with id `{set_id}` exists in this model directory (known sets: {})",
+                if known.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ),
             Self::Download(error) => error.message(),
             Self::Ocr(error) => error.to_string(),
             Self::Internal => "internal error".to_string(),
@@ -482,6 +515,19 @@ impl ServeError {
     pub fn detail(&self) -> serde_json::Value {
         match self {
             Self::EngineUnavailable { reason } => serde_json::json!({ "reason": reason }),
+            // 两个数值都给出（§6.5）——字段名与库侧 `DownloadError::InsufficientSpace`
+            // 的 `detail` 逐字相同，客户端不必区分"同步预检"与"任务内预检"。
+            Self::InsufficientDiskSpace {
+                required_bytes,
+                available_bytes,
+            } => serde_json::json!({
+                "required_bytes": required_bytes,
+                "available_bytes": available_bytes,
+            }),
+            Self::ModelSetNotFound { set_id, known } => serde_json::json!({
+                "set_id": set_id,
+                "known_sets": known,
+            }),
             Self::Download(error) => error.detail(),
             Self::Ocr(error) => {
                 let class = classify_ocr_error(error);
@@ -576,13 +622,21 @@ mod tests {
     /// 每个变体的 (状态码, code) 都被逐项锁住。
     #[test]
     fn every_variant_has_the_documented_status_and_code() {
-        let cases: [(ServeError, u16, &str); 19] = [
+        let cases: [(ServeError, u16, &str); 20] = [
             (ServeError::BadRequest, 400, "bad_request"),
             (ServeError::Unauthorized, 401, "unauthorized"),
             (ServeError::BadOrigin, 403, "bad_origin"),
             (ServeError::DownloadsDisabled, 403, "downloads_disabled"),
             (ServeError::RequestTimeout, 408, "request_timeout"),
             (ServeError::JobNotFound, 404, "job_not_found"),
+            (
+                ServeError::ModelSetNotFound {
+                    set_id: "nope".to_string(),
+                    known: vec!["test-set".to_string()],
+                },
+                404,
+                "model_set_not_found",
+            ),
             (ServeError::JobNotFinished, 409, "job_not_finished"),
             (ServeError::JobEvicted, 410, "job_evicted"),
             (ServeError::NotCancellable, 409, "not_cancellable"),
@@ -602,7 +656,10 @@ mod tests {
                 "engine_unavailable",
             ),
             (
-                ServeError::InsufficientDiskSpace,
+                ServeError::InsufficientDiskSpace {
+                    required_bytes: 1000,
+                    available_bytes: 10,
+                },
                 507,
                 "insufficient_disk_space",
             ),
@@ -736,6 +793,29 @@ mod tests {
         assert_eq!(error.detail()["expected"], "aa");
         assert_eq!(error.detail()["actual"], "bb");
         assert!(error.message().contains("SHA-256"), "{}", error.message());
+
+        // 同步（任务级）磁盘预检：与库侧任务内预检**同一组字段名**。
+        let error = ServeError::InsufficientDiskSpace {
+            required_bytes: 600_000_000,
+            available_bytes: 12_345,
+        };
+        let detail = error.detail();
+        assert_eq!(error.status_code(), 507);
+        assert_eq!(detail["required_bytes"], 600_000_000u64);
+        assert_eq!(detail["available_bytes"], 12_345);
+        assert!(error.message().contains("600000000"), "{}", error.message());
+        assert!(error.message().contains("12345"), "{}", error.message());
+
+        // 未知集合：请求的 id 与已知集合都给出（可定位，而不是一句 404）。
+        let error = ServeError::ModelSetNotFound {
+            set_id: "nope".to_string(),
+            known: vec!["PP-OCRv6".to_string()],
+        };
+        assert_eq!(error.status_code(), 404);
+        assert_eq!(error.detail()["set_id"], "nope");
+        assert_eq!(error.detail()["known_sets"][0], "PP-OCRv6");
+        assert!(error.message().contains("nope"), "{}", error.message());
+        assert!(error.message().contains("PP-OCRv6"), "{}", error.message());
     }
 
     /// `RapidOcrError` 的每一个变体都在同一张表里映射（无字符串匹配）。

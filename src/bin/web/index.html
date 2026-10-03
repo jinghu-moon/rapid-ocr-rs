@@ -591,7 +591,7 @@ const ERR_TEXT = {
   unauthorized:'令牌校验失败，请通过 rapidocr serve --open 打开本页',
   bad_origin:'Origin 校验失败（非本机来源）',
   bad_host:'Host 校验失败（防 DNS rebinding）',
-  payload_too_large:'图像超出请求体上限（--max-body-mb）',
+  payload_too_large:'请求体或下载总量超出上限（--max-body-mb / --max-download-mb）',
   result_too_large:'结果序列化超出上限（--max-result-mb）',
   busy:'队列已满（503 busy），请稍后重试',
   models_missing:'模型文件缺失，请先在横幅中下载',
@@ -1384,10 +1384,22 @@ function renderBanner(){
   if(state.dlJob){
     const st = state.dlJob.state || 'queued';
     const el = state.dlJob.elapsed_ms != null ? ` · ${(state.dlJob.elapsed_ms / 1000).toFixed(1)}s` : '';
+    /* M2：任务视图里的 download{files_done,files_total,bytes_done,bytes_total,current_file}
+       是服务端唯一的进度事实来源（逐文件 + 字节）。字节总数未知时退回文件计数。 */
+    const dp = state.dlJob.download;
+    let pct = null, cur = '';
+    if(dp && dp.files_total > 0){
+      pct = dp.bytes_total > 0 ? (dp.bytes_done / dp.bytes_total) * 100
+                               : (dp.files_done / dp.files_total) * 100;
+      pct = Math.max(0, Math.min(100, pct));
+      cur = dp.current_file ? ` · 当前 ${esc(dp.current_file)}` : '';
+      cur += ` · ${dp.files_done}/${dp.files_total} 个文件`;
+    }
+    const pctTxt = pct == null ? '…' : `${pct.toFixed(0)}%`;
     html += `<div class="banner-dl">
-      <div class="dl-line"><span>${ic('package')} 下载任务 <b>${esc(state.dlJob.id)}</b> · 集合「${esc(state.dlJob.set_id)}」· 状态 <b>${esc(modelJobZh(st))}</b>${el}（逐文件下载，完成后自动校验 SHA-256）</span><b>…</b></div>
-      <div class="bar ind"><i></i></div>
-      <div class="dl-line"><span>取消下载 = POST /api/jobs/{id}/cancel，与取消识别同一套 job 语义</span>
+      <div class="dl-line"><span>${ic('package')} 下载任务 <b>${esc(state.dlJob.id)}</b> · 集合「${esc(state.dlJob.set_id)}」· 状态 <b>${esc(modelJobZh(st))}</b>${el}${cur}（逐文件下载，完成后自动校验 SHA-256）</span><b>${pctTxt}</b></div>
+      <div class="bar${pct == null ? ' ind' : ''}"><i id="dlJobBar"></i></div>
+      <div class="dl-line"><span>取消下载 = POST /api/jobs/{id}/cancel，与取消识别同一套 job 语义（运行中的下载在<b>文件边界</b>生效）</span>
       <button class="btn-ghost sm" id="dlCancelBtn">${ic('x')}取消下载</button></div></div>`;
   } else if(demo.dlActive){
     html += `<div class="banner-dl">
@@ -1397,6 +1409,12 @@ function renderBanner(){
   box.innerHTML = html;
   const bar = $('dlBar');
   if(bar) bar.style.width = demo.dlPct + '%';      /* CSSOM，无需内联 style 属性 */
+  const jobBar = $('dlJobBar');
+  if(jobBar && state.dlJob && state.dlJob.download && state.dlJob.download.files_total > 0){
+    const d = state.dlJob.download;
+    const p = d.bytes_total > 0 ? (d.bytes_done / d.bytes_total) * 100 : (d.files_done / d.files_total) * 100;
+    jobBar.style.width = Math.max(0, Math.min(100, p)) + '%';
+  }
 }
 function modelJobZh(st){
   return { queued:'排队中', running:'下载中', succeeded:'已完成', failed:'失败', cancelled:'已取消' }[st] || st;

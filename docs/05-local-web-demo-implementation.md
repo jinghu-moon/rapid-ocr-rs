@@ -148,14 +148,14 @@ OCR（尤其公式路径）单图可达数秒至数十秒，**不得长期占用
 | `GET` | `/` | 内联单页（注入 nonce + token） |
 | `GET` | `/api/status` | 引擎/provider/ORT 指纹/队列与内存概况（路径脱敏） |
 | `GET` | `/api/models` | 模型集状态（§5.4） |
-| `POST` | `/api/models/download` | 启动下载任务（需 `--allow-download` **且** token） |
+| `POST` | `/api/models/download` | 启动下载任务（需 `--allow-download` **且** token）；请求体 `{"set_id": "<id>"}`，未知 id → **404 `model_set_not_found`**（绝不回落 `sets[0]`） |
 | `POST` | `/api/ocr` | 提交识别 → **202** `{job_id, queue, position, state:"queued"}` |
-| `GET` | `/api/jobs/{id}` | `{id, kind, queue, state, position, queued_ms, started_ms, elapsed_ms, error}` |
+| `GET` | `/api/jobs/{id}` | `{id, kind, queue, state, position, queued_ms, started_ms, elapsed_ms, error}` + M2 追加的 `{failure, download, cancel_requested}`（见 §4.3） |
 | `GET` | `/api/jobs/{id}/result` | 结果（未完成 409 `job_not_finished`；已淘汰 410 `job_evicted`） |
 | `GET` | `/api/jobs/{id}/annotated.png` | 叠加检测框 PNG（原图淘汰 → 410 `original_evicted`） |
 | `GET` | `/api/jobs/{id}/export?format=json\|md\|html` | 导出（HTML 走静态模式 + 独立 CSP，§9.5） |
 | `POST` | `/api/jobs/{id}/cancel` | 取消（§4.3） |
-| `POST` | `/api/engine/reload` | 显式创建/重建引擎（`BlockedModelsMissing` 或 `Failed` 时使用，§7.6） |
+| `POST` | `/api/engine/reload` | 显式创建/重建引擎（无请求体；响应 `{outcome, engine, missing, corrupt, source, model_dir, load_ms}`，§7.6） |
 
 ### 4.3 状态机与取消语义
 
@@ -169,6 +169,19 @@ queued ──► running ──► succeeded
 - `running` → **409 `not_cancellable`**（M1 不中断推理；不得假装取消成功）；
 - 终态 → 409 `job_finished`。
 - 前端必须区分"**取消上传**"（XHR abort）与"**取消推理**"（job cancel），按钮与文案分开。
+
+**M2 的补充（下载任务，不改变上面三条对 OCR 任务的语义）**：
+
+- `running` 的**下载**任务：`POST /cancel` → **200**，响应里 `state` 仍是 `running`、
+  `cancel_requested: true`；worker 在**文件边界**（§6.6）兑现取消，随后 `state` 才是
+  `cancelled`（已通过校验的文件保留，临时文件不残留）。**进行中的那个文件不会被打断**
+  （阻塞式 HTTP 读取没有安全的中断语义），这一点必须如实呈现，不得假装立即停止；
+- `failure`：失败任务的结构化分类 `{status, code, message, detail}`（`detail` 与
+  `/result` 上重放的错误体同源），`error` 仍是同一份人类可读文本；
+- `download`（仅 `kind = "model_download"` 非 `null`）：
+  `{files_done, files_total, bytes_done, bytes_total, current_file}`；`files_total`/`bytes_total`
+  只统计**需要下载**的文件（缺失 ∪ 损坏），`current_file` 在失败时指向出错的那个文件。
+
 
 ### 4.4 准入顺序（**防止在拒绝请求前读入大 body**）
 
@@ -699,6 +712,25 @@ curl.exe -s -X POST --data-binary "@D:\100_Projects\110_Daily\SnapClip\OCR-test-
 curl.exe -s http://127.0.0.1:8760/api/jobs/<id> -H "X-RapidOCR-Token: <token>"
 curl.exe -s http://127.0.0.1:8760/api/jobs/<id>/result -H "X-RapidOCR-Token: <token>" -o target\serve-ocr.json
 curl.exe -s -D - "http://127.0.0.1:8760/api/jobs/<id>/export?format=html" -H "X-RapidOCR-Token: <token>" -o target\serve-report.html
+
+# 模型下载（M2；需要 --allow-download，请求体**只有** set_id，body 不得携带 URL）
+# set_id 必须来自 GET /api/models 的 sets[].id：未知 id 是 404 model_set_not_found，
+# 不会被猜成"第一个集合"。
+curl.exe -s -X POST "http://127.0.0.1:8760/api/models/download" `
+  -H "Content-Type: application/json" `
+  -H "X-RapidOCR-Token: <token>" -H "Origin: http://127.0.0.1:8760" `
+  -d '{"set_id":"PP-OCRv6-small-ch"}'
+# 进度与取消：同一个 job 生命周期（download{files_done,files_total,bytes_done,bytes_total,current_file}）
+curl.exe -s http://127.0.0.1:8760/api/jobs/<download-job-id> -H "X-RapidOCR-Token: <token>"
+curl.exe -s -X POST http://127.0.0.1:8760/api/jobs/<download-job-id>/cancel `
+  -H "X-RapidOCR-Token: <token>" -H "Origin: http://127.0.0.1:8760"
+# 运行中的下载在**文件边界**生效：响应里 state 仍是 running + cancel_requested=true，
+# 轮询到 cancelled 才是真的停下（§6.6）。
+
+# 显式创建/重建引擎（M2；无请求体）。响应里的 engine 与 /api/status 的同一字段同形：
+# {"outcome":"ready|blocked_models_missing|failed","engine":{…},"missing":[…],"load_ms":…}
+curl.exe -s -X POST http://127.0.0.1:8760/api/engine/reload `
+  -H "X-RapidOCR-Token: <token>" -H "Origin: http://127.0.0.1:8760"
 
 # 与 CLI 对照（区域数应逐张一致）
 .\target\release\rapidocr.exe run --img-path "D:\100_Projects\110_Daily\SnapClip\OCR-test-image\01基础多位置文本.png" --config "D:\100_Projects\110_Daily\SnapClip\OCR-Model\test-config-small.yaml" --json

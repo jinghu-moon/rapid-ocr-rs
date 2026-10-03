@@ -1,4 +1,4 @@
-//! `rapidocr serve` 的服务端核心：HTTP 层、静态页、任务层与 M2 的下载接缝。
+//! `rapidocr serve` 的服务端核心：HTTP 层、静态页、任务层与模型下载（M2）。
 //!
 //! # 分层（§2.1）
 //!
@@ -10,7 +10,7 @@
 //!         ├── http 层：路由 / 准入顺序 / ServeError → 状态码 / 安全头     ← http.rs
 //!         ├── 静态页：include_str!("web/index.html") + nonce/token 注入    ← run.rs
 //!         ├── job 层：双队列 + 固定 worker + 有界结果存储 + tombstone       ← queue/jobs/server
-//!         ├── download 层：独立 worker + 双队列之外的有界 channel           ← download.rs（M2 接缝）
+//!         ├── download 层：独立 worker + 可注入执行体 + 文件边界取消        ← download.rs
 //!         └── rapid-ocr-rs（库，零 HTTP 依赖）
 //!               ModelSet / model_store（加固） / ImageInput → OcrRequest → OcrOutput
 //! ```
@@ -23,18 +23,26 @@
 //! | [`error`] | `ServeError`、状态码/`code` 映射、JSON 错误体 | §11.1 |
 //! | [`state`] | `ServiceState` / `EngineState` 状态机、启动期配置校验 | §7.5、§7.6 |
 //! | [`queue`] | 双队列容量与双向公平调度 | §8.2、§8.3 |
-//! | [`jobs`] | 有界任务存储、TTL、tombstone、404/410 | §4.3、§4.5 |
+//! | [`jobs`] | 有界任务存储、TTL、tombstone、404/410、下载进度与取消 | §4.3、§4.5、§6.6 |
 //! | [`security`] | 硬编码 loopback、Host/Origin、令牌、注入契约 | §7.1–§7.3、§9 |
 //! | [`admit`] | 准入顺序、有界读取、字节账本 | §4.4 |
 //! | [`cli`] | `serve` 的选项面与默认值（无行为） | §3 |
 //! | [`model_plan`] | 模型集的单一来源解析、逐文件状态、引擎路径绑定 | §5.3、§5.4、§7.6 |
 //! | [`engine`] | `OcrBackend` + 引擎工厂（测试可替换） | §8.2 |
 //! | [`results`] | 有界结果存储与有界序列化 | §4.5、§4.6 |
-//! | [`download`] | 独立下载 worker（M2 的处理体） | §8.1、§6 |
-//! | [`server`] | 运行期核心：共享状态、worker、TTL 清理、端点语义 | §4、§7.6、§8 |
+//! | [`download`] | 独立下载 worker + 可注入执行体 + `--allow-download-host` 校验 | §8.1、§6 |
+//! | [`server`] | 运行期核心：共享状态、worker、TTL 清理、端点语义、惰性建引擎 | §4、§7.6、§8 |
 //! | [`http`] | `tiny_http` 接线：路由、准入、响应头 | §4.2、§4.4、§7 |
 //! | [`run`] | 启动编排、静态页注入、启动日志、`--open` | §3、§7.1、§7.6、§9 |
-//! | [`tests`] | 真实绑定端口的端到端测试（HTTP + 双队列 + 安全） | §12 |
+//! | [`tests`] | 真实绑定端口的端到端测试（HTTP + 双队列 + 安全 + M2 下载） | §12 |
+//!
+//! # M2 的范围（模型管理）
+//!
+//! `POST /api/models/download` 现在是**真实**任务：集合严格按 `set_id` 解析（无 `sets[0]`
+//! 回落），库的加固下载器（[`rapid_ocr_rs::download_model_set_observed`]）逐文件下载，
+//! 进度写进任务存储，取消在**文件边界**生效（§6.6）；`POST /api/engine/reload` 是
+//! `EngineStateMachine::{begin_loading, models_still_missing}` 的生产者，下载完成后**不**
+//! 自动建引擎，而是在下一次 `POST /api/ocr` 或显式 reload 时惰性创建。
 //!
 //! # HTTP 依赖的边界（M1 的硬约束）
 //!

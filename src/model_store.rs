@@ -13,7 +13,7 @@
 //! | --- | --- | --- |
 //! | 1 仅 HTTPS | 非 `https` → [`DownloadError::SchemeRejected`]，且在任何文件系统/网络动作**之前**判定 | `an_http_url_is_rejected_by_the_public_entry_point` |
 //! | 2 禁止自动重定向 | `ClientBuilder::redirect(Policy::none())`；3xx → [`DownloadError::RedirectRejected`] | `a_redirect_is_rejected` |
-//! | 3 host 白名单来自可信配置 | [`ALLOWED_DOWNLOAD_HOSTS`] 是编译期常量；本地 `manifest.json` 只能提供 URL，**不能扩大**它 | `the_allowed_download_hosts_are_exactly_the_declared_set`、`a_local_manifest_cannot_widen_the_download_host_allow_list` |
+//! | 3 host 白名单来自可信配置 | [`ALLOWED_DOWNLOAD_HOSTS`] 是编译期常量；本地 `manifest.json` **只能提供 URL，不能扩大它**；扩展必须经 [`DownloadRequest::allowed_hosts`] 这个**显式参数**传入 | `the_allowed_download_hosts_are_exactly_the_declared_set`、`a_local_manifest_cannot_widen_the_download_host_allow_list`、`an_explicit_host_allow_list_extends_the_compiled_in_one` |
 //! | 4 `Content-Length` 预检 | 超过 `max_bytes` 在**创建临时文件之前**拒绝 | `a_declared_length_above_the_cap_is_rejected_before_anything_is_written` |
 //! | 5 流式上限 | 无可用长度时 `take(max_bytes + 1)`；超限删除临时文件 | `a_chunked_body_above_the_cap_is_rejected_and_leaves_no_temp_file`、`a_close_delimited_body_above_the_cap_is_rejected` |
 //! | 6 唯一临时文件名 | `.part-<pid>-<seq>`（[`unique_part_path`]），并发或残留的 `.part` 不会互撞 | `two_concurrent_downloads_of_one_target_fetch_exactly_once` |
@@ -23,6 +23,15 @@
 //! | 10 磁盘空间预检 | `GetDiskFreeSpaceExW`；空间来源可注入（[`FreeSpaceProbe`]） | `insufficient_disk_space_is_reported_before_anything_is_written` |
 //! | 11 分项超时 | [`DownloadRequest::connect_timeout`] / [`DownloadRequest::read_timeout`] | `an_expired_connect_budget_is_a_connect_timeout`、`a_stalled_body_read_is_a_read_timeout` |
 //! | 12 错误分类 | [`DownloadError`]（唯一的十二类实现，serve 侧直接复用） | `every_download_error_class_has_a_stable_kind` |
+//!
+//! # 进度、取消与空间核算（§6.5/§6.6）
+//!
+//! [`DownloadObserver`] 是集合下载的进度与取消接口：[`DownloadObserver::file_started`] 是
+//! **唯一**的取消检查点（返回 `false` → 该文件不开始，立即以 [`DownloadError::Cancelled`]
+//! 结束，已完成并校验过的文件保留）；[`DownloadObserver::bytes_written`] 报告当前文件的
+//! 累计字节；[`DownloadObserver::file_finished`] 报告一个文件已落盘。
+//! [`available_disk_bytes`] 把"任务级空间核算"（§6.5）需要的那个探测暴露出来，
+//! 它与下载器内部用的是同一个 `GetDiskFreeSpaceExW` 实现。
 //!
 //! # 临时文件的生命周期
 //!
@@ -63,7 +72,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     error::{RapidOcrError, Result},
-    model_set::{ModelFileState, ModelSet},
+    model_set::{ModelFileSpec, ModelFileState, ModelSet},
 };
 
 pub fn default_model_store_dir() -> PathBuf {
@@ -106,6 +115,14 @@ pub fn verify_existing_file(path: impl AsRef<Path>) -> Result<PathBuf> {
 /// `--allow-download-host`（§6.1 第 3 条、M2 接线）是**用户显式选择**的入口，
 /// 不会让库放宽这里的常量：库永远只认这份声明。
 pub const ALLOWED_DOWNLOAD_HOSTS: [&str; 1] = ["www.modelscope.cn"];
+
+/// [`DownloadRequest::new`] 使用的默认允许列表：**就是**编译期白名单本身。
+///
+/// §6.1 第 3 条的 opt-in 是[`DownloadRequest::allowed_hosts`]这个**显式参数**：
+/// 库**永不**修改 [`ALLOWED_DOWNLOAD_HOSTS`]，调用方只是把自己信任的列表传进来；
+/// 不传时得到的就是这份编译期声明。因此"本地 manifest 自己扩大白名单"这条路径
+/// 在类型上不存在——它只能提供一个 URL，不能提供一个参数。
+pub const DEFAULT_ALLOWED_HOSTS: &[&str] = &ALLOWED_DOWNLOAD_HOSTS;
 
 /// 库内默认的单文件下载上限（MiB），与 §3 的 `--max-download-mb` 默认值同源。
 pub const DEFAULT_MAX_DOWNLOAD_MB: u64 = 1024;
@@ -237,13 +254,76 @@ impl std::fmt::Display for DownloadError {
 impl std::error::Error for DownloadError {}
 
 // ---------------------------------------------------------------------------
+// 进度与取消：下载的观察者（§6.6）
+// ---------------------------------------------------------------------------
+
+/// 一次集合下载的进度与取消观察者（§6.6）。
+///
+/// # 为什么取消只在文件边界生效
+///
+/// `download_verified` 的读取循环不可中断：`reqwest` 的 blocking 读取一旦发起，就没有
+/// 安全的"半途放弃"语义（放弃也只会留下半个临时文件）。因此 §6.6 把取消定义在**文件
+/// 边界**：[`Self::file_started`] 是**唯一**的取消检查点，它的返回值决定是否开始**下一个**
+/// 文件。已经通过 SHA-256 校验并原子替换的文件一律保留；当前文件的临时文件由
+/// `PartFile` 的 `Drop` 保证不会残留。
+///
+/// **做不到的事（如实声明）**：`file_started` 返回 `false` 之后，下载器不会中断**正在
+/// 进行**的那一次文件下载——它会在该文件结束（或失败）之后返回
+/// [`DownloadError::Cancelled`]。因此"取消后立刻停止网络 I/O"不是本接口的语义。
+///
+/// 三个回调都在**下载线程**上同步调用，因此实现必须自己保证开销可控（serve 侧只更新
+/// 任务存储里的几个计数器）。
+pub trait DownloadObserver {
+    /// 开始一个文件之前调用（**唯一的取消检查点**）。
+    ///
+    /// `index` 从 1 开始，`total` 是本次任务要下载的文件数（已 `Present` 的文件不计数），
+    /// `declared_bytes` 是模型来源声明的体积（未知为 `None`）。
+    ///
+    /// 返回 `false` = 在文件边界取消：下载器**不开始**这个文件，立即返回
+    /// [`DownloadError::Cancelled`]。
+    fn file_started(
+        &mut self,
+        file: &ModelFileSpec,
+        index: usize,
+        total: usize,
+        declared_bytes: Option<u64>,
+    ) -> bool;
+
+    /// 当前文件已写入的累计字节（每个读取块调用一次，单调不减）。
+    fn bytes_written(&mut self, written_bytes: u64);
+
+    /// 一个文件已通过 SHA-256 校验并落盘。
+    fn file_finished(&mut self, file: &ModelFileSpec, index: usize, bytes: u64);
+}
+
+/// 不关心进度、从不取消的观察者（库内调用方的默认）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoObserver;
+
+impl DownloadObserver for NoObserver {
+    fn file_started(
+        &mut self,
+        _file: &ModelFileSpec,
+        _index: usize,
+        _total: usize,
+        _declared_bytes: Option<u64>,
+    ) -> bool {
+        true
+    }
+
+    fn bytes_written(&mut self, _written_bytes: u64) {}
+
+    fn file_finished(&mut self, _file: &ModelFileSpec, _index: usize, _bytes: u64) {}
+}
+
+// ---------------------------------------------------------------------------
 // 单文件下载
 // ---------------------------------------------------------------------------
 
 /// 一次经过加固的单文件下载请求（§6）。
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadRequest<'a> {
-    /// 下载 URL：必须 `https`，host 必须在 [`ALLOWED_DOWNLOAD_HOSTS`] 内。
+    /// 下载 URL：必须 `https`，host 必须在 `allowed_hosts` 内。
     pub url: &'a str,
     /// 期望的 SHA-256，**必填**（§6.4：不接受 `None`）。
     pub expected_sha256: &'a str,
@@ -259,12 +339,19 @@ pub struct DownloadRequest<'a> {
     /// "等待响应头"与"读取响应体"；它**不是**整个下载的总时长——一个持续推进的
     /// 600 MB 下载不会因为耗时超过它而失败。
     pub read_timeout: Duration,
+    /// 可信的 host 允许列表（§6.1 第 3 条）。
+    ///
+    /// **这是一个显式参数，不是对 [`ALLOWED_DOWNLOAD_HOSTS`] 的修改**：库常量永远是
+    /// "随本 crate 一起审查过的那一份"，`--allow-download-host`（或任何扩展）只能由
+    /// 用户显式传进来。默认值见 [`DEFAULT_ALLOWED_HOSTS`]。
+    pub allowed_hosts: &'a [&'a str],
 }
 
 impl<'a> DownloadRequest<'a> {
     /// 库内调用方（`EngineConfig::allow_download` 分支）使用的默认请求：
     /// 单文件上限 [`DEFAULT_MAX_DOWNLOAD_BYTES`]，超时用 [`DEFAULT_CONNECT_TIMEOUT`] /
-    /// [`DEFAULT_READ_TIMEOUT`]。serve 侧用 CLI 上的显式取值覆盖它们。
+    /// [`DEFAULT_READ_TIMEOUT`]，允许列表用编译期的 [`ALLOWED_DOWNLOAD_HOSTS`]。
+    /// serve 侧用 CLI 上的显式取值覆盖它们。
     pub fn new(url: &'a str, expected_sha256: &'a str, save_dir: &'a Path) -> Self {
         Self {
             url,
@@ -273,6 +360,7 @@ impl<'a> DownloadRequest<'a> {
             max_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             read_timeout: DEFAULT_READ_TIMEOUT,
+            allowed_hosts: DEFAULT_ALLOWED_HOSTS,
         }
     }
 }
@@ -281,8 +369,15 @@ impl<'a> DownloadRequest<'a> {
 ///
 /// 目标文件已存在且哈希正确时**不发请求**（缓存命中）；已存在但哈希不符时按 §6.3
 /// 走"重新下载并原子替换"，替换失败保留原文件。
+///
+/// 不接收观察者（因此没有进度、也不会在文件边界取消）：需要这两件事的调用方用
+/// [`download_model_set_observed`]。
 pub fn download_verified(req: &DownloadRequest<'_>) -> Result<PathBuf> {
-    download_verified_with(req, &DownloadPolicy::production(&WindowsFreeSpace))
+    download_verified_with(
+        req,
+        &DownloadPolicy::production(&WindowsFreeSpace),
+        &mut NoObserver,
+    )
 }
 
 /// 默认表/清单解析出的可选哈希 → 必填哈希（§6.4）。
@@ -374,6 +469,10 @@ impl DownloadBudget {
 /// 5. `size_bytes` 未知 → 仍然受剩余额度这条**流式**上限保护（不是跳过检查）。
 ///
 /// 返回值与集合的 `files` 同序，且每一项都已在磁盘上通过哈希校验。
+///
+/// 这是**不带观察者**的入口：不允许取消、也不上报进度（库内调用方的默认）。
+/// serve 侧的下载任务用 [`download_model_set_observed`]（它接受一个显式的 host 允许
+/// 列表与一个 [`DownloadObserver`]，因此 §6.6 的"文件边界取消"与进度上报是真实存在的）。
 pub fn download_model_set(
     set: &ModelSet,
     root: &Path,
@@ -381,29 +480,66 @@ pub fn download_model_set(
     connect_timeout: Duration,
     read_timeout: Duration,
 ) -> Result<Vec<PathBuf>> {
+    download_model_set_observed(
+        set,
+        root,
+        budget,
+        connect_timeout,
+        read_timeout,
+        DEFAULT_ALLOWED_HOSTS,
+        &mut NoObserver,
+    )
+}
+
+/// [`download_model_set`] 的完整入口：**显式** host 允许列表 + 进度/取消观察者。
+///
+/// `allowed_hosts` 是 §6.1 第 3 条的那个"必须来自可信配置"的列表：默认是编译期常量
+/// （[`DEFAULT_ALLOWED_HOSTS`]），扩展只能由调用方**显式**传入（serve 侧的
+/// `--allow-download-host`）。库不会因为清单里写了什么而改变它。
+pub fn download_model_set_observed(
+    set: &ModelSet,
+    root: &Path,
+    budget: &mut DownloadBudget,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    allowed_hosts: &[&str],
+    observer: &mut dyn DownloadObserver,
+) -> Result<Vec<PathBuf>> {
     download_model_set_with(
         set,
         root,
         budget,
         connect_timeout,
         read_timeout,
+        allowed_hosts,
+        observer,
         &DownloadPolicy::production(&WindowsFreeSpace),
     )
 }
 
 /// [`download_model_set`] 的实现；策略可注入，因此单测可以指向本机 fixture 服务器。
+#[allow(clippy::too_many_arguments)]
 fn download_model_set_with(
     set: &ModelSet,
     root: &Path,
     budget: &mut DownloadBudget,
     connect_timeout: Duration,
     read_timeout: Duration,
+    allowed_hosts: &[&str],
+    observer: &mut dyn DownloadObserver,
     policy: &DownloadPolicy<'_>,
 ) -> Result<Vec<PathBuf>> {
     set.validate()?;
     fs::create_dir_all(root)?;
 
     let status = set.status(root);
+    // 进度口径：`total` 是**需要下载**的文件数（缺失 ∪ 损坏）。已经 `Present`
+    // 的文件不需要网络也不需要空间，因此既不计数也不触发取消检查点
+    // （这与 §5.2 的 `download_bytes_total` 只统计 `Missing` 的口径不同：
+    // 损坏文件会被重新下载，因此它必须进任务进度）。
+    let total = status.files.iter().filter(|(_, s)| !s.is_present()).count();
+    let mut index = 0_usize;
+
     let mut files = Vec::with_capacity(status.files.len());
     for (spec, state) in &status.files {
         if !spec.has_hash() {
@@ -433,6 +569,13 @@ fn download_model_set_with(
             )));
         }
 
+        // §6.6：**唯一的取消检查点**。返回 `false` 时不开始这个文件，立即以
+        // `Cancelled` 结束（已经下载并校验过的文件留在磁盘上）。
+        index += 1;
+        if !observer.file_started(spec, index, total, spec.size_bytes) {
+            return Err(DownloadError::Cancelled.into());
+        }
+
         let cap = budget.per_file_cap();
         // §6.2：声明体积已知且超过剩余额度 → 在**发请求之前**拒绝。
         if let Some(size) = spec.size_bytes
@@ -452,20 +595,25 @@ fn download_model_set_with(
             max_bytes: cap,
             connect_timeout,
             read_timeout,
+            allowed_hosts,
         };
-        let downloaded = download_verified_with(&request, policy)?;
+        let downloaded = download_verified_with(&request, policy, observer)?;
         let written = fs::metadata(&downloaded)?.len();
         budget.charge(written)?;
+        observer.file_finished(spec, index, written);
         files.push(downloaded);
     }
     Ok(files)
 }
 
-/// 下载策略：白名单与磁盘空间来源。
+/// 下载策略：磁盘空间来源与（仅单测的）明文口子。
 ///
-/// 生产路径只有 [`Self::production`] 一个构造点（编译期白名单 + `GetDiskFreeSpaceExW`）。
+/// **白名单不在这里**：可信 host 列表是 [`DownloadRequest::allowed_hosts`] 的一部分，
+/// 因为它是**请求的契约**（§6.1 第 3 条），不是运行环境。把它同时放在策略里会让同一个
+/// 决定有两个来源——那正是本 crate 明确要避免的双权威。
+///
+/// 生产路径只有 [`Self::production`] 一个构造点。
 struct DownloadPolicy<'a> {
-    allowed_hosts: &'a [&'a str],
     free_space: &'a dyn FreeSpaceProbe,
     /// **仅单测**：放行 `http://`，以便对 `127.0.0.1` 上的明文 fixture 服务器验证
     /// 传输/落盘/预算逻辑（测试不得依赖公网）。生产构建里这个字段不存在，
@@ -477,7 +625,6 @@ struct DownloadPolicy<'a> {
 impl<'a> DownloadPolicy<'a> {
     fn production(free_space: &'a dyn FreeSpaceProbe) -> Self {
         Self {
-            allowed_hosts: &ALLOWED_DOWNLOAD_HOSTS,
             free_space,
             #[cfg(test)]
             insecure_http: false,
@@ -512,6 +659,7 @@ fn target_lock(target: &Path) -> Arc<Mutex<()>> {
 fn download_verified_with(
     req: &DownloadRequest<'_>,
     policy: &DownloadPolicy<'_>,
+    observer: &mut dyn DownloadObserver,
 ) -> Result<PathBuf> {
     // §6.4：哈希必填。空哈希是调用方的契约错误（类型已经不允许 `None`），
     // 在碰网络或文件系统之前失败。
@@ -539,7 +687,7 @@ fn download_verified_with(
             detail: format!("`{}` has no host", req.url),
         })
     })?;
-    if !host_is_allowed(host, policy.allowed_hosts) {
+    if !host_is_allowed(host, req.allowed_hosts) {
         return Err(DownloadError::HostRejected {
             host: host.to_string(),
         }
@@ -661,6 +809,8 @@ fn download_verified_with(
         }
         hasher.update(&buffer[..read]);
         part.write_all(&buffer[..read])?;
+        // 进度：只报告**当前文件**的累计字节（§4.3 的 bytes done/total 由 serve 侧换算）。
+        observer.bytes_written(written);
     }
 
     // §6.1 第 9 条：哈希不符 → 删除临时文件（由 `PartFile` 的 `Drop` 完成）。
@@ -893,6 +1043,16 @@ fn replace_file(source: &Path, target: &Path) -> Result<()> {
 // 磁盘可用空间（可注入，便于单测）
 // ---------------------------------------------------------------------------
 
+/// 目标目录所在卷的可用字节数（§6.5 的**任务级**空间核算）。
+///
+/// 生产实现就是 [`DownloadPolicy`] 内部用的同一个 `GetDiskFreeSpaceExW` 探测
+/// （[`WindowsFreeSpace`]），因此"下载前的任务级预检"与"每个文件写入前的预检"
+/// 是同一个事实，不存在两套口径。调用方（serve 的下载端点）用它把
+/// `InsufficientSpace { required_bytes, available_bytes }` 里的两个数值都拿到手。
+pub fn available_disk_bytes(directory: impl AsRef<Path>) -> Result<u64> {
+    WindowsFreeSpace.available_bytes(directory.as_ref())
+}
+
 /// 可用磁盘空间来源。
 ///
 /// 生产实现是 `GetDiskFreeSpaceExW`；单测注入固定值，否则"磁盘不足"这条分支只能靠
@@ -1005,11 +1165,12 @@ mod tests {
         FixedFreeSpace(1 << 40)
     }
 
-    /// 指向本机 fixture 的下载策略：白名单只有 `127.0.0.1`，并放行明文 `http://`
-    /// （生产构建里没有这两个口子，见 [`DownloadPolicy`] 的文档）。
+    /// 指向本机 fixture 的下载策略：放行明文 `http://`（生产构建里没有这个口子，
+    /// 见 [`DownloadPolicy`] 的文档）。**白名单不在这里**：它是
+    /// [`DownloadRequest::allowed_hosts`] 的一部分，测试用 [`FIXTURE_HOSTS`]
+    /// 作为那个**显式参数**（正好也证明了它是可替换的）。
     fn fixture_policy<'a>(free_space: &'a dyn FreeSpaceProbe) -> DownloadPolicy<'a> {
         DownloadPolicy {
-            allowed_hosts: &FIXTURE_HOSTS,
             free_space,
             insecure_http: true,
         }
@@ -1028,6 +1189,7 @@ mod tests {
             max_bytes,
             connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(5),
+            allowed_hosts: &FIXTURE_HOSTS,
         }
     }
 
@@ -1080,6 +1242,8 @@ mod tests {
             budget,
             Duration::from_secs(5),
             Duration::from_secs(5),
+            &FIXTURE_HOSTS,
+            &mut NoObserver,
             &fixture_policy(&huge_free_space()),
         )
     }
@@ -1181,6 +1345,8 @@ mod tests {
             max_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             read_timeout: DEFAULT_READ_TIMEOUT,
+            // 公开入口的默认：只有编译期白名单，清单里的 host 不在里面。
+            allowed_hosts: DEFAULT_ALLOWED_HOSTS,
         };
         let error = download_verified(&request)
             .expect_err("a manifest must not widen the compiled allow-list");
@@ -1213,6 +1379,8 @@ mod tests {
                 max_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
                 connect_timeout: DEFAULT_CONNECT_TIMEOUT,
                 read_timeout: DEFAULT_READ_TIMEOUT,
+                // 生产默认：编译期白名单本身（没有任何显式扩展）。
+                allowed_hosts: DEFAULT_ALLOWED_HOSTS,
             };
             let error = download_verified(&request).expect_err("the URL must be rejected");
             match (expected, download_error(error)) {
@@ -1239,6 +1407,7 @@ mod tests {
             max_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             read_timeout: DEFAULT_READ_TIMEOUT,
+            allowed_hosts: DEFAULT_ALLOWED_HOSTS,
         };
         let error = download_verified(&request).expect_err("an empty hash must be refused");
         match error {
@@ -1278,6 +1447,7 @@ mod tests {
         let path = download_verified_with(
             &fixture_request(&url, &expected, dir.path(), 1 << 20),
             &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
         )
         .expect("the download must succeed");
 
@@ -1316,6 +1486,7 @@ mod tests {
         download_verified_with(
             &fixture_request(&url, &expected, dir.path(), 1 << 20),
             &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
         )
         .expect("the download must succeed");
 
@@ -1344,6 +1515,7 @@ mod tests {
         let error = download_verified_with(
             &fixture_request(&url, UNMATCHED_HASH, dir.path(), 1 << 20),
             &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
         )
         .expect_err("a hash mismatch must fail");
 
@@ -1373,6 +1545,7 @@ mod tests {
         let error = download_verified_with(
             &fixture_request(&url, UNMATCHED_HASH, dir.path(), 1 << 20),
             &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
         )
         .expect_err("a 3xx response must be rejected");
 
@@ -1399,6 +1572,7 @@ mod tests {
         let error = download_verified_with(
             &fixture_request(&url, UNMATCHED_HASH, dir.path(), 1 << 20),
             &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
         )
         .expect_err("a 404 must fail");
 
@@ -1422,6 +1596,7 @@ mod tests {
         let error = download_verified_with(
             &fixture_request(&url, &expected, dir.path(), 1024),
             &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
         )
         .expect_err("a declared length above the cap must be rejected");
 
@@ -1452,6 +1627,7 @@ mod tests {
         let error = download_verified_with(
             &fixture_request(&url, UNMATCHED_HASH, dir.path(), 1024),
             &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
         )
         .expect_err("a chunked body above the cap must be rejected");
 
@@ -1481,6 +1657,7 @@ mod tests {
         let error = download_verified_with(
             &fixture_request(&url, UNMATCHED_HASH, dir.path(), 1024),
             &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
         )
         .expect_err("a close-delimited body above the cap must be rejected");
 
@@ -1503,6 +1680,7 @@ mod tests {
         let path = download_verified_with(
             &fixture_request(&url, &expected, dir.path(), 1 << 20),
             &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
         )
         .expect("a close-delimited body must be readable");
 
@@ -1523,6 +1701,7 @@ mod tests {
         let error = download_verified_with(
             &fixture_request(&url, UNMATCHED_HASH, dir.path(), 1 << 20),
             &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
         )
         .expect_err("`..` must not become a target path");
 
@@ -1559,6 +1738,7 @@ mod tests {
         let path = download_verified_with(
             &fixture_request(&url, &expected, dir.path(), 1 << 20),
             &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
         )
         .expect("a valid cached file must be reused");
 
@@ -1583,6 +1763,7 @@ mod tests {
         let path = download_verified_with(
             &fixture_request(&url, &expected, dir.path(), 1 << 20),
             &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
         )
         .expect("a corrupt target must be replaced");
 
@@ -1620,6 +1801,7 @@ mod tests {
         let error = download_verified_with(
             &fixture_request(&url, &expected, dir.path(), 1 << 20),
             &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
         )
         .expect_err("the replace must fail while the target denies deletion");
 
@@ -1659,6 +1841,7 @@ mod tests {
         let error = download_verified_with(
             &fixture_request(&url, &expected, dir.path(), 1 << 20),
             &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
         )
         .expect_err("replacing a directory must fail");
 
@@ -1695,6 +1878,7 @@ mod tests {
                 download_verified_with(
                     &fixture_request(&url, &expected, &save_dir, 1 << 20),
                     &fixture_policy(&huge_free_space()),
+                    &mut NoObserver,
                 )
             }));
         }
@@ -1729,6 +1913,7 @@ mod tests {
         let error = download_verified_with(
             &fixture_request(&url, &expected, dir.path(), 1 << 20),
             &fixture_policy(&FixedFreeSpace(1000)),
+            &mut NoObserver,
         )
         .expect_err("1000 available bytes cannot hold a 4096 byte file");
 
@@ -1755,6 +1940,7 @@ mod tests {
         let error = download_verified_with(
             &fixture_request(&url, UNMATCHED_HASH, dir.path(), 4096),
             &fixture_policy(&FixedFreeSpace(4000)),
+            &mut NoObserver,
         )
         .expect_err("an unknown length must be budgeted at the streaming cap");
 
@@ -1786,8 +1972,12 @@ mod tests {
         request.read_timeout = Duration::from_millis(200);
         request.connect_timeout = Duration::from_secs(5);
 
-        let error = download_verified_with(&request, &fixture_policy(&huge_free_space()))
-            .expect_err("a stalled body must time out");
+        let error = download_verified_with(
+            &request,
+            &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
+        )
+        .expect_err("a stalled body must time out");
 
         match download_error(error) {
             DownloadError::ReadTimeout { timeout_ms } => assert_eq!(timeout_ms, 200),
@@ -1811,8 +2001,12 @@ mod tests {
         request.read_timeout = Duration::from_millis(200);
         request.connect_timeout = Duration::from_secs(5);
 
-        let error = download_verified_with(&request, &fixture_policy(&huge_free_space()))
-            .expect_err("a server that never answers must time out");
+        let error = download_verified_with(
+            &request,
+            &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
+        )
+        .expect_err("a server that never answers must time out");
 
         match download_error(error) {
             DownloadError::ReadTimeout { timeout_ms } => assert_eq!(timeout_ms, 200),
@@ -1886,8 +2080,12 @@ mod tests {
         request.connect_timeout = Duration::from_secs(5);
         request.read_timeout = Duration::from_secs(10);
 
-        let error = download_verified_with(&request, &fixture_policy(&huge_free_space()))
-            .expect_err("nothing is listening on that port");
+        let error = download_verified_with(
+            &request,
+            &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
+        )
+        .expect_err("nothing is listening on that port");
 
         match download_error(error) {
             DownloadError::Network { detail } => assert!(!detail.is_empty()),
@@ -2247,5 +2445,305 @@ mod tests {
             "only the missing file is fetched"
         );
         assert_eq!(budget.spent_bytes(), 100, "a cache hit costs no budget");
+    }
+
+    // -----------------------------------------------------------------------
+    // 进度、取消与显式白名单（§6.1 第 3 条、§6.6）
+    // -----------------------------------------------------------------------
+
+    /// 带观察者、可指定显式白名单的集合下载（测试用 fixture 策略）。
+    fn download_set_observed(
+        set: &ModelSet,
+        root: &Path,
+        budget: &mut DownloadBudget,
+        allowed_hosts: &[&str],
+        observer: &mut dyn DownloadObserver,
+    ) -> Result<Vec<PathBuf>> {
+        download_model_set_with(
+            set,
+            root,
+            budget,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            allowed_hosts,
+            observer,
+            &fixture_policy(&huge_free_space()),
+        )
+    }
+
+    /// 记录每一次回调的观察者。`cancel_at` = 在第 N 个文件开始前请求取消（1 基）。
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: Vec<String>,
+        cancel_at: Option<usize>,
+    }
+
+    impl DownloadObserver for RecordingObserver {
+        fn file_started(
+            &mut self,
+            file: &ModelFileSpec,
+            index: usize,
+            total: usize,
+            declared_bytes: Option<u64>,
+        ) -> bool {
+            self.events.push(format!(
+                "start {} {index}/{total} {declared_bytes:?}",
+                file.name
+            ));
+            self.cancel_at != Some(index)
+        }
+
+        fn bytes_written(&mut self, written_bytes: u64) {
+            self.events.push(format!("bytes {written_bytes}"));
+        }
+
+        fn file_finished(&mut self, file: &ModelFileSpec, index: usize, bytes: u64) {
+            self.events
+                .push(format!("done {} {index} {bytes}", file.name));
+        }
+    }
+
+    /// 三个回调的顺序、下标、总数与字节数（§4.3 的进度字段就是这些事实）。
+    #[test]
+    fn the_observer_sees_every_file_its_index_and_its_bytes_in_order() {
+        let first = vec![1_u8; 1000];
+        let second = vec![2_u8; 2000];
+        let server = HttpFixture::start(move |request| match request.target.as_str() {
+            "/a.onnx" => FixtureResponse::ok(first.clone()),
+            _ => FixtureResponse::ok(second.clone()),
+        });
+        let dir = TempDir::new("observer-progress");
+        let files = vec![
+            set_file(
+                "a.onnx",
+                &server.url("/a.onnx"),
+                &sha256_hex(&vec![1_u8; 1000]),
+                Some(1000),
+            ),
+            set_file(
+                "b.onnx",
+                &server.url("/b.onnx"),
+                &sha256_hex(&vec![2_u8; 2000]),
+                Some(2000),
+            ),
+        ];
+        let mut observer = RecordingObserver::default();
+        let mut budget = DownloadBudget::new(1 << 20);
+
+        let paths = download_set_observed(
+            &model_set(files),
+            dir.path(),
+            &mut budget,
+            &FIXTURE_HOSTS,
+            &mut observer,
+        )
+        .expect("both files must download");
+
+        assert_eq!(paths.len(), 2);
+        let starts: Vec<&str> = observer
+            .events
+            .iter()
+            .filter(|event| event.starts_with("start "))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            starts,
+            vec!["start a.onnx 1/2 Some(1000)", "start b.onnx 2/2 Some(2000)"],
+            "{:?}",
+            observer.events
+        );
+        let dones: Vec<&str> = observer
+            .events
+            .iter()
+            .filter(|event| event.starts_with("done "))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            dones,
+            vec!["done a.onnx 1 1000", "done b.onnx 2 2000"],
+            "{:?}",
+            observer.events
+        );
+        // 字节回调报告的是**当前文件**的累计值：每个文件最终都会报出自己的完整大小。
+        assert!(observer.events.contains(&"bytes 1000".to_string()));
+        assert!(observer.events.contains(&"bytes 2000".to_string()));
+        // 在每个文件的区间内，字节数单调不减（分块读取时会有多次回调）。
+        let mut current = 0_u64;
+        for event in &observer.events {
+            if event.starts_with("start ") {
+                current = 0;
+                continue;
+            }
+            if let Some(value) = event.strip_prefix("bytes ") {
+                let value: u64 = value.parse().expect("a byte count");
+                assert!(value >= current, "bytes must be monotonic: {event}");
+                current = value;
+            }
+        }
+    }
+
+    /// §6.6：取消在**文件边界**生效——已完成并校验的文件保留，后续文件不再请求，
+    /// 临时文件不残留。
+    #[test]
+    fn cancelling_at_a_file_boundary_keeps_verified_files_and_leaves_no_temp_file() {
+        let server = HttpFixture::start(|request| {
+            FixtureResponse::ok(vec![
+                match request.target.as_str() {
+                    "/a.onnx" => 1_u8,
+                    "/b.onnx" => 2_u8,
+                    _ => 3_u8,
+                };
+                500
+            ])
+        });
+        let dir = TempDir::new("cancel-boundary");
+        let files = ["a.onnx", "b.onnx", "c.onnx"]
+            .iter()
+            .map(|name| {
+                set_file(
+                    name,
+                    &server.url(&format!("/{name}")),
+                    &sha256_hex(&vec![
+                        match *name {
+                            "a.onnx" => 1_u8,
+                            "b.onnx" => 2_u8,
+                            _ => 3_u8,
+                        };
+                        500
+                    ]),
+                    Some(500),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut observer = RecordingObserver {
+            cancel_at: Some(2),
+            ..RecordingObserver::default()
+        };
+        let mut budget = DownloadBudget::new(1 << 20);
+
+        let error = download_set_observed(
+            &model_set(files),
+            dir.path(),
+            &mut budget,
+            &FIXTURE_HOSTS,
+            &mut observer,
+        )
+        .expect_err("the cancel request must stop the set download");
+
+        match download_error(error) {
+            DownloadError::Cancelled => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        assert_eq!(
+            entries(dir.path()),
+            vec!["a.onnx".to_string()],
+            "the verified file is kept and no temp file is left behind"
+        );
+        assert_eq!(
+            server.request_count(),
+            1,
+            "the second file must never be requested"
+        );
+        assert_eq!(budget.spent_bytes(), 500, "only the kept file is charged");
+        assert_eq!(
+            sha256_file(dir.path().join("a.onnx")).expect("hash"),
+            sha256_hex(&vec![1_u8; 500])
+        );
+    }
+
+    /// 第一个文件之前就取消：一个字节都不写、一个请求都不发。
+    #[test]
+    fn a_cancel_requested_before_the_first_file_writes_nothing() {
+        let server = HttpFixture::start(|_| FixtureResponse::ok(vec![9_u8; 128]));
+        let dir = TempDir::new("cancel-first");
+        let files = vec![set_file(
+            "a.onnx",
+            &server.url("/a.onnx"),
+            &sha256_hex(&[9_u8; 128]),
+            Some(128),
+        )];
+        let mut observer = RecordingObserver {
+            cancel_at: Some(1),
+            ..RecordingObserver::default()
+        };
+
+        let error = download_set_observed(
+            &model_set(files),
+            dir.path(),
+            &mut DownloadBudget::new(1 << 20),
+            &FIXTURE_HOSTS,
+            &mut observer,
+        )
+        .expect_err("a cancel before the first file must stop immediately");
+
+        assert!(matches!(download_error(error), DownloadError::Cancelled));
+        assert!(entries(dir.path()).is_empty());
+        assert_eq!(server.request_count(), 0, "no request may be issued");
+    }
+
+    /// §6.1 第 3 条：编译期常量**不变**，扩展只能经**显式参数**传入。
+    #[test]
+    fn an_explicit_host_allow_list_extends_the_compiled_in_one() {
+        // 常量本身逐项锁死（与 the_allowed_download_hosts_are_exactly_the_declared_set 同源）。
+        assert_eq!(ALLOWED_DOWNLOAD_HOSTS, ["www.modelscope.cn"]);
+        assert_eq!(DEFAULT_ALLOWED_HOSTS, ALLOWED_DOWNLOAD_HOSTS);
+
+        let body = vec![5_u8; 64];
+        let expected = sha256_hex(&body);
+        let server = HttpFixture::start(move |_| FixtureResponse::ok(body.clone()));
+        let dir = TempDir::new("explicit-hosts");
+        let files = vec![set_file(
+            "a.onnx",
+            &server.url("/a.onnx"),
+            &expected,
+            Some(64),
+        )];
+
+        // 用编译期常量：本机 fixture 的 host 不在里面 → 拒绝，且不发请求。
+        let error = download_set_observed(
+            &model_set(files.clone()),
+            dir.path(),
+            &mut DownloadBudget::new(1 << 20),
+            DEFAULT_ALLOWED_HOSTS,
+            &mut NoObserver,
+        )
+        .expect_err("the compiled allow-list must reject 127.0.0.1");
+        match download_error(error) {
+            DownloadError::HostRejected { host } => assert_eq!(host, "127.0.0.1"),
+            other => panic!("expected HostRejected, got {other:?}"),
+        }
+        assert_eq!(server.request_count(), 0);
+        assert!(entries(dir.path()).is_empty());
+
+        // 同一个请求，只是**显式**传入了另一个受信任列表 → 放行。
+        let mut budget = DownloadBudget::new(1 << 20);
+        let paths = download_set_observed(
+            &model_set(files),
+            dir.path(),
+            &mut budget,
+            &FIXTURE_HOSTS,
+            &mut NoObserver,
+        )
+        .expect("an explicit allow-list entry must be honoured");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(server.request_count(), 1);
+        assert_eq!(
+            sha256_file(dir.path().join("a.onnx")).expect("hash"),
+            expected
+        );
+    }
+
+    /// §6.5 的任务级空间探测：与下载器内部用的是**同一个** Win32 实现。
+    #[test]
+    fn available_disk_bytes_reports_the_free_space_of_this_volume() {
+        let dir = TempDir::new("free-space-probe");
+        let available = available_disk_bytes(dir.path()).expect("the probe must succeed");
+        assert!(
+            available > 0,
+            "a writable volume has free space: {available}"
+        );
+        // 不存在的目录同样给出可定位错误，而不是 0（0 会被误读成"磁盘满了"）。
+        let missing = dir.path().join("does-not-exist");
+        assert!(available_disk_bytes(&missing).is_err());
     }
 }

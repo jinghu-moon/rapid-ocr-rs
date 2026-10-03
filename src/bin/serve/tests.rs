@@ -29,19 +29,21 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rapid_ocr_rs::{
-    CoordinateSpace, DetectionOutcome, EngineConfig, EngineInfo, GenericProviderPreference,
-    ImageInfo, ImageSize, LangDet, LangRec, ModelType, OcrOutput, OcrRegion, OcrRequest,
-    OcrTimings, OcrVersion, Polygon, ProviderInfo, ProviderResolutionInfo, RapidOcrError,
-    RecognitionOutcome, RegionSource, ResolvedProvider, StageReports, sha256_file,
+    CoordinateSpace, DetectionOutcome, DownloadError, EngineConfig, EngineInfo,
+    GenericProviderPreference, ImageInfo, ImageSize, LangDet, LangRec, ModelFileSpec, ModelType,
+    OcrOutput, OcrRegion, OcrRequest, OcrTimings, OcrVersion, Polygon, ProviderInfo,
+    ProviderResolutionInfo, RapidOcrError, RecognitionOutcome, RegionSource, ResolvedProvider,
+    StageReports, sha256_file,
 };
 use serde_json::Value;
 
+use super::download::{DownloadJob, DownloadSink, DownloaderFactory, ModelDownloader};
 use super::engine::{BackendProvider, EngineFactory, OcrBackend};
 use super::http::{BoundServer, ServeHandle};
 use super::limits::RawServeLimits;
@@ -49,7 +51,7 @@ use super::model_plan::ModelPlan;
 use super::queue::QueueClass;
 use super::run::render_page;
 use super::security::{LocalOrigin, ServeToken, generate_nonce};
-use super::server::{OcrRouting, ServeContext, ServeShared};
+use super::server::{FreeSpaceFactory, OcrRouting, ServeContext, ServeShared};
 use super::state::ServeStartup;
 
 // ---------------------------------------------------------------- 测试基础设施
@@ -188,8 +190,11 @@ fn scripted_output(regions: usize, text_bytes: usize) -> OcrOutput {
 struct TestOptions {
     limits: RawServeLimits,
     allow_download: bool,
+    allow_download_hosts: Vec<String>,
     routing: OcrRouting,
     engine_factory: EngineFactory,
+    downloader: DownloaderFactory,
+    free_space: FreeSpaceFactory,
     model_dir: PathBuf,
     engine_config: EngineConfig,
 }
@@ -199,8 +204,11 @@ impl TestOptions {
         Self {
             limits: RawServeLimits::default(),
             allow_download: false,
+            allow_download_hosts: Vec::new(),
             routing: OcrRouting::text_only(),
             engine_factory: scripted.factory(),
+            downloader: ScriptedDownload::default().factory(),
+            free_space: Arc::new(|_dir: &Path| Ok(1 << 40)),
             model_dir,
             engine_config: test_engine_config(),
         }
@@ -256,8 +264,11 @@ impl TestServer {
             page,
             nonce,
             allow_download: options.allow_download,
+            allow_download_hosts: options.allow_download_hosts,
             routing: options.routing,
             engine_factory: options.engine_factory,
+            downloader: options.downloader,
+            free_space: options.free_space,
         };
         let handle = ServeHandle::start(bound, context).expect("the runtime must start");
         let token = handle.shared().token().as_str().to_string();
@@ -335,6 +346,15 @@ impl TestServer {
             "/api/ocr",
             &[("Content-Type", "application/octet-stream")],
             body,
+        )
+    }
+
+    /// `POST /api/models/download`：请求体**只有** `set_id`（§7.2 禁止 URL）。
+    fn download(&self, set_id: &str) -> RawResponse {
+        self.post(
+            "/api/models/download",
+            &[("Content-Type", "application/json")],
+            format!("{{\"set_id\":\"{set_id}\"}}").as_bytes(),
         )
     }
 
@@ -477,6 +497,258 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+// ------------------------------------------------ M2 的下载接缝（无网络）
+
+/// 测试模型文件的内容：**由文件名唯一决定**。
+///
+/// 模型目录的 manifest 用它的真实 SHA-256 声明哈希，脚本化下载器写出同样的字节，
+/// 因此"下载完成后 `/api/models` 真的变成 `complete`"走的是库的真实哈希校验，
+/// 而不是把状态标记成"完成"。
+fn model_file_bytes(name: &str) -> Vec<u8> {
+    format!("M2 scripted model file {name}").into_bytes()
+}
+
+/// 一个用本地 manifest 描述的模型目录：
+/// `det.onnx` / `rec.onnx` / `dict.txt`（detector/recognizer/dictionary）。
+///
+/// `present` 里的文件真的写到磁盘上（内容 = [`model_file_bytes`]），其余缺失；
+/// `declared_size` 为 `Some` 时每个文件的 `size_bytes` 都写成它（用于构造
+/// "声明体积超过预算/磁盘空间"的场景，而文件本身仍然很小）。
+fn manifest_model_dir(name: &str, present: &[&str], declared_size: Option<u64>) -> PathBuf {
+    let dir = m2_root().join(format!("manifest-{name}-{}", unique()));
+    std::fs::create_dir_all(&dir).expect("create the model dir");
+    let files = [
+        ("det.onnx", "detector"),
+        ("rec.onnx", "recognizer"),
+        ("dict.txt", "dictionary"),
+    ];
+    let mut manifest = String::from(
+        "{\"schema_version\":1,\"id\":\"test-set\",\"family\":\"PP-OCR\",\"version\":\"v-test\",\
+         \"languages\":[\"en\"],\"files\":[",
+    );
+    for (index, (file, role)) in files.iter().enumerate() {
+        let bytes = model_file_bytes(file);
+        let path = dir.join(file);
+        std::fs::write(&path, &bytes).expect("write the model file");
+        let sha = sha256_file(&path).expect("hash the model file");
+        if index > 0 {
+            manifest.push(',');
+        }
+        let size = declared_size.unwrap_or(bytes.len() as u64);
+        manifest.push_str(&format!(
+            "{{\"name\":\"{file}\",\"role\":\"{role}\",\"sha256\":\"{sha}\",\"size_bytes\":{size},\
+             \"source_url\":\"https://www.modelscope.cn/models/{file}\"}}"
+        ));
+    }
+    manifest.push_str("]}");
+    std::fs::write(dir.join("manifest.json"), manifest).expect("write the manifest");
+    for (file, _) in files {
+        if !present.contains(&file) {
+            std::fs::remove_file(dir.join(file)).expect("remove the absent file");
+        }
+    }
+    dir
+}
+
+/// M2 fixture 的根目录（与 M1 的 `target/m1-serve-tests` 分开，避免互相干扰）。
+fn m2_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/m2-serve-tests")
+}
+
+/// 一个"到点即停"的闸门：脚本化下载器在某个文件开始后阻塞，直到测试放行。
+///
+/// 有了它，"运行中的进度"与"运行中取消"就是**确定性**的断言，而不是靠 sleep 猜时序。
+/// 两条 channel 的容量都是 0：`send` 会一直阻塞到对端 `recv`。
+struct Gate {
+    reached: std::sync::mpsc::SyncSender<()>,
+    reached_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+    release: std::sync::mpsc::SyncSender<()>,
+    release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl Gate {
+    fn new() -> Arc<Self> {
+        let (reached, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(0);
+        Arc::new(Self {
+            reached,
+            reached_rx: Mutex::new(reached_rx),
+            release,
+            release_rx: Mutex::new(release_rx),
+        })
+    }
+
+    /// 下载器侧：通知测试"到达"并阻塞到放行。
+    fn wait(&self) {
+        let _ = self.reached.send(());
+        let release = self.release_rx.lock().expect("the gate is not poisoned");
+        let _ = release.recv();
+    }
+
+    /// 测试侧：等到下载器到达闸门。
+    fn arrive(&self) {
+        let reached = self.reached_rx.lock().expect("the gate is not poisoned");
+        let _ = reached.recv();
+    }
+
+    /// 测试侧：放行一次。
+    fn release(&self) {
+        let _ = self.release.send(());
+    }
+}
+
+/// 脚本化下载器里"一个待下载文件"的动作（不足时复用最后一个；空计划 = 全部写入）。
+#[derive(Debug, Clone)]
+enum Step {
+    /// 把 [`model_file_bytes`] 写到模型目录（因此哈希校验真的会通过）。
+    Write,
+    /// 报告哈希不匹配（文件**不**落盘，模拟库侧删除临时文件后的结论）。
+    HashMismatch,
+    /// 报告传输失败。
+    Network,
+    /// 报告在文件边界取消。
+    Cancelled,
+}
+
+/// 脚本化下载器的共享状态（工厂每次调用都克隆它，因此多次任务共享记录）。
+#[derive(Clone)]
+struct ScriptedDownload {
+    plan: Vec<Step>,
+    /// 每次任务收到的**显式** host 允许列表（证明它是参数而不是被改掉的常量）。
+    seen_hosts: Arc<Mutex<Vec<Vec<String>>>>,
+    /// 真正写完的文件（按顺序），用于断言"取消后停在哪"。
+    written: Arc<Mutex<Vec<String>>>,
+    /// 每个文件开始后阻塞一次（可选）。
+    gate: Option<Arc<Gate>>,
+}
+
+impl Default for ScriptedDownload {
+    fn default() -> Self {
+        Self {
+            plan: Vec::new(),
+            seen_hosts: Arc::new(Mutex::new(Vec::new())),
+            written: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
+        }
+    }
+}
+
+impl ScriptedDownload {
+    fn with_plan(plan: Vec<Step>) -> Self {
+        Self {
+            plan,
+            ..Self::default()
+        }
+    }
+
+    fn with_gate(gate: Arc<Gate>) -> Self {
+        Self {
+            gate: Some(gate),
+            ..Self::default()
+        }
+    }
+
+    fn step(&self, index: usize) -> Step {
+        if self.plan.is_empty() {
+            return Step::Write;
+        }
+        self.plan
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| self.plan.last().cloned().expect("a non-empty plan"))
+    }
+
+    fn factory(self) -> DownloaderFactory {
+        Arc::new(move || {
+            Box::new(ScriptedDownloader {
+                state: self.clone(),
+            })
+        })
+    }
+
+    fn hosts_per_call(&self) -> Vec<Vec<String>> {
+        self.seen_hosts.lock().expect("not poisoned").clone()
+    }
+
+    fn written(&self) -> Vec<String> {
+        self.written.lock().expect("not poisoned").clone()
+    }
+}
+
+/// 把 [`ScriptedDownload`] 的计划演成一个 [`ModelDownloader`]。
+///
+/// 它**只**替代"网络 + 落盘"这一段：待下载文件如何选出（`state_in` 的真实实现）、
+/// 进度回调、取消检查点、任务状态机、`/api/models` 的哈希校验全部是生产代码。
+struct ScriptedDownloader {
+    state: ScriptedDownload,
+}
+
+impl ModelDownloader for ScriptedDownloader {
+    fn download(
+        &mut self,
+        job: &DownloadJob<'_>,
+        sink: &mut dyn DownloadSink,
+    ) -> Result<Vec<PathBuf>, RapidOcrError> {
+        self.state
+            .seen_hosts
+            .lock()
+            .expect("not poisoned")
+            .push(job.allowed_hosts.clone());
+        let pending: Vec<ModelFileSpec> = job
+            .set
+            .files
+            .iter()
+            .filter(|file| !file.state_in(job.root).is_present())
+            .cloned()
+            .collect();
+        let total = pending.len();
+        let mut paths = Vec::with_capacity(total);
+        for (offset, file) in pending.iter().enumerate() {
+            let index = offset + 1;
+            // 生产代码里的**唯一**取消检查点（由 `JobSink` 查询任务存储）。
+            if !sink.file_started(file, index, total, file.size_bytes) {
+                return Err(DownloadError::Cancelled.into());
+            }
+            if let Some(gate) = &self.state.gate {
+                gate.wait();
+            }
+            match self.state.step(offset) {
+                Step::Write => {
+                    let bytes = model_file_bytes(&file.name);
+                    std::fs::write(job.root.join(&file.name), &bytes)
+                        .expect("the scripted download must be able to write the model file");
+                    // 分两块上报：进度是"当前文件的累计值"（与库的分块读取一致）。
+                    sink.bytes_written(bytes.len() as u64 / 2);
+                    sink.bytes_written(bytes.len() as u64);
+                    sink.file_finished(file, index, bytes.len() as u64);
+                    self.state
+                        .written
+                        .lock()
+                        .expect("not poisoned")
+                        .push(file.name.clone());
+                    paths.push(job.root.join(&file.name));
+                }
+                Step::HashMismatch => {
+                    sink.bytes_written(1);
+                    return Err(DownloadError::HashMismatch {
+                        expected: file.sha256.clone(),
+                        actual: "00".repeat(32),
+                    }
+                    .into());
+                }
+                Step::Network => {
+                    return Err(DownloadError::Network {
+                        detail: "scripted transport failure".to_string(),
+                    }
+                    .into());
+                }
+                Step::Cancelled => return Err(DownloadError::Cancelled.into()),
+            }
+        }
+        Ok(paths)
+    }
 }
 
 /// 空的模型目录（默认表来源，全部文件缺失）。
@@ -762,11 +1034,10 @@ fn an_over_long_content_length_is_rejected_before_the_body_is_read() {
 fn unknown_paths_are_404_and_wrong_methods_are_405() {
     let server = TestServer::start(TestOptions::new(empty_model_dir("route"), Scripted::fast()));
 
-    // M3/M4 的端点不存在 → 404（不是 200，也不是 500）。
+    // M3 的端点不存在 → 404（不是 200，也不是 500）。
     for path in [
         "/api/jobs/job-0/annotated.png",
         "/api/jobs/job-0/export?format=json",
-        "/api/engine/reload",
         "/favicon.ico",
     ] {
         let response = server.get(path);
@@ -775,6 +1046,12 @@ fn unknown_paths_are_404_and_wrong_methods_are_405() {
     }
 
     let response = server.get("/api/ocr");
+    assert_eq!(response.status, 405, "{}", response.text());
+    assert_eq!(response.code(), "method_not_allowed");
+    assert_eq!(response.header("Allow"), Some("POST"));
+
+    // M2 新增的 `POST /api/engine/reload` 是真实路由：GET 它必须是 405 而不是 404。
+    let response = server.get("/api/engine/reload");
     assert_eq!(response.status, 405, "{}", response.text());
     assert_eq!(response.code(), "method_not_allowed");
     assert_eq!(response.header("Allow"), Some("POST"));
@@ -1175,8 +1452,16 @@ fn an_engine_that_fails_to_load_is_failed_with_a_reason_and_503() {
 
 // ---------------------------------------------------------------- 下载接缝（M2）
 
+/// `POST /api/models/download` 的三种"必须拒绝"与"已经齐备时如实成功"。
+///
+/// **M2 的行为变化**（这里是有意的期望变更，不是弱化）：
+/// - M1 的 worker 会把任务判为失败并写明"未实现、无网络 I/O"；M2 替换了处理体，
+///   因此同一个请求现在要么真的下载，要么（集合已经齐备时）**成功且 0 个文件要下**；
+/// - 未知 `set_id` 从 M1 的 400 `bad_request` 变成 **404 `model_set_not_found`**：
+///   §4.2 的请求体只有 `set_id`，"未知集合"必须有可定位的答复（带上请求的 id 与已知集合），
+///   而不是与"请求体畸形"共用 400。
 #[test]
-fn the_download_endpoint_degrades_visibly() {
+fn the_download_endpoint_refuses_disabled_unknown_and_url_bearing_requests() {
     let dir = complete_model_dir("download");
     let disabled = TestServer::start(TestOptions::new(dir.clone(), Scripted::fast()));
     let response = disabled.post(
@@ -1187,7 +1472,7 @@ fn the_download_endpoint_degrades_visibly() {
     assert_eq!(response.status, 403, "{}", response.text());
     assert_eq!(response.code(), "downloads_disabled");
 
-    // 打开 --allow-download：任务被创建，但 M1 的处理体如实判失败（不含任何网络 I/O）。
+    // 打开 --allow-download：这是一个**真实**任务。集合已经齐备 → 0 个文件要下 → 成功。
     let enabled = TestServer::start(TestOptions {
         allow_download: true,
         ..TestOptions::new(dir, Scripted::fast())
@@ -1200,13 +1485,13 @@ fn the_download_endpoint_degrades_visibly() {
     assert_eq!(response.status, 202, "{}", response.text());
     let accepted = response.json();
     assert_eq!(accepted["kind"], "model_download");
+    assert_eq!(accepted["queue"], "download");
+    assert_eq!(accepted["download"]["files_total"], 0);
     let id = accepted["job_id"].as_str().expect("job id").to_string();
     let view = enabled.wait_terminal(&id, Duration::from_secs(20));
-    assert_eq!(view["state"], "failed", "{view}");
+    assert_eq!(view["state"], "succeeded", "{view}");
     assert_eq!(view["kind"], "model_download");
-    let error = view["error"].as_str().unwrap_or_default();
-    assert!(error.contains("M2"), "{error}");
-    assert!(error.contains("no network request"), "{error}");
+    assert_eq!(view["failure"], serde_json::Value::Null);
 
     // 未知 set_id 与带 URL 的请求体都必须被拒绝，而不是被忽略。
     let unknown = enabled.post(
@@ -1214,7 +1499,8 @@ fn the_download_endpoint_degrades_visibly() {
         &[("Content-Type", "application/json")],
         br#"{"set_id":"nope"}"#,
     );
-    assert_eq!(unknown.status, 400, "{}", unknown.text());
+    assert_eq!(unknown.status, 404, "{}", unknown.text());
+    assert_eq!(unknown.code(), "model_set_not_found");
     let with_url = enabled.post(
         "/api/models/download",
         &[("Content-Type", "application/json")],
@@ -1406,4 +1692,842 @@ fn the_documented_route_set_is_the_only_one_that_exists() {
             .is_file(),
         "the inlined page must exist"
     );
+}
+
+// ---------------------------------------------------------------- M2 的辅助
+
+/// 目录里的临时文件（`.part-*`）：任何失败/取消路径都不允许留下它。
+fn part_files(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("the model dir must be readable")
+        .map(|entry| {
+            entry
+                .expect("a readable entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.contains(".part"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// 计数的引擎工厂：断言"到底建立了几次会话"。
+fn counting_engine_factory(counter: Arc<AtomicUsize>) -> EngineFactory {
+    Arc::new(move |_config: &EngineConfig| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(ScriptedBackend {
+            state: Scripted::fast(),
+        }))
+    })
+}
+
+/// 建立会话时阻塞的引擎工厂：确定性地观察 `loading` 状态。
+fn gated_engine_factory(gate: Arc<Gate>, counter: Arc<AtomicUsize>) -> EngineFactory {
+    Arc::new(move |_config: &EngineConfig| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        gate.wait();
+        Ok(Box::new(ScriptedBackend {
+            state: Scripted::fast(),
+        }))
+    })
+}
+
+// ---------------------------------------------------------------- M2：下载（无网络）
+
+/// 一个真实的下载任务从 202 走到 succeeded：进度逐文件推进、文件真的落盘、
+/// `/api/models` 变为 complete（哈希是库的真实校验），而引擎**不**在后台创建（§7.6）。
+#[test]
+fn a_download_job_fetches_every_missing_file_and_makes_the_set_complete() {
+    let dir = manifest_model_dir("download-ok", &["det.onnx"], None);
+    let scripted = ScriptedDownload::default();
+    let server = TestServer::start(TestOptions {
+        allow_download: true,
+        downloader: scripted.clone().factory(),
+        ..TestOptions::new(dir.clone(), Scripted::fast())
+    });
+
+    let before = server.get("/api/models").json();
+    assert_eq!(before["source"], "local_manifest");
+    assert_eq!(before["complete"], false);
+    assert_eq!(
+        before["missing"],
+        serde_json::json!(["rec.onnx", "dict.txt"])
+    );
+
+    let response = server.download("test-set");
+    assert_eq!(response.status, 202, "{}", response.text());
+    let accepted = response.json();
+    assert_eq!(accepted["kind"], "model_download");
+    assert_eq!(
+        accepted["queue"], "download",
+        "a download job is not in the text queue"
+    );
+    assert_eq!(accepted["state"], "queued");
+    assert_eq!(accepted["download"]["files_total"], 2);
+    assert_eq!(accepted["download"]["files_done"], 0);
+    let id = accepted["job_id"].as_str().expect("job id").to_string();
+
+    let view = server.wait_terminal(&id, Duration::from_secs(20));
+    assert_eq!(view["state"], "succeeded", "{view}");
+    assert_eq!(view["failure"], serde_json::Value::Null);
+    assert_eq!(view["queue"], "download");
+    assert_eq!(view["download"]["files_done"], 2);
+    assert_eq!(view["download"]["files_total"], 2);
+    assert_eq!(view["download"]["current_file"], serde_json::Value::Null);
+    let expected_bytes: u64 = ["rec.onnx", "dict.txt"]
+        .iter()
+        .map(|name| model_file_bytes(name).len() as u64)
+        .sum();
+    assert_eq!(view["download"]["bytes_done"], expected_bytes);
+    assert_eq!(view["download"]["bytes_total"], expected_bytes);
+
+    assert_eq!(
+        scripted.written(),
+        vec!["rec.onnx".to_string(), "dict.txt".to_string()]
+    );
+    let after = server.get("/api/models").json();
+    assert_eq!(after["complete"], true, "{after}");
+    assert_eq!(after["missing"], serde_json::json!([]));
+    assert_eq!(after["sets"][0]["complete"], true);
+    assert!(part_files(&dir).is_empty());
+
+    // §7.6：下载完成**不**自动创建引擎（避免后台突然占用数百 MB）。
+    assert_eq!(
+        server.get("/api/status").json()["engine"]["state"],
+        "blocked_models_missing"
+    );
+}
+
+/// 哈希失败：任务 failed，错误体带机器可读分类（客户端不必做字符串匹配），目录里不留文件。
+#[test]
+fn a_hash_failure_fails_the_download_job_with_a_structured_error() {
+    let dir = manifest_model_dir("download-hash", &["det.onnx"], None);
+    let server = TestServer::start(TestOptions {
+        allow_download: true,
+        downloader: ScriptedDownload::with_plan(vec![Step::HashMismatch]).factory(),
+        ..TestOptions::new(dir.clone(), Scripted::fast())
+    });
+    let id = server.download("test-set").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+
+    let view = server.wait_terminal(&id, Duration::from_secs(20));
+    assert_eq!(view["state"], "failed", "{view}");
+    assert_eq!(view["failure"]["status"], 502);
+    assert_eq!(view["failure"]["code"], "download_failed");
+    assert_eq!(view["failure"]["detail"]["kind"], "hash_mismatch");
+    assert!(
+        view["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("SHA-256")),
+        "{view}"
+    );
+    assert!(!dir.join("rec.onnx").exists());
+    assert!(!dir.join("dict.txt").exists());
+    assert!(part_files(&dir).is_empty(), "no temp file may survive");
+}
+
+/// §6.2：声明体积超过 `--max-download-mb` → **同步** 413，两个数值都在 `detail` 里，
+/// 且不建任务、不发请求。
+#[test]
+fn a_download_budget_refusal_is_a_413_with_both_numbers() {
+    let declared = 10 * 1024 * 1024;
+    let dir = manifest_model_dir("download-budget", &["det.onnx"], Some(declared));
+    let scripted = ScriptedDownload::default();
+    let server = TestServer::start(TestOptions {
+        limits: RawServeLimits {
+            max_download_mb: 1,
+            ..RawServeLimits::default()
+        },
+        allow_download: true,
+        downloader: scripted.clone().factory(),
+        ..TestOptions::new(dir, Scripted::fast())
+    });
+
+    let response = server.download("test-set");
+    assert_eq!(response.status, 413, "{}", response.text());
+    assert_eq!(response.code(), "payload_too_large");
+    let detail = &response.json()["detail"];
+    assert_eq!(detail["limit_bytes"], 1024 * 1024);
+    assert_eq!(detail["observed_bytes"], 2 * declared);
+    assert!(
+        scripted.hosts_per_call().is_empty(),
+        "a refused task must not reach the downloader"
+    );
+}
+
+/// §6.5：任务级磁盘核算不足 → **同步** 507，需求与可用两个数值都给出，且不建任务。
+#[test]
+fn a_disk_space_refusal_is_a_507_with_both_numbers() {
+    let declared = 10 * 1024 * 1024;
+    let dir = manifest_model_dir("download-disk", &["det.onnx"], Some(declared));
+    let scripted = ScriptedDownload::default();
+    let server = TestServer::start(TestOptions {
+        allow_download: true,
+        downloader: scripted.clone().factory(),
+        free_space: Arc::new(|_dir: &Path| Ok(10)),
+        ..TestOptions::new(dir, Scripted::fast())
+    });
+
+    let response = server.download("test-set");
+    assert_eq!(response.status, 507, "{}", response.text());
+    assert_eq!(response.code(), "insufficient_disk_space");
+    let detail = &response.json()["detail"];
+    assert_eq!(detail["required_bytes"], 2 * declared);
+    assert_eq!(detail["available_bytes"], 10);
+    assert!(scripted.hosts_per_call().is_empty());
+}
+
+/// 逐文件失败：已经校验通过的文件**保留**，任务给出失败分类（§6.3 的"不留半成品"）。
+#[test]
+fn a_per_file_failure_keeps_the_files_that_already_verified() {
+    let dir = manifest_model_dir("download-partial", &["det.onnx"], None);
+    let server = TestServer::start(TestOptions {
+        allow_download: true,
+        downloader: ScriptedDownload::with_plan(vec![Step::Write, Step::Network]).factory(),
+        ..TestOptions::new(dir.clone(), Scripted::fast())
+    });
+    let id = server.download("test-set").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+
+    let view = server.wait_terminal(&id, Duration::from_secs(20));
+    assert_eq!(view["state"], "failed", "{view}");
+    assert_eq!(view["failure"]["code"], "download_failed");
+    assert_eq!(view["failure"]["detail"]["kind"], "network");
+    assert_eq!(view["download"]["files_done"], 1);
+    assert_eq!(
+        view["download"]["current_file"], "dict.txt",
+        "the failing file stays named in the progress"
+    );
+    assert!(dir.join("rec.onnx").is_file(), "the verified file stays");
+    assert!(!dir.join("dict.txt").exists());
+    assert!(part_files(&dir).is_empty());
+}
+
+/// 运行中的进度可观测（**确定性**，用闸门而不是 sleep）：逐文件 done/total、
+/// 字节 done/total、当前文件名，全部来自 `GET /api/jobs/{id}`（§4.2）。
+#[test]
+fn the_download_progress_is_observable_while_the_job_runs() {
+    let dir = manifest_model_dir("download-progress", &["det.onnx"], None);
+    let gate = Gate::new();
+    let server = TestServer::start(TestOptions {
+        allow_download: true,
+        downloader: ScriptedDownload::with_gate(Arc::clone(&gate)).factory(),
+        ..TestOptions::new(dir, Scripted::fast())
+    });
+    let id = server.download("test-set").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    let rec_len = model_file_bytes("rec.onnx").len() as u64;
+    let dict_len = model_file_bytes("dict.txt").len() as u64;
+
+    // 第一个文件已经开始（闸门在 `file_started` 之后、写入之前）。
+    gate.arrive();
+    let view = server.get(&format!("/api/jobs/{id}")).json();
+    assert_eq!(view["state"], "running", "{view}");
+    assert_eq!(view["download"]["current_file"], "rec.onnx");
+    assert_eq!(view["download"]["files_done"], 0);
+    assert_eq!(view["download"]["files_total"], 2);
+    assert_eq!(view["download"]["bytes_done"], 0);
+    assert_eq!(view["download"]["bytes_total"], rec_len + dict_len);
+    gate.release();
+
+    // 第二个文件已经开始：第一个文件的字节已经计入。
+    gate.arrive();
+    let view = server.get(&format!("/api/jobs/{id}")).json();
+    assert_eq!(view["download"]["current_file"], "dict.txt");
+    assert_eq!(view["download"]["files_done"], 1);
+    assert_eq!(view["download"]["bytes_done"], rec_len);
+    gate.release();
+
+    let view = server.wait_terminal(&id, Duration::from_secs(20));
+    assert_eq!(view["state"], "succeeded", "{view}");
+    assert_eq!(view["download"]["files_done"], 2);
+    assert_eq!(view["download"]["bytes_done"], rec_len + dict_len);
+    assert_eq!(view["download"]["current_file"], serde_json::Value::Null);
+}
+
+/// §6.6：运行中的下载取消在**文件边界**生效——当前文件下载完，后续文件不再开始，
+/// 已校验文件保留，任务终态是 `cancelled`（不假装"已取消"，也不假装"不能取消"）。
+#[test]
+fn a_running_download_is_cancelled_at_a_file_boundary() {
+    let dir = manifest_model_dir("download-cancel", &["det.onnx"], None);
+    let gate = Gate::new();
+    let server = TestServer::start(TestOptions {
+        allow_download: true,
+        downloader: ScriptedDownload::with_gate(Arc::clone(&gate)).factory(),
+        ..TestOptions::new(dir.clone(), Scripted::fast())
+    });
+    let id = server.download("test-set").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+
+    gate.arrive(); // `rec.onnx` 正在下载
+    let cancelled = server.post(&format!("/api/jobs/{id}/cancel"), &[], b"");
+    assert_eq!(cancelled.status, 200, "{}", cancelled.text());
+    let view = cancelled.json();
+    assert_eq!(
+        view["state"], "running",
+        "the current file is still being downloaded"
+    );
+    assert_eq!(view["cancel_requested"], true);
+    gate.release(); // 当前文件完成 → 下一个文件在边界上被拒绝
+
+    let view = server.wait_terminal(&id, Duration::from_secs(20));
+    assert_eq!(view["state"], "cancelled", "{view}");
+    assert_eq!(view["cancel_requested"], true);
+    assert_eq!(
+        view["download"]["files_done"], 1,
+        "the current file was kept"
+    );
+    assert!(dir.join("rec.onnx").is_file(), "the verified file stays");
+    assert!(
+        !dir.join("dict.txt").exists(),
+        "the next file is never started"
+    );
+    assert!(
+        part_files(&dir).is_empty(),
+        "no temp file survives a cancellation"
+    );
+}
+
+/// 下载器报告"在文件边界取消"（库的 `DownloadError::Cancelled`）：任务必须落在
+/// `cancelled` 上，而不是永远停在 `running`（worker 会把取消请求补登记，见
+/// `ServeShared::finish_download_cancelled`）。
+#[test]
+fn a_download_error_cancelled_lands_on_cancelled_not_running() {
+    let dir = manifest_model_dir("download-cancelled-error", &["det.onnx"], None);
+    let server = TestServer::start(TestOptions {
+        allow_download: true,
+        downloader: ScriptedDownload::with_plan(vec![Step::Cancelled]).factory(),
+        ..TestOptions::new(dir.clone(), Scripted::fast())
+    });
+    let id = server.download("test-set").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+
+    let view = server.wait_terminal(&id, Duration::from_secs(20));
+    assert_eq!(view["state"], "cancelled", "{view}");
+    assert_eq!(
+        view["failure"],
+        serde_json::Value::Null,
+        "a cancellation is not a failure"
+    );
+    assert_eq!(view["cancel_requested"], true);
+    assert_eq!(view["download"]["current_file"], "rec.onnx");
+    assert!(!dir.join("rec.onnx").exists());
+    assert!(part_files(&dir).is_empty());
+}
+
+/// 排队中的下载取消是**立即**的（§4.3）：worker 不会开始它（`begin_download` 被拒绝）。
+#[test]
+fn cancelling_a_queued_download_is_immediate() {
+    let dir = manifest_model_dir("download-queued", &["det.onnx"], None);
+    let gate = Gate::new();
+    let server = TestServer::start(TestOptions {
+        allow_download: true,
+        downloader: ScriptedDownload::with_gate(Arc::clone(&gate)).factory(),
+        ..TestOptions::new(dir, Scripted::fast())
+    });
+
+    // 第一个任务占住唯一的下载 worker。
+    let first = server.download("test-set").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    gate.arrive();
+    // 第二个任务进入有界 channel（排队），随后立刻取消。
+    let second = server.download("test-set").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    let cancelled = server.post(&format!("/api/jobs/{second}/cancel"), &[], b"");
+    assert_eq!(cancelled.status, 200, "{}", cancelled.text());
+    let view = cancelled.json();
+    assert_eq!(
+        view["state"], "cancelled",
+        "a queued job cancels immediately"
+    );
+    assert_eq!(view["cancel_requested"], false);
+
+    gate.release();
+    gate.arrive();
+    gate.release();
+    let first_view = server.wait_terminal(&first, Duration::from_secs(20));
+    assert_eq!(first_view["state"], "succeeded", "{first_view}");
+
+    // 第二个任务从未开始：没有失败分类，也没有任何进度推进。
+    let second_view = server.get(&format!("/api/jobs/{second}")).json();
+    assert_eq!(second_view["state"], "cancelled");
+    assert_eq!(second_view["failure"], serde_json::Value::Null);
+    assert_eq!(second_view["download"]["files_done"], 0);
+    assert_eq!(
+        second_view["download"]["current_file"],
+        serde_json::Value::Null
+    );
+}
+
+/// §4.2：未知 `set_id` → 404（带请求的 id 与已知集合），空/畸形 id → 400；
+/// **绝不**回落到 `sets[0]`。
+#[test]
+fn an_unknown_or_empty_set_id_is_refused_and_never_guessed() {
+    let dir = manifest_model_dir("download-unknown", &["det.onnx"], None);
+    let scripted = ScriptedDownload::default();
+    let server = TestServer::start(TestOptions {
+        allow_download: true,
+        downloader: scripted.clone().factory(),
+        ..TestOptions::new(dir, Scripted::fast())
+    });
+
+    let unknown = server.download("nope");
+    assert_eq!(unknown.status, 404, "{}", unknown.text());
+    assert_eq!(unknown.code(), "model_set_not_found");
+    assert_eq!(unknown.json()["detail"]["set_id"], "nope");
+    assert_eq!(unknown.json()["detail"]["known_sets"][0], "test-set");
+
+    for bad in [
+        &br#"{"set_id":""}"#[..],
+        &br#"{}"#[..],
+        &br#"{"set_id":null}"#[..],
+        &br#"{"set_id":"test-set","url":"https://evil.example/x.onnx"}"#[..],
+    ] {
+        let response = server.post(
+            "/api/models/download",
+            &[("Content-Type", "application/json")],
+            bad,
+        );
+        assert_eq!(response.status, 400, "{}", response.text());
+    }
+    assert!(
+        scripted.hosts_per_call().is_empty(),
+        "a refused request must not download anything"
+    );
+}
+
+/// `--allow-download-host` 是**显式参数**：它出现在交给下载器的列表里，
+/// 而不是"库常量被改掉了"（常量本身由 `model_store` 的单测逐项锁死）。
+#[test]
+fn the_download_host_opt_in_is_passed_as_an_explicit_parameter() {
+    let dir = manifest_model_dir("download-hosts", &["det.onnx"], None);
+    let plain = ScriptedDownload::default();
+    let server = TestServer::start(TestOptions {
+        allow_download: true,
+        downloader: plain.clone().factory(),
+        ..TestOptions::new(dir, Scripted::fast())
+    });
+    let id = server.download("test-set").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    assert_eq!(
+        server.wait_terminal(&id, Duration::from_secs(20))["state"],
+        "succeeded"
+    );
+    assert_eq!(
+        plain.hosts_per_call(),
+        vec![vec!["www.modelscope.cn".to_string()]]
+    );
+
+    // 同一个请求，加上 `--allow-download-host evil.example`：列表被**显式**扩展。
+    let dir = manifest_model_dir("download-hosts-optin", &["det.onnx"], None);
+    let extended = ScriptedDownload::default();
+    let server = TestServer::start(TestOptions {
+        allow_download: true,
+        allow_download_hosts: vec!["evil.example".to_string()],
+        downloader: extended.clone().factory(),
+        ..TestOptions::new(dir, Scripted::fast())
+    });
+    let id = server.download("test-set").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    assert_eq!(
+        server.wait_terminal(&id, Duration::from_secs(20))["state"],
+        "succeeded"
+    );
+    assert_eq!(
+        extended.hosts_per_call(),
+        vec![vec![
+            "www.modelscope.cn".to_string(),
+            "evil.example".to_string()
+        ]]
+    );
+    // `/api/status` 如实给出生效的列表（启动日志里也有同样的两行 + 高风险警告）。
+    let status = server.get("/api/status").json();
+    assert_eq!(status["download_hosts"][0], "www.modelscope.cn");
+    assert_eq!(status["download_hosts"][1], "evil.example");
+}
+
+/// 未开 `--allow-download` → 403；`--allow-download` 打开后是**真实**任务（M2 替换了处理体）。
+#[test]
+fn the_download_endpoint_still_refuses_when_downloads_are_disabled() {
+    let dir = manifest_model_dir("download-disabled", &["det.onnx"], None);
+    let scripted = ScriptedDownload::default();
+    let server = TestServer::start(TestOptions {
+        downloader: scripted.clone().factory(),
+        ..TestOptions::new(dir, Scripted::fast())
+    });
+    let response = server.download("test-set");
+    assert_eq!(response.status, 403, "{}", response.text());
+    assert_eq!(response.code(), "downloads_disabled");
+    assert!(scripted.hosts_per_call().is_empty());
+}
+
+// ---------------------------------------------------------------- M2：引擎（惰性创建与 reload）
+
+/// §7.6：`POST /api/engine/reload` 是 `models_still_missing` 的生产者——模型仍缺失时
+/// 响应体里如实给出 `blocked_models_missing` 与缺失清单，而不是一句模糊的失败。
+#[test]
+fn the_reload_endpoint_reports_blocked_models_with_the_missing_list() {
+    let built = Arc::new(AtomicUsize::new(0));
+    let server = TestServer::start(TestOptions {
+        engine_factory: counting_engine_factory(Arc::clone(&built)),
+        ..TestOptions::new(empty_model_dir("reload-blocked"), Scripted::fast())
+    });
+    assert_eq!(
+        server.get("/api/status").json()["engine"]["state"],
+        "blocked_models_missing"
+    );
+
+    let reloaded = server.post("/api/engine/reload", &[], b"");
+    assert_eq!(reloaded.status, 200, "{}", reloaded.text());
+    let body = reloaded.json();
+    assert_eq!(body["outcome"], "blocked_models_missing");
+    assert_eq!(body["engine"]["state"], "blocked_models_missing");
+    let missing = body["missing"].as_array().expect("a missing list");
+    assert_eq!(missing.len(), 3, "{body}");
+    assert_eq!(
+        body["missing"],
+        server.get("/api/models").json()["missing"],
+        "the same computation as /api/models"
+    );
+    assert_eq!(body["engine"]["missing"], body["missing"]);
+    assert!(body["load_ms"].as_u64().is_some(), "{body}");
+    assert_eq!(built.load(Ordering::SeqCst), 0, "no session can be created");
+    assert_eq!(server.submit_ocr(b"image").status, 409);
+}
+
+/// §7.6：模型齐备时 reload 真的建立会话并给出耗时；显式 reload 会**重建**（M2 的入口，
+/// provider 运行期切换（`Rebuilding`）仍属 M3）。
+#[test]
+fn the_reload_endpoint_creates_the_engine_and_reports_the_elapsed_time() {
+    let dir = manifest_model_dir("reload-ready", &["det.onnx", "rec.onnx", "dict.txt"], None);
+    let built = Arc::new(AtomicUsize::new(0));
+    let server = TestServer::start(TestOptions {
+        engine_factory: counting_engine_factory(Arc::clone(&built)),
+        ..TestOptions::new(dir, Scripted::fast())
+    });
+    // 模型齐备 → 启动期预加载（§7.6 第 3 步）。
+    assert_eq!(server.get("/api/status").json()["engine"]["state"], "ready");
+    assert_eq!(built.load(Ordering::SeqCst), 1);
+
+    let reloaded = server.post("/api/engine/reload", &[], b"");
+    assert_eq!(reloaded.status, 200, "{}", reloaded.text());
+    let body = reloaded.json();
+    assert_eq!(body["outcome"], "ready");
+    assert_eq!(body["engine"]["state"], "ready");
+    assert_eq!(body["engine"]["selected_ep"], "cpu");
+    assert!(body["load_ms"].as_u64().is_some(), "{body}");
+    assert_eq!(
+        built.load(Ordering::SeqCst),
+        2,
+        "an explicit reload rebuilds the session"
+    );
+
+    let id = server.submit_ocr(b"image").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    assert_eq!(
+        server.wait_terminal(&id, Duration::from_secs(20))["state"],
+        "succeeded"
+    );
+}
+
+/// §7.6：模型齐备后**惰性**创建引擎——触发点是下一次 `POST /api/ocr`（或显式 reload），
+/// 而不是下载完成的瞬间；`loading` 期间 `/api/status` 如实显示，完成后给出生耗时。
+#[test]
+fn the_engine_is_created_lazily_on_the_next_ocr_request_and_loading_is_visible() {
+    let dir = manifest_model_dir("lazy-engine", &["det.onnx"], None);
+    let gate = Gate::new();
+    let built = Arc::new(AtomicUsize::new(0));
+    let server = TestServer::start(TestOptions {
+        engine_factory: gated_engine_factory(Arc::clone(&gate), Arc::clone(&built)),
+        ..TestOptions::new(dir.clone(), Scripted::fast())
+    });
+    assert_eq!(
+        server.get("/api/status").json()["engine"]["state"],
+        "blocked_models_missing"
+    );
+    assert_eq!(built.load(Ordering::SeqCst), 0);
+
+    // 缺的两个文件出现在磁盘上（等价于"下载完成"）——此时**仍然没有**引擎。
+    for name in ["rec.onnx", "dict.txt"] {
+        std::fs::write(dir.join(name), model_file_bytes(name)).expect("write the model file");
+    }
+    assert_eq!(
+        server.get("/api/status").json()["engine"]["state"],
+        "blocked_models_missing",
+        "a completed download must not create the engine in the background"
+    );
+    assert_eq!(
+        server.get("/api/models").json()["complete"],
+        true,
+        "the files are complete on disk"
+    );
+    assert_eq!(built.load(Ordering::SeqCst), 0);
+
+    // 下一次 `POST /api/ocr` 就是创建点（accept 线程只把状态推进 `Loading`）。
+    let accepted = server.submit_ocr(b"image");
+    assert_eq!(accepted.status, 202, "{}", accepted.text());
+    let id = accepted.json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    gate.arrive(); // 会话正在建立
+    let status = server.get("/api/status").json();
+    assert_eq!(status["engine"]["state"], "loading", "{status}");
+    assert_eq!(built.load(Ordering::SeqCst), 1);
+    gate.release();
+
+    let view = server.wait_terminal(&id, Duration::from_secs(20));
+    assert_eq!(view["state"], "succeeded", "{view}");
+    let status = server.get("/api/status").json();
+    assert_eq!(status["engine"]["state"], "ready");
+    assert!(
+        status["engine_load_ms"].as_u64().is_some(),
+        "the session creation time must be reported: {status}"
+    );
+}
+
+// ---------------------------------------------------------------- M2：真实网络（opt-in）
+
+/// opt-in 真实网络测试的门禁：只有 `RAPID_OCR_ALLOW_NETWORK=1` 时才真的联网。
+///
+/// 这不是"把测试弱化"，而是**网络测试的门禁**：绿/红只在显式要求时才成立，
+/// 默认运行时打印一行 `skipping`（CI 与本机都可能没有网络）。
+fn network_tests_enabled() -> bool {
+    if std::env::var("RAPID_OCR_ALLOW_NETWORK").as_deref() == Ok("1") {
+        return true;
+    }
+    eprintln!("skipping the real-network test: set RAPID_OCR_ALLOW_NETWORK=1 to run it");
+    false
+}
+
+/// 真实网络测试的模型目录：本地 manifest，**一个**待下载文件是默认表里真实存在的字典
+/// （74,947 B，URL 与 SHA-256 逐字抄自 `assets/default_models.yaml`，实测是直接 200、无重定向），
+/// 另外两个 role 由**已经就位**的夹具文件满足。
+///
+/// 为什么这样安排：
+///
+/// - `ModelPlan::resolve` 要求文本管线的三个 role 都在集合里声明，而这份夹具只需要验证
+///   **下载路径**（真实 URL + 强制 SHA-256 + 原子落盘），因此另外两个 role 用已经
+///   `Present` 的小夹具文件满足——`download_model_set` 对 `Present` 的文件不发请求、
+///   也不做 host 检查，于是这次真实网络往返只有**一次**；
+/// - 这也让测试避开下面那条**真实发现**：ModelScope 的 ONNX 权重走 302 到 CDN，
+///   而 §6.1 第 2 条要求拒绝重定向（见
+///   `a_real_network_weight_download_is_rejected_because_the_host_redirects`）。
+fn network_manifest_dir(name: &str) -> PathBuf {
+    let dir = m2_root().join(format!("network-manifest-{name}-{}", unique()));
+    std::fs::create_dir_all(&dir).expect("create the model dir");
+    // 两个已就位的夹具文件（内容由测试决定，哈希真实计算）。
+    let fixtures = [
+        ("network_det_fixture.onnx", "detector"),
+        ("network_rec_fixture.onnx", "recognizer"),
+    ];
+    let mut entries: Vec<(String, String, String, u64)> = Vec::new();
+    for (file, role) in fixtures {
+        let path = dir.join(file);
+        std::fs::write(&path, format!("present fixture {file}\n")).expect("write the fixture");
+        let size = std::fs::metadata(&path).expect("metadata").len();
+        entries.push((
+            file.to_string(),
+            role.to_string(),
+            format!("https://www.modelscope.cn/models/{file}"),
+            size,
+        ));
+    }
+    // 真实待下载的字典（默认表里的 ~75 KB 那个）。
+    entries.push((
+        "ppocrv6_dict.txt".to_string(),
+        "dictionary".to_string(),
+        "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/paddle/PP-OCRv6/rec/PP-OCRv6_rec_small/ppocrv6_dict.txt".to_string(),
+        74_947,
+    ));
+    let real_hashes = ["", "", REAL_DICTIONARY_SHA256];
+
+    let mut manifest = String::from(
+        "{\"schema_version\":1,\"id\":\"network-set\",\"family\":\"PP-OCR\",\"version\":\"v-real\",\
+         \"languages\":[\"en\"],\"files\":[",
+    );
+    for (index, (file, role, url, size)) in entries.iter().enumerate() {
+        let sha = if index < real_hashes.len() && !real_hashes[index].is_empty() {
+            real_hashes[index].to_string()
+        } else {
+            sha256_file(dir.join(file)).expect("hash the fixture")
+        };
+        if index > 0 {
+            manifest.push(',');
+        }
+        manifest.push_str(&format!(
+            "{{\"name\":\"{file}\",\"role\":\"{role}\",\"sha256\":\"{sha}\",\"size_bytes\":{size},\
+             \"source_url\":\"{url}\"}}"
+        ));
+    }
+    manifest.push_str("]}");
+    std::fs::write(dir.join("manifest.json"), manifest).expect("write the manifest");
+    dir
+}
+
+/// 默认表里 `ppocrv6_dict.txt` 的 SHA-256（74,947 B；`assets/default_models.yaml` 逐字）。
+const REAL_DICTIONARY_SHA256: &str =
+    "b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d";
+
+/// **opt-in 真实网络测试（成功路径）**：经 `POST /api/models/download` 把一个**真实**的
+/// 默认表字典（`ppocrv6_dict.txt`，74,947 B ≈ 75 KB）下载到一个**临时模型目录**，并断言：
+/// 任务成功、文件落盘、**SHA-256 与声明一致**、`/api/models` 变为 complete。
+///
+/// 它走的是**生产**下载器（真实网络 + 加固路径 + 强制 SHA-256），不是脚本化替身。
+#[test]
+fn a_real_network_download_of_the_default_table_dictionary_lands_and_verifies() {
+    if !network_tests_enabled() {
+        return;
+    }
+    let dir = network_manifest_dir("dictionary");
+    let server = TestServer::start(TestOptions {
+        allow_download: true,
+        downloader: super::download::real_downloader_factory(),
+        ..TestOptions::new(dir.clone(), Scripted::fast())
+    });
+
+    let models = server.get("/api/models").json();
+    assert_eq!(models["source"], "local_manifest");
+    assert_eq!(models["complete"], false, "{models}");
+    assert_eq!(models["missing"], serde_json::json!(["ppocrv6_dict.txt"]));
+    assert_eq!(models["sets"][0]["download_bytes_total"], 74_947);
+
+    let response = server.download("network-set");
+    assert_eq!(response.status, 202, "{}", response.text());
+    let id = response.json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    let view = server.wait_terminal(&id, Duration::from_secs(300));
+    assert_eq!(view["state"], "succeeded", "{view}");
+    eprintln!(
+        "real network download: files_done={} files_total={} bytes_done={} bytes_total={} elapsed_ms={}",
+        view["download"]["files_done"],
+        view["download"]["files_total"],
+        view["download"]["bytes_done"],
+        view["download"]["bytes_total"],
+        view["elapsed_ms"]
+    );
+    assert_eq!(view["download"]["files_done"], 1);
+    assert_eq!(view["download"]["files_total"], 1);
+    assert_eq!(view["download"]["bytes_done"], 74_947);
+    assert_eq!(view["download"]["current_file"], serde_json::Value::Null);
+
+    let after = server.get("/api/models").json();
+    assert_eq!(after["complete"], true, "{after}");
+    assert_eq!(after["missing"], serde_json::json!([]));
+    for file in after["sets"][0]["files"].as_array().expect("files") {
+        let name = file["name"].as_str().expect("name");
+        let declared = file["sha256"].as_str().expect("sha256");
+        let path = dir.join(name);
+        assert!(path.is_file(), "{} must be on disk", path.display());
+        let landed = sha256_file(&path).expect("hash the landed file");
+        eprintln!(
+            "real network download: {name} = {} bytes, sha256 {}",
+            std::fs::metadata(&path).expect("metadata").len(),
+            landed
+        );
+        assert_eq!(landed, declared, "{name} must match its declared SHA-256");
+    }
+    let dictionary = dir.join("ppocrv6_dict.txt");
+    assert_eq!(
+        sha256_file(&dictionary).expect("hash"),
+        REAL_DICTIONARY_SHA256,
+        "the landed dictionary must be the real one from the default table"
+    );
+}
+
+/// **opt-in 真实网络测试（拒绝路径：一条真实发现）**：默认表的 v6-tiny 文本集合里，
+/// **ONNX 权重**的 URL 在 ModelScope 上是 **302 → CDN**（`cdn-lfs-cn-*`），而 §6.1 第 2 条
+/// 明确禁止自动重定向（"未来若要支持必须逐跳校验 host/path"）。因此：
+///
+/// - 这条测试证明"拒绝重定向"在**真实主机**上确实触发（不是只在 fixture 里成立），
+///   并且任务的失败分类是结构化的（`detail.kind = "redirect"`）；
+/// - 它同时记录 M2 的一条**未解决风险**：默认表里的权重来源今天无法被加固下载器取用，
+///   `POST /api/models/download` 对"含权重的默认表集合"必然失败（见 `docs/06` 的 M2 记录）。
+#[test]
+fn a_real_network_weight_download_is_rejected_because_the_host_redirects() {
+    if !network_tests_enabled() {
+        return;
+    }
+    let dir = m2_root().join(format!("network-weights-{}", unique()));
+    std::fs::create_dir_all(&dir).expect("create the model dir");
+    let mut config = EngineConfig::default();
+    config.det.ocr_version = OcrVersion::PPocrV6;
+    config.det.model_type = ModelType::Tiny;
+    config.det.lang = LangDet::Multi;
+    config.rec.model.ocr_version = OcrVersion::PPocrV6;
+    config.rec.model.model_type = ModelType::Tiny;
+    config.rec.model.lang = LangRec::Ch;
+
+    let server = TestServer::start(TestOptions {
+        allow_download: true,
+        downloader: super::download::real_downloader_factory(),
+        engine_config: config,
+        ..TestOptions::new(dir.clone(), Scripted::fast())
+    });
+    let models = server.get("/api/models").json();
+    assert_eq!(models["source"], "default_table");
+    let set_id = models["sets"][0]["id"]
+        .as_str()
+        .expect("set id")
+        .to_string();
+
+    let response = server.download(&set_id);
+    assert_eq!(response.status, 202, "{}", response.text());
+    let id = response.json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    let view = server.wait_terminal(&id, Duration::from_secs(300));
+    eprintln!("real network download (weights): {view}");
+    assert_eq!(view["state"], "failed", "{view}");
+    assert_eq!(view["failure"]["status"], 502);
+    assert_eq!(view["failure"]["code"], "download_failed");
+    assert_eq!(
+        view["failure"]["detail"]["kind"], "redirect",
+        "the real host answers 302 to a CDN"
+    );
+    let message = view["error"].as_str().unwrap_or_default();
+    assert!(message.contains("redirect"), "{message}");
+    assert!(
+        message.contains("automatic redirects are disabled"),
+        "{message}"
+    );
+    // 一个字节都没有落盘，也没有残留的临时文件。
+    let mut entries: Vec<String> = std::fs::read_dir(&dir)
+        .expect("readable")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name != "manifest.json")
+        .collect();
+    entries.sort();
+    assert!(entries.is_empty(), "{entries:?}");
 }

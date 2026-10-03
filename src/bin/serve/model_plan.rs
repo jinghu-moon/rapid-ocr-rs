@@ -84,6 +84,24 @@ impl ModelPlan {
         self.source
     }
 
+    /// 模型目录（下载落盘位置、`/api/models` 的 `model_dir` 来源；响应里一律脱敏）。
+    pub fn model_dir(&self) -> &Path {
+        &self.model_dir
+    }
+
+    /// 按 `set_id` 取集合（§4.2 的 `POST /api/models/download` 请求体里**只有**这个 id）。
+    ///
+    /// 找不到就是找不到：调用方必须报可定位错误，**绝不**回落到 `sets[0]`
+    /// （页面每个下载按钮携带自己的 id，"默认下第一个集合"是它明确删掉的语义歧义）。
+    pub fn set_by_id(&self, set_id: &str) -> Option<&ModelSet> {
+        self.sets.iter().find(|set| set.id == set_id)
+    }
+
+    /// 全部集合 id（未知 `set_id` 的错误里给出它，便于定位）。
+    pub fn set_ids(&self) -> Vec<String> {
+        self.sets.iter().map(|set| set.id.clone()).collect()
+    }
+
     /// 每个集合的逐文件状态（§5.2 的唯一实现是库里的 `validate_model_files`）。
     ///
     /// **每次调用都会重新读盘并重新哈希**（模型文件 10–30 MB，一次约 10–100 ms）：
@@ -187,15 +205,51 @@ pub(super) fn blocking_files(statuses: &[ModelSetStatus]) -> Vec<BlockingFile> {
     out
 }
 
+/// 一个集合里待下载文件的规模（**唯一实现**：磁盘核算、预算预检与下载进度共用它）。
+pub(super) fn pending_download(status: &ModelSetStatus) -> PendingDownload {
+    let mut files = 0_usize;
+    let mut bytes = Some(0_u64);
+    for (file, state) in &status.files {
+        if state.is_present() {
+            continue;
+        }
+        files += 1;
+        bytes = match (bytes, file.size_bytes) {
+            (Some(total), Some(size)) => total.checked_add(size),
+            _ => None,
+        };
+    }
+    PendingDownload { files, bytes }
+}
+
 /// 一次请求上的模型状态报告（`/api/models` 与 OCR 409 的**同一份**数据）。
 #[derive(Debug, Clone)]
 pub(super) struct ModelReport {
     statuses: Vec<ModelSetStatus>,
 }
 
+/// 一个集合里"需要下载"的文件规模（§6.5 的核算口径）。
+///
+/// 与 [`ModelSetStatus::download_bytes_total`] 的区别是**损坏文件也要计入**：损坏的文件会被
+/// 重新下载（§6.3），因此它同样需要网络与磁盘空间。`bytes` 为 `None` 表示至少有一个待下载
+/// 文件没有声明体积（此时磁盘核算按 `--max-download-mb` 计入，见 §6.5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PendingDownload {
+    pub files: usize,
+    pub bytes: Option<u64>,
+}
+
 impl ModelReport {
     pub fn statuses(&self) -> &[ModelSetStatus] {
         &self.statuses
+    }
+
+    /// 某个集合里待下载文件的规模；集合不存在时为 `None`。
+    pub fn pending_download(&self, set_id: &str) -> Option<PendingDownload> {
+        self.statuses
+            .iter()
+            .find(|status| status.set_id == set_id)
+            .map(pending_download)
     }
 
     /// 缺失文件的文件名（按集合与声明顺序）。

@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use serde::Serialize;
 
-use super::error::ServeError;
+use super::error::{ErrorBody, ServeError};
 use super::limits::{ServeConfigError, ServeLimits, require_positive_u64, require_positive_usize};
 use super::queue::QueueClass;
 
@@ -45,6 +45,52 @@ impl JobKind {
         match self {
             Self::Ocr => "ocr",
             Self::ModelDownload => "model_download",
+        }
+    }
+}
+
+/// 任务所属的**队列**（§4.2 的 `queue` 字段）。
+///
+/// # 为什么它不是调度器的 [`QueueClass`]
+///
+/// M1 让下载任务借用 `QueueClass::Text`（`JobStore` 要一个类别）并把 `position` 恒置为
+/// `None`，理由是"它不会出现在任何队列里"。这个理由本身对，但**类型**是错的：调度器只
+/// 服务双队列（Text/Formula），而下载任务走 §8.1 的**独立有界 channel**，从不进调度器。
+/// 把它们混成一个类型，就会让 `/api/jobs/{id}` 与任何按 `queue` 聚合的诊断报告一个从未
+/// 排队的下载任务属于**文本队列**——一条不真实的诊断。因此这里给出中性类别
+/// [`Self::Download`]，并把"某个任务是否在双队列里"表达成 [`Self::class`] 的返回值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobQueue {
+    Text,
+    Formula,
+    /// 独立下载 channel（§8.1），不属于双队列。
+    Download,
+}
+
+impl JobQueue {
+    /// 机器可读名称（进 `/api/jobs/{id}` 的 `queue` 字段与日志）。
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Formula => "formula",
+            Self::Download => "download",
+        }
+    }
+
+    /// 它在双队列调度器里的类别；下载任务**没有**（返回 `None`）。
+    pub fn class(self) -> Option<QueueClass> {
+        match self {
+            Self::Text => Some(QueueClass::Text),
+            Self::Formula => Some(QueueClass::Formula),
+            Self::Download => None,
+        }
+    }
+
+    pub fn from_class(class: QueueClass) -> Self {
+        match class {
+            QueueClass::Text => Self::Text,
+            QueueClass::Formula => Self::Formula,
         }
     }
 }
@@ -118,14 +164,101 @@ impl JobStoreLimits {
     }
 }
 
+/// 下载任务的进度（§4.3 的作业形状：逐文件 done/total、字节 done/total、当前文件名）。
+///
+/// `files_total` / `bytes_total` 只统计**需要下载**的文件（缺失 ∪ 损坏，即"不是
+/// `Present`"的那些）；已经校验通过的文件既不需要网络也不需要空间，因此不参与进度。
+/// `bytes_total` 为 `None` 表示至少有一个待下载文件没有声明体积（§6.2 的流式上限兜底）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DownloadProgress {
+    /// 已通过 SHA-256 校验并落盘的文件数。
+    pub files_done: usize,
+    /// 本次任务要下载的文件数。
+    pub files_total: usize,
+    /// 已写入的字节数（含当前文件正在写入的部分）。
+    pub bytes_done: u64,
+    /// 待下载文件的体积之和；有未知体积时为 `null`。
+    pub bytes_total: Option<u64>,
+    /// 正在下载的文件名（没有进行中的文件时为 `null`）。
+    pub current_file: Option<String>,
+}
+
+impl DownloadProgress {
+    /// 任务刚创建（或刚开始执行）时的进度：一个文件都还没完成。
+    pub fn planned(files_total: usize, bytes_total: Option<u64>) -> Self {
+        Self {
+            files_done: 0,
+            files_total,
+            bytes_done: 0,
+            bytes_total,
+            current_file: None,
+        }
+    }
+}
+
+/// 失败任务的机器可读分类。
+///
+/// `status`/`code`/`detail` 与 [`ServeError`] 的 HTTP 映射**同源**：同一个失败原因不会
+/// 在 `/api/jobs/{id}` 里被压成一句人类可读文本（那会让客户端只能做字符串匹配）。
+/// `message` 同时进 §4.2 冻结的 `error` 字段，因此旧客户端不受影响。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct JobFailure {
+    /// 同一失败在 `/result` 上重放（或同步返回）时的 HTTP 状态码。
+    pub status: u16,
+    /// §11.1 的机器可读 `code`。
+    pub code: &'static str,
+    /// 人类可读说明（= `JobView.error`）。
+    pub message: String,
+    /// `detail` 载荷（例如 `TooLarge` 的 `limit_bytes`/`observed_bytes`）。
+    pub detail: serde_json::Value,
+}
+
+impl JobFailure {
+    pub fn new(
+        status: u16,
+        code: &'static str,
+        message: impl Into<String>,
+        detail: serde_json::Value,
+    ) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+            detail,
+        }
+    }
+
+    /// 由 HTTP 错误映射构造（`Outcome::Failed` 与 `ServeError` 两条来源共用一份实现）。
+    pub fn from_body(status: u16, body: &ErrorBody) -> Self {
+        Self {
+            status,
+            code: body.code,
+            message: body.message.clone(),
+            detail: body.detail.clone(),
+        }
+    }
+}
+
+impl From<&ServeError> for JobFailure {
+    fn from(error: &ServeError) -> Self {
+        Self {
+            status: error.status_code(),
+            code: error.code(),
+            message: error.message(),
+            detail: error.detail(),
+        }
+    }
+}
+
 /// 任务记录（存储内部形态）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JobRecord {
     pub id: String,
     pub kind: JobKind,
-    pub class: QueueClass,
+    /// 所属队列（下载任务用中性的 [`JobQueue::Download`]，见该类型的文档）。
+    pub queue: JobQueue,
     pub state: JobState,
-    /// 队列内位置（仅 `Queued` 时有意义）。
+    /// 队列内位置（仅 `Queued` 且属于双队列时有意义）。
     pub position: Option<usize>,
     /// 进入队列的时刻。
     pub queued_ms: Millis,
@@ -137,8 +270,12 @@ pub struct JobRecord {
     pub original_bytes: u64,
     /// 保留的**结果**字节数（序列化后的结果）。
     pub result_bytes: u64,
-    /// 终态原因（`Failed` 时是错误文本）。
-    pub error: Option<String>,
+    /// 失败分类（`Failed` 时存在；`Failed` 之外的终态为 `None`）。
+    pub failure: Option<JobFailure>,
+    /// 下载进度（`kind = ModelDownload` 时存在）。
+    pub download: Option<DownloadProgress>,
+    /// 是否已经收到取消请求（运行中的下载任务在**文件边界**兑现它，§6.6）。
+    pub cancel_requested: bool,
     /// 插入序号：同一时刻结束的任务用它做稳定排序。
     pub seq: u64,
 }
@@ -155,34 +292,60 @@ impl JobRecord {
         end.saturating_sub(self.started_ms.unwrap_or(self.queued_ms))
     }
 
-    /// `/api/jobs/{id}` 的响应视图（字段顺序与 §4.2 一致）。
+    /// 失败原因的人类可读文本（进 §4.2 冻结的 `error` 字段）。
+    pub fn error(&self) -> Option<String> {
+        self.failure.as_ref().map(|failure| failure.message.clone())
+    }
+
+    /// `/api/jobs/{id}` 的响应视图（字段顺序与 §4.2 一致，新增字段在该表之后）。
     pub fn view(&self, now: Millis) -> JobView {
         JobView {
             id: self.id.clone(),
             kind: self.kind,
-            queue: self.class,
+            queue: self.queue,
             state: self.state,
             position: self.position,
             queued_ms: self.queued_ms,
             started_ms: self.started_ms,
             elapsed_ms: self.elapsed_ms(now),
-            error: self.error.clone(),
+            error: self.error(),
+            failure: self.failure.clone(),
+            download: self.download.clone(),
+            cancel_requested: self.cancel_requested,
         }
     }
 }
 
 /// `/api/jobs/{id}` 的响应体。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct JobView {
     pub id: String,
     pub kind: JobKind,
-    pub queue: QueueClass,
+    pub queue: JobQueue,
     pub state: JobState,
     pub position: Option<usize>,
     pub queued_ms: Millis,
     pub started_ms: Option<Millis>,
     pub elapsed_ms: Millis,
     pub error: Option<String>,
+    /// 机器可读的失败分类（成功/未完成时为 `null`）。
+    pub failure: Option<JobFailure>,
+    /// 下载进度（仅 `kind = model_download` 时非 `null`）。
+    pub download: Option<DownloadProgress>,
+    /// 已登记取消请求（运行中的下载任务会在文件边界兑现，§6.6）。
+    pub cancel_requested: bool,
+}
+
+/// 取消的结论（§4.3 与 §6.6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// 排队中：立即取消，**可靠**（§4.3）。
+    Cancelled,
+    /// 运行中的**下载**任务：已登记取消请求，将在**文件边界**生效（§6.6）。
+    ///
+    /// 任务状态此刻**不变**（仍是 `running`）——M1 的 OCR 任务在这里返回 409
+    /// `not_cancellable`，因为推理不可中断；下载不假装"已取消"，但也不假装"不能取消"。
+    CancelRequested,
 }
 
 /// 一次 [`JobStore::tick`] 的结果（诊断与测试用）。
@@ -246,7 +409,7 @@ impl JobStore {
         &mut self,
         id: impl Into<String>,
         kind: JobKind,
-        class: QueueClass,
+        queue: JobQueue,
         original_bytes: u64,
         now: Millis,
     ) -> Result<(), ServeError> {
@@ -260,7 +423,7 @@ impl JobStore {
         let record = JobRecord {
             id: id.clone(),
             kind,
-            class,
+            queue,
             state: JobState::Queued,
             position: None,
             queued_ms: now,
@@ -268,7 +431,9 @@ impl JobStore {
             finished_ms: None,
             original_bytes,
             result_bytes: 0,
-            error: None,
+            failure: None,
+            download: None,
+            cancel_requested: false,
             seq,
         };
         self.retained_bytes = self.retained_bytes.saturating_add(record.total_bytes());
@@ -279,9 +444,36 @@ impl JobStore {
     }
 
     /// 更新队列内位置（调度器每次取任务后 M1 重新计算）。
+    ///
+    /// 不属于双队列的任务（下载）**没有**位置：调用方用 [`JobQueue::class`] 过滤。
     pub fn set_position(&mut self, id: &str, position: Option<usize>) -> Result<(), ServeError> {
         self.record_mut(id)?.position = position;
         Ok(())
+    }
+
+    /// 登记/刷新下载进度（§4.3 的作业形状）。
+    pub fn set_download_progress(
+        &mut self,
+        id: &str,
+        progress: DownloadProgress,
+    ) -> Result<(), ServeError> {
+        let record = self.record_mut(id)?;
+        if record.kind != JobKind::ModelDownload {
+            // 给 OCR 任务写下载进度是程序错误：不能静默接受一个不可能的字段组合。
+            return Err(ServeError::Internal);
+        }
+        record.download = Some(progress);
+        Ok(())
+    }
+
+    /// 是否已经收到取消请求（下载 worker 在**文件边界**查询它，§6.6）。
+    ///
+    /// 未知/已淘汰的任务返回 `false`：调用方随后会从状态转换里得到结论，
+    /// 这里不制造第二个错误来源。
+    pub fn is_cancel_requested(&self, id: &str) -> bool {
+        self.jobs
+            .get(id)
+            .is_some_and(|record| record.cancel_requested)
     }
 
     /// `Queued → Running`。
@@ -315,10 +507,27 @@ impl JobStore {
     }
 
     /// `Running → Failed`，原因写入视图的 `error` 字段。
+    ///
+    /// 只带人类可读文本（`failure` 为 `None`）：需要机器可读分类的调用方用
+    /// [`Self::fail_classified`]。
     pub fn fail(
         &mut self,
         id: &str,
         reason: impl Into<String>,
+        now: Millis,
+    ) -> Result<(), ServeError> {
+        self.fail_classified(
+            id,
+            JobFailure::new(500, "internal", reason, serde_json::Value::Null),
+            now,
+        )
+    }
+
+    /// `Running → Failed`，同时登记机器可读的分类（`code`/`status`/`detail`）。
+    pub fn fail_classified(
+        &mut self,
+        id: &str,
+        failure: JobFailure,
         now: Millis,
     ) -> Result<(), ServeError> {
         {
@@ -327,7 +536,7 @@ impl JobStore {
                 return Err(ServeError::Internal);
             }
             record.state = JobState::Failed;
-            record.error = Some(reason.into());
+            record.failure = Some(failure);
             record.finished_ms = Some(now);
             record.position = None;
         }
@@ -335,25 +544,47 @@ impl JobStore {
         Ok(())
     }
 
-    /// 取消（§4.3）。
+    /// 取消（§4.3 与 §6.6）。
     ///
-    /// 返回该任务所属队列，便于 M1 同时把它从调度器里移出。
-    /// `Running` 与终态一律返回 [`ServeError::NotCancellable`]（409），状态**不变**。
-    pub fn cancel(&mut self, id: &str, now: Millis) -> Result<QueueClass, ServeError> {
+    /// - `Queued`（任何类型）→ **立即** `Cancelled`，返回 [`CancelOutcome::Cancelled`]；
+    /// - `Running` 且是**下载**任务 → 只登记取消请求（[`CancelOutcome::CancelRequested`]），
+    ///   状态**不变**：§6.6 的取消只在文件边界生效，worker 随后用
+    ///   [`Self::finish_cancelled`] 落地；
+    /// - `Running` 的 OCR 任务与全部终态 → [`ServeError::NotCancellable`]（409），状态不变。
+    pub fn cancel(&mut self, id: &str, now: Millis) -> Result<CancelOutcome, ServeError> {
         let record = self.record_mut(id)?;
         match record.state {
             JobState::Queued => {
                 record.state = JobState::Cancelled;
                 record.finished_ms = Some(now);
-                let class = record.class;
                 self.enforce_retention(now);
-                Ok(class)
+                Ok(CancelOutcome::Cancelled)
+            }
+            JobState::Running if record.kind == JobKind::ModelDownload => {
+                record.cancel_requested = true;
+                Ok(CancelOutcome::CancelRequested)
             }
             JobState::Running => Err(ServeError::NotCancellable),
             JobState::Succeeded | JobState::Failed | JobState::Cancelled => {
                 Err(ServeError::NotCancellable)
             }
         }
+    }
+
+    /// 下载 worker 专用：把**已经登记取消请求**的运行中下载任务落地为 `Cancelled`
+    /// （§4.3 的 `running → cancelled` 边；M1 没有它的生产者，因为推理不可中断）。
+    pub fn finish_cancelled(&mut self, id: &str, now: Millis) -> Result<(), ServeError> {
+        {
+            let record = self.record_mut(id)?;
+            if record.state != JobState::Running || !record.cancel_requested {
+                return Err(ServeError::Internal);
+            }
+            record.state = JobState::Cancelled;
+            record.finished_ms = Some(now);
+            record.position = None;
+        }
+        self.enforce_retention(now);
+        Ok(())
     }
 
     /// 查询任务：`JobNotFound`(404) / `JobEvicted`(410) / 记录本身。
@@ -519,9 +750,11 @@ impl JobStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobIdGenerator, JobKind, JobState, JobStore, JobStoreLimits, Millis, TickReport};
+    use super::{
+        CancelOutcome, DownloadProgress, JobFailure, JobIdGenerator, JobKind, JobQueue, JobState,
+        JobStore, JobStoreLimits, Millis, TickReport,
+    };
     use crate::serve::error::ServeError;
-    use crate::serve::queue::QueueClass;
 
     fn limits(
         max_retained: usize,
@@ -538,7 +771,7 @@ mod tests {
 
     fn insert_ocr(store: &mut JobStore, id: &str, bytes: u64, now: Millis) {
         store
-            .insert(id, JobKind::Ocr, QueueClass::Text, bytes, now)
+            .insert(id, JobKind::Ocr, JobQueue::Text, bytes, now)
             .expect("fresh ids");
     }
 
@@ -576,13 +809,16 @@ mod tests {
         let view = store.view("job-0", 100).expect("present");
         assert_eq!(view.id, "job-0");
         assert_eq!(view.kind, JobKind::Ocr);
-        assert_eq!(view.queue, QueueClass::Text);
+        assert_eq!(view.queue, JobQueue::Text);
         assert_eq!(view.state, JobState::Queued);
         assert_eq!(view.position, Some(0));
         assert_eq!(view.queued_ms, 100);
         assert_eq!(view.started_ms, None);
         assert_eq!(view.elapsed_ms, 0);
         assert_eq!(view.error, None);
+        assert_eq!(view.failure, None);
+        assert_eq!(view.download, None, "an OCR job has no download progress");
+        assert!(!view.cancel_requested);
 
         store.start("job-0", 150).expect("queued -> running");
         let view = store.view("job-0", 400).expect("present");
@@ -624,7 +860,7 @@ mod tests {
         // 重复插入同一 ID 也必须被拒绝。
         assert!(matches!(
             store
-                .insert("job-0", JobKind::Ocr, QueueClass::Text, 0, 1)
+                .insert("job-0", JobKind::Ocr, JobQueue::Text, 0, 1)
                 .expect_err("duplicate id"),
             ServeError::Internal
         ));
@@ -641,8 +877,8 @@ mod tests {
     fn cancelling_a_queued_job_is_reliable() {
         let mut store = store();
         insert_ocr(&mut store, "job-0", 32, 10);
-        let class = store.cancel("job-0", 20).expect("queued cancel must work");
-        assert_eq!(class, QueueClass::Text);
+        let outcome = store.cancel("job-0", 20).expect("queued cancel must work");
+        assert_eq!(outcome, CancelOutcome::Cancelled);
         let view = store.view("job-0", 30).expect("present");
         assert_eq!(view.state, JobState::Cancelled);
         assert_eq!(view.elapsed_ms, 10, "cancelling freezes the elapsed time");
@@ -902,15 +1138,141 @@ mod tests {
     fn model_download_jobs_are_stored_with_their_own_kind_and_queue() {
         let mut store = store();
         store
-            .insert("dl-0", JobKind::ModelDownload, QueueClass::Formula, 0, 0)
+            .insert("dl-0", JobKind::ModelDownload, JobQueue::Download, 0, 0)
             .expect("fresh id");
+        store
+            .set_download_progress("dl-0", DownloadProgress::planned(2, Some(300)))
+            .expect("a download job carries progress");
         let view = store.view("dl-0", 0).expect("present");
         assert_eq!(view.kind, JobKind::ModelDownload);
-        assert_eq!(view.queue, QueueClass::Formula);
+        assert_eq!(
+            view.queue,
+            JobQueue::Download,
+            "a download job is not in the text queue"
+        );
+        assert_eq!(
+            view.queue.class(),
+            None,
+            "only the dual queue has a scheduler class"
+        );
         let json = serde_json::to_value(&view).expect("JobView must serialize");
         assert_eq!(json["kind"], "model_download");
-        assert_eq!(json["queue"], "formula");
+        assert_eq!(json["queue"], "download");
         assert_eq!(json["state"], "queued");
+        assert_eq!(json["position"], serde_json::Value::Null);
+        assert_eq!(json["download"]["files_done"], 0);
+        assert_eq!(json["download"]["files_total"], 2);
+        assert_eq!(json["download"]["bytes_done"], 0);
+        assert_eq!(json["download"]["bytes_total"], 300);
+        assert_eq!(json["download"]["current_file"], serde_json::Value::Null);
+        assert_eq!(json["cancel_requested"], false);
+    }
+
+    /// §6.6：运行中的**下载**可以取消（登记请求，状态不变），由 worker 在文件边界落地；
+    /// 运行中的 **OCR** 仍然 409（推理不可中断，不得假装取消成功）。
+    #[test]
+    fn a_running_download_can_be_cancelled_at_a_file_boundary_but_ocr_cannot() {
+        let mut downloads = store();
+        downloads
+            .insert("dl-0", JobKind::ModelDownload, JobQueue::Download, 0, 0)
+            .expect("fresh id");
+        downloads.start("dl-0", 1).expect("-> running");
+        assert_eq!(
+            downloads
+                .cancel("dl-0", 2)
+                .expect("a running download accepts a request"),
+            CancelOutcome::CancelRequested
+        );
+        let view = downloads.view("dl-0", 3).expect("present");
+        assert_eq!(
+            view.state,
+            JobState::Running,
+            "the state must not pretend the download already stopped"
+        );
+        assert!(view.cancel_requested);
+        assert!(downloads.is_cancel_requested("dl-0"));
+        // 只有登记过取消请求的运行中下载任务才能落地为 cancelled。
+        downloads.finish_cancelled("dl-0", 4).expect("-> cancelled");
+        let view = downloads.view("dl-0", 5).expect("present");
+        assert_eq!(view.state, JobState::Cancelled);
+        assert_eq!(view.elapsed_ms, 3, "elapsed freezes at the cancel time");
+        assert!(view.cancel_requested, "the audit flag stays visible");
+
+        // 没有取消请求就落地 = 伪造取消 → 内部错误。
+        downloads
+            .insert("dl-1", JobKind::ModelDownload, JobQueue::Download, 0, 0)
+            .expect("fresh id");
+        downloads.start("dl-1", 1).expect("-> running");
+        assert!(matches!(
+            downloads
+                .finish_cancelled("dl-1", 2)
+                .expect_err("only a requested cancel may be finished"),
+            ServeError::Internal
+        ));
+        assert_eq!(
+            downloads.record("dl-1").expect("present").state,
+            JobState::Running
+        );
+
+        // 排队中的下载取消之后，worker 的 `start` 必须失败（它会如实跳过，而不是改回排队）。
+        downloads
+            .insert("dl-2", JobKind::ModelDownload, JobQueue::Download, 0, 0)
+            .expect("fresh id");
+        assert_eq!(
+            downloads.cancel("dl-2", 3).expect("queued cancel"),
+            CancelOutcome::Cancelled
+        );
+        assert!(
+            downloads.start("dl-2", 4).is_err(),
+            "the worker must not start a job that was cancelled while queued"
+        );
+
+        // OCR：运行中依然是 409 not_cancellable，状态不变。
+        let mut ocr_store = store();
+        insert_ocr(&mut ocr_store, "job-0", 8, 0);
+        ocr_store.start("job-0", 1).expect("-> running");
+        let error = ocr_store
+            .cancel("job-0", 2)
+            .expect_err("a running OCR job is not cancellable");
+        assert_eq!(error.code(), "not_cancellable");
+        assert_eq!(
+            ocr_store.record("job-0").expect("present").state,
+            JobState::Running
+        );
+        assert!(!ocr_store.is_cancel_requested("job-0"));
+    }
+
+    /// 失败任务同时给出人类可读文本与机器可读分类（同一份原因，不靠字符串匹配）。
+    #[test]
+    fn a_classified_failure_carries_its_code_and_detail() {
+        let mut store = store();
+        store
+            .insert("dl-0", JobKind::ModelDownload, JobQueue::Download, 0, 0)
+            .expect("fresh id");
+        store.start("dl-0", 1).expect("-> running");
+        store
+            .fail_classified(
+                "dl-0",
+                JobFailure::new(
+                    507,
+                    "insufficient_disk_space",
+                    "insufficient disk space: 1000 bytes required, 10 bytes available",
+                    serde_json::json!({ "required_bytes": 1000, "available_bytes": 10 }),
+                ),
+                2,
+            )
+            .expect("-> failed");
+        let json = serde_json::to_value(store.view("dl-0", 3).expect("present"))
+            .expect("JobView must serialize");
+        assert_eq!(json["state"], "failed");
+        assert_eq!(json["failure"]["status"], 507);
+        assert_eq!(json["failure"]["code"], "insufficient_disk_space");
+        assert_eq!(json["failure"]["detail"]["required_bytes"], 1000);
+        assert_eq!(json["failure"]["detail"]["available_bytes"], 10);
+        assert_eq!(
+            json["error"], json["failure"]["message"],
+            "the frozen `error` field stays the same text"
+        );
     }
 
     /// `/api/jobs/{id}` 的字段名与 §4.2 完全一致。
@@ -931,12 +1293,16 @@ mod tests {
             "started_ms",
             "elapsed_ms",
             "error",
+            "failure",
+            "download",
+            "cancel_requested",
         ] {
             assert!(json.get(key).is_some(), "missing {key}: {json}");
         }
         assert_eq!(json["position"], 1);
         assert_eq!(json["started_ms"], serde_json::Value::Null);
         assert_eq!(json["elapsed_ms"], 4);
+        assert_eq!(json["failure"], serde_json::Value::Null);
     }
 
     /// 一次 tick 可以同时报告四类清理结果。

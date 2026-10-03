@@ -26,6 +26,7 @@
 //! 两把锁从不同时持有，因此没有锁序问题。
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -33,26 +34,30 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use rapid_ocr_rs::{
-    DetectionPolicy, FormulaPolicy, ImageInput, OcrOutput, OcrRequest, OrtRuntimeFingerprint,
-    OutputPolicy, PreprocessPolicy, RecognitionPolicy, StagePlan, TextOrder, WordOutputMode,
+    ALLOWED_DOWNLOAD_HOSTS, DetectionPolicy, DownloadError, FormulaPolicy, ImageInput, OcrOutput,
+    OcrRequest, OrtRuntimeFingerprint, OutputPolicy, PreprocessPolicy, RapidOcrError,
+    RecognitionPolicy, StagePlan, TextOrder, WordOutputMode, available_disk_bytes,
     ort_runtime_fingerprint, ort_runtime_version, peak_memory_source, peak_working_set_bytes,
     to_output_json,
 };
 use serde_json::{Value, json};
 
-use super::download::{self, DOWNLOAD_QUEUE_CAPACITY, DownloadCommand};
+use super::download::{
+    self, DOWNLOAD_QUEUE_CAPACITY, DownloadCommand, DownloadJob, DownloaderFactory,
+};
 use super::engine::{BackendProvider, EngineFactory, OcrBackend};
 use super::error::{ErrorBody, ServeError};
 use super::jobs::{
-    JobIdGenerator, JobKind, JobState as JobLifecycle, JobStore, JobStoreLimits, Millis,
+    CancelOutcome, DownloadProgress, JobFailure, JobIdGenerator, JobKind, JobQueue,
+    JobState as JobLifecycle, JobStore, JobStoreLimits, Millis,
 };
 use super::limits::ServeLimits;
-use super::model_plan::{ModelPlan, ModelReport, ModelSnapshot, source_label};
+use super::model_plan::{ModelPlan, ModelReport, ModelSnapshot, PendingDownload, source_label};
 use super::queue::{DualQueueScheduler, QueueClass, ScheduledJob, SchedulerConfig};
 use super::results::{Outcome, ResultStore, SerializeError, serialize_bounded};
 use super::security::{LocalOrigin, ServeToken};
 use super::state::{
-    EngineState, EngineStateMachine, ProviderStatus, ServeConfigPlan, ServiceState,
+    EngineState, EngineStateMachine, OcrAdmission, ProviderStatus, ServeConfigPlan, ServiceState,
 };
 
 /// 空闲 worker 的等待上限（只为周期性检查关闭标志）。
@@ -98,6 +103,29 @@ impl OcrRouting {
     }
 }
 
+/// 磁盘可用空间的来源（可注入，§6.5 的任务级预检）。
+///
+/// 与库内 `FreeSpaceProbe` 同一个思路：生产实现是库的 `available_disk_bytes`
+/// （`GetDiskFreeSpaceExW`），测试注入固定值，于是"磁盘不足 → 507 + 两个数值"
+/// 这条分支**不需要真的填满磁盘**就能验证。
+pub(super) type FreeSpaceFactory = Arc<dyn Fn(&Path) -> Result<u64, RapidOcrError> + Send + Sync>;
+
+/// 生产路径的探测：库的唯一实现。
+pub(super) fn real_free_space() -> FreeSpaceFactory {
+    Arc::new(|directory: &Path| available_disk_bytes(directory))
+}
+
+/// 一次"惰性创建/重建引擎"的结论（§7.6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EngineLoad {
+    /// 会话已建立（本次或此前）。
+    Ready,
+    /// 模型不齐备：状态机已刷新为 `blocked_models_missing` 并带上缺失清单。
+    BlockedModelsMissing,
+    /// 会话创建失败：状态机是 `failed`，原因在 [`EngineState::Failed`] 里。
+    Failed,
+}
+
 /// 启动期校验后的全部运行期输入（由 `run.rs` 组装，测试也用它构造运行时）。
 pub(super) struct ServeContext {
     pub limits: ServeLimits,
@@ -110,8 +138,12 @@ pub(super) struct ServeContext {
     pub page: String,
     pub nonce: String,
     pub allow_download: bool,
+    /// `--allow-download-host` 的**显式**扩展（§6.1 第 3 条；库常量不被修改）。
+    pub allow_download_hosts: Vec<String>,
     pub routing: OcrRouting,
     pub engine_factory: EngineFactory,
+    pub downloader: DownloaderFactory,
+    pub free_space: FreeSpaceFactory,
 }
 
 /// 待处理的原图字节（只有 worker 会取走它）。
@@ -134,13 +166,16 @@ struct JobState {
 
 impl JobState {
     /// 队列里每个任务的 `position` 以**调度器**为唯一事实来源（§4.2 的 `position`）。
+    ///
+    /// 不属于双队列的任务（下载）由 [`JobQueue::class`] 过滤掉：它们的 `position`
+    /// 永远是 `null`，而不是"文本队列里的某个位置"。
     fn sync_positions(&mut self) {
         let queued: Vec<(String, QueueClass)> = self
             .store
             .views(monotonic_ms())
             .into_iter()
             .filter(|view| view.state == JobLifecycle::Queued)
-            .map(|view| (view.id, view.queue))
+            .filter_map(|view| view.queue.class().map(|class| (view.id, class)))
             .collect();
         for (id, class) in queued {
             let position = self.scheduler.position_of(class, &id);
@@ -173,12 +208,22 @@ pub(super) struct ServeShared {
     page: String,
     nonce: String,
     allow_download: bool,
+    allow_download_hosts: Vec<String>,
     routing: OcrRouting,
     engine_state: Mutex<EngineStateMachine>,
     engine: Mutex<Option<Box<dyn OcrBackend>>>,
+    /// 引擎加载的互斥：`POST /api/ocr` 的惰性创建与 `POST /api/engine/reload` 只能有一个
+    /// 在建立会话（`engine_state` 的锁**不**覆盖加载过程，否则 `/api/status` 在加载期间
+    /// 会被阻塞、也看不到 `loading`）。
+    engine_load: Mutex<()>,
+    /// 上一次**真正建立会话**的耗时（毫秒）；`None` = 还没有建立过。
+    engine_load_ms: Mutex<Option<u64>>,
     jobs: Mutex<JobState>,
     queue_signal: Condvar,
     download_tx: SyncSender<DownloadCommand>,
+    engine_factory: EngineFactory,
+    downloader: DownloaderFactory,
+    free_space: FreeSpaceFactory,
     shutting_down: AtomicBool,
 }
 
@@ -243,6 +288,34 @@ impl ServeShared {
     /// 引擎状态名（启动日志与错误文案用）。
     pub fn engine_state_name(&self) -> &'static str {
         self.engine_state().name()
+    }
+
+    /// 上一次**真正建立会话**的耗时（毫秒，§11「M2：模型齐备后惰性创建 engine 并显示耗时」）。
+    pub fn engine_load_ms(&self) -> Option<u64> {
+        *lock(&self.engine_load_ms)
+    }
+
+    /// 引擎 `Failed` 的原因（进 503 的 `detail.reason`）。
+    pub(super) fn engine_failure_reason(&self) -> Option<String> {
+        match self.engine_state() {
+            EngineState::Failed { reason } => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// 与 `GET /api/models` **同源同值**的 409 载荷（HTTP 层与 OCR worker 共用，§7.6）。
+    pub(super) fn models_missing_failure(&self) -> ErrorBody {
+        let error = self.models_missing_error();
+        ErrorBody {
+            code: error.code(),
+            message: error.message(),
+            detail: self.models_missing_detail(),
+        }
+    }
+
+    /// 模型不齐备时任务的终态载荷（`models_missing` / `models_corrupt`，两者都是 409）。
+    pub(super) fn models_missing_outcome(&self) -> Outcome {
+        Outcome::Failed(409, self.models_missing_failure())
     }
 
     /// `/api/status`（§4.2、§7.4、§7.5、§7.6）。
@@ -310,7 +383,22 @@ impl ServeShared {
             "model_dir": REDACTED_MODEL_DIR,
             "source": source_label(self.model_plan.source()),
             "downloads_allowed": self.allow_download,
+            "download_hosts": self.effective_download_hosts(),
+            "engine_load_ms": self.engine_load_ms(),
         })
+    }
+
+    /// 生效的可信 host 列表（编译期白名单 ∪ `--allow-download-host`，§6.1 第 3 条）。
+    ///
+    /// 只用于诊断与启动日志：**不是**把库常量改成扩展后的值——库每次下载都收到这份
+    /// 显式参数（见 [`Self::download_job`]），常量本身一个字都没变。
+    pub fn effective_download_hosts(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = ALLOWED_DOWNLOAD_HOSTS
+            .iter()
+            .map(|host| (*host).to_string())
+            .collect();
+        hosts.extend(self.allow_download_hosts.iter().cloned());
+        hosts
     }
 
     /// `/api/models`（§5.4；`missing`/`corrupt`/`blocked` 与 OCR 409 的 `detail` 同源同序）。
@@ -375,10 +463,8 @@ impl ServeShared {
         class: QueueClass,
         max_side: Option<u32>,
     ) -> Result<Value, ServeError> {
-        // §7.6：模型缺失 / 引擎不可用在这里拒绝（不建任务、不入队）。
-        // `ModelsMissing` 的具体形状与 `code`（`models_missing` / `models_corrupt`）
-        // 由 `error_body` 在响应层补齐，并复用 `/api/models` 的字段。
-        ServeError::from_ocr_admission(self.engine_state().ocr_admission())?;
+        // §7.6 + M2 的惰性创建：模型缺失/引擎不可用在这里拒绝（不建任务、不入队）。
+        self.admit_ocr()?;
 
         let original_bytes = bytes.len() as u64;
         let mut state = lock(&self.jobs);
@@ -387,7 +473,7 @@ impl ServeShared {
         if let Err(error) = state.store.insert(
             id.clone(),
             JobKind::Ocr,
-            class,
+            JobQueue::from_class(class),
             original_bytes,
             monotonic_ms(),
         ) {
@@ -410,39 +496,102 @@ impl ServeShared {
         }))
     }
 
-    /// `POST /api/models/download`（M2 的处理体在 `download.rs`）。
+    /// `POST /api/ocr` 的引擎准入（§7.6 第 3 步 + M2 的惰性创建）。
+    ///
+    /// - `Ready` → 执行；`Loading`/`Rebuilding` → 入队等待（**不拒绝**）；
+    /// - `BlockedModelsMissing` → 先看磁盘上的**当前**事实：若模型已经齐备（典型场景是
+    ///   刚下载完），转入 `Loading` 并把会话创建留给 worker（推理/建会话绝不在 accept
+    ///   线程）；否则 409 + 与 `/api/models` 同源同值的缺失清单；
+    /// - `Failed` → 503 `engine_unavailable`（原因在 `/api/status` 与 `detail.reason` 里）。
+    fn admit_ocr(&self) -> Result<(), ServeError> {
+        let admission = self.engine_state().ocr_admission();
+        if matches!(admission, OcrAdmission::ModelsMissing { .. }) {
+            // 只有这一种结论需要看磁盘上的当前事实（下载可能刚刚补齐模型）。
+            return self.admit_with_models_on_disk();
+        }
+        // `Run`/`Queue` → 通过；`Unavailable` → 503（映射只有一份实现）。
+        ServeError::from_ocr_admission(admission)
+    }
+
+    /// `BlockedModelsMissing` 下的准入：模型现在齐备就转入 `Loading`（惰性创建），否则 409。
+    fn admit_with_models_on_disk(&self) -> Result<(), ServeError> {
+        let blocking = self.models().blocking_names();
+        if blocking.is_empty() {
+            // 下载让它齐备了：进入 `Loading`（`BlockedModelsMissing → Loading` 是 §7.6 的
+            // 合法转换），真正的会话由 worker 创建——accept 线程绝不建立会话。
+            let mut machine = lock(&self.engine_state);
+            let _ = machine.begin_loading();
+            return Ok(());
+        }
+        {
+            // 仍然缺失：刷新状态机里的清单（`Blocked → Blocked`），
+            // 这样 `/api/status` 与 409 的 `detail` 不会各说一套。
+            let mut machine = lock(&self.engine_state);
+            let _ = machine.models_still_missing(blocking);
+        }
+        Err(self.models_missing_error())
+    }
+
+    /// `POST /api/models/download`（§4.2）。
+    ///
+    /// 请求体里**只有** `set_id`（§7.2 禁止 URL）。集合严格按 id 解析：未知 id → 404
+    /// `model_set_not_found`（并列出已知集合），**没有** `sets[0]` 回落。
+    /// 两处同步拒绝都给出**两个数值**（§6.2 的预算、§6.5 的磁盘空间）。
     pub fn submit_download(&self, set_id: &str) -> Result<Value, ServeError> {
         if !self.allow_download {
             return Err(ServeError::DownloadsDisabled);
         }
-        let report = self.models();
-        let Some(status) = report
-            .statuses()
-            .iter()
-            .find(|status| status.set_id == set_id)
-        else {
-            return Err(ServeError::BadRequest);
-        };
-        // §6.2：已知大小的缺失文件之和超过 `--max-download-mb` 时，在**发请求之前**拒绝
-        // （`DownloadBudget` 是库侧唯一的额度表示；M2 的下载器按剩余额度逐文件递减）。
-        let budget = self.limits.download_budget();
-        if status
-            .download_bytes_total
-            .is_some_and(|total| total > budget.total_bytes())
-        {
-            return Err(ServeError::PayloadTooLarge);
+        if self.model_plan.set_by_id(set_id).is_none() {
+            return Err(ServeError::ModelSetNotFound {
+                set_id: set_id.to_string(),
+                known: self.model_plan.set_ids(),
+            });
         }
+        let pending = self
+            .models()
+            .pending_download(set_id)
+            .unwrap_or(PendingDownload {
+                files: 0,
+                bytes: Some(0),
+            });
+        let budget_bytes = self.limits.download_budget().total_bytes();
+        // §6.2：已知总量超过 `--max-download-mb` → 在**发请求之前**拒绝。
+        // 错误类型就是库的分类（413 `payload_too_large`，`detail` 里两个数值），
+        // 因此同步拒绝与任务内的失败是同一套表示。
+        if let Some(total) = pending.bytes
+            && total > budget_bytes
+        {
+            return Err(ServeError::Download(DownloadError::TooLarge {
+                limit_bytes: budget_bytes,
+                observed_bytes: Some(total),
+            }));
+        }
+        // §6.5：任务级磁盘核算。未知体积按 `--max-download-mb` 计入（宁可提前拒绝，
+        // 也不要在写到一半时才发现空间不够）。
+        let required = pending.bytes.unwrap_or(budget_bytes);
+        let available = (self.free_space)(self.model_plan.model_dir())?;
+        if available < required {
+            return Err(ServeError::InsufficientDiskSpace {
+                required_bytes: required,
+                available_bytes: available,
+            });
+        }
+
         let id = {
             let mut state = lock(&self.jobs);
             let id = state.ids.generate();
-            // 下载任务不属于双队列（§8.1 的独立 channel）；`JobStore` 要求一个队列类别，
-            // 这里给 `Text` 并保持 `position=None`——它不会出现在任何队列里。
+            // 下载任务不属于双队列（§8.1 的独立 channel）：`JobQueue::Download` 是中性类别，
+            // `position` 永远是 `null`（见 `JobQueue` 的文档）。
             state.store.insert(
                 id.clone(),
                 JobKind::ModelDownload,
-                QueueClass::Text,
+                JobQueue::Download,
                 0,
                 monotonic_ms(),
+            )?;
+            state.store.set_download_progress(
+                &id,
+                DownloadProgress::planned(pending.files, pending.bytes),
             )?;
             id
         };
@@ -453,8 +602,15 @@ impl ServeShared {
             Ok(()) => Ok(json!({
                 "job_id": id,
                 "kind": JobKind::ModelDownload.name(),
-                "queue": "download",
+                "queue": JobQueue::Download.name(),
                 "state": JobLifecycle::Queued.name(),
+                "download": {
+                    "files_done": 0,
+                    "files_total": pending.files,
+                    "bytes_done": 0,
+                    "bytes_total": pending.bytes,
+                    "current_file": Value::Null,
+                },
             })),
             Err(error) => {
                 // 有界 channel 满 → 与 OCR 队列满同语义（503 busy），并回收任务。
@@ -505,12 +661,21 @@ impl ServeShared {
         }
     }
 
-    /// `POST /api/jobs/{id}/cancel`（§4.3）。
+    /// `POST /api/jobs/{id}/cancel`（§4.3 与 §6.6）。
+    ///
+    /// 排队中 → 立即取消（并从调度器/待处理原图里移除）；运行中的**下载** → 登记取消请求
+    /// （状态仍是 `running`，视图里的 `cancel_requested` 为 `true`，worker 在文件边界兑现）；
+    /// 运行中的 OCR 与终态 → 409 `not_cancellable`。
     pub fn cancel_job(&self, id: &str) -> Result<Value, ServeError> {
         let mut state = lock(&self.jobs);
-        let class = state.store.cancel(id, monotonic_ms())?;
-        state.scheduler.remove(class, id);
-        state.pending.remove(id);
+        let outcome = state.store.cancel(id, monotonic_ms())?;
+        if outcome == CancelOutcome::Cancelled {
+            let queue = state.store.record(id)?.queue;
+            if let Some(class) = queue.class() {
+                state.scheduler.remove(class, id);
+            }
+            state.pending.remove(id);
+        }
         state.sync_positions();
         let view = state.store.view(id, monotonic_ms())?;
         Ok(serde_json::to_value(view).expect("JobView serialization cannot fail"))
@@ -521,10 +686,78 @@ impl ServeShared {
         lock(&self.jobs).store.start(id, monotonic_ms())
     }
 
-    /// 下载 worker 用：`Running → Failed` 并记录原因。
-    pub(super) fn fail_download(&self, id: &str, reason: impl Into<String>) {
+    /// 关闭时放弃一条还没开始的下载命令（§4.3：排队中的任务取消是可靠的）。
+    ///
+    /// M1 在这里调的是 `fail`，但任务此刻是 `Queued` → `Running → Failed` 会被存储拒绝，
+    /// 任务于是永远停在 `queued`。虽然进程马上退出、没人会看见，但那是"看起来对"而不是"对"。
+    pub(super) fn abandon_download(&self, id: &str) {
         let mut state = lock(&self.jobs);
-        let _ = state.store.fail(id, reason, monotonic_ms());
+        let _ = state.store.cancel(id, monotonic_ms());
+    }
+
+    /// 下载 worker 用：`Running → Failed`，原因与分类都来自**同一个** `ServeError`
+    /// （因此 507/413/502 的 `code` 与 `detail` 里的两个数值不会被压成字符串）。
+    pub(super) fn finish_download_failed(&self, id: &str, error: ServeError) {
+        let mut state = lock(&self.jobs);
+        let _ = state
+            .store
+            .fail_classified(id, JobFailure::from(&error), monotonic_ms());
+    }
+
+    /// 下载 worker 用：`Running → Succeeded`（下载产物不是保留结果，因此结果字节为 0）。
+    pub(super) fn finish_download_ok(&self, id: &str) {
+        let mut state = lock(&self.jobs);
+        let _ = state.store.succeed(id, 0, monotonic_ms());
+    }
+
+    /// 下载 worker 用：`Running → Cancelled`（§4.3 的 `running → cancelled` 边）。
+    ///
+    /// 库只在观察者**在文件边界返回 `false`** 时产生 `DownloadError::Cancelled`；万一出现
+    /// "取消结论先到、请求登记后到"的竞态，这里把请求补登记，绝不让任务停在 `running`。
+    pub(super) fn finish_download_cancelled(&self, id: &str) {
+        let mut state = lock(&self.jobs);
+        if !state.store.is_cancel_requested(id) {
+            let _ = state.store.cancel(id, monotonic_ms());
+        }
+        let _ = state.store.finish_cancelled(id, monotonic_ms());
+    }
+
+    /// 下载 worker 用：登记/刷新进度（§4.3 的作业形状）。
+    pub(super) fn set_download_progress(&self, id: &str, progress: DownloadProgress) {
+        let mut state = lock(&self.jobs);
+        let _ = state.store.set_download_progress(id, progress);
+    }
+
+    /// 下载 worker 用：是否已经收到取消请求（§6.6 的唯一检查点）。
+    pub(super) fn is_cancel_requested(&self, id: &str) -> bool {
+        lock(&self.jobs).store.is_cancel_requested(id)
+    }
+
+    /// 下载 worker 用：一次下载任务的全部输入。
+    ///
+    /// host 允许列表在这里**显式**拼出来（编译期白名单 ∪ `--allow-download-host`）：
+    /// 传递给库的是参数，`ALLOWED_DOWNLOAD_HOSTS` 这个常量一个字都没变（§6.1 第 3 条）。
+    pub(super) fn download_job(&self, set_id: &str) -> Option<DownloadJob<'_>> {
+        let set = self.model_plan.set_by_id(set_id)?;
+        let (connect_timeout, read_timeout) = download::default_timeouts();
+        Some(DownloadJob {
+            set,
+            root: self.model_plan.model_dir(),
+            budget_bytes: self.limits.max_download_bytes,
+            connect_timeout,
+            read_timeout,
+            allowed_hosts: self.effective_download_hosts(),
+        })
+    }
+
+    /// 下载 worker 用：某个集合待下载文件的规模（进度起点的唯一口径）。
+    pub(super) fn pending_download(&self, set_id: &str) -> Option<PendingDownload> {
+        self.models().pending_download(set_id)
+    }
+
+    /// 已知集合 id（未知 `set_id` 的错误里给出它，便于定位）。
+    pub(super) fn known_set_ids(&self) -> Vec<String> {
+        self.model_plan.set_ids()
     }
 
     /// OCR worker 用：取走待处理的原图。
@@ -535,27 +768,162 @@ impl ServeShared {
     /// OCR worker 用：登记终态载荷并结算任务状态。
     fn finish(&self, job_id: &str, outcome: Outcome) {
         let now = monotonic_ms();
-        let failure = match &outcome {
-            Outcome::Succeeded(_) => None,
-            Outcome::Failed(_, body) => Some(body.message.clone()),
-        };
-        let bytes = outcome.bytes();
         let mut state = lock(&self.jobs);
+        let bytes = outcome.bytes();
+        // 失败分类与 `/result` 上重放的是**同一份**状态码与错误体（不再压成一句文本）。
+        let failure = match &outcome {
+            Outcome::Failed(status, body) => Some(JobFailure::from_body(*status, body)),
+            Outcome::Succeeded(_) => None,
+        };
         if !state.results.insert(job_id, outcome) {
-            let _ = state
-                .store
-                .fail(job_id, "the result store is full", monotonic_ms());
+            let _ = state.store.fail(job_id, "the result store is full", now);
             return;
         }
         match failure {
             None => {
                 let _ = state.store.succeed(job_id, bytes, now);
             }
-            Some(message) => {
-                let _ = state.store.fail(job_id, message, now);
+            Some(failure) => {
+                let _ = state.store.fail_classified(job_id, failure, now);
             }
         }
     }
+
+    /// 惰性创建 / 显式重建引擎（§7.6）。
+    ///
+    /// 这就是 `EngineStateMachine::{begin_loading, models_still_missing}` 的**生产者**：
+    ///
+    /// - 模型齐备 → `Loading → Ready|Failed`（真实建立会话；`Loading` 期间 `engine_state`
+    ///   的锁**不被持有**，因此 `/api/status` 能看到 `loading`，新 OCR 请求排队而不被拒绝）；
+    /// - 模型仍缺失 → 保持 `blocked_models_missing` 并刷新缺失清单（`models_still_missing`）；
+    /// - `force = false`（`POST /api/ocr` 的惰性路径）在已经 `Ready` 且引擎在场时立即返回，
+    ///   `force = true`（`POST /api/engine/reload`）即使已 `Ready` 也重新建立会话
+    ///   （用户的显式意图是"按磁盘上的当前文件重新加载"）。
+    fn ensure_engine_loaded(&self, force: bool) -> EngineLoad {
+        if !force
+            && matches!(self.engine_state(), EngineState::Ready { .. })
+            && lock(&self.engine).is_some()
+        {
+            return EngineLoad::Ready;
+        }
+        // 一次只允许一个加载者（惰性路径与 reload 可能同时到达）。
+        let _loading = lock(&self.engine_load);
+        if !force
+            && matches!(self.engine_state(), EngineState::Ready { .. })
+            && lock(&self.engine).is_some()
+        {
+            return EngineLoad::Ready;
+        }
+
+        let blocking = self.models().blocking_names();
+        {
+            let mut machine = lock(&self.engine_state);
+            if matches!(machine.state(), EngineState::Loading) {
+                // `submit_ocr` 的惰性准入已经把它推进了 `Loading`：不再转换，
+                // 但如果在这之后文件消失了，必须如实报失败（`Loading → Failed`）。
+                if !blocking.is_empty() {
+                    let _ = machine.load_failed(missing_models_reason(&blocking));
+                    return EngineLoad::Failed;
+                }
+            } else if blocking.is_empty() {
+                if machine.begin_loading().is_err() {
+                    return EngineLoad::Failed;
+                }
+            } else if matches!(machine.state(), EngineState::BlockedModelsMissing { .. }) {
+                // 仍然缺失：刷新清单，状态保持 `blocked_models_missing`。
+                let _ = machine.models_still_missing(blocking);
+                return EngineLoad::BlockedModelsMissing;
+            } else {
+                // `Ready`/`Failed` 无法合法进入 `BlockedModelsMissing`（§7.6 的转换表）：
+                // 如实报 `Failed` 并点名缺哪些文件，而不是模糊的"引擎不可用"。
+                if machine.begin_loading().is_err() {
+                    return EngineLoad::Failed;
+                }
+                let _ = machine.load_failed(missing_models_reason(&blocking));
+                return EngineLoad::Failed;
+            }
+        }
+
+        // 建立会话期间**不持有** `engine_state`（见方法文档）。
+        let started = Instant::now();
+        let mut config = self.plan.engine.clone();
+        let result = match self.model_plan.pin_engine_paths(&mut config) {
+            Ok(()) => (self.engine_factory)(&config),
+            Err(error) => Err(RapidOcrError::ModelResolve(error.to_string())),
+        };
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let mut provider: Option<BackendProvider> = None;
+        let mut reason: Option<String> = None;
+        {
+            let mut engine = lock(&self.engine);
+            // 旧引擎先丢弃：`Failed` 状态下留着一个可用引擎只会让状态与事实不一致。
+            *engine = None;
+            match result {
+                Ok(backend) => {
+                    provider = Some(backend.provider());
+                    *engine = Some(backend);
+                }
+                Err(error) => reason = Some(error.to_string()),
+            }
+        }
+        *lock(&self.engine_load_ms) = Some(elapsed_ms);
+
+        let mut machine = lock(&self.engine_state);
+        match (provider, reason) {
+            (Some(provider), _) => {
+                let _ = machine.load_succeeded(
+                    self.plan.requested_label(),
+                    provider.selected_ep,
+                    provider.fallback_to_cpu,
+                );
+                EngineLoad::Ready
+            }
+            (None, Some(reason)) => {
+                let _ = machine.load_failed(reason);
+                EngineLoad::Failed
+            }
+            (None, None) => {
+                let _ = machine.load_failed("the engine factory returned no backend");
+                EngineLoad::Failed
+            }
+        }
+    }
+
+    /// `POST /api/engine/reload`（§4.2、§7.6）。
+    ///
+    /// 响应体里的 `engine` 与 `/api/status` 的 `engine` **是同一个值**（冻结的
+    /// `EngineState` 形状），因此"模型仍缺失"时客户端读到的是
+    /// `{"state":"blocked_models_missing","missing":[…]}`——**不是**一句模糊的失败。
+    /// `missing`/`corrupt` 与 `/api/models` 同源同值；`load_ms` 是**本次** reload 的墙钟耗时
+    /// （`/api/status` 的 `engine_load_ms` 是上一次真正建立会话的耗时）。
+    pub fn reload_engine(&self) -> Value {
+        let started = Instant::now();
+        let outcome = self.ensure_engine_loaded(true);
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let report = self.models();
+        let outcome_label = match outcome {
+            EngineLoad::Ready => "ready",
+            EngineLoad::BlockedModelsMissing => "blocked_models_missing",
+            EngineLoad::Failed => "failed",
+        };
+        json!({
+            "outcome": outcome_label,
+            "engine": self.engine_state(),
+            "missing": report.missing_names(),
+            "corrupt": report.corrupt_names(),
+            "source": source_label(self.model_plan.source()),
+            "model_dir": REDACTED_MODEL_DIR,
+            "load_ms": elapsed_ms,
+        })
+    }
+}
+
+/// 模型缺失/损坏时的引擎失败说明（点名文件，可定位）。
+fn missing_models_reason(blocking: &[String]) -> String {
+    format!(
+        "the model files are missing or corrupt, so no session can be created: {}",
+        blocking.join(", ")
+    )
 }
 
 /// HTTP 层的响应体（状态码 + Content-Type + 字节）。
@@ -632,9 +1000,12 @@ impl ServeRuntime {
             page: context.page,
             nonce: context.nonce,
             allow_download: context.allow_download,
+            allow_download_hosts: context.allow_download_hosts,
             routing: context.routing,
             engine_state: Mutex::new(machine),
             engine: Mutex::new(backend),
+            engine_load: Mutex::new(()),
+            engine_load_ms: Mutex::new(None),
             jobs: Mutex::new(JobState {
                 store: JobStore::new(JobStoreLimits::from_limits(&context.limits)),
                 scheduler: DualQueueScheduler::new(SchedulerConfig::from_limits(&context.limits)),
@@ -647,6 +1018,9 @@ impl ServeRuntime {
             }),
             queue_signal: Condvar::new(),
             download_tx,
+            engine_factory: context.engine_factory,
+            downloader: context.downloader,
+            free_space: context.free_space,
             shutting_down: AtomicBool::new(false),
         });
 
@@ -657,8 +1031,9 @@ impl ServeRuntime {
         }
         {
             let runtime = Arc::clone(&shared);
+            let downloader = Arc::clone(&shared.downloader);
             workers.push(spawn("serve-download", move || {
-                download::worker(runtime, download_rx)
+                download::worker(runtime, download_rx, downloader)
             })?);
         }
         {
@@ -724,6 +1099,10 @@ fn load_engine(context: &ServeContext) -> (EngineStateMachine, Option<Box<dyn Oc
 }
 
 /// OCR worker：**恰好一个**（引擎 `&mut self`，§8.2）。
+///
+/// 取出任务后先确保引擎在场（M2 的惰性创建：`POST /api/ocr` 只把状态推进 `Loading`，
+/// 会话在这里建立，accept 线程绝不建立会话）。建不起来时任务以**同一份**错误映射失败
+/// （409 `models_missing` + 与 `/api/models` 同源同值的清单 / 503 `engine_unavailable` + reason）。
 fn ocr_worker(runtime: Arc<ServeShared>) {
     while !runtime.is_shutting_down() {
         let Some(scheduled) = next_scheduled(&runtime) else {
@@ -737,7 +1116,16 @@ fn ocr_worker(runtime: Arc<ServeShared>) {
             );
             continue;
         };
-        let outcome = recognize(&runtime, &scheduled.id, pending);
+        let outcome = match runtime.ensure_engine_loaded(false) {
+            EngineLoad::Ready => recognize(&runtime, &scheduled.id, pending),
+            EngineLoad::BlockedModelsMissing => runtime.models_missing_outcome(),
+            EngineLoad::Failed => {
+                let reason = runtime
+                    .engine_failure_reason()
+                    .unwrap_or_else(|| "the OCR engine could not be created".to_string());
+                failure(503, "engine_unavailable", reason)
+            }
+        };
         runtime.finish(&scheduled.id, outcome);
     }
 }
