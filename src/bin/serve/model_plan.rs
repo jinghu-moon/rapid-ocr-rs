@@ -19,11 +19,18 @@
 //!
 //! 这样"引擎要加载的文件"与"`/api/models` 报告状态的文件"在结构上就是同一份清单。
 //!
-//! # M1 只解析文本管线
+//! # 两条管线的 role 组（M4）
 //!
-//! §10.8 冻结"公式路由默认关闭"，且 `serve` 的 CLI 面（§3）没有公式模型选项，
-//! 因此本模块只请求文本管线的 role（detector + recognizer + dictionary，
-//! `global.use_cls` 为真时再加 classifier）。公式模型集属于 M4。
+//! 本模块请求 `ModelRequest::text_and_formula`：文本管线的 role（detector + recognizer +
+//! dictionary，`global.use_cls` 为真时再加 classifier）**与**公式管线的 role
+//! （`formula_recognizer`）。这与库的 `ModelRequest::required_roles()` 是**同一份**定义，
+//! 因此"哪些 role 属于哪条管线"只有一处实现。
+//!
+//! 关键推论（M4 的核心修复）：就绪判定必须**按 role 组**进行，而不是"所有集合的并集"。
+//! 公式模型文件（566 MB，默认不下载）缺失绝不能让文本引擎进入
+//! `BlockedModelsMissing`——那会让普通 OCR 返回 409。因此本模块提供两组独立结论：
+//! 文本组（引擎状态机与 `/api/ocr` 的 409 用它）与公式组（公式队列与 `/api/models`
+//! 的 `formula` 块用它）。页面也按 `files[].role` 分组，两边判据一致。
 
 use std::path::{Path, PathBuf};
 
@@ -34,10 +41,37 @@ use rapid_ocr_rs::{
 
 use super::state::ModelReadiness;
 
+/// 一条管线（§8.1 的双队列各自需要哪些 role）。
+///
+/// 判定**只按 role**，不按"集合 id"或集合在响应里的顺序：本地清单只产生一个集合、
+/// 默认表产生两个，同一条规则（见 [`Pipeline::of`]）在两种来源下都必须成立。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Pipeline {
+    Text,
+    Formula,
+}
+
+impl Pipeline {
+    /// 某个 role 属于哪条管线（**唯一**实现，与库的
+    /// `ModelRequest::{text_roles, formula_roles}` 是同一个划分）。
+    pub fn of(role: ModelRole) -> Self {
+        match role {
+            ModelRole::FormulaDetector | ModelRole::FormulaRecognizer => Self::Formula,
+            ModelRole::Detector
+            | ModelRole::Classifier
+            | ModelRole::Recognizer
+            | ModelRole::Dictionary
+            | ModelRole::Tokenizer => Self::Text,
+        }
+    }
+}
+
 /// 一个"阻塞就绪"的模型文件：缺失或损坏。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BlockingFile {
     pub name: String,
+    /// 它在哪条管线里（分组依据；见 [`Pipeline`]）。
+    pub pipeline: Pipeline,
     /// `true` = 存在但哈希/内容不对（§5.2 的 `Corrupt`），文案与退出行为都不同。
     pub corrupt: bool,
 }
@@ -66,18 +100,26 @@ impl ModelPlan {
             }
         }
 
-        let request = ModelRequest::text_only(selection(engine));
+        // M4：清单必须同时覆盖文本与公式两条管线（`/api/models` 要把公式集合报告出来，
+        // 页面才能显示它的体积并按用户点击下载）。缺少 role 时由库的
+        // `ModelSet::require_roles` 报"缺哪些 role"，不静默降级（§5.3）。
+        let request = ModelRequest::text_and_formula(selection(engine));
         let sets = source
             .model_sets(&request)
             .map_err(ModelPlanError::Source)?;
         if sets.is_empty() {
             return Err(ModelPlanError::NoSets);
         }
-        Ok(Self {
+        let plan = Self {
             model_dir: model_dir.to_path_buf(),
             source: source.kind(),
             sets,
-        })
+        };
+        // 公式识别模型是公式队列的**必需**文件（`ModelRequest::formula_roles`），
+        // 这里立刻解析一次，让"公式集合声明了同一 role 的两个不同文件"这类
+        // 结构性错误在**启动期**就带上管线信息报出来，而不是等到第一次公式请求。
+        plan.formula_recognizer()?;
+        Ok(plan)
     }
 
     pub fn source(&self) -> ModelSourceKind {
@@ -104,9 +146,11 @@ impl ModelPlan {
 
     /// 每个集合的逐文件状态（§5.2 的唯一实现是库里的 `validate_model_files`）。
     ///
-    /// **每次调用都会重新读盘并重新哈希**（模型文件 10–30 MB，一次约 10–100 ms）：
+    /// **每次调用都会重新读盘并重新哈希**（文本模型 10–30 MB，公式模型约 566 MB）：
     /// `/api/models` 与 `/api/ocr` 的 409 因此总是报告磁盘上的**当前**事实，而不是启动时的
-    /// 快照（M2 下载完成后页面必须看到 `present`），两者也就必然一致。
+    /// 快照（M2 下载完成后页面必须看到 `present`），两者也就必然一致。请求路径上**不**调它
+    /// （公式队列的准入用 [`Self::missing_on_disk`] 的廉价存在性检查，哈希在识别器加载时
+    /// 由库用 `expected_model_sha256` 完成）。
     pub fn report(&self) -> ModelReport {
         ModelReport {
             statuses: self
@@ -117,12 +161,35 @@ impl ModelPlan {
         }
     }
 
-    /// 启动期快照：引擎状态机的输入（§7.6 第 3 步）。
+    /// 某个管线里**磁盘上不存在**的文件名（只 `stat`，**不哈希**）。
+    ///
+    /// 这是"请求路径上的廉价预检"：真正的权威判定是库在加载文件时用集合声明的
+    /// SHA-256 做的校验（`FormulaRecognizer::from_model_with_hash`）。两者分工明确：
+    /// 这里回答"要不要现在就去下载"，那里回答"下到的东西对不对"。
+    pub fn missing_on_disk(&self, pipeline: Pipeline) -> Vec<String> {
+        let mut out = Vec::new();
+        for set in &self.sets {
+            for file in &set.files {
+                if Pipeline::of(file.role) != pipeline {
+                    continue;
+                }
+                if !self.model_dir.join(&file.name).is_file() {
+                    out.push(file.name.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// 启动期快照：引擎状态机的输入（§7.6 第 3 步）。**引擎只看文本管线**。
     pub fn snapshot(&self) -> ModelSnapshot {
+        // `report()` 会读盘并哈希（公式模型约 566 MB），因此只算一次。
+        let report = self.report();
         ModelSnapshot {
             model_dir: self.model_dir.clone(),
             source: self.source,
-            blocking: blocking_files(&self.report().statuses),
+            blocking: blocking_files(report.statuses(), Pipeline::Text),
+            formula_blocking: blocking_files(report.statuses(), Pipeline::Formula),
         }
     }
 
@@ -157,46 +224,91 @@ impl ModelPlan {
 
     /// 某个 role 在模型集里的绝对路径。
     ///
-    /// M1 只请求一条管线，因此每个 role 至多出现在一个集合里；重复出现（两个集合声明同一
-    /// role 的不同文件）会返回可定位错误，而不是"悄悄用第一个"。
+    /// 每个 role 必须**唯一**地映射到一个文件：重复出现（两个集合声明同一 role 的不同文件，
+    /// 或同一个清单里声明两次）会返回 [`ModelPlanError::AmbiguousRole`]，而不是"悄悄用第一个"。
+    /// 公式识别模型走的是**同一个**函数，因此歧义判定只有一份实现。
     fn file_for(&self, role: ModelRole) -> Result<PathBuf, ModelPlanError> {
-        let mut found: Option<&str> = None;
+        let spec = self
+            .spec_for(role)?
+            .ok_or(ModelPlanError::MissingRole { role })?;
+        Ok(self.model_dir.join(&spec.name))
+    }
+
+    /// 某个 role 在模型集里的文件描述（`None` = 该 role 没有被任何集合声明）。
+    ///
+    /// [`Self::file_for`] 的共享实现：两者都经这里做"重复声明 → `AmbiguousRole`"的判定。
+    fn spec_for(
+        &self,
+        role: ModelRole,
+    ) -> Result<Option<&rapid_ocr_rs::ModelFileSpec>, ModelPlanError> {
+        let mut found: Option<&rapid_ocr_rs::ModelFileSpec> = None;
         for set in &self.sets {
             for file in &set.files {
                 if file.role != role {
                     continue;
                 }
                 match found {
-                    None => found = Some(file.name.as_str()),
-                    Some(existing) if existing == file.name => {}
+                    None => found = Some(file),
+                    Some(existing) if existing.name == file.name => {}
                     Some(existing) => {
                         return Err(ModelPlanError::AmbiguousRole {
                             role,
-                            first: existing.to_string(),
+                            first: existing.name.clone(),
                             second: file.name.clone(),
                         });
                     }
                 }
             }
         }
-        let name = found.ok_or(ModelPlanError::MissingRole { role })?;
-        Ok(self.model_dir.join(name))
+        Ok(found)
+    }
+
+    /// 公式识别模型（路径 + 集合声明的 SHA-256）。
+    ///
+    /// 它是公式队列的必需文件（`ModelRequest::formula_roles`），因此缺失是可定位的启动期
+    /// 错误；`expected_model_sha256` 由集合给出，加载时由库校验——这就是"下到的东西对不对"
+    /// 的权威判定。歧义（同一 role 两个文件）在这里同样被拒绝。
+    pub fn formula_recognizer(&self) -> Result<(PathBuf, String), ModelPlanError> {
+        let role = ModelRole::FormulaRecognizer;
+        let spec = self
+            .spec_for(role)?
+            .ok_or(ModelPlanError::MissingRole { role })?;
+        Ok((self.model_dir.join(&spec.name), spec.sha256.clone()))
+    }
+
+    /// 公式检测模型（`formula_detector` role）。
+    ///
+    /// 它在 `FormulaPolicy` 里是**可选**的（默认表不把它登记为集合成员：没有可信的公开
+    /// 下载来源），因此 `None` 是正常结果，不是错误；但一旦集合声明了它，就只认集合里的
+    /// 那一个文件（不静默回落到别的路径）。
+    pub fn formula_detector(&self) -> Result<Option<PathBuf>, ModelPlanError> {
+        Ok(self
+            .spec_for(ModelRole::FormulaDetector)?
+            .map(|spec| self.model_dir.join(&spec.name)))
     }
 }
 
-/// 缺失/损坏文件的有序清单（启动期快照与 `/api/models` 的**同一实现**）。
-pub(super) fn blocking_files(statuses: &[ModelSetStatus]) -> Vec<BlockingFile> {
+/// 某个管线里缺失/损坏文件的有序清单（启动期快照与 `/api/models` 的**同一实现**）。
+///
+/// 按 `files[].role` 分组（[`Pipeline::of`]），不按集合：默认表把两条管线放在两个集合里，
+/// 本地清单把两条管线放在**一个**集合里，两种来源下结论必须一样。
+pub(super) fn blocking_files(statuses: &[ModelSetStatus], pipeline: Pipeline) -> Vec<BlockingFile> {
     let mut out = Vec::new();
     for status in statuses {
         for (file, state) in &status.files {
+            if Pipeline::of(file.role) != pipeline {
+                continue;
+            }
             match state {
                 ModelFileState::Present => {}
                 ModelFileState::Missing => out.push(BlockingFile {
                     name: file.name.clone(),
+                    pipeline,
                     corrupt: false,
                 }),
                 ModelFileState::Corrupt { .. } => out.push(BlockingFile {
                     name: file.name.clone(),
+                    pipeline,
                     corrupt: true,
                 }),
             }
@@ -252,35 +364,96 @@ impl ModelReport {
             .map(pending_download)
     }
 
-    /// 缺失文件的文件名（按集合与声明顺序）。
+    /// 文本管线缺失文件的文件名（按集合与声明顺序）。这是**引擎**看的那一份：
+    /// `/api/ocr` 的 409 与 `EngineState::BlockedModelsMissing` 都用它。
     pub fn missing_names(&self) -> Vec<String> {
-        self.blocking()
+        self.blocking(Pipeline::Text)
             .into_iter()
             .filter(|file| !file.corrupt)
             .map(|file| file.name)
             .collect()
     }
 
-    /// 损坏文件的文件名（顺序同上）。
+    /// 文本管线损坏文件的文件名（顺序同上）。
     pub fn corrupt_names(&self) -> Vec<String> {
-        self.blocking()
+        self.blocking(Pipeline::Text)
             .into_iter()
             .filter(|file| file.corrupt)
             .map(|file| file.name)
             .collect()
     }
 
-    /// 缺失 ∪ 损坏（引擎看两者都不可用）。
+    /// 文本管线的缺失 ∪ 损坏（引擎看两者都不可用）。
     pub fn blocking_names(&self) -> Vec<String> {
-        self.blocking().into_iter().map(|file| file.name).collect()
+        self.blocking(Pipeline::Text)
+            .into_iter()
+            .map(|file| file.name)
+            .collect()
     }
 
+    /// 文本管线是否齐备（**不是**"所有集合都齐备"：公式集合的 566 MB 模型缺失
+    /// 绝不能让普通 OCR 变成 409，见模块文档）。
+    ///
+    /// 齐备 = 文本管线的**每个**文件都 `Present` **且**声明了哈希（§5.2：没有哈希的文件
+    /// 只能证明"存在"，因此该集合永远不得报 `complete`）。
     pub fn is_complete(&self) -> bool {
-        self.statuses.iter().all(|status| status.complete)
+        self.pipeline_complete(Pipeline::Text)
     }
 
-    fn blocking(&self) -> Vec<BlockingFile> {
-        blocking_files(&self.statuses)
+    /// 公式管线缺失文件的文件名。
+    pub fn formula_missing_names(&self) -> Vec<String> {
+        self.blocking(Pipeline::Formula)
+            .into_iter()
+            .filter(|file| !file.corrupt)
+            .map(|file| file.name)
+            .collect()
+    }
+
+    /// 公式管线损坏文件的文件名。
+    pub fn formula_corrupt_names(&self) -> Vec<String> {
+        self.blocking(Pipeline::Formula)
+            .into_iter()
+            .filter(|file| file.corrupt)
+            .map(|file| file.name)
+            .collect()
+    }
+
+    /// 公式管线的缺失 ∪ 损坏。
+    pub fn formula_blocking_names(&self) -> Vec<String> {
+        self.blocking(Pipeline::Formula)
+            .into_iter()
+            .map(|file| file.name)
+            .collect()
+    }
+
+    /// 公式管线是否齐备（页面用它决定公式开关是否可勾选）。
+    pub fn formula_complete(&self) -> bool {
+        self.pipeline_complete(Pipeline::Formula)
+    }
+
+    /// 某条管线是否齐备：文件都在、且都声明了哈希（§5.2）。
+    ///
+    /// 与 [`Self::blocking`] 的分工：`blocking` 回答"缺哪些/坏哪些"（给用户看的清单），
+    /// 这里回答"够不够用"（给门禁用的结论）。没有哈希的文件不会出现在 `blocking` 里，
+    /// 但它让结论永远不是"齐备"——这正是 §5.2 那条规则的落点。
+    fn pipeline_complete(&self, pipeline: Pipeline) -> bool {
+        let mut seen = false;
+        for status in &self.statuses {
+            for (file, state) in &status.files {
+                if Pipeline::of(file.role) != pipeline {
+                    continue;
+                }
+                seen = true;
+                if !state.is_present() || !file.has_hash() {
+                    return false;
+                }
+            }
+        }
+        seen
+    }
+
+    fn blocking(&self, pipeline: Pipeline) -> Vec<BlockingFile> {
+        blocking_files(&self.statuses, pipeline)
     }
 }
 
@@ -289,7 +462,11 @@ impl ModelReport {
 pub(super) struct ModelSnapshot {
     model_dir: PathBuf,
     source: ModelSourceKind,
+    /// 文本管线（引擎）的缺失/损坏文件。
     blocking: Vec<BlockingFile>,
+    /// 公式管线的缺失/损坏文件（启动日志用；路由开关不依赖它——它只影响
+    /// `queue=formula` 的 409，不影响服务可用性）。
+    formula_blocking: Vec<BlockingFile>,
 }
 
 impl ModelSnapshot {
@@ -297,9 +474,9 @@ impl ModelSnapshot {
         &self.model_dir
     }
 
-    /// 引擎状态机的输入（§7.6 第 3 步）：缺失与损坏都要进 `BlockedModelsMissing`
-    /// 的清单——引擎对两者都不可用，区别只在响应的 `code`（`models_missing` /
-    /// `models_corrupt`）与文案上。
+    /// 引擎状态机的输入（§7.6 第 3 步）：**文本管线**的缺失与损坏都要进
+    /// `BlockedModelsMissing` 的清单——引擎对两者都不可用，区别只在响应的 `code`
+    /// （`models_missing` / `models_corrupt`）与文案上。
     pub fn readiness(&self) -> ModelReadiness {
         if self.blocking.is_empty() {
             ModelReadiness::Complete
@@ -314,13 +491,23 @@ impl ModelSnapshot {
         self.blocking.iter().map(|file| file.name.clone()).collect()
     }
 
+    /// 公式管线启动期缺失/损坏的文件名（日志与诊断用）。
+    pub fn formula_blocking_names(&self) -> Vec<String> {
+        self.formula_blocking
+            .iter()
+            .map(|file| file.name.clone())
+            .collect()
+    }
+
     /// 启动日志用的一行摘要（避免把绝对路径写进响应）。
+    ///
+    /// 两条管线分别给出结论：只报一个总数会让"公式模型没下载"看起来像"引擎起不来"。
     pub fn summary(&self) -> String {
-        if self.blocking.is_empty() {
-            format!("{} model file(s) verified", self.blocking.len())
-        } else {
-            format!("{} model file(s) missing or corrupt", self.blocking.len())
-        }
+        format!(
+            "text pipeline: {} model file(s) missing or corrupt; formula pipeline: {}",
+            self.blocking.len(),
+            self.formula_blocking.len()
+        )
     }
 
     /// `/api/models` 与 409 的 `source` 字段文本（与库的枚举同值）。
@@ -410,20 +597,20 @@ mod tests {
 
     use rapid_ocr_rs::{EngineConfig, ModelRole};
 
-    use super::{ModelPlan, ModelPlanError};
+    use super::{ModelPlan, ModelPlanError, Pipeline};
 
     fn fixture_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/m1-plan-fixture")
     }
 
-    /// 默认表（无 `manifest.json`）下解析出的文本集合：detector + recognizer + dictionary。
+    /// 默认表（无 `manifest.json`）下解析出的**两条**管线：文本集合 + 公式集合。
     #[test]
     fn the_default_table_describes_the_configured_pipeline() {
         let dir = fixture_dir();
         std::fs::create_dir_all(&dir).expect("fixture dir");
         let plan = ModelPlan::resolve(&dir, &EngineConfig::default()).expect("default table");
         let report = plan.report();
-        assert_eq!(report.statuses().len(), 1);
+        assert_eq!(report.statuses().len(), 2, "text set + formula set (M4)");
         let set = &report.statuses()[0];
         let roles: Vec<&str> = set
             .files
@@ -433,7 +620,30 @@ mod tests {
         assert!(roles.contains(&"detector"), "{roles:?}");
         assert!(roles.contains(&"recognizer"), "{roles:?}");
         assert!(roles.contains(&"dictionary"), "{roles:?}");
-        // 空目录 → 全部缺失，且缺失清单顺序与声明顺序一致。
+        // 第二个集合是公式集合：只有 `formula_recognizer`（公式检测模型是可选的，
+        // 默认表不登记它，见 assets/default_models.yaml 的 `formula:` 段注释）。
+        let formula = &report.statuses()[1];
+        let formula_roles: Vec<&str> = formula
+            .files
+            .iter()
+            .map(|(file, _)| file.role.as_str())
+            .collect();
+        assert_eq!(formula_roles, vec!["formula_recognizer"]);
+        assert_eq!(formula.set_id, "PP-FormulaNet_plus-M");
+        let (name, size) = (
+            formula.files[0].0.name.clone(),
+            formula.files[0].0.size_bytes,
+        );
+        assert_eq!(name, "pp_formulanet_plus_m.onnx");
+        assert!(
+            size.is_some_and(|bytes| bytes > 500_000_000),
+            "the page must be able to show the ~566 MB size before downloading: {size:?}"
+        );
+        assert!(formula.files[0].0.has_hash(), "the set declares a SHA-256");
+        assert!(formula.files[0].0.has_source_url(), "and a trusted source");
+        assert!(!formula.complete, "the fixture dir has no formula model");
+
+        // 空目录 → 文本管线全部缺失，且缺失清单顺序与声明顺序一致。
         let snapshot = plan.snapshot();
         let declared: Vec<String> = set
             .files
@@ -448,6 +658,92 @@ mod tests {
             snapshot.readiness(),
             super::ModelReadiness::Incomplete { .. }
         ));
+
+        // 公式管线单独报告（**不影响**上面的引擎结论）。
+        assert_eq!(report.formula_missing_names(), vec![name.clone()]);
+        assert!(!report.formula_complete());
+        assert_eq!(snapshot.formula_blocking_names(), vec![name.clone()]);
+        // 廉价存在性检查与哈希结论在这一场景下一致（空目录）。
+        assert_eq!(plan.missing_on_disk(Pipeline::Formula), vec![name]);
+        assert_eq!(
+            plan.missing_on_disk(Pipeline::Text),
+            set.files
+                .iter()
+                .map(|(file, _)| file.name.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// **M4 的核心不变量**：公式模型缺失绝不能让文本引擎被阻塞。
+    ///
+    /// 模型目录里只有文本管线需要的文件时（内容故意是占位字节 → 哈希不匹配）：
+    /// 文本管线的清单与公式管线的清单**互不混入**，公式的缺失不进引擎的 409 清单。
+    #[test]
+    fn a_missing_formula_model_never_blocks_the_text_pipeline() {
+        let dir = fixture_dir().join("text-only-complete");
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let plan = ModelPlan::resolve(&dir, &EngineConfig::default()).expect("default table");
+
+        // 引擎要加载的文本文件（名字由模型表决定，测试不写死）：把它们以**占位内容**写到
+        // 磁盘上——存在但不是真模型（哈希必然不匹配）。
+        let empty = plan.report();
+        let text_files: Vec<String> = empty
+            .statuses()
+            .iter()
+            .flat_map(|status| status.files.iter())
+            .filter(|(file, _)| Pipeline::of(file.role) == Pipeline::Text)
+            .map(|(file, _)| file.name.clone())
+            .collect();
+        assert_eq!(text_files.len(), 3, "{text_files:?}");
+        for name in &text_files {
+            std::fs::write(dir.join(name), b"placeholder").expect("fixture file");
+        }
+
+        let plan = ModelPlan::resolve(&dir, &EngineConfig::default()).expect("default table");
+        let report = plan.report();
+        // 文本文件都在磁盘上、哈希全部不匹配 → 三个都进 corrupt 清单（而不是 missing）。
+        assert_eq!(report.missing_names(), Vec::<String>::new());
+        assert_eq!(report.corrupt_names(), text_files);
+        assert!(!report.is_complete());
+        // 公式管线：缺失，且**不混进**文本管线的清单。
+        assert_eq!(
+            report.formula_missing_names(),
+            vec!["pp_formulanet_plus_m.onnx"]
+        );
+        assert!(!report.formula_complete());
+        for name in report.blocking_names() {
+            assert!(
+                !name.contains("formula"),
+                "the engine list must stay text-scoped: {name}"
+            );
+        }
+        // 存在性检查（请求路径上的廉价预检）只看磁盘。
+        assert!(plan.missing_on_disk(Pipeline::Text).is_empty());
+        assert_eq!(
+            plan.missing_on_disk(Pipeline::Formula),
+            vec!["pp_formulanet_plus_m.onnx"]
+        );
+        // 引擎状态机因此只看文本清单：公式缺失不进 `BlockedModelsMissing` 的清单。
+        let snapshot = plan.snapshot();
+        assert_eq!(snapshot.blocking_names(), text_files);
+        assert_eq!(
+            snapshot.formula_blocking_names(),
+            vec!["pp_formulanet_plus_m.onnx"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 公式识别模型（路径 + 集合声明的哈希）与可选的公式检测模型。
+    #[test]
+    fn the_formula_roles_resolve_through_the_same_rule() {
+        let dir = fixture_dir();
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let plan = ModelPlan::resolve(&dir, &EngineConfig::default()).expect("default table");
+        let (path, sha256) = plan.formula_recognizer().expect("formula recognizer");
+        assert_eq!(path, dir.join("pp_formulanet_plus_m.onnx"));
+        assert_eq!(sha256.len(), 64, "the set's SHA-256 travels with the path");
+        // 默认表不登记公式检测模型：`None` 是正常结果，不是错误。
+        assert_eq!(plan.formula_detector().expect("optional"), None);
     }
 
     /// det/rec 的 model_type 冲突在默认表下必须报可定位错误，而不是静默选一个。
@@ -493,6 +789,9 @@ mod tests {
     }
 
     /// 缺 role 时给出可定位错误（这里用 manifest 表达"集合里没有 dictionary"）。
+    ///
+    /// M4 起公式识别模型也是必需 role，因此错误里会**同时**列出两个缺失 role
+    /// （`ModelSet::require_roles` 一次列全，而不是只报第一个）。
     #[test]
     fn a_missing_role_is_reported_by_the_shared_rule() {
         let dir = fixture_dir().join("no-dictionary");
@@ -507,6 +806,10 @@ mod tests {
         let error = ModelPlan::resolve(&dir, &EngineConfig::default()).expect_err("must reject");
         let text = error.to_string();
         assert!(text.contains("dictionary"), "{text}");
+        assert!(
+            text.contains("formula_recognizer"),
+            "the formula pipeline's required role must be named too: {text}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -538,7 +841,8 @@ mod tests {
                 "files":[{"name":"det-a.onnx","role":"detector","sha256":"aa"},
                          {"name":"det-b.onnx","role":"detector","sha256":"bb"},
                          {"name":"rec.onnx","role":"recognizer","sha256":"cc"},
-                         {"name":"dict.txt","role":"dictionary","sha256":"dd"}]}"#,
+                         {"name":"dict.txt","role":"dictionary","sha256":"dd"},
+                         {"name":"fx.onnx","role":"formula_recognizer","sha256":"ee"}]}"#,
         )
         .expect("manifest");
         let plan = ModelPlan::resolve(&dir, &EngineConfig::default()).expect("manifest source");
@@ -550,6 +854,39 @@ mod tests {
             error,
             ModelPlanError::AmbiguousRole {
                 role: ModelRole::Detector,
+                ..
+            }
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **M4**：公式识别模型声明了两次（两个文件）时，启动期就拒绝，而不是挑一个。
+    ///
+    /// 这条锁住"公式路径不是 `sets.last()` 或 `files.find(...)` 的随意取值"：
+    /// `file_for` / `spec_for` 是唯一的解析实现，歧义判定因此对公式 role 同样成立。
+    #[test]
+    fn an_ambiguous_formula_recognizer_is_rejected_at_startup() {
+        let dir = fixture_dir().join("ambiguous-formula");
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{"schema_version":1,"id":"t","family":"PP-OCR","version":"v6",
+                "files":[{"name":"det.onnx","role":"detector","sha256":"aa"},
+                         {"name":"rec.onnx","role":"recognizer","sha256":"cc"},
+                         {"name":"dict.txt","role":"dictionary","sha256":"dd"},
+                         {"name":"fx-a.onnx","role":"formula_recognizer","sha256":"ee"},
+                         {"name":"fx-b.onnx","role":"formula_recognizer","sha256":"ff"}]}"#,
+        )
+        .expect("manifest");
+        let error = ModelPlan::resolve(&dir, &EngineConfig::default()).expect_err("must reject");
+        let text = error.to_string();
+        assert!(text.contains("formula_recognizer"), "{text}");
+        assert!(text.contains("fx-a.onnx"), "{text}");
+        assert!(text.contains("fx-b.onnx"), "{text}");
+        assert!(matches!(
+            error,
+            ModelPlanError::AmbiguousRole {
+                role: ModelRole::FormulaRecognizer,
                 ..
             }
         ));

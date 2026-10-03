@@ -33,7 +33,7 @@ use super::security::{
     NonLoopbackBindError, PlaceholderError, ServeToken, TOKEN_PLACEHOLDER,
     assert_no_placeholders_left, generate_nonce, inject,
 };
-use super::server::{OcrRouting, ServeContext};
+use super::server::ServeContext;
 use super::state::{ServeStartup, StartupConfigError};
 
 /// 内联页面的唯一来源（`Temp/demo3-v2.html` 是评审过的原型，**保持不动**）。
@@ -55,6 +55,8 @@ pub(crate) enum ServeStartError {
     Models(ModelPlanError),
     /// 静态页注入契约失败（§9）。
     Page(PageError),
+    /// `--formula-detector` 指向的文件不存在（M4：配置错误在启动期失败）。
+    FormulaDetector { path: std::path::PathBuf },
     /// 运行期无法启动（线程创建失败）。
     Runtime(std::io::Error),
 }
@@ -71,6 +73,13 @@ impl std::fmt::Display for ServeStartError {
             Self::Config(error) => write!(f, "startup configuration rejected: {error}"),
             Self::Models(error) => write!(f, "model inventory rejected: {error}"),
             Self::Page(error) => write!(f, "{error}"),
+            Self::FormulaDetector { path } => write!(
+                f,
+                "--formula-detector {} does not exist (or is not a file); the formula queue needs \
+                 the page formula detection model, and a wrong path must fail at startup instead \
+                 of on the first formula request (docs/05 §4.2)",
+                path.display()
+            ),
             Self::Runtime(error) => write!(f, "cannot start the serve runtime: {error}"),
         }
     }
@@ -168,6 +177,23 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
     let engine_config_min_side = startup.plan.engine.global.min_side_len;
     debug_assert!(engine_config_min_side > 0);
 
+    // M4：公式队列的检测模型。优先级与其它开关一致（CLI > 模型集声明）：
+    // `--formula-detector` 是显式配置，模型集里的 `formula_detector` role（本地清单可以声明）
+    // 是"这个目录自己描述了它"；两者都没有时公式路由不可用（§10.8 默认关闭），
+    // 但**普通 OCR 完全不受影响**。
+    let formula_detector = match args.formula_detector.clone() {
+        Some(path) => {
+            // 启动期就校验它真的存在：一个打错的文件名应该在启动时报出来，
+            // 而不是等到第一次公式请求（§7.6 第 2 步的"配置错误在启动期失败"）。
+            if !path.is_file() {
+                return Err(ServeStartError::FormulaDetector { path });
+            }
+            Some(path)
+        }
+        None => model_plan.formula_detector()?,
+    };
+    let routing = super::server::routing_for(formula_detector.as_deref());
+
     log_startup(
         &args,
         &startup,
@@ -177,6 +203,8 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
         yaml_provider_is_overridden(&args),
         yaml_max_side,
         yaml_provider,
+        &routing,
+        formula_detector.as_deref(),
     );
 
     let port = local.port();
@@ -193,8 +221,10 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
         allow_download_hosts,
         // §7.5：运行期切换 provider 必须沿用启动期的同一个开关值。
         allow_provider_fallback: args.allow_provider_fallback(),
-        // §10.8：M1 的公式路由固定关闭（M4 才会接上真实来源）。
-        routing: OcrRouting::text_only(),
+        // M4：公式路由由"是否配置了页面公式检测模型"唯一决定（§4.2、§10.8）。
+        // 请求侧没有第二个开关：`queue=formula` **就是**公式管线的选择。
+        routing,
+        formula_detector,
         engine_factory: super::engine::real_engine_factory(),
         downloader: super::download::real_downloader_factory(),
         free_space: super::server::real_free_space(),
@@ -292,6 +322,8 @@ fn log_startup(
     provider_overridden: bool,
     yaml_max_side: usize,
     yaml_provider: rapid_ocr_rs::ProviderPreference,
+    routing: &super::server::OcrRouting,
+    formula_detector: Option<&std::path::Path>,
 ) {
     println!(
         "serve: listening on {} (IPv4 loopback only; there is deliberately no --host option)",
@@ -307,6 +339,30 @@ fn log_startup(
         snapshot.model_dir().display(),
         snapshot.source_label(),
         snapshot.summary()
+    );
+    println!(
+        "serve: formula queue {} (formula detector: {}; ordinary OCR is independent of it)",
+        if routing.formula {
+            "enabled by --formula-detector"
+        } else {
+            "disabled (no formula detector configured)"
+        },
+        formula_detector
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string())
+    );
+    let formula_blocking = snapshot.formula_blocking_names();
+    println!(
+        "serve: formula model set {}",
+        if formula_blocking.is_empty() {
+            "complete".to_string()
+        } else {
+            format!(
+                "incomplete: {} (the formula queue returns 409 until it is present; text OCR is \
+                 unaffected)",
+                formula_blocking.join(", ")
+            )
+        }
     );
     println!(
         "serve: provider requested={} (documented default: {DEFAULT_PROVIDER}; {}), \

@@ -53,6 +53,11 @@ pub const DEFAULT_MAX_RETAINED_MB: u64 = 64;
 pub const DEFAULT_MAX_TOMBSTONES: usize = 256;
 /// `--job-ttl-secs`：终态任务与 tombstone 保留时长，默认 600 s。
 pub const DEFAULT_JOB_TTL_SECS: u64 = 600;
+/// `--max-eval-cases`：`POST /api/evaluate` 一张清单最多评估多少张图，默认 32（M4）。
+///
+/// 评估是**批量**动作（每张图一次完整推理），没有上限就等于允许一个请求把单 worker
+/// 占住任意久；32 张足够覆盖本机的小样本评估，也让一次请求的时间有界。
+pub const DEFAULT_MAX_EVAL_CASES: usize = 32;
 /// `--allow-download` 默认关闭（§0.1：模型下载默认关闭、显式触发）。
 pub const DEFAULT_ALLOW_DOWNLOAD: bool = false;
 /// `--allow-provider-fallback` 默认关闭（§7.5：非 cpu provider 默认强制不回退）。
@@ -178,6 +183,8 @@ pub struct RawServeLimits {
     pub max_retained_mb: u64,
     pub max_tombstones: usize,
     pub job_ttl_secs: u64,
+    /// `POST /api/evaluate` 的用例上限（M4，见 [`DEFAULT_MAX_EVAL_CASES`]）。
+    pub max_eval_cases: usize,
 }
 
 impl Default for RawServeLimits {
@@ -196,6 +203,7 @@ impl Default for RawServeLimits {
             max_retained_mb: DEFAULT_MAX_RETAINED_MB,
             max_tombstones: DEFAULT_MAX_TOMBSTONES,
             job_ttl_secs: DEFAULT_JOB_TTL_SECS,
+            max_eval_cases: DEFAULT_MAX_EVAL_CASES,
         }
     }
 }
@@ -224,6 +232,7 @@ impl RawServeLimits {
             max_retained: require_positive_usize("--max-retained", self.max_retained)?,
             max_retained_bytes: mib_to_bytes("--max-retained-mb", self.max_retained_mb)?,
             max_tombstones: require_positive_usize("--max-tombstones", self.max_tombstones)?,
+            max_eval_cases: require_positive_usize("--max-eval-cases", self.max_eval_cases)?,
             job_ttl_ms: require_positive_u64("--job-ttl-secs", self.job_ttl_secs)?
                 .checked_mul(1000)
                 .ok_or_else(|| {
@@ -252,6 +261,8 @@ pub struct ServeLimits {
     pub max_retained_bytes: u64,
     pub max_tombstones: usize,
     pub job_ttl_ms: u64,
+    /// M4：`POST /api/evaluate` 的用例上限（`--max-eval-cases`）。
+    pub max_eval_cases: usize,
 }
 
 impl ServeLimits {
@@ -279,10 +290,10 @@ impl Default for ServeLimits {
 mod tests {
     use super::{
         DEFAULT_JOB_TTL_SECS, DEFAULT_MAX_BODY_MB, DEFAULT_MAX_CONSECUTIVE_FORMULA,
-        DEFAULT_MAX_CONSECUTIVE_TEXT, DEFAULT_MAX_DOWNLOAD_MB, DEFAULT_MAX_EXPORT_MB,
-        DEFAULT_MAX_QUEUE_FORMULA, DEFAULT_MAX_QUEUE_TEXT, DEFAULT_MAX_RESULT_MB,
-        DEFAULT_MAX_RETAINED, DEFAULT_MAX_RETAINED_MB, DEFAULT_MAX_TOMBSTONES, DEFAULT_PORT, MIB,
-        RawServeLimits, ServeLimits,
+        DEFAULT_MAX_CONSECUTIVE_TEXT, DEFAULT_MAX_DOWNLOAD_MB, DEFAULT_MAX_EVAL_CASES,
+        DEFAULT_MAX_EXPORT_MB, DEFAULT_MAX_QUEUE_FORMULA, DEFAULT_MAX_QUEUE_TEXT,
+        DEFAULT_MAX_RESULT_MB, DEFAULT_MAX_RETAINED, DEFAULT_MAX_RETAINED_MB,
+        DEFAULT_MAX_TOMBSTONES, DEFAULT_PORT, MIB, RawServeLimits, ServeLimits,
     };
 
     fn default_limits() -> ServeLimits {
@@ -305,6 +316,7 @@ mod tests {
         assert_eq!(DEFAULT_MAX_RETAINED_MB, 64);
         assert_eq!(DEFAULT_MAX_TOMBSTONES, 256);
         assert_eq!(DEFAULT_JOB_TTL_SECS, 600);
+        assert_eq!(DEFAULT_MAX_EVAL_CASES, 32);
 
         let limits = default_limits();
         assert_eq!(limits.max_body_bytes, 32 * MIB);
@@ -313,6 +325,7 @@ mod tests {
         assert_eq!(limits.max_download_bytes, 1024 * MIB);
         assert_eq!(limits.max_retained_bytes, 64 * MIB);
         assert_eq!(limits.job_ttl_ms, 600_000);
+        assert_eq!(limits.max_eval_cases, 32);
         // §6.2：默认下载上限必须大于 566 MB 的公式模型。
         assert!(limits.max_download_bytes > 566 * 1_000_000);
     }
@@ -464,6 +477,16 @@ mod tests {
             .validate()
             .expect_err("--job-ttl-secs=0 must be rejected");
         assert_eq!(error.field(), "--job-ttl-secs");
+
+        // M4：评估用例上限也是"≥ 1"的取值（0 个用例的评估没有意义）。
+        let eval = RawServeLimits {
+            max_eval_cases: 0,
+            ..Default::default()
+        };
+        let error = eval
+            .validate()
+            .expect_err("--max-eval-cases=0 must be rejected");
+        assert_eq!(error.field(), "--max-eval-cases");
     }
 
     /// TTL 的秒→毫秒换算同样不允许溢出。

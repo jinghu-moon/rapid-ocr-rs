@@ -22,6 +22,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -36,7 +37,9 @@ use super::admit::{
 };
 use super::cli::ProviderChoice;
 use super::error::ServeError;
+use super::evaluate;
 use super::export::ExportFormat;
+use super::queue::QueueClass;
 use super::run::ServeStartError;
 use super::security::{self, SECURITY_HEADERS};
 use super::server::{Body, READ_CHUNK_BYTES, ServeContext, ServeRuntime, ServeShared};
@@ -82,6 +85,8 @@ enum Route {
     ModelsDownload,
     EngineReload,
     Ocr,
+    /// `POST /api/evaluate`（M4）：批量评估一份已标注清单。
+    Evaluate,
     Job(String),
     JobResult(String),
     JobCancel(String),
@@ -101,9 +106,11 @@ impl Route {
             | Self::JobResult(_)
             | Self::JobAnnotated(_)
             | Self::JobExport(_) => HttpMethod::Get,
-            Self::ModelsDownload | Self::EngineReload | Self::Ocr | Self::JobCancel(_) => {
-                HttpMethod::Post
-            }
+            Self::ModelsDownload
+            | Self::EngineReload
+            | Self::Ocr
+            | Self::Evaluate
+            | Self::JobCancel(_) => HttpMethod::Post,
         }
     }
 
@@ -304,13 +311,26 @@ fn handle(shared: &Arc<ServeShared>, mut request: Request) {
                     let serve_error = error
                         .rejected()
                         .expect("a Rejected admission error always carries a ServeError");
-                    let body = error_body(shared, &route, serve_error);
+                    let body = shared.error_body(serve_error);
                     let _ = respond(request, body, &[]);
                 }
             }
             return;
         }
     };
+
+    // §4.4 第 4 步之后、第 6 步（读 body）之前：公式队列的**廉价**模型存在性预检。
+    //
+    // 只 `stat`（公式模型约 566 MB，把它放进每个请求的准入路径会让吞吐崩掉），
+    // 但足以在**读入请求体之前**给出可定位的 409（"先下载它"）；权威的哈希判定发生在
+    // 识别器加载时（模型集声明的 SHA-256）。文本队列不受影响。
+    if matches!(route, Route::Ocr)
+        && class == Some(QueueClass::Formula)
+        && !shared.formula_models_on_disk()
+    {
+        let _ = respond(request, shared.formula_blocked_body(), &[]);
+        return;
+    }
 
     let outcome = dispatch(shared, &mut request, &route, query, &descriptor, admitted);
     match outcome {
@@ -326,8 +346,15 @@ fn handle(shared: &Arc<ServeShared>, mut request: Request) {
                 let _ = respond(request, Body::error(&error), &[]);
             }
         }
+        // 响应由评估线程写（M4）：同一个理由（批量推理期间服务必须继续可观测、可提交任务）。
+        Ok(Dispatch::Evaluate(manifest)) => {
+            if let Err(failure) = spawn_evaluation(shared, manifest, request) {
+                let (error, request) = *failure;
+                let _ = respond(request, Body::error(&error), &[]);
+            }
+        }
         Err(error) => {
-            let body = error_body(shared, &route, &error);
+            let body = shared.error_body(&error);
             let _ = respond(request, body, &[]);
         }
     }
@@ -339,6 +366,8 @@ enum Dispatch {
     Respond(Body, Vec<(String, String)>),
     /// 交给 [`spawn_provider_switch`]：它拥有请求对象（含写响应的责任）。
     SwitchProvider(ProviderPreference),
+    /// 交给 [`spawn_evaluation`]（M4）：评估是批量动作，同样由独立线程写响应。
+    Evaluate(PathBuf),
 }
 
 /// 端点分发（准入已通过，这里才允许读 body）。
@@ -381,6 +410,15 @@ fn dispatch(
             let set_id = parse_set_id(&bytes)?;
             let value = shared.submit_download(&set_id)?;
             Ok(Dispatch::Respond(json_body(202, value)?, Vec::new()))
+        }
+        Route::Evaluate => {
+            check_json_content_type(descriptor.content_type)?;
+            let bytes = read_body(request, admitted)?;
+            let manifest = evaluate::parse_manifest_body(&bytes)?;
+            // **委派**：一次评估最多 `--max-eval-cases` 张图、每张一次完整推理；在 accept
+            // 线程上跑会让 `/api/status`、两个 OCR 队列与下载在整个评估期间停摆。
+            // 请求对象由 `handle` 交给那个线程（这里只做"要不要委派"的判定）。
+            Ok(Dispatch::Evaluate(manifest))
         }
         Route::EngineReload => {
             // 显式创建/重建引擎（§4.2、§7.6）：无 body = M2 的"按当前文件重建"；
@@ -482,17 +520,53 @@ fn spawn_provider_switch(
     }
 }
 
-/// 错误响应：OCR 的 409 带回与 `/api/models` 一致的清单（§7.6）。
+/// 在独立线程里执行一次评估，并由那个线程写响应（M4；见 `evaluate.rs` 的模块文档）。
 ///
-/// `models_missing` 与 `models_corrupt` 由 [`ServeShared::models_missing_error`] 决定
-/// （有损坏文件时报 `models_corrupt`），`detail` 复用 `/api/models` 的字段名与值。
-fn error_body(shared: &ServeShared, route: &Route, error: &ServeError) -> Body {
-    match (route, error) {
-        (Route::Ocr, ServeError::ModelsMissing | ServeError::ModelsCorrupt) => {
-            let error = shared.models_missing_error();
-            Body::error_with_detail(&error, shared.models_missing_detail())
+/// 与 [`spawn_provider_switch`] 同一形状：
+///
+/// - 同一时刻只允许一个评估（[`ServeShared::begin_evaluation`]）：第二个请求立刻得到
+///   503 `busy`，**不排队**；
+/// - 线程创建失败 / 已有评估在跑 → 把请求连同错误原样还给调用方，由它写出错误响应，
+///   绝不留下"没有响应的连接"；
+/// - 断言与 `/api/models` 同源同值的错误（模型缺失 409 / 引擎 503）由那个线程产出。
+fn spawn_evaluation(
+    shared: &Arc<ServeShared>,
+    manifest: PathBuf,
+    request: Request,
+) -> Result<(), Box<(ServeError, Request)>> {
+    let Some(guard) = shared.begin_evaluation() else {
+        return Err(Box::new((ServeError::Busy, request)));
+    };
+    let shared = Arc::clone(shared);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Request>(1);
+    let spawned = thread::Builder::new()
+        .name("serve-evaluate".to_string())
+        .spawn(move || {
+            // 资格在线程退出时释放（含 panic）。
+            let _guard = guard;
+            let Ok(request) = rx.recv() else {
+                return;
+            };
+            let body = match evaluate::run(&shared, &manifest) {
+                Ok(value) => match serde_json::to_vec(&value) {
+                    Ok(bytes) => Body::json(200, bytes),
+                    Err(_) => Body::error(&ServeError::Internal),
+                },
+                // 与 `/api/ocr` **同一份**错误映射（含 409 的模型清单）：
+                // `ServeShared::error_body` 是唯一实现。
+                Err(error) => shared.error_body(&error),
+            };
+            let _ = respond(request, body, &[]);
+        });
+    match spawned {
+        Ok(_) => {
+            let _ = tx.send(request);
+            Ok(())
         }
-        _ => Body::error(error),
+        Err(error) => {
+            eprintln!("serve: cannot start the evaluation thread: {error}");
+            Err(Box::new((ServeError::Internal, request)))
+        }
     }
 }
 
@@ -678,6 +752,7 @@ fn route_of(method: HttpMethod, path: &str) -> (RouteDecision, Option<Route>) {
         "/api/models/download" => Some(Route::ModelsDownload),
         "/api/engine/reload" => Some(Route::EngineReload),
         "/api/ocr" => Some(Route::Ocr),
+        "/api/evaluate" => Some(Route::Evaluate),
         _ => job_route(path),
     };
     match candidate {
@@ -786,6 +861,7 @@ mod tests {
             ),
             (HttpMethod::Post, "/api/engine/reload", Route::EngineReload),
             (HttpMethod::Post, "/api/ocr", Route::Ocr),
+            (HttpMethod::Post, "/api/evaluate", Route::Evaluate),
             (
                 HttpMethod::Get,
                 "/api/jobs/job-1",
@@ -836,6 +912,9 @@ mod tests {
 
         // 路径存在但方法不对 → 405（并给出 Allow）。
         let (decision, route) = route_of(HttpMethod::Get, "/api/ocr");
+        assert_eq!(decision, RouteDecision::MethodNotAllowed);
+        assert_eq!(route.expect("known path").allow(), "POST");
+        let (decision, route) = route_of(HttpMethod::Get, "/api/evaluate");
         assert_eq!(decision, RouteDecision::MethodNotAllowed);
         assert_eq!(route.expect("known path").allow(), "POST");
         let (decision, route) = route_of(HttpMethod::Post, "/api/status");

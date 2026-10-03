@@ -25,6 +25,7 @@
 //! | `JobNotFound` | 404 | `job_not_found` | §4.5 |
 //! | `ModelSetNotFound` | 404 | `model_set_not_found` | §4.2（M2 新增，见下） |
 //! | `Busy` | 503 | `busy` | §4.5 / §8.2 |
+//! | `Evaluation`（M4） | 400 | `bad_request` | §4.2（`detail.reason` 可定位） |
 //! | `ModelsMissing` | 409 | `models_missing` | §11.1 |
 //! | `ModelsCorrupt` | 409 | `models_corrupt` | §11.1 |
 //! | `JobNotFinished` | 409 | `job_not_finished` | §4.3 |
@@ -55,6 +56,10 @@
 //!   无法生效（名称非法或对应 feature 未编译进来）。`code` 复用 §11.1 已有的
 //!   `bad_request`（400），但 `detail.reason` 必须保留**库侧原文**（§7.5 第 3 条要求启动期
 //!   与运行期给出同一句可定位措辞，见 `state.rs::ServeConfigPlan::validate`）。
+//! - [`ServeError::Evaluation`]（M4）：`POST /api/evaluate` 的评估请求无法执行（清单读不出来、
+//!   格式不对、用例数超过 `--max-eval-cases`、某张图解析不到）。`code` 同样是 §11.1 已有的
+//!   `bad_request`（400），`detail.reason` 说明**要改哪个输入**；它不是"内部错误"，
+//!   也不该退化成一个没有信息量的 400 文案。
 //!
 //! 其余变体与 §11.1 逐项一致。`engine_unavailable` 的 `reason` 字段来自 §7.6。
 //!
@@ -288,6 +293,15 @@ pub enum ServeError {
         set_id: String,
         known: Vec<String>,
     },
+    /// **M4 新增的变体**：`POST /api/evaluate` 的评估请求无法执行。
+    ///
+    /// `code` 复用 §11.1 已有的 `bad_request`（400），但 `detail.reason` 必须给出**可定位**
+    /// 的原因：清单读不出来、不是 `rapidocr evaluate` 的格式、用例数超过 `--max-eval-cases`、
+    /// 或某一张图路径解析不到。这些都不是"服务器内部错误"，也不该压成一句 `bad_request`
+    /// 的默认文案（用户需要知道改哪一个输入）。
+    Evaluation {
+        reason: String,
+    },
     /// §11.1 的 422。当前由 `Ocr(RapidOcrError::InvalidImage | InvalidInput | Decode)`
     /// 分类产生（保留库侧原文），因此该变体本身没有构造点。
     #[allow(dead_code)]
@@ -442,7 +456,7 @@ impl ServeError {
             Self::UnsupportedInput => 422,
             Self::Busy | Self::EngineUnavailable { .. } => 503,
             Self::InsufficientDiskSpace { .. } => 507,
-            Self::ProviderRejected { .. } => 400,
+            Self::ProviderRejected { .. } | Self::Evaluation { .. } => 400,
             Self::Download(error) => error.status_code(),
             Self::Ocr(error) => classify_ocr_error(error).status,
             Self::Internal => 500,
@@ -473,7 +487,7 @@ impl ServeError {
             Self::Busy => "busy",
             Self::EngineUnavailable { .. } => "engine_unavailable",
             Self::InsufficientDiskSpace { .. } => "insufficient_disk_space",
-            Self::ProviderRejected { .. } => "bad_request",
+            Self::ProviderRejected { .. } | Self::Evaluation { .. } => "bad_request",
             Self::Download(error) => error.code(),
             Self::Ocr(error) => classify_ocr_error(error).code,
             Self::Internal => "internal",
@@ -525,6 +539,9 @@ impl ServeError {
             ),
             Self::ProviderRejected { provider, reason } => {
                 format!("the requested provider `{provider}` cannot be used: {reason}")
+            }
+            Self::Evaluation { reason } => {
+                format!("the evaluation request was rejected: {reason}")
             }
             Self::BadHost => {
                 "the Host header does not belong to this server (possible DNS rebinding)"
@@ -590,6 +607,7 @@ impl ServeError {
                 "provider": provider,
                 "reason": reason,
             }),
+            Self::Evaluation { reason } => serde_json::json!({ "reason": reason }),
             Self::Download(error) => error.detail(),
             Self::Ocr(error) => {
                 let class = classify_ocr_error(error);

@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rapid_ocr_rs::{
-    CoordinateSpace, DetectionOutcome, DownloadError, EngineConfig, EngineInfo,
+    CoordinateSpace, DetectionOutcome, DownloadError, EngineConfig, EngineInfo, FormulaPolicy,
     GenericProviderPreference, ImageInfo, ImageSize, LangDet, LangRec, ModelFileSpec, ModelType,
     OcrOutput, OcrRegion, OcrRequest, OcrTimings, OcrVersion, Polygon, ProviderInfo,
     ProviderResolutionInfo, RapidOcrError, RecognitionOutcome, RegionSource, ResolvedProvider,
@@ -69,6 +69,11 @@ struct Scripted {
     ep: String,
     /// 每次识别是谁服务的（按顺序），用来断言"队列里的任务用了新引擎"。
     served: Arc<Mutex<Vec<String>>>,
+    /// 每次识别收到的 `FormulaPolicy`（M4：公式队列真的把公式管线接上了）。
+    formulas: Arc<Mutex<Vec<FormulaPolicy>>>,
+    /// 可选的闸门：识别在返回**之前**阻塞，直到测试放行（M4 的单飞测试用它把
+    /// "评估正在跑"变成确定性事实，而不是靠 sleep 猜时序）。
+    gate: Option<Arc<Gate>>,
 }
 
 impl Scripted {
@@ -82,6 +87,8 @@ impl Scripted {
             running: Arc::new(AtomicBool::new(false)),
             ep: "cpu".to_string(),
             served: Arc::new(Mutex::new(Vec::new())),
+            formulas: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
         }
     }
 
@@ -90,6 +97,20 @@ impl Scripted {
             delay,
             ..Self::fast()
         }
+    }
+
+    /// 识别进入闸门（到达即通知测试，然后阻塞到放行）。
+    fn with_gate(mut self, gate: Arc<Gate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// 最近的 `n` 次识别收到的公式策略（时间顺序）。
+    fn formulas(&self) -> Vec<FormulaPolicy> {
+        self.formulas
+            .lock()
+            .expect("the scripted recorder is not poisoned")
+            .clone()
     }
 
     fn factory(self) -> EngineFactory {
@@ -108,13 +129,21 @@ struct ScriptedBackend {
 }
 
 impl OcrBackend for ScriptedBackend {
-    fn recognize(&mut self, _request: OcrRequest) -> Result<OcrOutput, RapidOcrError> {
+    fn recognize(&mut self, request: OcrRequest) -> Result<OcrOutput, RapidOcrError> {
         self.state.calls.fetch_add(1, Ordering::SeqCst);
+        self.state
+            .formulas
+            .lock()
+            .expect("the scripted recorder is not poisoned")
+            .push(request.formula.clone());
         self.state
             .served
             .lock()
             .expect("the scripted recorder is not poisoned")
             .push(self.state.ep.clone());
+        if let Some(gate) = &self.state.gate {
+            gate.wait();
+        }
         self.state.running.store(true, Ordering::SeqCst);
         if !self.state.delay.is_zero() {
             std::thread::sleep(self.state.delay);
@@ -207,6 +236,9 @@ struct TestOptions {
     /// `--allow-provider-fallback`（§7.5）：运行期切换 provider 会用同一个值。
     allow_provider_fallback: bool,
     routing: OcrRouting,
+    /// `--formula-detector`（M4）；路由打开时它必须有值，否则 `FormulaPolicy` 会是
+    /// "只处理显式区域"的退化形状。
+    formula_detector: Option<PathBuf>,
     engine_factory: EngineFactory,
     downloader: DownloaderFactory,
     free_space: FreeSpaceFactory,
@@ -221,13 +253,33 @@ impl TestOptions {
             allow_download: false,
             allow_download_hosts: Vec::new(),
             allow_provider_fallback: false,
-            routing: OcrRouting::text_only(),
+            routing: OcrRouting::text_only(
+                "test server: no --formula-detector, so the formula queue is refused (§10.8)",
+            ),
+            formula_detector: None,
             engine_factory: scripted.factory(),
             downloader: ScriptedDownload::default().factory(),
             free_space: Arc::new(|_dir: &Path| Ok(1 << 40)),
             model_dir,
             engine_config: test_engine_config(),
         }
+    }
+
+    /// 打开公式路由（M4）：检测模型路径在场，公式队列因此可达。
+    ///
+    /// `detector` 只需是一个路径：脚本化后端不加载它（真实启动期的存在性校验在 `run.rs`），
+    /// 但 `FormulaPolicy.detector_path` 必须真的有值——否则接上的就是"只处理显式区域"的
+    /// 退化形状，公式任务会静默地一个区域都产不出来。
+    fn with_formula_routing(mut self, detector: &Path) -> Self {
+        self.routing = OcrRouting::formula_enabled();
+        self.formula_detector = Some(detector.to_path_buf());
+        self
+    }
+
+    /// 覆盖队列容量/配额（§8.3 的公平性测试用）。
+    fn with_limits(mut self, limits: RawServeLimits) -> Self {
+        self.limits = limits;
+        self
     }
 }
 
@@ -289,6 +341,7 @@ impl TestServer {
             // §7.5：`ServeStartup::validate` 用的是同一个开关，运行期切换 provider 也用它。
             allow_provider_fallback: options.allow_provider_fallback,
             routing: options.routing,
+            formula_detector: options.formula_detector,
             engine_factory: options.engine_factory,
             downloader: options.downloader,
             free_space: options.free_space,
@@ -551,7 +604,11 @@ fn model_file_bytes(name: &str) -> Vec<u8> {
 }
 
 /// 一个用本地 manifest 描述的模型目录：
-/// `det.onnx` / `rec.onnx` / `dict.txt`（detector/recognizer/dictionary）。
+/// `det.onnx` / `rec.onnx` / `dict.txt`（文本管线）+ `fx.onnx`（`formula_recognizer`）。
+///
+/// M4 起**每个**清单来源都必须声明公式 role：`serve` 的模型清单请求
+/// `ModelRequest::text_and_formula`（页面要能报告公式集合的体积并让用户按集合下载），
+/// 因此缺 role 是一个可定位的启动期错误（§5.3），不是静默降级。
 ///
 /// `present` 里的文件真的写到磁盘上（内容 = [`model_file_bytes`]），其余缺失；
 /// `declared_size` 为 `Some` 时每个文件的 `size_bytes` 都写成它（用于构造
@@ -559,11 +616,7 @@ fn model_file_bytes(name: &str) -> Vec<u8> {
 fn manifest_model_dir(name: &str, present: &[&str], declared_size: Option<u64>) -> PathBuf {
     let dir = m2_root().join(format!("manifest-{name}-{}", unique()));
     std::fs::create_dir_all(&dir).expect("create the model dir");
-    let files = [
-        ("det.onnx", "detector"),
-        ("rec.onnx", "recognizer"),
-        ("dict.txt", "dictionary"),
-    ];
+    let files = model_fixture_files();
     let mut manifest = String::from(
         "{\"schema_version\":1,\"id\":\"test-set\",\"family\":\"PP-OCR\",\"version\":\"v-test\",\
          \"languages\":[\"en\"],\"files\":[",
@@ -590,6 +643,40 @@ fn manifest_model_dir(name: &str, present: &[&str], declared_size: Option<u64>) 
         }
     }
     dir
+}
+
+/// 测试清单描述的四个文件（M4 起包含公式识别模型）。
+///
+/// 文本三个 + 公式一个：这样**同一个集合**里就有两条管线的 role，
+/// "按 role 分组判定就绪"这条规则在本地清单来源下也被真实地走到了。
+fn model_fixture_files() -> [(&'static str, &'static str); 4] {
+    [
+        ("det.onnx", "detector"),
+        ("rec.onnx", "recognizer"),
+        ("dict.txt", "dictionary"),
+        ("fx.onnx", "formula_recognizer"),
+    ]
+}
+
+/// 测试清单里的文本管线文件（`present` 参数里最常用的那一组）。
+fn text_fixture_files() -> [&'static str; 3] {
+    ["det.onnx", "rec.onnx", "dict.txt"]
+}
+
+/// 与 [`manifest_model_dir`] 相同，但公式识别模型**已经在场**。
+///
+/// M2 的下载用例考察的是**文本集合**的进度、预算、磁盘核算与取消；公式文件（566 MB，
+/// 在真实场景里是一个独立的下载动作）不该参与这些数字。M4 起每个清单都必须声明
+/// `formula_recognizer` role（否则启动期就报缺 role），因此这里把它放成 `present`：
+/// 它不出现在"待下载"集合里，M2 的数字仍然逐字成立。
+fn manifest_model_dir_text_only(
+    name: &str,
+    present: &[&str],
+    declared_size: Option<u64>,
+) -> PathBuf {
+    let mut files: Vec<&str> = present.to_vec();
+    files.push("fx.onnx");
+    manifest_model_dir(name, &files, declared_size)
 }
 
 /// M2 fixture 的根目录（与 M1 的 `target/m1-serve-tests` 分开，避免互相干扰）。
@@ -798,15 +885,14 @@ fn empty_model_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// 齐备的模型目录：本地 `manifest.json` + 三个内容为 `name` 的文件（SHA-256 真实计算）。
+/// 齐备的模型目录：本地 `manifest.json` + 四个内容为 `name` 的文件（SHA-256 真实计算）。
+///
+/// 四个 = 文本三个 + `fx.onnx`（`formula_recognizer`）：M4 起"齐备"是**两条管线**都齐备，
+/// 否则 `/api/models` 的 `formula.complete` 会是假、页面上的公式开关会被正确地禁用。
 fn complete_model_dir(name: &str) -> PathBuf {
     let dir = test_root().join(format!("complete-{name}-{}", unique()));
     std::fs::create_dir_all(&dir).expect("create the model dir");
-    let files = [
-        ("det.onnx", "detector"),
-        ("rec.onnx", "recognizer"),
-        ("dict.txt", "dictionary"),
-    ];
+    let files = model_fixture_files();
     let mut manifest = String::from(
         "{\"schema_version\":1,\"id\":\"test-set\",\"family\":\"PP-OCR\",\"version\":\"v-test\",\
          \"files\":[",
@@ -1431,7 +1517,7 @@ fn status_reports_the_frozen_three_provider_fields_and_redacts_paths() {
 
 #[test]
 fn models_reports_every_file_state_and_matches_the_ocr_409() {
-    // 空目录：默认表来源，三个文件全缺。
+    // 空目录：默认表来源，文本三个文件全缺 + 公式模型缺失（M4）。
     let server = TestServer::start(TestOptions::new(
         empty_model_dir("models"),
         Scripted::fast(),
@@ -1442,7 +1528,7 @@ fn models_reports_every_file_state_and_matches_the_ocr_409() {
     assert_eq!(value["source"], "default_table");
     assert_eq!(value["downloads_allowed"], false);
     let sets = value["sets"].as_array().expect("sets");
-    assert_eq!(sets.len(), 1, "{value}");
+    assert_eq!(sets.len(), 2, "text set + formula set (M4): {value}");
     let files = sets[0]["files"].as_array().expect("files");
     assert_eq!(files.len(), 3);
     for file in files {
@@ -1453,6 +1539,22 @@ fn models_reports_every_file_state_and_matches_the_ocr_409() {
         assert!(file["sha256"].as_str().is_some());
         assert!(file["source_url"].as_str().is_some());
     }
+    // 公式集合：**一个**文件、有体积与哈希（页面必须能在下载前显示 566 MB）。
+    let formula_set = &sets[1];
+    assert_eq!(formula_set["id"], "PP-FormulaNet_plus-M");
+    let formula_files = formula_set["files"].as_array().expect("formula files");
+    assert_eq!(formula_files.len(), 1);
+    assert_eq!(formula_files[0]["role"], "formula_recognizer");
+    assert_eq!(formula_files[0]["name"], "pp_formulanet_plus_m.onnx");
+    assert_eq!(formula_files[0]["state"], "missing");
+    assert_eq!(formula_files[0]["size_bytes"], 593_915_961u64);
+    assert_eq!(
+        formula_files[0]["sha256"],
+        "71b6d389cf7b857e45252a4b98cfced1a3ffca7bf24d9497d02d052a41d9493b"
+    );
+
+    // 顶层四个字段是**文本管线**作用域（引擎要加载的那些文件）；
+    // 公式管线在 `formula` 块里单独报告（M4 的根因修复：公式缺失不得让普通 OCR 变 409）。
     let missing: Vec<&str> = value["missing"]
         .as_array()
         .expect("missing")
@@ -1460,13 +1562,39 @@ fn models_reports_every_file_state_and_matches_the_ocr_409() {
         .filter_map(Value::as_str)
         .collect();
     assert_eq!(missing.len(), 3);
+    assert_eq!(value["complete"], false);
+    assert_eq!(value["blocked"], value["missing"]);
+    assert_eq!(
+        value["formula"]["missing"],
+        serde_json::json!(["pp_formulanet_plus_m.onnx"])
+    );
+    assert_eq!(value["formula"]["complete"], false);
+    assert_eq!(
+        value["formula"]["required_roles"],
+        serde_json::json!(["formula_recognizer"])
+    );
+    // 这个测试实例没有配置检测模型：路由关闭，且理由是可读文字（不是只有禁用态）。
+    assert_eq!(value["formula"]["routing"], false);
+    assert!(
+        value["formula"]["disabled_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("--formula-detector")),
+        "{value}"
+    );
 
     // 引擎在空模型目录下是 BlockedModelsMissing，而**服务**是 Ready（§7.6）。
     let status = server.get("/api/status").json();
     assert_eq!(status["state"], "ready");
     assert_eq!(status["engine"]["state"], "blocked_models_missing");
+    // 引擎的缺失清单同样只含文本文件（公式模型缺失不是"引擎起不来"）。
+    let engine_missing = status["engine"]["missing"]
+        .as_array()
+        .expect("engine missing");
+    assert_eq!(engine_missing.len(), 3, "{status}");
+    assert_eq!(status["formula"]["routing"], false);
+    assert!(status["limits"]["max_eval_cases"].as_u64().unwrap_or(0) > 0);
 
-    // OCR 409：字段与 /api/models **逐字节一致**。
+    // OCR 409：字段与 /api/models **逐字节一致**（文本作用域）。
     let rejected = server.submit_ocr(b"image bytes");
     assert_eq!(rejected.status, 409, "{}", rejected.text());
     assert_eq!(rejected.code(), "models_missing");
@@ -1475,6 +1603,15 @@ fn models_reports_every_file_state_and_matches_the_ocr_409() {
     assert_eq!(detail["corrupt"], value["corrupt"]);
     assert_eq!(detail["source"], value["source"]);
     assert_eq!(detail["model_dir"], value["model_dir"]);
+
+    // 公式队列：路由未启用 → 400（不静默按文本处理，M1 的语义在 M4 不变）。
+    let formula = server.post(
+        "/api/ocr?queue=formula",
+        &[("Content-Type", "application/octet-stream")],
+        b"image bytes",
+    );
+    assert_eq!(formula.status, 400, "{}", formula.text());
+    assert_eq!(formula.code(), "bad_request");
 }
 
 #[test]
@@ -1573,11 +1710,13 @@ fn the_download_endpoint_refuses_disabled_unknown_and_url_bearing_requests() {
 #[test]
 fn a_formula_flood_does_not_starve_text_jobs() {
     let delay = Duration::from_millis(25);
-    let server = TestServer::start(TestOptions {
-        limits: limits(4, 2),
-        routing: OcrRouting { formula: true },
-        ..TestOptions::new(complete_model_dir("fair-formula"), Scripted::slow(delay))
-    });
+    let dir = complete_model_dir("fair-formula");
+    let scripted = Scripted::slow(delay);
+    let server = TestServer::start(
+        TestOptions::new(dir.clone(), scripted.clone())
+            .with_formula_routing(&dir.join("pix2text-mfd-1.5.onnx"))
+            .with_limits(limits(4, 2)),
+    );
     let shared = server.shared();
     // 上界来自 `/api/status` 的公开字段（调度参数的可观测口径），而不是内部访问器。
     let status = server.get("/api/status").json();
@@ -1598,11 +1737,13 @@ fn a_formula_flood_does_not_starve_text_jobs() {
 #[test]
 fn a_text_flood_does_not_starve_formula_jobs() {
     let delay = Duration::from_millis(25);
-    let server = TestServer::start(TestOptions {
-        limits: limits(4, 2),
-        routing: OcrRouting { formula: true },
-        ..TestOptions::new(complete_model_dir("fair-text"), Scripted::slow(delay))
-    });
+    let dir = complete_model_dir("fair-text");
+    let scripted = Scripted::slow(delay);
+    let server = TestServer::start(
+        TestOptions::new(dir.clone(), scripted.clone())
+            .with_formula_routing(&dir.join("pix2text-mfd-1.5.onnx"))
+            .with_limits(limits(4, 2)),
+    );
     let shared = server.shared();
     assert_eq!(shared.engine_state_name(), "ready");
     let status = server.get("/api/status").json();
@@ -1738,6 +1879,408 @@ fn the_formula_queue_is_refused_when_formula_routing_is_off() {
     assert_eq!(response.code(), "bad_request");
     // 普通任务照常可提交（公式关闭不影响文本）。
     assert_eq!(server.submit_ocr(b"image").status, 202);
+
+    // M4：路由关闭的**理由**必须能通过 `/api/models`（页面据此禁用开关）与 `/api/status`
+    // 读到，而不是只表现为一个禁用控件（§9.4：不只靠颜色）。
+    let models = server.get("/api/models").json();
+    assert_eq!(models["formula"]["routing"], false);
+    let reason = models["formula"]["disabled_reason"]
+        .as_str()
+        .expect("a textual reason");
+    assert!(reason.contains("--formula-detector"), "{reason}");
+    assert_eq!(models["formula"]["detector"]["configured"], false);
+    assert_eq!(models["formula"]["detector"]["file"], Value::Null);
+    let status = server.get("/api/status").json();
+    assert_eq!(status["formula"]["routing"], false);
+    assert_eq!(
+        status["formula"]["disabled_reason"],
+        models["formula"]["disabled_reason"]
+    );
+}
+
+// ---------------------------------------------------------------- M4：公式队列
+
+/// 公式队列是**真实**的第二条管线：`queue=formula` 进公式队列，并在 worker 里拿到
+/// 由模型集解析出的 `FormulaPolicy`（识别模型 + 集合声明的 SHA-256 + 检测模型）。
+///
+/// 脚本化后端不加载模型，但它在 `OcrRequest.formula` 上看到的正是生产路径组装的那一份，
+/// 因此"路由真的接上了公式管线"不是靠猜测：三个字段逐个断言。
+#[test]
+fn the_formula_queue_runs_the_formula_pipeline_from_the_model_set() {
+    let dir = complete_model_dir("m4-formula");
+    let detector = dir.join("pix2text-mfd-1.5.onnx");
+    let scripted = Scripted::fast();
+    let server = TestServer::start(
+        TestOptions::new(dir.clone(), scripted.clone()).with_formula_routing(&detector),
+    );
+
+    // 模型集报告公式集合齐备 + 路由可用（页面据此允许勾选）。
+    let models = server.get("/api/models").json();
+    assert_eq!(models["formula"]["complete"], true, "{models}");
+    assert_eq!(models["formula"]["routing"], true);
+    assert_eq!(models["formula"]["disabled_reason"], Value::Null);
+    assert_eq!(models["formula"]["detector"]["configured"], true);
+    assert_eq!(
+        models["formula"]["detector"]["file"], "pix2text-mfd-1.5.onnx",
+        "only the file name is exposed (§7.4)"
+    );
+    assert!(
+        !models.to_string().contains(&dir.display().to_string()),
+        "no absolute path may leak: {models}"
+    );
+
+    let text = server.submit_ocr(b"text image");
+    assert_eq!(text.status, 202, "{}", text.text());
+    assert_eq!(text.json()["queue"], "text");
+    let formula = server.post(
+        "/api/ocr?queue=formula",
+        &[("Content-Type", "application/octet-stream")],
+        b"formula image",
+    );
+    assert_eq!(formula.status, 202, "{}", formula.text());
+    let accepted = formula.json();
+    assert_eq!(accepted["queue"], "formula", "{accepted}");
+    assert_eq!(accepted["kind"], "ocr");
+
+    let text_id = text.json()["job_id"].as_str().expect("id").to_string();
+    let formula_id = accepted["job_id"].as_str().expect("id").to_string();
+    let text_view = server.wait_terminal(&text_id, Duration::from_secs(20));
+    let formula_view = server.wait_terminal(&formula_id, Duration::from_secs(20));
+    assert_eq!(text_view["state"], "succeeded", "{text_view}");
+    assert_eq!(formula_view["state"], "succeeded", "{formula_view}");
+    assert_eq!(formula_view["queue"], "formula");
+
+    let policies = scripted.formulas();
+    assert_eq!(policies.len(), 2, "one request per job");
+    // 顺序：文本任务先入队（两个队列都非空时调度器先取文本）。
+    assert!(
+        !policies[0].enabled,
+        "the text queue must not enable the formula pipeline: {:?}",
+        policies[0]
+    );
+    assert_eq!(policies[0].model_path, None);
+    let formula = &policies[1];
+    assert!(formula.enabled, "the formula queue must enable it");
+    assert_eq!(
+        formula.model_path.as_deref(),
+        Some(dir.join("fx.onnx").as_path())
+    );
+    assert_eq!(
+        formula.detector_path.as_deref(),
+        Some(detector.as_path()),
+        "the detector comes from the startup-resolved path"
+    );
+    // 识别模型的 SHA-256 来自**模型集**（权威判定在下一次真实加载时由库执行）。
+    let declared = models["sets"][0]["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .find(|file| file["role"] == "formula_recognizer")
+        .and_then(|file| file["sha256"].as_str())
+        .expect("the formula model's declared hash");
+    assert_eq!(formula.expected_model_sha256.as_deref(), Some(declared));
+    // §10.8：识别模型是被**显式**下载的集合成员，公式区域仍按请求开关逐次选择。
+    assert!(
+        !formula.include_token_ids,
+        "token ids stay out of the default"
+    );
+}
+
+/// 公式集合不齐备：`queue=formula` 是 **409**（可定位、指向要下载的文件），
+/// 而普通 OCR 完全不受影响（M4 的核心不变量，走真实 HTTP）。
+#[test]
+fn an_incomplete_formula_set_is_409_while_text_ocr_keeps_working() {
+    let dir = manifest_model_dir("m4-formula-incomplete", &text_fixture_files(), None);
+    let detector = dir.join("pix2text-mfd-1.5.onnx");
+    let server = TestServer::start(
+        TestOptions::new(dir.clone(), Scripted::fast()).with_formula_routing(&detector),
+    );
+
+    // `/api/models`：文本齐备（顶层 complete=true），公式不齐备（formula.complete=false）。
+    let models = server.get("/api/models").json();
+    assert_eq!(models["complete"], true, "{models}");
+    assert_eq!(models["missing"], serde_json::json!([]));
+    assert_eq!(models["formula"]["complete"], false);
+    assert_eq!(models["formula"]["missing"], serde_json::json!(["fx.onnx"]));
+    assert_eq!(models["formula"]["routing"], true);
+
+    // 公式请求在**读 body 之前**就被拒绝（§4.4 第 4 步之后），且 detail 是公式作用域。
+    let formula = server.post(
+        "/api/ocr?queue=formula",
+        &[("Content-Type", "application/octet-stream")],
+        b"formula image",
+    );
+    assert_eq!(formula.status, 409, "{}", formula.text());
+    assert_eq!(formula.code(), "models_missing");
+    let detail = &formula.json()["detail"];
+    assert_eq!(detail["scope"], "formula");
+    assert_eq!(detail["missing"], serde_json::json!(["fx.onnx"]));
+    assert_eq!(
+        detail["missing_on_disk"],
+        serde_json::json!(["fx.onnx"]),
+        "the request-path pre-check is existence based (no hashing)"
+    );
+
+    // 普通 OCR 照常可用（脚本化后端），并且它拿到的策略**没有**启用公式。
+    let text = server.submit_ocr(b"text image");
+    assert_eq!(text.status, 202, "{}", text.text());
+    let id = text.json()["job_id"].as_str().expect("id").to_string();
+    let view = server.wait_terminal(&id, Duration::from_secs(20));
+    assert_eq!(view["state"], "succeeded", "{view}");
+    assert_eq!(view["queue"], "text");
+}
+
+/// 公式角色在**运行期**被拿掉（文件删除）时：`/api/models` 与 409 都如实反映，
+/// 而不是缓存启动期快照（与 M2"下载完成后立刻变 present"同一条规则）。
+#[test]
+fn removing_the_formula_model_turns_the_route_into_a_409() {
+    let dir = complete_model_dir("m4-formula-removed");
+    let detector = dir.join("pix2text-mfd-1.5.onnx");
+    let server = TestServer::start(
+        TestOptions::new(dir.clone(), Scripted::fast()).with_formula_routing(&detector),
+    );
+    assert_eq!(
+        server.get("/api/models").json()["formula"]["complete"],
+        true
+    );
+    std::fs::remove_file(dir.join("fx.onnx")).expect("remove the formula model");
+
+    let models = server.get("/api/models").json();
+    assert_eq!(models["formula"]["complete"], false);
+    assert_eq!(models["formula"]["missing"], serde_json::json!(["fx.onnx"]));
+    // 文本集合仍然齐备：顶层字段不受公式影响。
+    assert_eq!(models["complete"], true, "{models}");
+    let formula = server.post(
+        "/api/ocr?queue=formula",
+        &[("Content-Type", "application/octet-stream")],
+        b"formula image",
+    );
+    assert_eq!(formula.status, 409, "{}", formula.text());
+    assert_eq!(formula.json()["detail"]["scope"], "formula");
+    assert_eq!(server.submit_ocr(b"text").status, 202);
+}
+
+// ---------------------------------------------------------------- M4：评估
+
+/// `POST /api/evaluate`：清单里每个用例跑一次真实识别路径，返回**库的**汇总
+/// （`EvaluationSummary` + CLI 附加的运行时字段）。
+///
+/// 指标由库的 `evaluate_case` 计算，因此期望值在这里独立算一遍
+/// （`cer=0` 的用例 + 一个不匹配的用例），而不是断言"有个数字"。
+#[test]
+fn the_evaluate_endpoint_returns_the_library_summary() {
+    let dir = complete_model_dir("m4-evaluate");
+    // 脚本化后端为每个区域产出 `region-<i>`，三个区域换行拼接 → 这就是"预测文本"。
+    let scripted = Scripted::fast();
+    let server = TestServer::start(TestOptions::new(dir.clone(), scripted));
+
+    let manifest = eval_manifest(
+        &dir,
+        "eval-ok",
+        &[
+            ("01.png", "region-0\nregion-1\nregion-2"),
+            ("02.png", "totally different"),
+        ],
+    );
+    let response = server.post(
+        "/api/evaluate",
+        &[("Content-Type", "application/json")],
+        format!("{{\"manifest\":{:?}}}", manifest.display().to_string()).as_bytes(),
+    );
+    assert_eq!(response.status, 200, "{}", response.text());
+    let report = response.json();
+
+    let expected_second = cer("totally different", "region-0\nregion-1\nregion-2");
+    let expected_mean = (0.0_f32 + expected_second) / 2.0;
+    assert_eq!(report["cases"].as_array().expect("cases").len(), 2);
+    assert_eq!(report["cases"][0]["image"], "01.png");
+    assert_eq!(report["cases"][0]["cer"], 0.0);
+    assert_eq!(report["cases"][0]["exact_text"], true);
+    assert_eq!(report["cases"][1]["image"], "02.png");
+    assert!(
+        (report["cases"][1]["cer"].as_f64().expect("cer") - f64::from(expected_second)).abs()
+            < 1e-6,
+        "{report}"
+    );
+    assert!(
+        (report["mean_cer"].as_f64().expect("mean_cer") - f64::from(expected_mean)).abs() < 1e-6
+    );
+    assert_eq!(report["exact_match_rate"], 0.5);
+    // 与 `rapidocr evaluate` 的报告字段逐字段相同（同一份实现）。
+    assert_eq!(report["iou_threshold"], 0.5);
+    assert_eq!(report["manifest_file"], "manifest.json");
+    assert!(report["peak_working_set_bytes"].as_u64().unwrap_or(0) > 0);
+    assert!(report["memory_source"].is_string());
+    assert!(report["ort_runtime"].is_object());
+    assert!(report["ort_runtime_version"].is_string());
+    assert!(
+        !report.to_string().contains(&dir.display().to_string()),
+        "no absolute path in the report: {report}"
+    );
+}
+
+/// 评估的拒绝路径全部是**可定位**的 400，而不是笼统的 `bad_request`。
+#[test]
+fn an_invalid_evaluation_request_is_a_locating_400() {
+    let dir = complete_model_dir("m4-evaluate-refused");
+    let server = TestServer::start(TestOptions::new(dir.clone(), Scripted::fast()));
+
+    let no_body = server.post(
+        "/api/evaluate",
+        &[("Content-Type", "application/json")],
+        b"{}",
+    );
+    assert_eq!(no_body.status, 400, "{}", no_body.text());
+
+    let extra_key = server.post(
+        "/api/evaluate",
+        &[("Content-Type", "application/json")],
+        br#"{"manifest":"a.json","iou_threshold":0.9}"#,
+    );
+    assert_eq!(extra_key.status, 400);
+
+    let missing = dir.join("no-such-manifest.json");
+    let response = server.post(
+        "/api/evaluate",
+        &[("Content-Type", "application/json")],
+        format!("{{\"manifest\":{:?}}}", missing.display().to_string()).as_bytes(),
+    );
+    assert_eq!(response.status, 400, "{}", response.text());
+    assert_eq!(response.code(), "bad_request");
+    let reason = response.json()["detail"]["reason"]
+        .as_str()
+        .expect("reason")
+        .to_string();
+    assert!(reason.contains("no-such-manifest.json"), "{reason}");
+
+    // 超过 `--max-eval-cases` 的清单：同样 400，理由点名那个开关。
+    let manifest = eval_manifest(
+        &dir,
+        "eval-too-many",
+        &[("a.png", "x"), ("b.png", "x"), ("c.png", "x")],
+    );
+    let server = TestServer::start(TestOptions::new(dir.clone(), Scripted::fast()).with_limits(
+        RawServeLimits {
+            max_eval_cases: 2,
+            ..RawServeLimits::default()
+        },
+    ));
+    let response = server.post(
+        "/api/evaluate",
+        &[("Content-Type", "application/json")],
+        format!("{{\"manifest\":{:?}}}", manifest.display().to_string()).as_bytes(),
+    );
+    assert_eq!(response.status, 400, "{}", response.text());
+    let reason = response.json()["detail"]["reason"]
+        .as_str()
+        .expect("reason")
+        .to_string();
+    assert!(reason.contains("--max-eval-cases"), "{reason}");
+}
+
+/// 模型缺失时评估与 OCR 一样是 409（同一条准入），而不是在建会话时崩掉。
+#[test]
+fn evaluation_needs_the_same_model_admission_as_ocr() {
+    let dir = empty_model_dir("m4-evaluate-models");
+    let server = TestServer::start(TestOptions::new(dir.clone(), Scripted::fast()));
+    // 清单本身必须能读出来：否则先得到的是"清单读不出来"的 400（那是输入问题），
+    // 而不是模型准入的 409。两件事各自可定位，顺序在 `evaluate::run` 里写死。
+    let manifest = eval_manifest(&dir, "admission", &[("01.png", "x")]);
+    let response = server.post(
+        "/api/evaluate",
+        &[("Content-Type", "application/json")],
+        format!("{{\"manifest\":{:?}}}", manifest.display().to_string()).as_bytes(),
+    );
+    assert_eq!(response.status, 409, "{}", response.text());
+    assert_eq!(response.code(), "models_missing");
+    assert_eq!(
+        response.json()["detail"]["missing"],
+        server.get("/api/models").json()["missing"]
+    );
+}
+
+/// 同时只允许一个评估：第二个请求得到 503 `busy`（不排队），第一个照常完成。
+#[test]
+fn a_second_evaluation_is_refused_while_one_is_running() {
+    let dir = complete_model_dir("m4-evaluate-busy");
+    let gate = Gate::new();
+    let server = TestServer::start(TestOptions::new(
+        dir.clone(),
+        Scripted::fast().with_gate(Arc::clone(&gate)),
+    ));
+    let manifest = eval_manifest(
+        &dir,
+        "eval-busy",
+        &[("01.png", "region-0\nregion-1\nregion-2")],
+    );
+    let body = format!("{{\"manifest\":{:?}}}", manifest.display().to_string()).into_bytes();
+
+    let addr = server.addr;
+    let host = server.host.clone();
+    let origin = server.origin.clone();
+    let token = server.token.clone();
+    let first_body = body.clone();
+    let first = std::thread::spawn(move || {
+        raw_request(
+            addr,
+            "POST",
+            "/api/evaluate",
+            &[
+                ("Host", host.as_str()),
+                ("X-RapidOCR-Token", token.as_str()),
+                ("Origin", origin.as_str()),
+                ("Content-Type", "application/json"),
+            ],
+            Some(&first_body),
+        )
+    });
+    // 评估线程已经进到第一张图（闸门在推理之前）。
+    gate.arrive();
+    let second = server.post(
+        "/api/evaluate",
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    assert_eq!(second.status, 503, "{}", second.text());
+    assert_eq!(second.code(), "busy");
+    gate.release();
+    let first = first.join().expect("the evaluation thread must finish");
+    assert_eq!(first.status, 200, "{}", first.text());
+    // 资格已释放：第三次请求可以正常开始（这里用一个不存在的清单证明它走到了解析阶段，
+    // 而不是又被 503 挡住）。
+    let third = server.post(
+        "/api/evaluate",
+        &[("Content-Type", "application/json")],
+        br#"{"manifest":"definitely-not-here.json"}"#,
+    );
+    assert_eq!(third.status, 400, "{}", third.text());
+}
+
+/// 评估的逐例文本 → 期望 CER（与库同一个公式：字符级编辑距离 / 参考长度）。
+fn cer(reference: &str, hypothesis: &str) -> f32 {
+    rapid_ocr_rs::evaluation::ocr::character_error_rate(reference, hypothesis)
+}
+
+/// 写一份 `rapidocr evaluate --manifest` 格式的清单 + 对应的小图片文件。
+///
+/// 图片内容不重要（脚本化后端不解码），但**文件必须存在**：端点读不到文件时是 400。
+fn eval_manifest(dir: &Path, label: &str, cases: &[(&str, &str)]) -> PathBuf {
+    let root = dir.join(format!("{label}-{}", unique()));
+    std::fs::create_dir_all(&root).expect("create the manifest dir");
+    let mut manifest = String::from("[");
+    for (index, (image, text)) in cases.iter().enumerate() {
+        std::fs::write(root.join(image), format!("image bytes for {image}")).expect("write image");
+        if index > 0 {
+            manifest.push(',');
+        }
+        manifest.push_str(&format!(
+            "{{\"image\":{image:?},\"text\":{text:?},\"boxes\":[]}}"
+        ));
+    }
+    manifest.push(']');
+    let path = root.join("manifest.json");
+    std::fs::write(&path, manifest).expect("write the manifest");
+    path
 }
 
 #[test]
@@ -1889,7 +2432,7 @@ impl Drop for ReleaseOnDrop {
 /// `/api/models` 变为 complete（哈希是库的真实校验），而引擎**不**在后台创建（§7.6）。
 #[test]
 fn a_download_job_fetches_every_missing_file_and_makes_the_set_complete() {
-    let dir = manifest_model_dir("download-ok", &["det.onnx"], None);
+    let dir = manifest_model_dir_text_only("download-ok", &["det.onnx"], None);
     let scripted = ScriptedDownload::default();
     let server = TestServer::start(TestOptions {
         allow_download: true,
@@ -1984,7 +2527,7 @@ fn a_hash_failure_fails_the_download_job_with_a_structured_error() {
 #[test]
 fn a_download_budget_refusal_is_a_413_with_both_numbers() {
     let declared = 10 * 1024 * 1024;
-    let dir = manifest_model_dir("download-budget", &["det.onnx"], Some(declared));
+    let dir = manifest_model_dir_text_only("download-budget", &["det.onnx"], Some(declared));
     let scripted = ScriptedDownload::default();
     let server = TestServer::start(TestOptions {
         limits: RawServeLimits {
@@ -2012,7 +2555,7 @@ fn a_download_budget_refusal_is_a_413_with_both_numbers() {
 #[test]
 fn a_disk_space_refusal_is_a_507_with_both_numbers() {
     let declared = 10 * 1024 * 1024;
-    let dir = manifest_model_dir("download-disk", &["det.onnx"], Some(declared));
+    let dir = manifest_model_dir_text_only("download-disk", &["det.onnx"], Some(declared));
     let scripted = ScriptedDownload::default();
     let server = TestServer::start(TestOptions {
         allow_download: true,
@@ -2062,7 +2605,7 @@ fn a_per_file_failure_keeps_the_files_that_already_verified() {
 /// 字节 done/total、当前文件名，全部来自 `GET /api/jobs/{id}`（§4.2）。
 #[test]
 fn the_download_progress_is_observable_while_the_job_runs() {
-    let dir = manifest_model_dir("download-progress", &["det.onnx"], None);
+    let dir = manifest_model_dir_text_only("download-progress", &["det.onnx"], None);
     let gate = Gate::new();
     let server = TestServer::start(TestOptions {
         allow_download: true,
@@ -2179,7 +2722,7 @@ fn a_download_error_cancelled_lands_on_cancelled_not_running() {
 /// 排队中的下载取消是**立即**的（§4.3）：worker 不会开始它（`begin_download` 被拒绝）。
 #[test]
 fn cancelling_a_queued_download_is_immediate() {
-    let dir = manifest_model_dir("download-queued", &["det.onnx"], None);
+    let dir = manifest_model_dir_text_only("download-queued", &["det.onnx"], None);
     let gate = Gate::new();
     let server = TestServer::start(TestOptions {
         allow_download: true,

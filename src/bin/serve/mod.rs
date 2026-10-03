@@ -32,6 +32,7 @@
 //! | [`results`] | 有界结果存储与有界序列化 | §4.5、§4.6 |
 //! | [`export`] | 标注 PNG、base64、JSON/Markdown/HTML 导出文档与时间账本 | §4.2、§9.5 |
 //! | [`download`] | 独立下载 worker + 可注入执行体 + `--allow-download-host` 校验 | §8.1、§6 |
+//! | [`evaluate`] | `POST /api/evaluate`：复用库的 `evaluation`（CER/精确匹配） | §4.2、§12 |
 //! | [`server`] | 运行期核心：共享状态、worker、TTL 清理、端点语义、惰性建引擎 | §4、§7.6、§8 |
 //! | [`http`] | `tiny_http` 接线：路由、准入、响应头 | §4.2、§4.4、§7 |
 //! | [`run`] | 启动编排、静态页注入、启动日志、`--open` | §3、§7.1、§7.6、§9 |
@@ -57,6 +58,7 @@ mod cli;
 mod download;
 mod engine;
 mod error;
+mod evaluate;
 mod export;
 mod http;
 mod jobs;

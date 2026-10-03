@@ -3265,3 +3265,584 @@ run --json first-point x identical=True
 7. **`/api/status.retention.retained_originals` 是 M3 新增的诊断字段**，页面不读它
    （只用它做测试断言）；若前端要用，需要像 M2 的 `download_hosts`/`engine_load_ms` 那样
    在 `docs/05` §4.2 的 `/api/status` 一栏登记。
+
+---
+
+# 【M4】公式与评估：真实的第二队列、模型集接线与复用库的评估
+
+- **时间**：2026-10-04（本机）
+- **工作范围**：`crates/rapid-ocr-rs`（父仓库 `.gitignore` 的既有改动与本阶段无关）
+- **未提交**：按要求不 commit；证据全部来自当前工作树
+- **开工基线**：`c2f35d6`（M0 `1144ddb` + M0b `dbab12e` + M1 `06bd0af` + M2 `8532fd8` + M2b `dcf8583` + M3 `c2f35d6`）
+- **阶段**：`docs/05` §11「M4」的全部条目 + §3 / §4.1 / §4.2（新增 4.2.1）/§4.4 / §5.3 / §5.4 /
+  §8.3 / §9.2 / §9.4 / §10.8 / §11.1 / §12 里与本里程碑相关的冻结契约
+- **被收口的接缝**：M1 接缝「M4（公式与评估）」4 条、M2 接缝 5（公式模型集）、M3 接缝 1–3
+  （公式模型与路由、公式区域进入导出/诊断、评估复用库）
+- **本阶段**：`docs/05` 的三处**文档修正**（§5.4 作用域、§4.2.1 新协议、§4.1 的唯一例外）、
+  §3 的两个新选项、§8.3/§10.8/§11.1/§12 的补充。**没有改动任何库文件**（见"证据：未触碰的文件"）
+
+## 环境
+
+| 项目 | 值 |
+| --- | --- |
+| target | Windows x64 + MSVC ABI：`x86_64-pc-windows-msvc` |
+| 工具链 | rustc 1.98.1 / cargo 1.98.1 |
+| crate | `rapid-ocr-rs` 0.7.0（独立 git 仓库，本阶段未提交） |
+| 真实资产（文本） | `OCR-Model/small/`（det/rec/dict）、`OCR-Model/test-config-small.yaml`、`OCR-test-image/`（12 图 + `golden-manifest.json`） |
+| 真实资产（公式） | `OCR-Model/Formula-Recognition-Models/onnx/pp_formulanet_plus_m.onnx`（593,915,961 B）、`OCR-Model/Formula-Detection-Model/pix2text-mfd-1.5.onnx`（80,311,115 B）、`Formula-TestSet/` |
+| 模型目录（证据用） | `target/m4-model-dir/`（4 个**硬链接**：三个文本文件 + 公式识别模型）、`target/m4-model-dir-noformula/`（只硬链接文本三个） |
+
+**变更规模**（`git diff --stat`，12 个跟踪文件 + 1 个新文件：+1764 / −179）：
+
+| 文件 | 改动 | 内容 |
+| --- | --- | --- |
+| `src/bin/serve/model_plan.rs` | +423 | `ModelRequest::text_and_formula`；按 **role 组**（`Pipeline`）分组的就绪判定；`spec_for`/`file_for` 唯一解析（含 `AmbiguousRole`）；公式识别/检测解析；廉价的 `missing_on_disk` |
+| `src/bin/serve/server.rs` | +354 | M4 的 `OcrRouting`（带 `disabled_reason`）、`routing_for`、公式策略组装、公式 409（存在性预检）、`/api/models.formula` 块、`error_body` 唯一映射点、`text_request`/`recognize_with` 唯一引擎入口、评估单飞凭据 |
+| `src/bin/serve/tests.rs` | +609 | 4 个 fixture 修正 + 15 个新测试（公式队列、公式 409、评估 4 条、页面就绪数据面） |
+| `src/bin/web/index.html` | +143 | `QUEUE_ROLES.formula` 的角色修正；`formula` 块进 `normalizeModels`；`modelsReadyFor('formula')` 叠加路由门禁；评估小节（路径 + 表格） |
+| `src/bin/serve/http.rs` | +107 | `/api/evaluate` 路由 + `spawn_evaluation`（独立线程、单飞）、公式队列的**读 body 之前**存在性预检、错误体映射收口 |
+| `src/bin/serve/run.rs` | +62 | `--formula-detector` 启动期校验与解析（CLI > 模型集 role）、公式路由判据接线、启动日志两行 |
+| `src/bin/serve/cli.rs` | +53 | `--formula-detector`、`--max-eval-cases`（选项面 21 → 23，逐项枚举测试同步） |
+| `src/bin/serve/limits.rs` | +31 | `--max-eval-cases`（默认 32，≥ 1） |
+| `src/bin/rapidocr.rs` | +28 | `evaluation_report_value`（CLI 与 serve 的评估报告**同一份**实现） |
+| `src/bin/serve/error.rs` | +22 | `ServeError::Evaluation`（400 `bad_request` + `detail.reason`） |
+| `src/bin/serve/evaluate.rs` | 新文件 | `POST /api/evaluate` 的请求体白名单、清单加载/限流/路径解析、复用 `evaluation::ocr` 的逐例评估 + 4 个单测 |
+| `src/bin/serve/mod.rs` | +2 | 模块表与 `mod evaluate;` |
+| `docs/05-...md` | +109 | 见上文"文档修正" |
+
+**D1/D2/D3/D4 的签名（新增或改动的对外面）**：
+
+```rust
+// model_plan.rs —— role 分组的唯一实现
+pub(super) enum Pipeline { Text, Formula }
+impl Pipeline { pub fn of(role: ModelRole) -> Self }
+pub(super) fn blocking_files(statuses: &[ModelSetStatus], pipeline: Pipeline) -> Vec<BlockingFile>
+impl ModelPlan {
+    pub fn missing_on_disk(&self, pipeline: Pipeline) -> Vec<String>;   // 只 stat，不哈希
+    pub fn formula_recognizer(&self) -> Result<(PathBuf, String), ModelPlanError>;
+    pub fn formula_detector(&self) -> Result<Option<PathBuf>, ModelPlanError>;
+    fn spec_for(&self, role: ModelRole) -> Result<Option<&ModelFileSpec>, ModelPlanError>;
+}
+impl ModelReport {
+    pub fn is_complete(&self) -> bool;              // 文本管线（每个文件 Present 且有哈希）
+    pub fn formula_complete(&self) -> bool;
+    pub fn formula_missing_names(&self) -> Vec<String>;  // 以及 corrupt / blocking
+}
+
+// server.rs
+pub(super) struct OcrRouting { pub formula: bool, pub disabled_reason: Option<String> }
+pub(super) fn routing_for(detector: Option<&Path>) -> OcrRouting;
+impl ServeShared {
+    pub fn formula_policy(&self) -> Option<FormulaPolicy>;
+    pub fn formula_models_on_disk(&self) -> bool;
+    pub fn formula_status_json(&self, report: &ModelReport) -> Value;
+    pub fn formula_blocked_body(&self) -> Body;
+    pub fn error_body(&self, error: &ServeError) -> Body;
+    pub fn begin_evaluation(self: &Arc<Self>) -> Option<EvaluationGuard>;
+    pub fn max_eval_cases(&self) -> usize;
+}
+pub(super) fn text_request(bytes: Arc<[u8]>, max_side: Option<u32>, formula: FormulaPolicy) -> OcrRequest;
+pub(super) fn recognize_with(runtime: &ServeShared, request: OcrRequest) -> Result<OcrOutput, ServeError>;
+
+// evaluate.rs / http.rs / cli.rs
+pub(super) fn parse_manifest_body(bytes: &[u8]) -> Result<PathBuf, ServeError>;
+pub(super) fn load_cases(manifest: &Path, limit: usize) -> Result<Vec<EvaluationCase>, ServeError>;
+pub(super) fn resolve_image(manifest: &Path, case: &EvaluationCase) -> PathBuf;
+pub(super) fn run(shared: &ServeShared, manifest: &Path) -> Result<Value, ServeError>;
+pub(super) const IOU_THRESHOLD: f32 = 0.5;
+fn spawn_evaluation(shared: &Arc<ServeShared>, manifest: PathBuf, request: Request) -> Result<(), Box<(ServeError, Request)>>;
+// CLI：--formula-detector <ONNX>、--max-eval-cases <N>（默认 32）
+// 协议：POST /api/ocr?queue=formula（队列即管线）、POST /api/evaluate {"manifest": "<path>"}
+//      /api/models.formula = {complete, missing, corrupt, blocked, routing, disabled_reason,
+//                             required_roles, detector:{configured,file}}
+//      /api/status += formula 块 + limits.max_eval_cases
+```
+
+---
+
+## 交付物 1：公式模型集接线（`ModelPlan` → `/api/models`）
+
+**改动前的根因**：`ModelPlan::resolve` 固定请求 `ModelRequest::text_only`，因此
+`/api/models` 只有一个集合，页面永远看不到 566 MB 的公式模型；而且 M1 的
+`ModelReport::is_complete()` / `blocking_names()` 是"**所有集合的并集**"——一旦把公式集合
+加进来而沿用这个口径，**公式模型没下载就会让普通 OCR 变成 409**。这是本阶段要修的根因，
+不是"加个字段"。
+
+**改动后**：
+
+1. `resolve` 请求 `ModelRequest::text_and_formula(selection)`（库已有的入口，与
+   `ModelRequest::required_roles()` 是**同一份** role 定义），并在启动期立刻解析一次
+   `formula_recognizer()`：同一 role 声明两个不同文件时**启动期**就报
+   `AmbiguousRole`（`spec_for` 是唯一解析实现，公式 role 与文本 role 走同一条判定）。
+2. 就绪判定按 **role 组**（`Pipeline::of`）而不是按集合或集合顺序：默认表把两条管线放在两个
+   集合里，本地清单把两条管线放在**一个**集合里，两种来源下结论一致。
+   文本组 = detector/classifier/recognizer/dictionary/tokenizer；公式组 = formula_detector/
+   formula_recognizer。
+3. `/api/models` 的顶层 `complete`/`missing`/`corrupt`/`blocked` 收窄为**文本管线**作用域
+   （= 引擎真正加载的文件 = `/api/ocr` 的 409 与 `EngineState::BlockedModelsMissing` 用的
+   那一份），新增 `formula` 块给出公式管线的同一组字段 + `routing`/`disabled_reason` +
+   `detector`（只给文件名）。`complete` 仍然要求"每个文件 Present **且**声明了哈希"（§5.2）。
+4. 公式集合本身**一行代码都不用改**就走通了 M2 的下载路径：它是模型集里的一个集合，
+   `/api/models` 报 `download_bytes_total=593915961`（≈566 MB），页面按集合渲染
+   `下载「PP-FormulaNet_plus-M」· 566 MB` 的按钮（点击才下载，`data-set-id` 就是集合 id，
+   没有"默认下 sets[0]"）。
+
+**修改前后行为**（真实服务 + 真实模型，见验证 4/6）：
+
+| 项目 | 修改前 | 修改后 |
+| --- | --- | --- |
+| `ModelPlan` 请求的管线 | `text_only` | `text_and_formula` |
+| `/api/models.sets` | 1 个（文本） | 2 个（文本 + `PP-FormulaNet_plus-M`） |
+| `/api/models.complete` 的作用域 | "所有集合"的并集 | **文本管线**（公式缺失不再影响它） |
+| 公式模型缺失时 `POST /api/ocr`（文本） | —（当时公式集合根本不在清单里） | 仍然 **202 → succeeded**（这是必须成立的回归，验证 6 用真实模型跑了） |
+| 同一 role 两个文件 | 文本 role 会拒绝 | 文本与**公式** role 都拒绝（`AmbiguousRole`，启动期） |
+
+## 交付物 2：公式作为真实的第二队列
+
+**协议决策（已写进 `docs/05` §4.2.1）**：队列类别**就是**管线选择，
+即 `POST /api/ocr?queue=formula` 走公式管线、进公式队列；**不**增加 `formula=1`。
+理由写在文档里：队列与管线在 §8.3 里本来就是一一对应的，再加一个布尔开关会多出
+`queue=text&formula=1` 这种自相矛盾的组合，而页面本来就已经按开关发送 `queue=formula`
+（原型既有代码，未改）。
+
+**改动后**：
+
+- `OcrRouting` 的含义从"M1 的固定关闭"变成"启动期判据 + 文字理由"：
+  `routing_for(detector)` 只在配置了页面公式检测模型时打开（`--formula-detector`，或本地清单
+  声明的 `formula_detector` role，CLI 优先）。**没有检测模型就不打开路由**（仍是 400），
+  而不是"接了但永远产不出公式区域"——`FormulaPolicy` 在没有 `detector_path` 时只处理
+  `input_regions`，HTTP 请求里没有这种区域，那会是一条"成功且零公式区域"的假路径。
+- 公式队列的任务在 worker 里得到**由模型集组装**的 `FormulaPolicy`：识别模型路径 +
+  **集合声明的 SHA-256**（库在加载时校验，这就是"下到的东西对不对"的权威判定）+
+  检测模型路径。队列类别是唯一的管线选择点（`recognize()` 里一个 `match class`）。
+- 公式队列的准入预检：`queue=formula` 且公式 role 的文件**不在磁盘上** → 在**读 body 之前**
+  409 `models_missing`/`models_corrupt`，`detail.scope="formula"`、`missing`/`corrupt`/
+  `missing_on_disk` 三个清单。预检只 `stat`（公式模型 566 MB，放进每个请求的准入路径会让
+  吞吐崩掉），哈希判定留给加载时——这一点在 `detail` 与文档里都说清楚了。
+- 页面门禁：`QUEUE_ROLES.formula` 从 `['formula_detector','formula_recognizer']` 改成
+  `['formula_recognizer']`（= 库的 `ModelRequest::formula_roles()`），再叠加
+  `/api/models.formula.routing`。**这是页面唯一必要的语义修正**：默认表刻意不把检测模型登记为
+  集合成员（§5.1 的注释、`assets/default_models.yaml` 的 `formula:` 段），把它当必需角色会让
+  开关**永远**不可用。不可用时行内给出文字理由（缺角色 → "缺少 公式识别"；无检测模型 →
+  服务端原文），不只靠禁用态/颜色（§9.4）。
+
+**修改前后行为**：
+
+| 项目 | 修改前（M3） | 修改后 |
+| --- | --- | --- |
+| `POST /api/ocr?queue=formula` | 生产路径固定 **400**（路由关闭；只有测试注入的 `OcrRouting{formula:true}` 能达到） | 202（模型齐备+检测模型在场）/ **409**（公式模型缺失，公式作用域 detail）/ 400（没有检测模型） |
+| 公式任务执行 | 不存在 | 真实公式管线：检测 → 抹白 → 文本管线 → 批量公式识别，`stages.formula=completed`、`timings.formula_ms` 有值 |
+| 普通 OCR 与公式缺口 | — | 文本 409/引擎状态只含文本文件；公式缺失时普通 OCR 照常 202→succeeded |
+| 页面公式开关 | 因角色列表错误而**恒不可用** | 公式集合齐备 + 路由可用才可勾选，否则给文字理由 |
+
+## 交付物 3：公式区域进入结果与导出
+
+**库侧本来就支持**（`RegionKind::Formula`、`OcrRegion.formula`、`timings.formula_ms`、
+`to_output_markdown`、`render_output_report`、`TimingLedger.formula_ms`），M3 的记录已说明
+"生产路径跑不出公式区域，因此这一层只有单元/夹具证据"。M4 接上管线后不需要新协议，
+用真实模型逐项验证（验证 4）：
+
+- `/api/jobs/{id}/result`：50 个区域里 **8 个 `kind="formula"`**，每个带 `formula.latex` +
+  `formula.model_id="pp_formulanet_plus_m"` + `detection.score`；`timings.formula_ms≈5798`、
+  `stages.formula.state="completed"`；
+- `export?format=json`：**与 `/result` 逐字节相同**，解析后 formula 区域的 latex 列表与结果一致；
+- `export?format=md`：latex 出现、`公式` 标记出现、无 `<script`；
+- `export?format=html`：latex 出现（39 处 "公式/formula" 标记）、**无 `<script`**（`ReportMode::Static`）、
+  附件头与导出 CSP 未变（M3 的测试仍在守这条）；
+- 页面：区域列表本来就按 `kind === 'formula'` 渲染"公式"标签 + 虚线框（第二视觉线索，
+  不只靠颜色），文本取 `formula.latex`；诊断面板的"逐阶段耗时"表会自动列出 `formula_ms`
+  （它渲染 `timings` 里除 `total` 外的全部数值字段）。**因此页面无需为 D3 改动**——
+  这也是本阶段"先验证再改"的结果，而不是"没改所以没做"。
+
+## 交付物 4：评估（复用库的 `evaluation`）
+
+**范围（明确说清做了什么、故意没做什么）**：
+
+- 做：`POST /api/evaluate`，请求体**恰好** `{"manifest": "<本机清单路径>"}`（白名单式校验，
+  与 `parse_set_id` 同一形状）；清单格式 = `rapidocr evaluate --manifest` 的
+  `[{image, text, boxes}]`，`image` 相对清单所在目录解析（与 CLI 同一规则）；
+  逐例调用 `evaluation::ocr::evaluate_case`（CER / 精确匹配 / 检测精度与召回 / 多边形 IoU），
+  汇总用 `EvaluationSummary::from_cases`——**一行指标实现都没有另写**；
+- 报告字段与 CLI **同源**：抽出 `crate::evaluation_report_value(&EvaluationSummary)`
+  （库的质量指标 + `peak_working_set_bytes`/`memory_source`/`ort_runtime`/`ort_runtime_version`），
+  CLI 的 `rapidocr evaluate` 与 serve 都调它；serve 额外加 `iou_threshold` 与
+  `manifest_file`（只给文件名，§7.4 脱敏）；
+- 执行方式：**独立线程 + 单飞**（`Documents/05` §4.1 记录的唯一例外，理由写进文档）。
+  第二个并发评估 503 `busy`；推理走与 OCR 任务**同一条**引擎锁路径；`--max-eval-cases`
+  （默认 32）给一次请求的时间上界；模型缺失/引擎不可用分别是 409/503，与 `/api/ocr`
+  **同一份**错误体（`ServeShared::error_body` 是唯一映射点）。
+- **故意没做**（都比"半成品 UI"更诚实）：没有逐例进度、没有取消（推理不可中断，§4.3）；
+  没有把评估做成队列任务（那需要给结果类型加第二种载荷，而它的中间状态没有可轮询语义）；
+  没有上传清单 + multipart（§2.2 明确不引入 multipart，因此页面的输入是**路径**，
+  由用户手输/粘贴）。公式领域的指标集（`evaluation::formula`）**不在本端点范围内**：
+  `rapidocr evaluate` 的口径就是文本 OCR 的质量，混进公式指标会造出第二套"默认汇总"，
+  而库的 `evaluation` 模块文档明确要求两类指标不得混合。
+
+**页面**：右侧"评估"小节 = 一行输入（清单绝对路径）+ "评估"按钮 + 一张小表
+（均值 CER / 精确匹配率 / 用例数 / IoU 阈值 + 逐例 CER/精确/图像名列）。事件在 nonce 脚本里
+绑定（无内联 `onclick`），失败时显示服务端 `detail.reason` 原文。
+
+---
+
+## 验证
+
+### 1. 静态检查与 feature 矩阵（全部 exit 0）
+
+| # | 命令 | 结果 |
+| --- | --- | --- |
+| 1 | `cargo fmt --all -- --check` | 0 |
+| 2 | `cargo clippy --all-targets -- -D warnings` | 0 |
+| 3 | `cargo clippy --features serve --all-targets -- -D warnings` | 0 |
+| 4 | `cargo test --all-targets` | **384 passed**（lib）+ 2 + 4 + 14，**0 failed** |
+| 5 | `cargo test --features serve --all-targets` | **384 passed**（lib）+ 2 + 4 + 14 + **218 passed**（bin，含 4 个 M4 单测模块与 15 个新测试），**0 failed** |
+| 6 | `cargo build --release --bins` | 0 |
+| 7 | `cargo build --release --features serve --bins` | 0 |
+
+日志：`target/m4-gate/gates.log`。第 5 项的 218 个 bin 测试里，
+`serve::tests`（真实端口 + 原始 TCP）52 → 60 个，其中 M4 新增：
+
+```text
+serve::tests::the_formula_queue_runs_the_formula_pipeline_from_the_model_set
+serve::tests::an_incomplete_formula_set_is_409_while_text_ocr_keeps_working
+serve::tests::removing_the_formula_model_turns_the_route_into_a_409
+serve::tests::the_evaluate_endpoint_returns_the_library_summary
+serve::tests::an_invalid_evaluation_request_is_a_locating_400
+serve::tests::evaluation_needs_the_same_model_admission_as_ocr
+serve::tests::a_second_evaluation_is_refused_while_one_is_running
+serve::model_plan::tests::a_missing_formula_model_never_blocks_the_text_pipeline
+serve::model_plan::tests::the_formula_roles_resolve_through_the_same_rule
+serve::model_plan::tests::an_ambiguous_formula_recognizer_is_rejected_at_startup
+serve::server::tests::the_routing_refuses_to_silently_use_the_formula_queue
+serve::server::tests::the_formula_routing_is_decided_by_the_detector_alone
+serve::evaluate::tests::{the_evaluate_body_carries_only_a_manifest_path,
+                         a_bad_manifest_is_rejected_with_a_locating_reason,
+                         case_images_resolve_relative_to_the_manifest,
+                         the_iou_threshold_matches_the_cli_default}
+```
+
+本轮**没有**弱化/跳过/删除任何断言：改动过的测试只有三类合法原因（fixture 必须声明公式 role；
+`/api/models` 的集合数与作用域按 M4 语义变化；`OcrRouting` 多了 `disabled_reason` 字段），
+每一处都在测试里写明了"为什么期望变了"。
+
+### 2. 依赖隔离（默认依赖图**逐位不变**）
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo tree -e normal -p rapid-ocr-rs` | **606 行**，SHA-256 `BD2AB5E41B1A6D649E2F80B0D3D3E55327B96EB7C6F861E55DFC7C8501C3F6FC`（与 M2b/M3 记录**逐位相同**）；`tiny_http` **0** 次 |
+| `cargo tree -e normal --no-default-features` | 605 行，`tiny_http` **0** 次 |
+| `cargo tree -e normal -p rapid-ocr-rs --features serve` | 611 行，`tiny_http` **1** 次 |
+
+`Cargo.toml` 未改；M4 也没有引入任何新依赖（评估用的是库自带的 `evaluation` + 已有的
+`serde_json`）。
+
+### 3. 12 图 HTTP 与 CLI 逐张一致（**12/12**，真实服务 + 真实模型）
+
+`target/m4-evidence/run-12-images.ps1`（release `rapidocr.exe serve --model-dir target/m4-model-dir
+--config OCR-Model/test-config-small.yaml`）：
+
+```text
+models: complete=True formula.complete=True formula.routing=False
+01基础多位置文本.png   serve= 42 cli= 42 count=True texts=True
+02多语言与RTL混排.png  serve= 21 cli= 21 count=True texts=True
+03旋转与倾斜.png       serve= 13 cli= 13 count=True texts=True
+04表格与键值对.png     serve= 61 cli= 61 count=True texts=True
+05代码与等宽字体.png   serve= 38 cli= 38 count=True texts=True
+06低对比度与深色背景.png serve= 21 cli= 21 count=True texts=True
+07小字号与密集排版.png serve= 37 cli= 37 count=True texts=True
+08数字公式与符号.png   serve= 51 cli= 51 count=True texts=True
+09竖排文本.png         serve= 14 cli= 14 count=True texts=True
+10长段落与分栏.png     serve= 37 cli= 37 count=True texts=True
+11文字样式与特效.png   serve= 22 cli= 22 count=True texts=True
+12综合压力测试.png     serve= 61 cli= 61 count=True texts=True
+TOTAL serve=418 cli=418 images=12
+ALL_12_MATCH=True      （逐张 regions 数、recognition.text 序列全等）
+```
+
+每张图的完整响应与 CLI 输出分别在 `target/m4-gate/serve-<name>.json` 与 `cli-<name>.json`。
+注意这一次 `formula.routing=False`（没给 `--formula-detector`）：**生产默认形态下普通 OCR 与
+M1 完全一致**，公式能力的存在没有改变文本路径。
+
+### 4. 公式队列（真实 566 MB 模型 + 真实页面）
+
+`target/m4-evidence/run-formula.ps1`（`--formula-detector ...\pix2text-mfd-1.5.onnx`）：
+
+```text
+models.source=default_table top.complete=True
+formula.complete=True formula.routing=True detector=pix2text-mfd-1.5.onnx
+formula set: id=PP-FormulaNet_plus-M complete=True bytes=0
+  file pp_formulanet_plus_m.onnx role=formula_recognizer state=present
+       size=593915961 sha256=71b6d389cf7b857e45252a4b98cfced1a3ffca7bf24d9497d02d052a41d9493b
+status.formula.routing=True limits.max_eval_cases=32
+
+POST /api/ocr?queue=formula  -> 202 {"kind":"ocr","queue":"formula","state":"queued"}
+job state=succeeded queue=formula queued_ms=449 elapsed_ms=6519
+regions=50 formula_regions=8
+formula_timings: formula_ms=5798.48486328125 total_ms=6510.61767578125 stages.formula=Completed
+  latex=\scriptstyle \int 0 ^ { \wedge } \infty ... = \sqrt { \pi } / 2  model=pp_formulanet_plus_m score=0.6838
+  latex=\sqrt { 2 } \approx 1 . 4 1 4 \quad \pi \approx 3 . 1 4 1 5 9        score=0.6219
+  latex=\scriptstyle \mathbf { a } ^ { 2 } + \mathbf { b } ^ { 2 } = ...      score=0.5917
+  latex=\mathrm { X } \leq \mathrm { y } \geq ...                              score=0.5587
+  latex=1 \quad / \quad \backslash ...                                         score=0.3750
+  latex=C - 9 2                                                                score=0.3394
+  latex=\rightarrow \leftarrow \uparrow \downarrow ...                         score=0.3322
+  latex=6.022 \times 10^{23} / 1.6 \mathrm{e} - 19 / 3.0 \mathrm{E} + 8 ...   score=0.3111
+
+CLI(同一策略: --formula-model --formula-detector): regions=50 formula_regions=8 formula_ms=5278.98
+MATCH_regions=True  MATCH_texts=True  MATCH_formula_latex=True
+export json: bytes=40485 carries_latex=True same_as_result=True formula_regions=8
+export md:   bytes=1450  carries_latex=True has_script=False formula_markers=1
+export html: bytes=672818 carries_latex=True has_script=False formula_markers=39
+```
+
+（用 `OCR-test-image\08数字公式与符号.png`：一页含 8 个公式区域；服务端与 CLI 的
+区域数、文本序列、latex 序列**三者全等**。）
+
+**页面就绪判定（不是"读代码觉得对"，而是把页面的函数跑在真实 JSON 上）**：
+`target/m4-page-probe.mjs` 从 `src/bin/web/index.html` 抽出**同一份**内联脚本，在最小 DOM 桩里
+执行后调用页面自己的 `modelsReadyFor`/`formulaBlockedText`/`renderBanner`：
+
+```text
+# 公式集合齐备 + 路由可用（models-formula.json）
+{"text_queue":{"ready":true,...},"formula_queue":{"ready":true},"banner":{"hidden":true}}
+# 公式模型缺失（models-incomplete.json）
+{"text_queue":{"ready":true},"formula_queue":{"ready":false,"missing":["公式识别"],
+ "reason":"缺少 公式识别"},
+ "banner":{"hidden":false,"incomplete_sets":["PP-FormulaNet_plus-M"],
+           "shows_set_button":true,"shows_formula_size":true,"offers_only_clicked_set":true}}
+# 没有检测模型（models-nodetector.json）
+{"formula_complete":true,"formula_routing":false,"text_queue":{"ready":true},
+ "formula_queue":{"ready":false,"reason":"服务端未启用公式路由（--formula-detector）"}}
+```
+
+第二条同时证明了交付物 1 的"体积提示 + 按集合点击"：横幅里出现的正是
+`下载「PP-FormulaNet_plus-M」· 566 MB`（`fmtBytes(593915961)`）且按钮带 `data-set-id`。
+
+### 5. 双向公平性（**真实工作**，两个方向都成立）
+
+`target/m4-evidence/run-fairness.ps1`，参数 `--max-queue-text 2 --max-queue-formula 1
+--max-consecutive-text 2 --max-consecutive-formula 1`，上界取自 `/api/status`：
+
+```text
+queues: text(capacity=2 quota=2 wait_bound=2) formula(capacity=1 quota=1 wait_bound=2)
+
+=== direction 1: formula flood, text victim ===
+flood: accepted=1 refused(503)=9 completed=2
+flood saturation observed: 10/10 status polls had used >= capacity
+max other-class job elapsed_ms=5957
+victim(text): state=succeeded queued_ms=524 elapsed_ms=1105 wall_ms=7016
+bound: (wait_bound=2 + 1) * 5957 + 2000 ms = 19871 ms
+DIRECTION_1_FORMULA_FLOOD__TEXT_VICTIM_OK=True
+
+=== direction 2: text flood, formula victim ===
+flood: accepted=4 refused(503)=12 completed=5
+flood saturation observed: 16/16 status polls had used >= capacity
+max other-class job elapsed_ms=5197
+victim(formula): state=succeeded queued_ms=7988 elapsed_ms=4430 wall_ms=11749
+bound: (wait_bound=2 + 1) * 5197 + 2000 ms = 17591 ms
+DIRECTION_2_TEXT_FLOOD__FORMULA_VICTIM_OK=True
+
+served_in_round: text=1 formula=0    queue used: text=1 formula=0
+BOTH_DIRECTIONS_OK=True
+```
+
+要点（如实）：
+
+- 两个方向的"洪水"都由**真实推理**产生（方向 1 是真实公式 OCR，方向 2 是真实文本 OCR），
+  调度器与队列代码**一行未改**（M0c 冻结的策略）；
+- 脚本断言的不只是"受害者等得不久"，还包括"洪水在窗口内**确实被服务过**"
+  （完成的任务数 2 / 5，以及 10/10、16/16 次 `/api/status` 观测到 `used >= capacity`）；
+  否则"没被饿死"没有意义；
+- 方向 1 的受害者只等了 **524 ms**：两个队列都非空时调度器先取文本（本轮文本配额 2），
+  于是文本任务排在一个**正在跑的**公式任务之后、在洪水任务之前被服务——这正是 §8.3
+  保底规则想要的结果，比上界强得多；
+- 方向 2 的受害者等了 **7988 ms**（≈1.5 个文本任务），远在 17591 ms 的界内；
+- 这里的"界"用墙钟表达，因此额外留了 2000 ms 的调度/上报余量；**规则本身**
+  （另一类最多被服务 `wait_bound` 次）由 `queue.rs` 的确定性单测证明（M0c/M1 保留）。
+
+### 6. 不完整的公式集 / 没有检测模型（普通 OCR 必须照常）
+
+`target/m4-evidence/run-incomplete.ps1`：
+
+```text
+# A：文本模型齐备、公式模型缺失、给了 --formula-detector
+A: top.complete=True top.missing=
+A: formula.complete=False formula.missing=pp_formulanet_plus_m.onnx formula.routing=True reason=
+A: queue=formula -> HTTP 409 code=models_missing
+   detail={"blocked":[...],"missing":["pp_formulanet_plus_m.onnx"],
+           "missing_on_disk":["pp_formulanet_plus_m.onnx"],"scope":"formula",
+           "model_dir":"<redacted>","source":"default_table"}
+A: queue=text -> HTTP 202 queue=text
+A: text job state=succeeded regions=42
+A: page probe -> {"text_queue":{"ready":true},
+                  "formula_queue":{"ready":false,"reason":"缺少 公式识别"}}
+
+# B：模型齐备、**没有** --formula-detector
+B: formula.complete=True formula.routing=False detector.configured=False
+B: disabled_reason=formula routing is not enabled on this server: no page formula detector is
+                   configured, ... Pass --formula-detector <ONNX> ... ordinary OCR is unaffected
+B: queue=formula -> HTTP 400 code=bad_request
+B: queue=text -> HTTP 202      B: text job state=succeeded
+B: page probe -> {"formula_queue":{"ready":false,
+                  "reason":"服务端未启用公式路由（--formula-detector）"}}
+```
+
+再加一条运行期变化（单元/HTTP 测试 `removing_the_formula_model_turns_the_route_into_a_409`）：
+真删掉 `<model-dir>/fx.onnx` 后 `/api/models.formula` 立刻变 `missing`（不缓存启动期快照），
+公式请求变 409，文本集合仍 `complete=true`。
+
+### 7. 评估端点复现库/CLI 的数字（真实 12 图标注清单）
+
+`target/m4-evidence/run-evaluate.ps1`（`OCR-test-image/golden-manifest.json`，12 例真实标注）：
+
+```text
+POST /api/evaluate -> HTTP 200 in 12.3 s
+serve: cases=12 mean_cer=0.44765135645866394 exact_match_rate=0 mean_det_precision= iou_threshold=0.5
+       manifest_file=golden-manifest.json
+serve: ort_runtime_version=1.28.0 memory_source=windows:GetProcessMemoryInfo.PeakWorkingSetSize
+       peak_working_set_bytes=1219923968
+cli:   cases=12 mean_cer=0.44765135645866394 exact_match_rate=0 mean_det_precision=
+MATCH_cases=True MATCH_mean_cer=True MATCH_exact_match_rate=True MATCH_per_case=True
+mean_cer 原始字面量： serve=0.44765135645866394  cli=0.44765135645866394
+SERVE_MEAN_CER_IS_GATE_LITERAL=True
+逐例 CER 字面量全等（12/12）：01=0.48523622751236 02=0.608949422836304 03=0.470119535923004
+04=0.329704523086548 05=0.657448709011078 06=0.379396975040436 07=0.536519408226013
+08=0.390644758939743 09=0.0838709697127342 10=0.575593948364258 11=0.441422581672668
+12=0.412908941507339
+page table row 0: image=01基础多位置文本.png cer=0.48523622751236 exact_text=False
+```
+
+即：HTTP 端点的 `mean_cer` 与 CLI/硬门槛的 `0.44765135645866394` **是同一个浮点值的同一串
+字面量**，逐例 CER 也一一相同（报告字段还包含 `ort_runtime`/`peak_working_set_bytes` 等
+CLI 附加项）。响应保存在 `target/m4-gate/evaluate-serve.json` 与 `evaluate-cli.json`。
+
+### 8. 12 图硬门槛（`target/m4-gate/`，**没有**覆盖 `tests/baseline/`）
+
+```powershell
+target\release\bench_warm_e2e.exe --config <OCR-Model>\test-config-small.yaml `
+  --images-dir <OCR-test-image> --warmup-rounds 1 --rounds 3 --max-side-len 2000 `
+  --intra-threads 16 --output target\m4-gate\bench-cpu-2000.json
+target\release\rapidocr.exe evaluate --manifest <OCR-test-image>\golden-manifest.json `
+  --config <OCR-Model>\test-config-small.yaml --output target\m4-gate\evaluation-cpu.json
+```
+
+| 门槛 | 要求 | 本次实测（release） | 比较方式 | 结论 |
+| --- | --- | --- | --- | --- |
+| 12 图区域数均值 | `34.833333333333336` | **`34.833333333333336`**（36 样本） | 原始 JSON 的**数字字面量**精确比较 | True |
+| 12 图 mean CER | `0.44765135645866394` | **`0.44765135645866394`**（12 例） | 同上 | True |
+
+补充：`tests/baseline/windows-baseline/bench-cpu-2000.json` 的 `regions.avg` 与本次
+字面量相同；`tests/baseline/evaluation-small.json` 里存的是**低精度**的 `0.44765136`
+（epoch-0 快照，位数更少）——这是既有事实，不是 M4 的差异：M1/M3/M4 三次 `*-gate/evaluation-cpu.json`
+的字面量都是 `0.44765135645866394`。`git status --porcelain -- tests/baseline` 为空。
+
+### 9. 环境变量门控的 `formula_integration_tests`
+
+```powershell
+$env:RAPID_OCR_MODEL_ROOT='D:\100_Projects\110_Daily\SnapClip\OCR-Model'
+$env:RAPID_OCR_FORMULA_TEST_ROOT='D:\100_Projects\110_Daily\SnapClip\Formula-TestSet'
+cargo test --lib formula_integration_tests -- --test-threads=1
+```
+
+**11 passed, 0 failed, 0 ignored**（81.02 s），日志里 `skipping test` 出现 **0** 次
+（→ 真实加载了公式模型与真实页面）。日志：`target/m4-gate/formula-integration.log`。
+
+### 10. im2latex-100 smoke：**跳过，理由如下**
+
+本阶段**没有改动任何公式推理代码**：`git status` 显示改动的 12 个跟踪文件全部在
+`src/bin/serve/*`、`src/bin/web/index.html`、`src/bin/rapidocr.rs` 与 `docs/05`，
+`src/formula/**`、`src/ocr/**`、`src/evaluation/**`、`src/bin/formula_eval.rs` **一个文件都没有动**
+（库文件 0 改动，因此依赖图逐位不变）。im2latex-100 smoke 跑的是 `formula_eval` 这条
+公式推理路径，其代码与依赖在 M4 中完全没有变化；作为替代证据，公式路径由验证 4
+（真实 566 MB 模型 + 真实页面，与 CLI 的 regions/text/latex 三者全等）与验证 9
+（环境变量门控的公式集成测试，11 passed / 0 skipped）覆盖。若审查方要求"即使没改也复跑"，
+命令与上一里程碑相同（`formula_eval --dataset im2latex --split test --limit 100`），
+本阶段基于上面的理由选择不占用这段时间。
+
+---
+
+## 关键行为对比（AGENTS.md §9）
+
+| 项目 | 修改前（M3） | 修改后（M4） | 预期结果 |
+| --- | --- | --- | --- |
+| `ModelPlan` 请求的管线 | `text_only` | `text_and_formula`；公式 role 缺失/歧义都在启动期报错 | §5.3、§5.4 |
+| 就绪判定的粒度 | 所有集合的并集 | **按 `files[].role` 分组**（文本 / 公式） | §5.2、§8.1 |
+| 公式模型缺失对普通 OCR 的影响 | （公式集合当时不在清单里，无从发生） | **无影响**：`/api/models.complete`、409 `detail`、`BlockedModelsMissing.missing` 都只含文本文件 | §7.6、§10.8 |
+| `POST /api/ocr?queue=formula` | 生产路径固定 400 | 202 / 409（公式作用域 detail，读 body 前判定）/ 400（无检测模型） | §4.2.1、§4.4 |
+| 公式任务执行 | 不存在（只有测试注入的路由） | 真实公式管线；`FormulaPolicy` 的模型与 SHA-256 来自模型集 | §5.3、§10.8 |
+| 公式区域 | 生产路径跑不出来（只有夹具证据） | 8/50 个 `RegionKind::Formula` + latex；JSON/MD/HTML 三种导出都带上 | §9.2、§9.5 |
+| 页面公式开关 | 角色列表错误 → **恒不可用** | 公式集合齐备 + 路由可用才可勾选；否则给文字理由（含服务端原文） | §9.4、§10.8 |
+| 页面模型横幅 | 文本集合一个按钮 | 每个不齐备集合各自一个按钮，公式集合显示 `566 MB`，点击才下载 | §5.4、§9.2 |
+| 评估 | 无 | `POST /api/evaluate`：复用库指标，字段与 CLI 同源 | §11 M4 |
+| CLI 选项面 | 21 个 | 23 个（`--formula-detector`、`--max-eval-cases`），仍无 `--host`/`--ocr-workers` | §3、§7.1、§8.2 |
+| 库 / 依赖 / 推理链路 | — | **库文件 0 改动**；`Cargo.toml` 未改；三份依赖树与 M3 快照 0 差异；两个 12 图硬门槛逐位相同 | §2.1 |
+
+**证据：未触碰的文件**
+
+- `Temp/demo3-v2.html`：`git status --porcelain -- Temp` 只列 `?? demo1/2/3.html`（本阶段之前
+  就未跟踪）；`demo3-v2.html` 的 SHA-256 仍是
+  `14871FED101D11451F9B799FD199144D6CEC7874C5682D0D630DED1F5E3D46EE`（与 M3 记录相同）；
+- `docs/03-windows-only-optimization-tasks.md`：`git status --porcelain` 为空；
+- `tests/baseline/`：`git status --porcelain -- tests/baseline` 为空（门槛输出写在 `target/m4-gate/`）；
+- 页面注入契约未动：`__CSP_NONCE__` ×4（其中 3 个是真实 `nonce="…"` 属性）、`__SRV_TOKEN__` ×3；
+  两个内联脚本各自 `node --check` exit 0（主脚本 73,542 字符）。
+
+---
+
+## 与 `docs/05` §11「M4」验收清单的对照
+
+| §11 M4 条目 | 本阶段 | 证据 |
+| --- | --- | --- |
+| 公式模型下载（566 MB，显式点击 + 体积提示） | ✅ 完成 | 交付物 1；`/api/models` 报告 `download_bytes_total=593915961` 与 SHA-256；页面探针确认横幅渲染 `下载「PP-FormulaNet_plus-M」· 566 MB` 且按钮带该集合的 `data-set-id`（绝不自动下载、绝不回落 `sets[0]`） |
+| 公式 OCR 走独立队列（§8.3） | ✅ 完成 | 交付物 2；验证 4（真实 202 `queue=formula` → succeeded，8 个公式区域）与验证 5（两个方向都用真实工作） |
+| 公式区域展示与诊断 | ✅ 完成 | 交付物 3；验证 4：`/result` 8/50 个 `kind="formula"` + `formula_ms≈5798` + `stages.formula=completed`；三种导出都带 latex；页面本就按 `kind` 渲染"公式"标签 + 虚线框（第二视觉线索） |
+| 上传标注样本 → CER / 精确匹配（复用 `evaluation`，不另写指标） | ✅ 完成（范围明确） | 交付物 4；验证 7：12 例真实标注，逐例 CER 与均值与 CLI **字面量全等**；7 个 HTTP/单元测试覆盖拒绝路径、准入与单飞 |
+| **M4 的隐含验收**：普通 OCR 不受公式缺口影响 | ✅ 完成 | 验证 3（12/12，`formula.routing=False` 的默认形态）与验证 6（公式缺失/无检测模型时文本仍 202→succeeded） |
+
+---
+
+## 接缝（留给后续 / 发布前）
+
+1. **公式检测模型没有可信下载来源**：`--formula-detector` 是本机路径，用户必须自己准备
+   `pix2text-mfd-1.5.onnx`。将来若登记了可信来源，它应当作为 `formula_detector` role 进入
+   默认表（`ModelRegistry::formula_model_set` 只做了一次 `ModelFileSpec::new`，不需要新抽象），
+   届时 `--formula-detector` 自然退化为"覆盖"；`/api/models.formula.detector` 的形状不用改。
+2. **`/api/models` 每次调用都会重新哈希 566 MB 的公式模型**（本机约 1 s，
+   `target/m4-model-dir` 实测）。请求路径不受影响（公式准入只用 `stat` 的
+   `missing_on_disk`），但页面若把 `/api/models` 轮询变密就会明显变慢。要改就得引入
+   "带失效条件的缓存"（例如按 mtime+size），这是 M1 接缝 8 的放大版。
+3. **评估是同步返回报告的**（§4.1 记录的唯一例外）：没有逐例进度、没有取消。要进度就得把
+   它变成队列任务，并给结果类型加第二种载荷（`ResultStore` 目前只装 `Arc<OcrOutput>`）。
+4. **评估的清单路径来自请求体**：带 token 的本机页面可以指向本机任意清单 JSON，并由其中的
+   `image` 字段读本机图片。这是本机单用户工具既定信任模型（§7.1/§7.2）下的一致行为，
+   但没有"路径必须在某个根目录内"的限制；要收窄需要新增 `--eval-root`（文档尚未要求）。
+5. **页面的评估输入是路径而不是上传**：浏览器给不出本机路径输入体验（用户需手输/粘贴）。
+   要上传清单 + 图片就得引入 multipart，而 §2.2 明确不引入 multipart 解析依赖。
+6. **公式检测模型的执行 provider / 批次**沿用引擎的运行时档案（库内共享，
+   `runtime_profile().session_runtime()`），serve 没有为它加开关——这是有意的：
+   provider 结论只应有一处（§7.5）。
+7. **无检测模型时公式路由整体不可用（400）**：这是刻意的取舍（见交付物 2），但意味着
+   "文件都在、却没有检测模型"的用户拿不到任何公式区域。页面的文字理由与服务端
+   `disabled_reason` 已经把这件事讲清楚；若将来把"显式区域"接进 HTTP（例如请求体里的
+   `input_regions`），这条路由就可以在没有检测模型时也工作。
+
+## 未覆盖风险（如实）
+
+1. **未提交、未在干净 clone 上验证**：按要求不 commit；证据来自当前工作树（`c2f35d6` + 本阶段改动）。
+2. **真实浏览器手工闭环未做**：公式开关的点击、566 MB 下载按钮、评估表格与路径输入都只做了
+   数据面（真实 JSON）+ 页面函数探针（`node`）验证；没有人工在浏览器里点过（M1/M2/M3 的同类
+   未覆盖风险仍在）。评估表格的 CSS 也没有在真实浏览器里复核。
+3. **没有真的下载一遍 566 MB 公式模型**：本机已有该文件，证据用的是硬链接；下载路径本身与
+   文本集合共用同一条库实现（`download_model_set_observed`，与集合无关），M2/M2b 已用真实网络
+   验证过它；但"公式集合的 566 MB 从 ModelScope 下下来"这一步**没有**在 M4 重新跑。
+4. **公平性验证是墙钟上界**：规则本身（另一类最多被服务 `wait_bound` 次）由 `queue.rs`
+   的确定性单测证明；HTTP 层的墙钟数字受机器负载影响，因此加了 2000 ms 余量，并把
+   "洪水确实被服务过"作为断言。上界与实测之间差一到两个数量级（524/7988 ms vs 19871/17591 ms），
+   因此这个余量不影响结论，但它毕竟是余量而不是等式。
+5. **`--max-eval-cases` 的默认 32 是新的**（§3 之前没有这一项）：一张 32 例的清单在真实图片上
+   约 30–60 s（12 例实测 12.3 s），期间该端点占着一个线程与引擎锁；评估与 OCR 任务因此会互相
+   排队（引擎只有一个 worker）。这是"单引擎"的固有约束（§8.2），不是 M4 引入的。
+6. **`AmbiguousRole` 只验证到启动期**：本地清单里同一 role 两个文件（文本与公式各一例）都会
+   拒绝启动；"两个**集合**声明同一 role 的不同文件"在默认表里无法构造（默认表的两个集合
+   role 不重叠），因此那条组合只有代码路径上的同一实现，没有独立夹具。
+7. **`tests/baseline/evaluation-small.json` 的精度差异**（见验证 8）是既有事实；本阶段
+   没有修改任何 baseline 文件，但审查时容易误判，故在此点名。

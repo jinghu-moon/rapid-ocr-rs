@@ -344,6 +344,15 @@ main{flex:1;min-height:0;display:grid;grid-template-columns:minmax(400px,46fr) 5
 /* ============ 右下：导出与诊断 ============ */
 .export-row{display:flex;gap:12px;margin-top:14px;flex-wrap:wrap}
 .export-row .btn-ghost{flex:1;min-width:120px}
+/* M4 评估：一行输入 + 一张小表（复用诊断表的排版，不新增视觉语言） */
+.eval-row{display:flex;gap:10px;margin-top:14px;align-items:stretch}
+.eval-input{flex:1;min-width:0;background:transparent;color:var(--fg);border:1px solid var(--line);
+  border-radius:2px;padding:8px 10px;font-family:"JetBrains Mono",Consolas,monospace;font-size:11.5px}
+.eval-input:focus-visible{outline:2px solid var(--fg);outline-offset:1px}
+.eval-out{margin-top:12px;border:1px solid var(--line);padding:12px 14px}
+.eval-out .diag-table td:first-child{text-align:left}
+.eval-sum{font-size:12px;color:var(--fg);margin:0 0 10px;line-height:1.8}
+.eval-sum b{font-weight:600}
 .diag{margin-top:22px;border:1px solid var(--line)}
 .diag summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;
   padding:12px 16px;font-size:13px;color:var(--fg2);user-select:none}
@@ -554,6 +563,17 @@ main{flex:1;min-height:0;display:grid;grid-template-columns:minmax(400px,46fr) 5
         <button class="btn-ghost" id="expHtml" disabled title="静态报告，不含脚本">HTML（静态）</button>
       </div>
 
+      <!-- M4 评估：复用库的 evaluation（CER / 精确匹配），不另写指标。
+           请求体只有 {manifest} —— 与本机 `rapidocr evaluate --manifest` 同格式。 -->
+      <div class="sec-label gap">评估 <span>EVALUATE&nbsp;·&nbsp;CER</span></div>
+      <div class="eval-row">
+        <input type="text" id="evalPath" class="eval-input" spellcheck="false"
+               placeholder="已标注清单的绝对路径（与 rapidocr evaluate --manifest 同格式）"
+               aria-label="标注清单路径">
+        <button class="btn-ghost" id="evalBtn">评估</button>
+      </div>
+      <div class="eval-out" id="evalOut" aria-live="polite" hidden></div>
+
       <details class="diag" id="diag">
         <summary>
           <svg class="ic" aria-hidden="true" focusable="false"><use href="#i-clock"/></svg>
@@ -682,13 +702,19 @@ function jobActive(){ return !!(state.job && (state.job.state === 'queued' || st
 /* ============ 队列就绪判定（docs/05 §8.1 双队列 / §10.8 公式路由默认关闭） ============
   模型集的**就绪是按队列分别判定的**，不存在"任一集合不齐备就整页不可用"这种全局结论：
     · text    → 只需普通 OCR 模型集齐备：detector + recognizer + dictionary；
-    · formula → 需要公式模型集齐备：formula_detector + formula_recognizer。
+    · formula → 需要公式模型集齐备：formula_recognizer。
   公式模型缺失（566 MB，默认不下载）绝不允许阻塞普通文本 OCR；反之亦然。
   后端以 `files[].role` + `files[].state` 表达每个文件的状态（§5.4 / ModelSetStatus），
-  因此这里按**角色**取并集判定，而不是挑某一个集合 id —— 服务端将来拆/并集合都不影响。 */
+  因此这里按**角色**取并集判定，而不是挑某一个集合 id —— 服务端将来拆/并集合都不影响。
+
+  M4 的一处数据修正：公式**检测**模型（pix2text-mfd-1.5.onnx）在 FormulaPolicy 里是可选的、
+  也没有可信的下载来源，因此它**不是**公式集合的成员（assets/default_models.yaml 的
+  `formula:` 段注释、库的 `ModelRequest::formula_roles()` 只要求 formula_recognizer）。
+  把它当成必需角色会让开关永远不可用；它是否存在由服务端在 `/api/models` 的
+  `formula.detector` / `formula.routing` 里回答（见 modelsReadyFor）。 */
 const QUEUE_ROLES = {
   text:    ['detector', 'recognizer', 'dictionary'],
-  formula: ['formula_detector', 'formula_recognizer']
+  formula: ['formula_recognizer']
 };
 function modelFiles(){
   const m = state.models;
@@ -696,12 +722,16 @@ function modelFiles(){
   if(m.error) return null;
   return m.sets.flatMap(s => (s.files || []));
 }
-/* 返回 {ready, missing:[角色中文名], fatal:bool}。
+/* 返回 {ready, missing:[角色中文名], fatal:bool, reason:string|null}。
    fatal = 连模型清单都没有（请求失败 / 尚未返回）——此时才不允许提交任何队列。
-   损坏（corrupt）与缺失一样都是"不可用"，但文案必须区分（§5.2 损坏建议重新下载）。 */
+   损坏（corrupt）与缺失一样都是"不可用"，但文案必须区分（§5.2 损坏建议重新下载）。
+   formula 还额外要求服务端的**公式路由可用**（`/api/models.formula.routing`）：
+   M4 的公式管线需要页面公式检测模型（--formula-detector），没有它就只处理调用方显式声明的
+   区域，而 HTTP 请求里没有这种区域——那样"成功"的公式任务永远产不出公式区域。
+   服务端把理由写在 `formula.disabled_reason` 里，这里原样显示（§9.4：不只靠禁用态）。 */
 function modelsReadyFor(queue){
   const files = modelFiles();
-  if(files === null) return { ready:false, missing:[], fatal:true };
+  if(files === null) return { ready:false, missing:[], fatal:true, reason:null };
   const need = QUEUE_ROLES[queue] || QUEUE_ROLES.text;
   const missing = [];
   need.forEach(role => {
@@ -711,7 +741,22 @@ function modelsReadyFor(queue){
     else if(f.state === 'corrupt') missing.push(zh + '（损坏）');
     else if(f.state !== 'present') missing.push(zh);
   });
-  return { ready: missing.length === 0, missing, fatal:false };
+  if(missing.length) return { ready:false, missing, fatal:false, reason:null };
+  if(queue === 'formula'){
+    const fx = state.models && state.models.formula;
+    if(fx && fx.routing === false){
+      return { ready:false, missing:[], fatal:false,
+               reason: fx.disabled_reason || '服务端未启用公式路由（--formula-detector）' };
+    }
+  }
+  return { ready:true, missing:[], fatal:false, reason:null };
+}
+/* 公式开关不可用时的一行理由（缺失角色优先，其次是服务端的路由说明）。 */
+function formulaBlockedText(st){
+  if(!st || st.ready) return '';
+  const missing = (st.missing || []).join('、');
+  if(missing) return `缺少 ${missing}`;
+  return st.reason || '公式模型（/api/models 尚未返回）';
 }
 
 function toast(msg, type, icon){
@@ -929,6 +974,15 @@ function normalizeModels(m){
   return {
     source: m.source || 'default_table',
     downloadsAllowed: !!m.downloads_allowed,
+    /* M4：公式管线的独立结论（顶层 complete/missing 是**文本管线**作用域，
+       引擎要加载的就是那些文件；公式缺失不得让普通 OCR 变成 409）。 */
+    formula: m.formula ? {
+      complete: !!m.formula.complete,
+      missing: m.formula.missing || [],
+      routing: m.formula.routing !== false,
+      reason: m.formula.disabled_reason || null,
+      detector: m.formula.detector || null
+    } : null,
     sets: (m.sets || []).map(s => ({
       id: s.id, complete: !!s.complete, bytes: s.download_bytes_total,
       files: (s.files || []).map(f => ({
@@ -1273,7 +1327,8 @@ function queueReadyHtml(){
     : `<b>文本队列 · 不可用</b><br>缺少 ${esc(t.missing.join('、'))} → POST /api/ocr 会被服务端以 409 models_missing 拒绝。`;
   const fxCell = f.ready
     ? '<b>公式队列 · 就绪</b><br>公式模型集齐备，可在左侧开启公式识别路由。'
-    : `<b>公式队列 · 不可用（不影响普通 OCR）</b><br>缺少 ${esc(f.missing.join('、') || '公式模型')}；公式路由默认关闭（§10.8），普通文本 OCR 照常可用。`;
+    : `<b>公式队列 · 不可用（不影响普通 OCR）</b><br>${esc(formulaBlockedText(f))}；` +
+      '公式路由默认关闭（§10.8），普通文本 OCR 照常可用。';
   return `<div class="eng-q ${t.ready ? 'eng-q-ok' : 'eng-q-warn'}" id="qReady">
       ${ic(t.ready ? 'check' : 'alert')}<span class="eng-q-txt">${textCell}</span></div>
     <div class="eng-q eng-q-off ${f.ready ? 'eng-q-ok' : ''}" id="qReadyFormula">
@@ -1566,8 +1621,9 @@ function renderButton(){
   if(state.result){ lbl.textContent = '重新识别'; use('refresh'); }
   else { lbl.textContent = '开始识别'; use('scan'); }
 }
-/* 公式开关：只有公式集合齐备时才可勾选；不可用时给出**文字**理由（不只靠颜色/透明度）。
-   禁用状态随 /api/models 刷新实时变化 —— 下载完成后重新启用，不需要重载页面。 */
+/* 公式开关：只有公式集合齐备**且**服务端路由可用时才可勾选；不可用时给出**文字**理由
+   （不只靠颜色/透明度）。禁用状态随 /api/models 刷新实时变化 —— 下载完成后重新启用，
+   不需要重载页面。 */
 function renderFormulaToggle(){
   const row = $('fxRow'), box = $('fxToggle'), cap = $('fxCap');
   const st = modelsReadyFor('formula');
@@ -1577,18 +1633,18 @@ function renderFormulaToggle(){
   box.checked = state.formula === true;
   row.hidden = false;
   row.classList.toggle('disabled', !on);
+  const why = formulaBlockedText(st);
   row.title = on ? '公式路由：区域检测 → 公式识别（独立队列，最多 2 个在排队）'
-                 : `公式模型集未就绪：缺少 ${st.missing.join('、') || '公式模型'}；普通文本 OCR 不受影响`;
+                 : `公式队列不可用：${why}；普通文本 OCR 不受影响`;
   cap.textContent = on
     ? '公式模型集就绪。开启后公式区域走独立队列（docs/05 §8.3），整块区域从文本通道中抹白。'
-    : `不可开启：缺少 ${st.missing.join('、') || '公式模型（/api/models 尚未返回）'}。` +
-      '公式路由默认关闭（docs/05 §10.8），**普通文本 OCR 不受影响**，可在上方横幅按集合下载公式模型。';
+    : `不可开启：${why}。正文里普通文本 OCR 不受影响；公式识别模型可在上方横幅按集合下载（566 MB）。`;
 }
  $('fxToggle').addEventListener('change', e => {
   const st = modelsReadyFor('formula');
   if(e.target.checked && !st.ready){                        /* 兜底：状态变化期间被勾选 */
     e.target.checked = false;
-    toast(`公式模型集未就绪（缺少 ${st.missing.join('、') || '公式模型'}），无法开启公式路由`, 'err', 'cloud-off');
+    toast(`公式队列不可用（${formulaBlockedText(st)}），无法开启公式路由`, 'err', 'cloud-off');
     return;
   }
   state.formula = !!e.target.checked;
@@ -1825,6 +1881,59 @@ async function exportAs(fmt){
   }catch(e){ toastErr(e); }
 }
 
+/* ================= 评估（M4：POST /api/evaluate，复用库的 evaluation） =================
+   服务端返回的就是 `rapidocr evaluate` 的那份报告（库的 EvaluationSummary + 运行时四字段），
+   因此这里的字段名与 CLI 报告逐字段相同：cases[].{image,cer,exact_text,...}、
+   mean_cer、exact_match_rate、iou_threshold、ort_runtime…。前端只排版、不重算指标。 */
+function fmtPct(v){ return typeof v === 'number' ? (v * 100).toFixed(1) + '%' : '—'; }
+function fmtNum(v, d){ return typeof v === 'number' ? v.toFixed(d == null ? 4 : d) : '—'; }
+function renderEvaluation(rep){
+  const out = $('evalOut');
+  out.hidden = false;
+  const cases = Array.isArray(rep.cases) ? rep.cases : [];
+  out.innerHTML =
+    `<p class="eval-sum"><b>均值 CER</b> ${fmtNum(rep.mean_cer)} · ` +
+    `<b>精确匹配</b> ${fmtPct(rep.exact_match_rate)} · ` +
+    `<b>用例</b> ${cases.length} · <b>IoU 阈值</b> ${fmtNum(rep.iou_threshold, 2)} · ` +
+    `清单 <code>${esc(rep.manifest_file || '—')}</code></p>` +
+    `<table class="diag-table">
+       <tr><td>#</td><td>图像</td><td>CER</td><td>精确</td></tr>` +
+    cases.map((c, i) =>
+      `<tr><td>${i + 1}</td><td title="${esc(c.image || '')}">${esc((c.image || '').split(/[\\/]/).pop())}</td>` +
+      `<td>${fmtNum(c.cer)}</td><td>${c.exact_text === true ? '是' : '否'}</td></tr>`).join('') +
+    `</table>
+     <p class="diag-note">指标由服务端复用库的 <code>evaluation</code> 计算（字符错误率 = 编辑距离 ÷ 参考长度；
+     精确匹配按空白归一化后比较），与 <code>rapidocr evaluate --manifest</code> 的报告同源同字段。
+     一次请求最多评估 <code>--max-eval-cases</code> 张图（默认 32，见 /api/status 的 limits）。</p>`;
+}
+ async function runEvaluation(){
+  if(DEMO){
+    toast('离线预览模式不执行评估：请用 rapidocr serve 打开本页，并在输入框填入清单路径', 'err', 'info');
+    return;
+  }
+  const path = ($('evalPath').value || '').trim();
+  const btn = $('evalBtn');
+  const out = $('evalOut');
+  if(!path){ toast('请先填入已标注清单的绝对路径（rapidocr evaluate --manifest 的格式）', 'err', 'info'); return; }
+  btn.disabled = true;
+  out.hidden = false;
+  out.innerHTML = `<p class="eval-sum">${ic('loader','spin')} 评估中…（每张图一次完整推理，最多 --max-eval-cases 张）</p>`;
+  try{
+    const rep = await apiSendJson('POST', '/api/evaluate', { manifest: path });
+    renderEvaluation(rep);
+    toast(`评估完成 · 均值 CER ${fmtNum(rep.mean_cer)}`, 'ok');
+  }catch(e){
+    out.hidden = true; out.innerHTML = '';
+    /* detail.reason 是可定位的原因（清单读不出来 / 用例超限 / 图读不出来），原样显示。 */
+    const reason = e && e.body && e.body.detail && e.body.detail.reason;
+    if(reason) toast(reason, 'err', 'alert'); else toastErr(e);
+  }finally{
+    btn.disabled = false;
+  }
+}
+ $('evalBtn').addEventListener('click', runEvaluation);
+ $('evalPath').addEventListener('keydown', e => { if(e.key === 'Enter') runEvaluation(); });
+
 /* ================= 渲染：诊断面板（复用 timings / 指纹，不重新测量，§7.5/§10.6） ================= */
 /* 诊断面板顶部永远先渲染契约错误：字段缺失/改名在这里留痕，
    与 toast 一起构成"可见 + 可查"的两条路径（P2-2）。
@@ -1954,6 +2063,12 @@ function demoInitialModels(){
      与 docs/05 一致：公式模型默认不下载（§10.8），普通 OCR 不依赖它（M4 公式独立）。 */
   return normalizeModels({
     model_dir:'<redacted>', source:'default_table', downloads_allowed:true,
+    /* M4：顶层字段是**文本管线**作用域；公式管线单独一块。 */
+    complete:true, missing:[], corrupt:[], blocked:[],
+    formula:{ complete:false, missing:['pp_formulanet_plus_m.onnx'], corrupt:[], blocked:[],
+              routing:true, disabled_reason:null,
+              required_roles:['formula_recognizer'],
+              detector:{ configured:true, file:'pix2text-mfd-1.5.onnx' } },
     sets:[
       { id:'PP-OCRv5（演示）', complete:true, download_bytes_total:0,
         files:[

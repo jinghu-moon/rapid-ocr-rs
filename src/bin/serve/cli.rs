@@ -21,9 +21,10 @@ use rapid_ocr_rs::{EngineConfig, ProviderPreference};
 
 use super::limits::{
     DEFAULT_JOB_TTL_SECS, DEFAULT_MAX_BODY_MB, DEFAULT_MAX_CONSECUTIVE_FORMULA,
-    DEFAULT_MAX_CONSECUTIVE_TEXT, DEFAULT_MAX_DOWNLOAD_MB, DEFAULT_MAX_EXPORT_MB,
-    DEFAULT_MAX_QUEUE_FORMULA, DEFAULT_MAX_QUEUE_TEXT, DEFAULT_MAX_RESULT_MB, DEFAULT_MAX_RETAINED,
-    DEFAULT_MAX_RETAINED_MB, DEFAULT_MAX_TOMBSTONES, DEFAULT_PORT, RawServeLimits,
+    DEFAULT_MAX_CONSECUTIVE_TEXT, DEFAULT_MAX_DOWNLOAD_MB, DEFAULT_MAX_EVAL_CASES,
+    DEFAULT_MAX_EXPORT_MB, DEFAULT_MAX_QUEUE_FORMULA, DEFAULT_MAX_QUEUE_TEXT,
+    DEFAULT_MAX_RESULT_MB, DEFAULT_MAX_RETAINED, DEFAULT_MAX_RETAINED_MB, DEFAULT_MAX_TOMBSTONES,
+    DEFAULT_PORT, RawServeLimits,
 };
 use super::state::StartupConfigError;
 
@@ -140,6 +141,17 @@ pub struct ServeArgs {
     /// 终态任务与 tombstone 保留时长（秒，默认 600）。
     #[arg(long = "job-ttl-secs", default_value_t = DEFAULT_JOB_TTL_SECS, value_name = "N")]
     pub job_ttl_secs: u64,
+
+    /// 页面公式检测模型（`pix2text-mfd-1.5.onnx`；给出即启用公式队列，§4.2、§10.8）。
+    ///
+    /// 公式**识别**模型来自模型集（`formula_recognizer`，默认表可下载）；检测模型在
+    /// `FormulaPolicy` 里是可选的、且没有可信的公开下载来源，因此只能显式给出。
+    #[arg(long = "formula-detector", value_name = "ONNX")]
+    pub formula_detector: Option<PathBuf>,
+
+    /// `POST /api/evaluate` 一张清单最多评估多少张图（默认 32）。
+    #[arg(long = "max-eval-cases", default_value_t = DEFAULT_MAX_EVAL_CASES, value_name = "N")]
+    pub max_eval_cases: usize,
 }
 
 impl ServeArgs {
@@ -158,6 +170,7 @@ impl ServeArgs {
             max_retained_mb: self.max_retained_mb,
             max_tombstones: self.max_tombstones,
             job_ttl_secs: self.job_ttl_secs,
+            max_eval_cases: self.max_eval_cases,
         }
     }
 
@@ -212,13 +225,13 @@ mod tests {
     use crate::serve::limits::{
         DEFAULT_ALLOW_DOWNLOAD, DEFAULT_ALLOW_PROVIDER_FALLBACK, DEFAULT_JOB_TTL_SECS,
         DEFAULT_MAX_BODY_MB, DEFAULT_MAX_CONSECUTIVE_FORMULA, DEFAULT_MAX_CONSECUTIVE_TEXT,
-        DEFAULT_MAX_DOWNLOAD_MB, DEFAULT_MAX_EXPORT_MB, DEFAULT_MAX_QUEUE_FORMULA,
-        DEFAULT_MAX_QUEUE_TEXT, DEFAULT_MAX_RESULT_MB, DEFAULT_MAX_RETAINED,
-        DEFAULT_MAX_RETAINED_MB, DEFAULT_MAX_TOMBSTONES, DEFAULT_PORT, MIB,
+        DEFAULT_MAX_DOWNLOAD_MB, DEFAULT_MAX_EVAL_CASES, DEFAULT_MAX_EXPORT_MB,
+        DEFAULT_MAX_QUEUE_FORMULA, DEFAULT_MAX_QUEUE_TEXT, DEFAULT_MAX_RESULT_MB,
+        DEFAULT_MAX_RETAINED, DEFAULT_MAX_RETAINED_MB, DEFAULT_MAX_TOMBSTONES, DEFAULT_PORT, MIB,
     };
 
     /// §3 的完整选项名清单（**唯一**的一处枚举）。
-    const DOCUMENTED_OPTION_NAMES: [&str; 21] = [
+    const DOCUMENTED_OPTION_NAMES: [&str; 23] = [
         "port",
         "model-dir",
         "config",
@@ -240,6 +253,9 @@ mod tests {
         "max-retained-mb",
         "max-tombstones",
         "job-ttl-secs",
+        // M4：公式队列的检测模型与评估用例上限（§3、§4.2）。
+        "formula-detector",
+        "max-eval-cases",
     ];
 
     /// 测试用的最小 `Parser` 包装。
@@ -347,6 +363,9 @@ mod tests {
         assert_eq!(args.max_retained_mb, DEFAULT_MAX_RETAINED_MB);
         assert_eq!(args.max_tombstones, DEFAULT_MAX_TOMBSTONES);
         assert_eq!(args.job_ttl_secs, DEFAULT_JOB_TTL_SECS);
+        // M4：公式检测模型默认**不给**（路由默认关闭，§10.8），用例上限是文档默认值。
+        assert_eq!(args.formula_detector, None);
+        assert_eq!(args.max_eval_cases, DEFAULT_MAX_EVAL_CASES);
 
         // §3 表格里的数字本身（防止常量被改歪还自洽）。
         assert_eq!(args.max_body_mb, 32);
@@ -361,6 +380,7 @@ mod tests {
         assert_eq!(args.max_retained_mb, 64);
         assert_eq!(args.max_tombstones, 256);
         assert_eq!(args.job_ttl_secs, 600);
+        assert_eq!(args.max_eval_cases, 32);
 
         // 默认值经同一套换算变成字节。
         let limits = args.raw_limits().validate().expect("defaults are valid");
@@ -414,6 +434,10 @@ mod tests {
             "512",
             "--job-ttl-secs",
             "1200",
+            "--formula-detector",
+            "D:\\models\\pix2text-mfd-1.5.onnx",
+            "--max-eval-cases",
+            "8",
         ]);
         assert_eq!(args.port, 9000);
         assert_eq!(
@@ -450,6 +474,11 @@ mod tests {
         assert_eq!(limits.max_retained_bytes, 128 * MIB);
         assert_eq!(limits.max_tombstones, 512);
         assert_eq!(limits.job_ttl_ms, 1_200_000);
+        assert_eq!(limits.max_eval_cases, 8);
+        assert_eq!(
+            args.formula_detector.as_deref(),
+            Some(std::path::Path::new("D:\\models\\pix2text-mfd-1.5.onnx"))
+        );
         assert!(!args.uses_documented_defaults());
     }
 
@@ -495,6 +524,16 @@ mod tests {
         assert_eq!(
             args.raw_limits().validate().expect_err("zero TTL").field(),
             "--job-ttl-secs"
+        );
+
+        // M4：评估用例上限同样必须 ≥ 1（0 个用例的评估没有意义，是配置错误）。
+        let args = parse(&["--max-eval-cases", "0"]);
+        assert_eq!(
+            args.raw_limits()
+                .validate()
+                .expect_err("zero eval cases")
+                .field(),
+            "--max-eval-cases"
         );
     }
 

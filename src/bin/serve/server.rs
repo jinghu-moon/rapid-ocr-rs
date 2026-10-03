@@ -26,7 +26,7 @@
 //! 两把锁从不同时持有，因此没有锁序问题。
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -52,7 +52,9 @@ use super::jobs::{
     JobState as JobLifecycle, JobStore, JobStoreLimits, Millis,
 };
 use super::limits::ServeLimits;
-use super::model_plan::{ModelPlan, ModelReport, ModelSnapshot, PendingDownload, source_label};
+use super::model_plan::{
+    ModelPlan, ModelReport, ModelSnapshot, PendingDownload, Pipeline, source_label,
+};
 use super::queue::{DualQueueScheduler, QueueClass, ScheduledJob, SchedulerConfig};
 use super::results::{Outcome, ResultStore, SerializeError, Succeeded, serialize_bounded};
 use super::security::{LocalOrigin, ServeToken};
@@ -76,30 +78,67 @@ pub(super) fn monotonic_ms() -> Millis {
     start.elapsed().as_millis() as Millis
 }
 
-/// OCR 的队列路由。
+/// OCR 的队列路由（§8.1、§10.8）。
 ///
-/// M1 的默认是 [`Self::text_only`]（§10.8：公式路由默认关闭，页面也不发送任何开关）。
-/// 公式路由要等 M4 才会接上真实来源；在此之前 `queue=formula` 的显式请求会被拒绝，
-/// 而不是悄悄按文本处理。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// M4 起公式路由是**真实**的：`queue=formula` 会被路由到公式管线并在公式队列里排队。
+/// 判据只有一条（[`routing_for`]）：服务端必须有一个公式**检测**模型
+/// （`--formula-detector`，或模型集里声明的 `formula_detector` role）。
+///
+/// 为什么没有检测模型就**不**打开路由，而不是"接了但永远没有公式区域"：`FormulaPolicy`
+/// 在没有 `detector_path` 时只处理调用方显式声明的区域（`input_regions`），而 HTTP 请求里
+/// 没有这种区域，于是公式队列会稳定地返回零个公式区域——一个"看起来成功但没有做任何事"
+/// 的路径。宁可明确拒绝（400，理由写在 `disabled_reason` 里，页面据此禁用开关），
+/// 也不提供一条静默无效的路由。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct OcrRouting {
     pub formula: bool,
+    /// 公式路由不可用时给用户的**文字**理由（进 `/api/models` 的 `formula.disabled_reason`
+    /// 与 `/api/status`；页面把它显示在公式开关旁，不只靠颜色/禁用态）。
+    pub disabled_reason: Option<String>,
 }
 
 impl OcrRouting {
-    /// M1 生产路径的路由：全部进普通队列。
-    pub const fn text_only() -> Self {
-        Self { formula: false }
+    /// 公式路由可用（检测模型已经在场）。
+    pub const fn formula_enabled() -> Self {
+        Self {
+            formula: true,
+            disabled_reason: None,
+        }
+    }
+
+    /// 公式路由不可用，并给出可定位理由。
+    pub fn text_only(reason: impl Into<String>) -> Self {
+        Self {
+            formula: false,
+            disabled_reason: Some(reason.into()),
+        }
     }
 
     /// 查询参数里的 `queue` 取值 → 队列类别。
-    pub fn class_for(self, requested: Option<&str>) -> Result<QueueClass, ServeError> {
+    pub fn class_for(&self, requested: Option<&str>) -> Result<QueueClass, ServeError> {
         match requested {
             None | Some("text") => Ok(QueueClass::Text),
             Some("formula") if self.formula => Ok(QueueClass::Formula),
             // 公式路由没启用时**不**降级成文本：静默换队列会让 409/503 的判断失去意义。
             Some(_) => Err(ServeError::BadRequest),
         }
+    }
+}
+
+/// 启动期决定公式路由是否可用（**唯一**判据）。
+///
+/// 参数是已经解析好的检测模型（`--formula-detector` 优先，其次是模型集里声明的
+/// `formula_detector` role，见 `run.rs`）。理由文案里点名用户真正要做的动作。
+pub(super) fn routing_for(detector: Option<&Path>) -> OcrRouting {
+    match detector {
+        Some(_) => OcrRouting::formula_enabled(),
+        None => OcrRouting::text_only(
+            "formula routing is not enabled on this server: no page formula detector is \
+             configured, and without one the formula pipeline can only handle caller-declared \
+             regions (there are none over HTTP). Pass --formula-detector <ONNX> (for example \
+             pix2text-mfd-1.5.onnx) to enable the formula queue; ordinary OCR is unaffected \
+             (docs/05 §4.2, §10.8)",
+        ),
     }
 }
 
@@ -144,6 +183,9 @@ pub(super) struct ServeContext {
     /// 否则同一条冻结规则会有两种解释（见 [`ServeShared::switch_provider`]）。
     pub allow_provider_fallback: bool,
     pub routing: OcrRouting,
+    /// 页面公式检测模型（M4）：`--formula-detector` 优先，其次是模型集里声明的
+    /// `formula_detector` role。`None` = 公式路由不可用（见 [`OcrRouting`]）。
+    pub formula_detector: Option<PathBuf>,
     pub engine_factory: EngineFactory,
     pub downloader: DownloaderFactory,
     pub free_space: FreeSpaceFactory,
@@ -234,6 +276,8 @@ pub(super) struct ServeShared {
     /// `--allow-provider-fallback`（§7.5）：运行期切换 provider 复用**同一个**开关。
     allow_provider_fallback: bool,
     routing: OcrRouting,
+    /// 页面公式检测模型（M4）；`None` = 公式路由不可用。
+    formula_detector: Option<PathBuf>,
     engine_state: Mutex<EngineStateMachine>,
     engine: Mutex<Option<Box<dyn OcrBackend>>>,
     /// 引擎加载的互斥：`POST /api/ocr` 的惰性创建、`POST /api/engine/reload` 与 M3 的
@@ -250,6 +294,13 @@ pub(super) struct ServeShared {
     /// 执行、由那个线程写响应（见 `http.rs::spawn_provider_switch`）。这个标志保证同时
     /// 只有一个切换：第二个请求得到 503 `busy`，而不是排队等一个可能很久的序列。
     provider_switch: AtomicBool,
+    /// 是否已经有一个 `POST /api/evaluate` 在跑（M4）。
+    ///
+    /// 评估是**批量**动作（每张图一次完整推理，最多 `--max-eval-cases` 张），因此它在
+    /// 独立线程里执行、由那个线程写响应：accept 线程立刻回到循环，`/api/status`、
+    /// 两个 OCR 队列与下载任务在整个评估期间照常可用。同时只允许一个评估在跑，
+    /// 第二个请求得到 503 `busy`（排队只会让两个客户端都等到一个很长的序列结束）。
+    evaluation: AtomicBool,
     jobs: Mutex<JobState>,
     queue_signal: Condvar,
     download_tx: SyncSender<DownloadCommand>,
@@ -313,7 +364,69 @@ impl ServeShared {
     }
 
     pub fn routing(&self) -> OcrRouting {
-        self.routing
+        self.routing.clone()
+    }
+
+    /// 公式队列任务的 `FormulaPolicy`（M4）：识别模型与**集合声明的 SHA-256** 都来自模型集，
+    /// 检测模型来自启动期解析的显式路径。
+    ///
+    /// 返回 `None` 只有一种情况：模型集里没有公式识别模型（启动期已拒绝，理论上不可达）。
+    pub fn formula_policy(&self) -> Option<FormulaPolicy> {
+        let (model_path, sha256) = self.model_plan.formula_recognizer().ok()?;
+        Some(FormulaPolicy {
+            enabled: true,
+            model_path: Some(model_path),
+            expected_model_sha256: Some(sha256),
+            detector_path: self.formula_detector.clone(),
+            ..FormulaPolicy::default()
+        })
+    }
+
+    /// 公式队列的**廉价**准入预检（§4.4 第 4 步之后、读 body 之前）：公式 role 的文件
+    /// 是否都在磁盘上。
+    ///
+    /// 只 `stat`，**不哈希**——公式模型约 566 MB，把它加进每个请求的准入路径会让吞吐
+    /// 直接崩掉。权威判定是库在加载识别器时的 SHA-256 校验（`expected_model_sha256`），
+    /// 损坏的文件因此会在任务里以 409 `models_corrupt` 失败，而不是在这里被误报为缺失。
+    pub fn formula_models_on_disk(&self) -> bool {
+        self.model_plan
+            .missing_on_disk(Pipeline::Formula)
+            .is_empty()
+    }
+
+    /// 上面那条预检的响应体（与 `/api/models` 的 `formula` 块同源同序）。
+    pub fn formula_blocked_body(&self) -> Body {
+        Body::json(409, render_error_body(&self.formula_missing_failure()))
+    }
+
+    /// 公式队列的 409 载荷（`code` 由磁盘上的哈希结论决定，`detail` 是公式作用域）。
+    fn formula_missing_failure(&self) -> ErrorBody {
+        let report = self.models();
+        ErrorBody {
+            code: if report.formula_corrupt_names().is_empty() {
+                "models_missing"
+            } else {
+                "models_corrupt"
+            },
+            message: "the formula model set is incomplete".to_string(),
+            detail: self.formula_detail(),
+        }
+    }
+
+    /// 公式队列 409 的 `detail`（**公式**作用域；与 `/api/models` 的 `formula` 块同值）。
+    pub fn formula_detail(&self) -> Value {
+        let report = self.models();
+        json!({
+            "scope": "formula",
+            "missing": report.formula_missing_names(),
+            "corrupt": report.formula_corrupt_names(),
+            "blocked": report.formula_blocking_names(),
+            "missing_on_disk": self
+                .model_plan
+                .missing_on_disk(Pipeline::Formula),
+            "source": source_label(self.model_plan.source()),
+            "model_dir": REDACTED_MODEL_DIR,
+        })
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -414,6 +527,7 @@ impl ServeShared {
             },
             "queues": queues,
             "retention": retention,
+            "formula": self.formula_status_json(&self.models()),
             "limits": {
                 "max_body_bytes": self.limits.max_body_bytes,
                 "max_result_bytes": self.limits.max_result_bytes,
@@ -422,6 +536,8 @@ impl ServeShared {
                 "max_retained": self.limits.max_retained,
                 "max_retained_bytes": self.limits.max_retained_bytes,
                 "max_tombstones": self.limits.max_tombstones,
+                // M4：`POST /api/evaluate` 的用例上限（一张清单最多评多少张图）。
+                "max_eval_cases": self.limits.max_eval_cases,
             },
             "model_dir": REDACTED_MODEL_DIR,
             "source": source_label(self.model_plan.source()),
@@ -447,6 +563,17 @@ impl ServeShared {
     }
 
     /// `/api/models`（§5.4；`missing`/`corrupt`/`blocked` 与 OCR 409 的 `detail` 同源同序）。
+    ///
+    /// # M4 的作用域（根因修复，不是加字段）
+    ///
+    /// M1 的顶层 `complete`/`missing`/`corrupt`/`blocked` 是"所有集合的并集"，因为当时只有
+    /// 一条管线。M4 请求了公式集合（566 MB，默认不下载）之后，这个并集会让**普通 OCR**
+    /// 因为公式模型没下载而报 409——一个把可选能力变成硬依赖的错误结论。
+    /// 因此：
+    ///
+    /// - 顶层四个字段 = **文本管线**（= 引擎要加载的那些文件；`POST /api/ocr` 的 409 用它）；
+    /// - 新增 `formula` 块 = **公式管线**的同一组字段 + 路由是否可用 + 不可用的文字理由；
+    /// - `sets[]` 保持 §5.4 的扁平形状不变（页面按 `files[].role` 自己分组，两边判据一致）。
     pub fn models_json(&self) -> Value {
         let report = self.models();
         json!({
@@ -457,7 +584,32 @@ impl ServeShared {
             "missing": report.missing_names(),
             "corrupt": report.corrupt_names(),
             "blocked": report.blocking_names(),
+            "formula": self.formula_status_json(&report),
             "sets": report.statuses().iter().map(set_status_json).collect::<Vec<_>>(),
+        })
+    }
+
+    /// `/api/models` 的 `formula` 块（**唯一**实现；`/api/ocr` 的公式 409 复用它）。
+    ///
+    /// 页面用它给公式开关设门禁：`complete`（模型集齐备）**与** `routing`（服务端真的能把
+    /// 请求跑成公式区域）两者都成立才允许勾选，`disabled_reason` 给出文字理由。
+    pub fn formula_status_json(&self, report: &ModelReport) -> Value {
+        json!({
+            "complete": report.formula_complete(),
+            "missing": report.formula_missing_names(),
+            "corrupt": report.formula_corrupt_names(),
+            "blocked": report.formula_blocking_names(),
+            "routing": self.routing.formula,
+            "disabled_reason": self.routing.disabled_reason,
+            "required_roles": ["formula_recognizer"],
+            "detector": {
+                "configured": self.formula_detector.is_some(),
+                // §7.4 脱敏：只给文件名，绝不把本机绝对路径写进响应。
+                "file": self
+                    .formula_detector
+                    .as_deref()
+                    .map(|path| file_name(&path.to_string_lossy())),
+            },
         })
     }
 
@@ -492,6 +644,20 @@ impl ServeShared {
             ServeError::ModelsMissing
         } else {
             ServeError::ModelsCorrupt
+        }
+    }
+
+    /// 一次 `ServeError` → 响应体（**唯一**的映射点；HTTP 层与评估线程共用）。
+    ///
+    /// §7.6 要求"模型缺失/损坏"的错误体带**与 `/api/models` 同源同值**的清单：这两类错误
+    /// 因此在这里补齐 `detail`。映射按**错误种类**而不是按路由：只有 OCR 与评估这两条
+    /// 真实推理路径会产生它们，因此不需要在每个调用点重复一次路由判断。
+    pub(super) fn error_body(&self, error: &ServeError) -> Body {
+        match error {
+            ServeError::ModelsMissing | ServeError::ModelsCorrupt => {
+                Body::error_with_detail(&self.models_missing_error(), self.models_missing_detail())
+            }
+            other => Body::error(other),
         }
     }
 
@@ -1001,7 +1167,9 @@ impl ServeShared {
     /// **M3 的 provider 切换不经过这里**：它走
     /// [`Self::apply_provider`] 的 `Ready → Rebuilding → …` 序列（暂停新任务 → 排空 →
     /// 销毁旧 engine → 建立新 engine），因为那是"切换设置"，与"按当前文件重建"是两件事。
-    fn ensure_engine_loaded(&self, force: bool) -> EngineLoad {
+    /// M4 起 `POST /api/evaluate` 也在自己的线程里调它（与 OCR worker 走同一条惰性路径：
+    /// 会话绝不在 accept 线程上建立）。
+    pub(super) fn ensure_engine_loaded(&self, force: bool) -> EngineLoad {
         let plan = self.plan_snapshot();
         if !force
             && matches!(self.engine_state(), EngineState::Ready { .. })
@@ -1134,6 +1302,24 @@ impl ServeShared {
         Some(ProviderSwitchGuard {
             shared: Arc::clone(self),
         })
+    }
+
+    /// 取得"由我执行这次评估"的资格（同时只允许一个，M4）。
+    ///
+    /// 与 [`Self::begin_provider_switch`] 同一形状：第二个请求得到 503 `busy`，
+    /// 凭据在线程退出时（含 panic）释放。
+    pub fn begin_evaluation(self: &Arc<Self>) -> Option<EvaluationGuard> {
+        self.evaluation
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        Some(EvaluationGuard {
+            shared: Arc::clone(self),
+        })
+    }
+
+    /// `POST /api/evaluate` 的用例上限（`--max-eval-cases`）。
+    pub fn max_eval_cases(&self) -> usize {
+        self.limits.max_eval_cases
     }
 
     /// 运行期切换 provider 的**唯一**入口（§7.5、§7.6、M3）。
@@ -1318,6 +1504,17 @@ impl Drop for ProviderSwitchGuard {
     }
 }
 
+/// [`ServeShared::begin_evaluation`] 的资格凭据：`Drop` 时释放（panic 也释放）。
+pub(super) struct EvaluationGuard {
+    shared: Arc<ServeShared>,
+}
+
+impl Drop for EvaluationGuard {
+    fn drop(&mut self) {
+        self.shared.evaluation.store(false, Ordering::SeqCst);
+    }
+}
+
 /// 模型缺失/损坏时的引擎失败说明（点名文件，可定位）。
 fn missing_models_reason(blocking: &[String]) -> String {
     format!(
@@ -1446,11 +1643,13 @@ impl ServeRuntime {
             allow_download_hosts: context.allow_download_hosts,
             allow_provider_fallback: context.allow_provider_fallback,
             routing: context.routing,
+            formula_detector: context.formula_detector,
             engine_state: Mutex::new(machine),
             engine: Mutex::new(backend),
             engine_load: Mutex::new(()),
             engine_load_ms: Mutex::new(None),
             provider_switch: AtomicBool::new(false),
+            evaluation: AtomicBool::new(false),
             jobs: Mutex::new(JobState {
                 store: JobStore::new(JobStoreLimits::from_limits(&context.limits)),
                 scheduler: DualQueueScheduler::new(SchedulerConfig::from_limits(&context.limits)),
@@ -1591,7 +1790,7 @@ fn ocr_worker(runtime: Arc<ServeShared>) {
             );
             continue;
         };
-        let outcome = recognize(&runtime, &scheduled.id, bytes, max_side);
+        let outcome = recognize(&runtime, &scheduled.id, bytes, max_side, scheduled.class);
         runtime.finish(&scheduled.id, outcome);
     }
 }
@@ -1634,14 +1833,55 @@ fn wait_for_work(runtime: &ServeShared) {
     let _ = runtime.queue_signal.wait_timeout(state, WORKER_POLL);
 }
 
-/// 一次识别：锁引擎 → 推理 → 有界序列化（§4.6）。
+/// 一次识别：按队列类别组装请求（**唯一的**管线选择点）→ 锁引擎 → 推理 → 有界序列化（§4.6）。
+///
+/// 队列类别**就是**管线选择（§8.3：双队列正是"普通 OCR / 公式 OCR"两条管线）：请求里没有
+/// 第二个可能与之矛盾的开关。公式队列的 `FormulaPolicy` 全部由模型集与启动期解析给出
+/// （识别模型路径 + 集合声明的 SHA-256 + 检测模型路径），请求体里不允许出现任何路径。
 fn recognize(
     runtime: &ServeShared,
     job_id: &str,
     bytes: Arc<[u8]>,
     max_side: Option<u32>,
+    class: QueueClass,
 ) -> Outcome {
-    let request = OcrRequest {
+    let formula = match class {
+        QueueClass::Text => FormulaPolicy::default(),
+        QueueClass::Formula => match runtime.formula_policy() {
+            Some(policy) => policy,
+            // 路由可用却解析不到公式识别模型：模型集在运行期被改动了。
+            // 用与 `/api/models` 同源同值的 409 如实失败，而不是静默按文本处理。
+            None => return Outcome::Failed(409, runtime.formula_missing_failure()),
+        },
+    };
+    let request = text_request(bytes, max_side, formula);
+
+    let output = match recognize_with(runtime, request) {
+        Ok(output) => output,
+        Err(error) => {
+            if error.status_code() == 500 {
+                eprintln!(
+                    "serve: recognition failed for job {job_id}: {}",
+                    error.message()
+                );
+            }
+            return Outcome::Failed(error.status_code(), error.body());
+        }
+    };
+    serialize_output(output, runtime.limits.max_result_bytes)
+}
+
+/// 一次请求的输入 → [`OcrRequest`]（**唯一**实现：OCR worker 的两条管线与
+/// `POST /api/evaluate` 的批量路径共用）。
+///
+/// `stages`/`preprocess`/`detection`/`recognition`/`output` 都是内建默认值：serve 的输入面
+/// 只有图像字节、`?max_side=` 与队列类别（§4.2），没有第二个能改变管线形状的请求参数。
+pub(super) fn text_request(
+    bytes: Arc<[u8]>,
+    max_side: Option<u32>,
+    formula: FormulaPolicy,
+) -> OcrRequest {
+    OcrRequest {
         input: ImageInput::Encoded(bytes),
         roi: None,
         scale_hint: None,
@@ -1655,28 +1895,25 @@ fn recognize(
             words: WordOutputMode::Off,
         },
         output: OutputPolicy::default(),
-        // §10.8：公式路由默认关闭（M4 才接线）。
-        formula: FormulaPolicy::default(),
-    };
+        formula,
+    }
+}
 
-    let output = {
-        let mut engine = lock(&runtime.engine);
-        let Some(backend) = engine.as_mut() else {
-            return failure(
-                503,
-                "engine_unavailable",
-                format!("the OCR engine is not loaded (job {job_id})"),
-            );
-        };
-        match backend.recognize(request) {
-            Ok(output) => output,
-            Err(error) => {
-                let serve_error = ServeError::from(error);
-                return Outcome::Failed(serve_error.status_code(), serve_error.body());
-            }
-        }
+/// 锁引擎并推理（**唯一**的引擎调用点：OCR worker 与 `POST /api/evaluate` 共用）。
+///
+/// 引擎锁只在一次推理期间持有；`ensure_engine_loaded` 的加载/切换路径按
+/// `engine_load → engine` 的顺序取锁，因此这里不会与它们交错。
+pub(super) fn recognize_with(
+    runtime: &ServeShared,
+    request: OcrRequest,
+) -> Result<OcrOutput, ServeError> {
+    let mut engine = lock(&runtime.engine);
+    let Some(backend) = engine.as_mut() else {
+        return Err(ServeError::EngineUnavailable {
+            reason: "the OCR engine is not loaded".to_string(),
+        });
     };
-    serialize_output(output, runtime.limits.max_result_bytes)
+    backend.recognize(request).map_err(ServeError::from)
 }
 
 /// `OcrOutput` → 有界 JSON（§4.6：超限即中止，绝不先建大 `String`）。
@@ -1845,31 +2082,54 @@ mod tests {
         assert_eq!(REDACTED_MODEL_DIR, "<redacted>");
     }
 
+    /// M1 的路由语义在 M4 的形态下仍然成立：公式路由**关闭**时 `queue=formula` 是 400
+    /// （不静默降级成文本）；**打开**时它真的进公式队列。
+    ///
+    /// M4 新增的是"谁决定打开"：`routing_for` 只在配置了页面公式检测模型时打开，
+    /// 并把**不开的理由**带进 `/api/models` 的文字说明。
     #[test]
-    fn the_m1_routing_refuses_to_silently_use_the_formula_queue() {
+    fn the_routing_refuses_to_silently_use_the_formula_queue() {
+        let disabled = OcrRouting::text_only("test: no detector");
+        assert_eq!(disabled.class_for(None).expect("text"), QueueClass::Text);
         assert_eq!(
-            OcrRouting::text_only().class_for(None).expect("text"),
-            QueueClass::Text
-        );
-        assert_eq!(
-            OcrRouting::text_only()
-                .class_for(Some("text"))
-                .expect("text"),
+            disabled.class_for(Some("text")).expect("text"),
             QueueClass::Text
         );
         assert!(matches!(
-            OcrRouting::text_only().class_for(Some("formula")),
+            disabled.class_for(Some("formula")),
             Err(ServeError::BadRequest)
         ));
         assert!(matches!(
-            OcrRouting::text_only().class_for(Some("bogus")),
+            disabled.class_for(Some("bogus")),
             Err(ServeError::BadRequest)
         ));
-        let enabled = OcrRouting { formula: true };
+        assert_eq!(
+            disabled.disabled_reason.as_deref(),
+            Some("test: no detector"),
+            "the page needs a textual reason, not just a disabled control"
+        );
+
+        let enabled = OcrRouting::formula_enabled();
         assert_eq!(
             enabled.class_for(Some("formula")).expect("formula"),
             QueueClass::Formula
         );
+        assert_eq!(enabled.disabled_reason, None);
+        assert_eq!(enabled.class_for(None).expect("text"), QueueClass::Text);
+    }
+
+    /// 公式路由的启动期判据（**唯一**）：有检测模型才打开，否则给出可定位理由。
+    #[test]
+    fn the_formula_routing_is_decided_by_the_detector_alone() {
+        let enabled = super::routing_for(Some(Path::new("D:\\m\\pix2text-mfd-1.5.onnx")));
+        assert!(enabled.formula);
+        assert_eq!(enabled.disabled_reason, None);
+
+        let disabled = super::routing_for(None);
+        assert!(!disabled.formula);
+        let reason = disabled.disabled_reason.expect("a textual reason");
+        assert!(reason.contains("--formula-detector"), "{reason}");
+        assert!(reason.contains("ordinary OCR is unaffected"), "{reason}");
     }
 
     /// 指纹里的绝对路径绝不进响应：只留文件名。

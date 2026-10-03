@@ -315,7 +315,26 @@ fn evaluate_cmd(
     //
     // ORT 指纹必须随质量报告一起落地：没有它就无法证明两份评估跑在同一份运行库上，
     // 而阶段 0 的报告正是因为没有版本/路径/哈希而无法被严格比较。
-    let mut report = serde_json::to_value(&summary)?;
+    //
+    // M4：`rapidocr serve` 的 `POST /api/evaluate` 复用**同一个**函数，因此两个入口的
+    // 报告字段（含运行时四字段）逐字段相同，而不是两处各拼一遍。
+    let report = evaluation_report_value(&summary)?;
+    let text = serde_json::to_string_pretty(&report)?;
+    if let Some(path) = output {
+        std::fs::write(path, &text)?;
+    }
+    println!("{text}");
+    Ok(())
+}
+
+/// 质量指标（库）+ 进程级运行时字段 → 评估报告 JSON（**唯一**实现）。
+///
+/// 两个消费者：CLI 的 `rapidocr evaluate`（`--output` 与 stdout）与 serve 的
+/// `POST /api/evaluate`（HTTP 响应体）。字段名与顺序由这份实现决定。
+pub(crate) fn evaluation_report_value(
+    summary: &EvaluationSummary,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut report = serde_json::to_value(summary)?;
     if let Some(object) = report.as_object_mut() {
         object.insert(
             "peak_working_set_bytes".to_string(),
@@ -334,10 +353,5 @@ fn evaluate_cmd(
             serde_json::json!(rapid_ocr_rs::ort_runtime_version()),
         );
     }
-    let text = serde_json::to_string_pretty(&report)?;
-    if let Some(path) = output {
-        std::fs::write(path, &text)?;
-    }
-    println!("{text}");
-    Ok(())
+    Ok(report)
 }

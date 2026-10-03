@@ -128,10 +128,28 @@ rapidocr serve [OPTIONS]
   --max-retained-mb <N>      终态任务占用字节上限，默认 64
   --max-tombstones <N>       已淘汰任务 ID 记录上限，默认 256（§4.5）
   --job-ttl-secs <N>         终态任务与 tombstone 保留时长，默认 600
+
+  # M4：公式队列与评估
+  --formula-detector <ONNX>  页面公式检测模型（pix2text-mfd-1.5.onnx）；给出即启用公式队列
+                             （§4.2、§10.8）。缺省时 `queue=formula` 仍是 400，
+                             理由进 `/api/models` 的 `formula.disabled_reason`
+  --max-eval-cases <N>       `POST /api/evaluate` 一张清单最多评估多少张图，默认 32
 ```
 
 **参数优先级（必须一致并记录）**：**CLI flag > `--config` YAML > 内建默认**。
 `serve` 会用 CLI 值覆盖配置中的 `max_side_len` 与 `provider_preference`，并在启动日志中打印"哪个值生效、被覆盖的值是什么"。未启用 `serve` feature 时子命令仍可解析，但返回可定位错误（提示 `cargo build --features serve`）。
+
+**M4 的两处实现结论（改的是文档没写清的地方）**：
+
+1. 公式**识别**模型（`pp_formulanet_plus_m.onnx`，566 MB）来自模型集（`formula_recognizer` role，
+   默认表可下载）；公式**检测**模型在 `FormulaPolicy` 里是可选的、也没有可信的公开下载来源
+   （§5.1 的 role 枚举里有 `FormulaDetector`，但 `assets/default_models.yaml` 刻意不登记它），
+   因此 `serve` 只能通过 `--formula-detector` 显式给出。本地清单若声明了 `formula_detector`
+   role，`serve` 也认它（CLI > 模型集）；两者都没有时**公式路由不可用**——理由是可读文字，
+   见 §5.4 的 `formula.disabled_reason`。
+2. 没有检测模型时**不**打开路由，而不是"接了但永远产不出公式区域"：`FormulaPolicy` 在没有
+   `detector_path` 时只处理调用方显式声明的区域（`input_regions`），而 HTTP 请求里没有这种
+   区域。那样公式任务会稳定地"成功且零公式区域"，是一个看起来能用、实际什么都没做的路径。
 
 ---
 
@@ -141,21 +159,54 @@ rapidocr serve [OPTIONS]
 
 OCR（尤其公式路径）单图可达数秒至数十秒，**不得长期占用 HTTP 请求**。所有识别都是异步任务，不存在"同步返回结果"的第二套语义。
 
+**M4 的唯一例外（显式记录，不是悄悄放宽）**：`POST /api/evaluate` 是**批量、无中途交互**的
+行政动作——它的结果是一份完整报告，没有"部分报告"这样可轮询的中间状态，也没有取消语义
+（推理不可中断，§4.3）。因此它**同步返回报告**，但必须满足三条：请求在**独立线程**里执行、
+由那个线程写响应（accept 线程立刻回到循环，服务全程可观测、可提交任务）；同时只允许一个
+评估（第二个请求 503 `busy`，不排队）；用例数受 `--max-eval-cases` 约束，一次请求的时间有上界。
+推理仍然走与 OCR 任务**同一条**引擎锁路径，并遵守"会话绝不在 accept 线程上建立"。
+
 ### 4.2 端点
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/` | 内联单页（注入 nonce + token） |
-| `GET` | `/api/status` | 引擎/provider/ORT 指纹/队列与内存概况（路径脱敏） |
-| `GET` | `/api/models` | 模型集状态（§5.4） |
-| `POST` | `/api/models/download` | 启动下载任务（需 `--allow-download` **且** token）；请求体 `{"set_id": "<id>"}`，未知 id → **404 `model_set_not_found`**（绝不回落 `sets[0]`） |
-| `POST` | `/api/ocr` | 提交识别 → **202** `{job_id, queue, position, state:"queued"}` |
+| `GET` | `/api/status` | 引擎/provider/ORT 指纹/队列与内存概况（路径脱敏）+ M4 的 `formula` 块（与 `/api/models` 同源同值） |
+| `GET` | `/api/models` | 模型集状态（§5.4；M4 起顶层字段是**文本管线**作用域，公式管线在 `formula` 块里） |
+| `POST` | `/api/models/download` | 启动下载任务（需 `--allow-download` **且** token）；请求体 `{"set_id": "<id>"}`，未知 id → **404 `model_set_not_found`**（绝不回落 `sets[0]`）。公式集合（566 MB）与文本集合同一条路径、同一个按钮语义 |
+| `POST` | `/api/ocr` | 提交识别 → **202** `{job_id, queue, position, state:"queued"}`。队列由 `?queue=text\|formula` 选择，**队列类别就是管线选择**（M4，见下） |
+| `POST` | `/api/evaluate` | **M4 新增**：批量评估一份已标注清单 → 200 + 库的评估报告。请求体**恰好**一个键 `{"manifest": "<本机清单路径>"}`（与 `rapidocr evaluate --manifest` 同格式：`[{image, text, boxes}]`，`image` 相对清单目录解析）。报告字段与 CLI 的 `rapidocr evaluate` **同一份实现**（`cases[]` + `mean_cer` + `exact_match_rate` + `mean_detection_*` + `peak_working_set_bytes` + `memory_source` + `ort_runtime` + `ort_runtime_version`），另加 `iou_threshold` 与 `manifest_file`（只给文件名）。可定位的拒绝是 **400 `bad_request`** + `detail.reason`（清单读不出来/格式不对/用例数超过 `--max-eval-cases`/某张图读不出来）；模型缺失与引擎不可用分别是 409 `models_missing` / 503 `engine_unavailable`（与 `/api/ocr` 同一份错误体） |
 | `GET` | `/api/jobs/{id}` | `{id, kind, queue, state, position, queued_ms, started_ms, elapsed_ms, error}` + M2 追加的 `{failure, download, cancel_requested}`（见 §4.3） |
 | `GET` | `/api/jobs/{id}/result` | 结果（未完成 409 `job_not_finished`；已淘汰 410 `job_evicted`） |
 | `GET` | `/api/jobs/{id}/annotated.png` | 叠加检测框 PNG（原图淘汰 → 410 `original_evicted`） |
 | `GET` | `/api/jobs/{id}/export?format=json\|md\|html` | 导出（HTML 走静态模式 + 独立 CSP，§9.5） |
 | `POST` | `/api/jobs/{id}/cancel` | 取消（§4.3） |
 | `POST` | `/api/engine/reload` | 显式创建/重建引擎。请求体**可省略**：省略 = "按磁盘上的当前文件重建会话"；带 `{"provider":"cpu\|directml\|cuda"}` = **显式应用 provider 设置**（§7.6 的 `Rebuilding` 序列，运行期切换，M3）。响应 `{outcome, engine, provider, requested, selected_ep, fallback_to_cpu, missing, corrupt, source, model_dir, load_ms, rollback_ms, error}`（§7.6） |
+
+#### 4.2.1 公式队列的请求协议（M4 定案）
+
+页面上的"公式识别路由"开关**只**通过 `?queue=formula` 表达，没有第二个开关：
+
+```text
+POST /api/ocr?queue=text                → 文本管线，进文本队列（默认）
+POST /api/ocr?queue=formula             → 公式管线，进公式队列
+```
+
+**为什么不做 `formula=1`**：队列类别与管线是一一对应的（§8.3 的双队列正是"普通 OCR / 公式 OCR"
+两条管线），再加一个布尔开关就会多出一种自相矛盾的组合（`queue=text&formula=1` 该按哪个跑？），
+而页面本来就已经按开关发送 `queue=formula`。因此这里选择"一个含义一个字段"，
+而不是"两个可能冲突的字段相加"。
+
+三种结论必须可区分：
+
+| 情况 | 结论 |
+| --- | --- |
+| 路由可用、公式模型齐备 | 202 `{queue:"formula"}`，进公式队列，由公式管线执行 |
+| 路由可用、公式模型**缺失/损坏** | **409** `models_missing` / `models_corrupt`，`detail.scope="formula"`、`missing`/`corrupt`/`missing_on_disk` 列出公式 role 的文件。存在性检查在**读 body 之前**完成（只 `stat`，不哈希 566 MB）；权威哈希判定由库在加载识别器时按集合声明的 SHA-256 执行 |
+| 路由**不可用**（没配 `--formula-detector`） | **400** `bad_request`（M1 起不变），理由在 `/api/models` 的 `formula.disabled_reason` 里 |
+
+**普通 OCR 永不因公式缺口而失败**：`/api/ocr` 的 409 只报告**文本管线**的缺失文件，
+`EngineState::BlockedModelsMissing` 的清单同样是文本作用域（§5.4、§7.6）。
 
 ### 4.3 状态机与取消语义
 
@@ -287,6 +338,10 @@ pub struct ManifestFile { pub name: String, pub role: ModelRole, pub sha256: Str
    - 否则 → `default_models.yaml` 是唯一来源；
    - 若所选来源**缺少当前管线所需的 role**（例如启用了公式但 manifest 没有 `FormulaRecognizer`）→ **报错并列出缺失 role**，不静默降级；
    - 旧格式清单（固定四字段）→ 视为 `schema_version` 不支持，给出可定位错误与迁移提示。
+   - **M4 的收口**：`serve` 的清单请求是 `ModelRequest::text_and_formula`（两条管线的 role 并集），
+     因为页面必须能报告公式集合的体积/哈希并让用户按集合下载。因此**本地清单也要声明
+     `formula_recognizer`**；缺它时启动期就会列出缺失 role（错误里同时点名两条管线缺什么），
+     而不是等到第一次公式请求。这一条是 §5.3 原文的直接推论，M1 时还看不出来（当时只请求文本管线）。
 3. `default_models.yaml` 仍是"可下载来源表"的载体（URL + SHA256），`ModelSet` 由它或 manifest 构造；**HTTP 层永不直接解析 YAML**。
 
 ### 5.4 `GET /api/models` 响应
@@ -296,6 +351,20 @@ pub struct ManifestFile { pub name: String, pub role: ModelRole, pub sha256: Str
   "model_dir": "<redacted>",
   "source": "default_table | local_manifest",
   "downloads_allowed": false,
+  "complete": false,
+  "missing": ["PP-OCRv6_det_small.onnx"],
+  "corrupt": [],
+  "blocked": ["PP-OCRv6_det_small.onnx"],
+  "formula": {
+    "complete": false,
+    "missing": ["pp_formulanet_plus_m.onnx"],
+    "corrupt": [],
+    "blocked": ["pp_formulanet_plus_m.onnx"],
+    "routing": true,
+    "disabled_reason": null,
+    "required_roles": ["formula_recognizer"],
+    "detector": { "configured": true, "file": "pix2text-mfd-1.5.onnx" }
+  },
   "sets": [
     { "id": "PP-OCRv6", "complete": false, "download_bytes_total": 42106880,
       "files": [ { "name": "PP-OCRv6_det_medium.onnx", "role": "detector",
@@ -303,6 +372,23 @@ pub struct ManifestFile { pub name: String, pub role: ModelRole, pub sha256: Str
   ]
 }
 ```
+
+**M4 的作用域修正（本文件上一版把四个顶层字段写成"所有集合"的并集，那是错的）**：
+
+- 顶层的 `complete`/`missing`/`corrupt`/`blocked` = **文本管线**（detector/classifier/recognizer/
+  dictionary/tokenizer），也就是引擎真正要加载的那些文件；`POST /api/ocr` 的 409 `detail`
+  与 `EngineState::BlockedModelsMissing` 用它。公式模型（566 MB，默认不下载）缺失**绝不会**
+  让普通 OCR 变成 409——这正是 M4 要修掉的根因；
+- `formula` 块 = **公式管线**（`formula_recognizer`）的同一组字段，外加
+  `routing`（服务端是否启用了公式队列，§4.2）与 `disabled_reason`（不可用时的**文字**理由，
+  页面据此禁用开关并显示原因，§9.4 要求不只靠颜色）；`detector` 只给**文件名**（§7.4 路径脱敏）；
+- 分组依据是 `files[].role`（`Pipeline::of`），**不是集合 id 或集合顺序**：默认表把两条管线
+  放在两个集合里，本地清单把两条管线放在**一个**集合里，两种来源下结论必须一致；
+- 页面同一套判据：`QUEUE_ROLES.text = [detector, recognizer, dictionary]`、
+  `QUEUE_ROLES.formula = [formula_recognizer]`（= 库的 `ModelRequest::text_roles/formula_roles`），
+  再叠加 `formula.routing`。
+- `complete` 仍然要求"每个文件都 `Present` **且**声明了哈希"（§5.2：没有哈希的文件不得让集合
+  报 `complete`）；`missing`/`corrupt` 只列缺失与损坏。
 
 ---
 
@@ -512,6 +598,13 @@ pub enum EngineState {
   1. 持续灌入公式任务 → 普通 OCR 等待时间有上界；
   2. 持续灌入普通任务 → 公式任务等待时间有上界（**新增**，上一版会失败）。
 
+**M4：验收用的是真实工作，而不是脚本化后端**。M1 的公式队列在生产路径上不可达（当时
+`queue=formula` 是 400），只能用测试专用慢速后端驱动；M4 接上真实公式管线后，两个方向都由
+**真实推理**驱动：真实的文本 OCR（真实照片）与真实的公式 OCR（`pp_formulanet_plus_m.onnx`
++ `pix2text-mfd-1.5.onnx`），上界仍取自 `/api/status` 的 `wait_bound`，并把"洪水队列在窗口内
+确实被服务过"（完成的任务数 + 观测到的队列占用）作为断言的一部分。见 M4 记录的验证 3。
+调度策略本身（`queue.rs`）**一行未改**：M0c 冻结的取法与可证明上界是这条验收的基础。
+
 ### 8.4 结果存储
 
 TTL + 数量 + 字节三重上限 + tombstone（§4.5），**不允许**无界 `HashMap`。
@@ -604,7 +697,9 @@ img-src 'self' blob: data:; connect-src 'self'; base-uri 'none'; form-action 'no
 5. 下载与推理分离线程；
 6. 诊断数据复用 `timings`/`stages`/ORT 指纹/`memory`，不重新测量；
 7. 不把 provider 名称当性能结论；
-8. 公式路由**默认关闭**（避免意外加载 566 MB 模型）；
+8. 公式路由**默认关闭**（避免意外加载 566 MB 模型）。M4 的落地方式：页面上的开关默认关；
+   服务端侧"路由是否可用"由 `--formula-detector` 唯一决定（§4.2.1），而**加载**是惰性的——
+   只有真的提交了 `queue=formula` 的任务，库才会去建那个 566 MB 的会话；
 9. `/api/status` 路径脱敏（§7.4）。
 
 ---
@@ -652,6 +747,7 @@ pub enum ServeError {
 | 图片无法解码/超限 | 422 | `unsupported_input` |
 | 未完成 / 已淘汰 / 不可取消 | 409 / **410** / 409 | `job_not_finished` / `job_evicted` / `not_cancellable` |
 | 下载失败 / 超时 | 502 / 504 | `download_failed` / `download_timeout` |
+| 评估请求不合法（M4：清单读不出来/格式不对/超过 `--max-eval-cases`/图读不出来） | 400 | `bad_request`（`detail.reason` 可定位） |
 | 其他 | 500 | `internal` |
 
 ### M1：最小闭环
@@ -712,6 +808,9 @@ pub enum ServeError {
 | 导出 | HTML 导出含 `Content-Disposition: attachment`、导出 CSP、正文无 `<script>` |
 | 参数优先级 | CLI `--config` / `--provider` / `--max-side` 三者优先级与启动日志一致 |
 | 真实资产 | 12 图 HTTP 与 CLI 逐张一致；公式路径单独验证 |
+| 公平性（双向，M4） | 公式洪水下普通 OCR 等待有上界；**普通洪水下公式任务等待有上界**——两个方向都用**真实推理**（真实照片 + 真实公式模型），上界取 `/api/status` 的 `wait_bound` 并证明洪水队列在窗口内确实被服务 |
+| 评估（M4） | `POST /api/evaluate` 的报告与 `rapidocr evaluate` **逐字段同值**（逐例 CER + 均值 + 精确匹配率）；超限/坏清单是可定位的 400；同一时刻只允许一个评估（503 `busy`） |
+| 公式模型（M4） | `/api/models` 报告公式集合的 role/体积/SHA-256；下载按钮按集合（566 MB 显式点击，绝不自动下载）；剔除公式文件后路由变 409 且普通 OCR 不受影响 |
 | 手工 | 浏览器闭环、粘贴、上传进度、标注图、键盘与焦点可用 |
 | 性能 | 诊断面板数据与 CLI 报告同值（不重新测量） |
 
