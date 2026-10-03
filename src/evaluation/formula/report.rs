@@ -80,6 +80,8 @@ pub fn classify_error(error: &RapidOcrError) -> FailureKind {
         RapidOcrError::UnsupportedBackend(_) => FailureKind::InputRejected,
         RapidOcrError::HashMismatch { .. } => FailureKind::InputRejected,
         RapidOcrError::ModelResolve(_) => FailureKind::InputRejected,
+        // 公式评测只从本地路径加载模型（不下载），因此 `Download` 在这一层来自
+        // "远端图片取不回来"（`input/image_loader.rs`），归类为 ImageDecode 保持不变。
         RapidOcrError::Download(_) => FailureKind::ImageDecode,
         RapidOcrError::Io(_) => FailureKind::ImageDecode,
         RapidOcrError::Reqwest(_) => FailureKind::ImageDecode,

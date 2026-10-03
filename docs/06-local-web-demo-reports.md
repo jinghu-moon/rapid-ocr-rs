@@ -1179,3 +1179,416 @@ body/result/export/download = 32/8/32/1024 MiB、队列 4/2、连续配额 4/1�
 - 未编辑 `src/model_set.rs` / `src/model_source.rs` / `src/model_registry.rs` /
   `src/model_store.rs` / `src/api.rs` / `assets/default_models.yaml`（M0a 在途）；
 - 未提交任何 commit。
+
+---
+
+## M0b：加固下载器（`download_verified` / `DownloadError` / 预算 / 调用方迁移）
+
+**阶段**：M0b —— `docs/05` §11「M0」里 §6（加固下载器）+ §6.2（`--max-download-mb`
+语义）+ §6.4（迁移并删除旧入口）+ §6.7（Windows 原子替换）的全部条目。
+**不做**（属 M1/M2）：HTTP 服务器、路由、serve 的下载 worker 与取消（§6.6 的
+"文件边界取消"只定义错误类，不接线）、下载进度上报。
+**开工基线**：`1144ddb`（M0a「模型清单」+ M0c「serve 核心」已提交；本阶段在其上继续）。
+**日期**：2026-10-03
+**提交**：`（未提交：按要求不 commit）`
+
+**变更摘要**（15 个文件，`git diff --numstat`：+3098 / −192，其中本记录的追加占
++411/−0；`src/model_store.rs` +2130/−61、`src/test_support.rs` +351/−0）：
+
+| 文件 | 改动 | 说明 |
+| --- | --- | --- |
+| `src/model_store.rs` | 182 → 2251 行（1 → **35** 测试） | `download_verified` 唯一入口、`DownloadError` 十二类、`DownloadBudget`、`download_model_set`、`MoveFileExW`/`GetDiskFreeSpaceExW` 绑定；删除 `ensure_downloaded` |
+| `src/test_support.rs` | 164 → 515 行（+1 测试） | 本机 HTTP fixture 服务器（`HttpFixture`）与其自身回归测试 |
+| `src/bin/serve/error.rs` | 923 → 906 行（7 测试） | 删除 serve 侧重复的 `DownloadError`，改为库类型上的 `DownloadErrorMapping` 映射 |
+| `src/bin/serve/limits.rs` | 485 → 531 行（6 → **7** 测试） | `DEFAULT_MAX_DOWNLOAD_MB` 改为引用库常量；新增 `ServeLimits::download_budget()` |
+| `src/error.rs` | `RapidOcrError::Download(String)` → `Download(DownloadError)`（`#[error(transparent)]` / `#[from]`） | 分类信息不再被压成字符串 |
+| `src/exports.rs` | 导出下载器公开面；`ensure_downloaded` 从公开面消失 | — |
+| `src/ocr/det/detector.rs`、`src/ocr/cls/classifier.rs`、`src/ocr/rec/recognizer.rs` | 4 个下载调用点迁移；`&PathBuf` → `&Path` | 见交付物 2 |
+| `src/input/image_loader.rs` | 远端图片取回失败的分类从 `Download(String)` 改为 `DownloadError::Network` | 见交付物 2 的发现 1 |
+| `src/bin/serve/mod.rs`、`src/model_set.rs`、`src/model_registry.rs`、`src/evaluation/formula/report.rs` | 文档/注释同步（不再指向已删除的入口） | 无行为变化 |
+| `docs/05-local-web-demo-implementation.md` | §13 参考命令补 `Content-Type` | 交付物 5 |
+| `docs/06-local-web-demo-reports.md` | 本记录（追加） | — |
+
+---
+
+### 交付物 1：`download_verified` 取代 `ensure_downloaded`（§6）
+
+```rust
+pub struct DownloadRequest<'a> {
+    pub url: &'a str,
+    pub expected_sha256: &'a str,   // 必填
+    pub save_dir: &'a Path,
+    pub max_bytes: u64,             // 来自 --max-download-mb（§6.2）
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
+}
+impl<'a> DownloadRequest<'a> {
+    /// 库内调用方（EngineConfig::allow_download 分支）的默认请求。
+    pub fn new(url: &'a str, expected_sha256: &'a str, save_dir: &'a Path) -> Self;
+}
+pub fn download_verified(req: &DownloadRequest<'_>) -> Result<PathBuf>;
+
+pub const ALLOWED_DOWNLOAD_HOSTS: [&str; 1] = ["www.modelscope.cn"];
+pub const DEFAULT_MAX_DOWNLOAD_MB: u64 = 1024;
+pub const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = DEFAULT_MAX_DOWNLOAD_MB * 1024 * 1024;
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub fn require_model_hash<'a>(expected: Option<&'a str>, source: &str) -> Result<&'a str>;
+
+pub struct DownloadBudget { /* total_bytes, spent_bytes */ }
+impl DownloadBudget {
+    pub const fn new(total_bytes: u64) -> Self;
+    pub const fn total_bytes(&self) -> u64;
+    pub const fn spent_bytes(&self) -> u64;
+    pub const fn remaining_bytes(&self) -> u64;
+    pub const fn per_file_cap(&self) -> u64;      // = 剩余额度
+    pub fn charge(&mut self, bytes: u64) -> Result<()>;   // 超出 → TooLarge，且不记账
+}
+
+pub fn download_model_set(set: &ModelSet, root: &Path, budget: &mut DownloadBudget,
+                          connect_timeout: Duration, read_timeout: Duration)
+                          -> Result<Vec<PathBuf>>;
+
+pub enum DownloadError {
+    SchemeRejected { scheme: String },
+    RedirectRejected { location: Option<String> },
+    HostRejected { host: String },
+    TooLarge { limit_bytes: u64, observed_bytes: Option<u64> },
+    Network { detail: String },
+    ConnectTimeout { timeout_ms: u64 },
+    ReadTimeout { timeout_ms: u64 },
+    InsufficientSpace { required_bytes: u64, available_bytes: u64 },
+    HashMismatch { expected: String, actual: String },
+    Cancelled,
+}
+impl DownloadError { pub const fn kind(&self) -> &'static str }   // 机器可读标签（进 detail.kind）
+```
+
+`sha256_file` / `verify_existing_file` / `default_model_store_dir` **签名与实现未改**。
+
+**§6.1 的十二条要求 → 实现 → 测试**（每条测试都在 `src/model_store.rs`，全部通过）：
+
+| # | 要求 | 实现 | 测试（实测结果） |
+| --- | --- | --- | --- |
+| 1 | 仅 HTTPS | `url.scheme() != "https"` → `SchemeRejected`，在**任何**文件系统/网络动作之前 | `the_public_entry_point_rejects_scheme_and_host_before_any_side_effect`（走公开入口，断言 `save_dir` **未被创建**） |
+| 2 | 禁止自动重定向 | `ClientBuilder::redirect(Policy::none())`；3xx → `RedirectRejected{location}` | `a_redirect_is_rejected_and_nothing_is_written`（302 + Location，目录为空，请求数 1） |
+| 3 | host 白名单来自可信配置 | `ALLOWED_DOWNLOAD_HOSTS` 编译期常量；整串大小写不敏感精确比较 | `the_allowed_download_hosts_are_exactly_the_declared_set`（逐项锁死 + 8 个越界 host）、`a_local_manifest_cannot_widen_the_download_host_allow_list`（`manifest.json` 声明 `https://evil.example/...` → 仍 `HostRejected`） |
+| 4 | `Content-Length` 预检 | 在 `File::create` **之前**判定 | `a_declared_length_above_the_cap_is_rejected_before_anything_is_written`（目录里连 `.part` 都没有） |
+| 5 | 流式上限 | `response.take(max_bytes + 1)`，累计超限即停 | `a_chunked_body_above_the_cap_...`（`observed_bytes == Some(1025)`）、`a_close_delimited_body_above_the_cap_...`，两者都断言临时文件已删除 |
+| 6 | 唯一临时文件名 | `.part-<pid>-<seq>`（`AtomicU64` 序号） | `a_verified_download_writes_the_file_and_leaves_no_temp_file`、并发测试 |
+| 7 | Windows 原子替换 | `MoveFileExW(src, dst, MOVEFILE_REPLACE_EXISTING \| MOVEFILE_WRITE_THROUGH)` | `an_existing_corrupt_target_is_replaced`（§6.7 的回归测试）、`a_failed_replace_keeps_the_original_file_and_drops_the_temp_file`、`a_replace_onto_a_directory_fails_and_keeps_the_directory` |
+| 8 | 同文件单飞 | 目标路径 → `Arc<Mutex<()>>` 锁表 | `two_concurrent_downloads_of_one_target_fetch_exactly_once`（2 线程 + Barrier，**恰好 1 次**网络请求） |
+| 9 | 哈希必填 | `&str` 必填 + 空串在 I/O 前拒绝；不匹配删除临时文件 | `a_hash_mismatch_deletes_the_temp_file_and_leaves_no_target`、`an_empty_expected_hash_is_refused_before_any_io` |
+| 10 | 磁盘空间预检 | `GetDiskFreeSpaceExW`；空间来源经 `FreeSpaceProbe` 注入 | `insufficient_disk_space_is_reported_before_anything_is_written`（注入 1000 B）、`an_unknown_length_download_is_budgeted_at_the_streaming_cap`（注入 4000 B / 上限 4096 B） |
+| 11 | 分项超时 | `connect_timeout()` 与 `timeout()`（阻塞客户端按"每次等待"计时）分开配置 | `a_stalled_body_read_is_a_read_timeout`、`a_server_that_never_answers_is_a_read_timeout_not_a_connect_timeout`、`a_connect_phase_timeout_and_a_read_phase_timeout_are_distinct_classes`、`a_refused_connection_is_a_network_error` |
+| 12 | 错误分类唯一 | `DownloadError`（十二类）+ `kind()`；serve 只做 HTTP 映射 | `every_download_error_class_has_a_stable_kind`（10 个变体 × kind + 包进 `RapidOcrError` 后消息不丢） |
+
+**另外两条与安全/可诊断性相关的新增测试**：
+`a_url_whose_last_segment_is_not_a_bare_file_name_is_rejected`（URL 末段 `..` 不能变成
+落盘路径：复用 `model_set::validate_model_file_name` 的唯一实现）、
+`the_downloader_issues_a_plain_get_with_its_own_user_agent`（请求行与 UA 的形状，
+fixture 侧记录 `index/method/target/headers`）。
+
+#### 临时文件的生命周期（结构性保证，而不是逐分支手写清理）
+
+临时文件由 `PartFile` 持有，**任何**提前返回（拒绝、超限、超时、哈希不符、替换失败）
+都在 `Drop` 里删除它。因此"校验没过但文件还在"这条路径在结构上不存在：
+替换成功才 `keep = true`。§6.1 第 5、9 条要求的"删除临时文件"由此覆盖，而不是靠
+在每个 `return` 前手动 `remove_file`。
+
+#### 关于 §6.7 的 `fs::rename` 降级路径：**没有保留**
+
+§6.7 允许"把 `fs::rename` 作为**降级**路径，但必须记录崩溃窗口"。本阶段**不保留**降级
+路径，只留一条 Win32 调用：std 的 `fs::rename` 在 Windows 上目前也走
+`MoveFileExW(MOVEFILE_REPLACE_EXISTING)`，但它既不请求 `MOVEFILE_WRITE_THROUGH`，
+也不把 Win32 错误码交给调用方——两条路径并存只会让"失败时发生了什么"无法定位。
+失败时返回 `RapidOcrError::Io`，文本含 `MoveFileExW(<src> -> <dst>) failed with Win32
+error <code>; the existing file was left untouched`（`src/model_store.rs` 的
+`replace_file`）。
+
+#### 连接超时 vs 读取超时：为什么判定用"实测耗时"
+
+reqwest 0.12 的 blocking 客户端**不区分**"连接阶段超时"与"等待响应头超时"：
+两者都是 `Kind::Request` + `TimedOut`，而 `is_connect()` 对连接**超时**为 `false`
+（只对连接**错误**，例如目标拒绝连接，为 `true`）。本机实测（见下方"做不到的事"）：
+
+| 场景 | `is_timeout()` | `is_connect()` | 说明 |
+| --- | --- | --- | --- |
+| 目标拒绝连接（端口无人监听） | `false` | `true` | → `Network` |
+| 服务器只接受、不响应 | `true` | `false` | 阻塞层的读取预算到期 → `ReadTimeout` |
+| 服务器发头后停住 | `true`（io 层包装） | `false` | → `ReadTimeout` |
+| `connect_timeout = 1 ns` + 环回监听 | `true` | `false` | 真实原因是**读取**预算（连接 ~0.4 ms 内已完成） |
+
+因此 `classify_send_timeout(is_connect, elapsed, connect_timeout, read_timeout)` 的规则是：
+`is_connect` **或** 耗时未达到读取预算 → `ConnectTimeout`（报告连接预算）；否则
+`ReadTimeout`（报告读取预算）。前提是 `connect_timeout < read_timeout`（库内默认
+10 s / 30 s），已由 `the_library_defaults_match_the_documented_download_limits`
+用 `const { assert!(...) }` 锁住。
+
+---
+
+### 交付物 2：迁移全部调用方并删除旧入口（§6.4）
+
+`ensure_downloaded` **已删除**，`Option<&str>` 哈希入口**不存在**，也没有兼容 shim
+（`src/` 里对它的引用只剩注释；`exports.rs` 的公开面已换成新的下载器）。
+
+| 调用方 | 迁移前 | 迁移后 | 现在提供的哈希 |
+| --- | --- | --- | --- |
+| `src/ocr/det/detector.rs::Detector::new` | `ensure_downloaded(&resolved.model_url, resolved.sha256.as_deref(), …)` | `require_model_hash(...)` + `DownloadRequest::new(...)` + `download_verified` | 默认表 `resolve_det` 的 `SHA256`（v4/v5/v6 全部 40 个 det/cls/rec 条目都有，`every_default_table_entry_carries_a_sha256` 锁住） |
+| `src/ocr/cls/classifier.rs::Classifier::new` | 同上 | 同上 | 默认表 `resolve_cls` 的 `SHA256` |
+| `src/ocr/rec/recognizer.rs::resolve_model_path` | 同上 | 同上 | 默认表 `resolve_rec` 的 `SHA256` |
+| `src/ocr/rec/recognizer.rs::resolve_character_path` | `ensure_downloaded(&dictionary.url, dictionary.sha256.as_deref(), …)`（M0a 起已是 `Some`，但**签名**允许 `None`） | 同上，字典哈希同样经 `require_model_hash` | 字典条目（M0a 补的 30 个 `dict.SHA256`） |
+| `src/input/image_loader.rs::read_url` | `RapidOcrError::Download(format!(...))`（远端图片取回失败） | `RapidOcrError::Download(DownloadError::Network { detail })` | 不涉及哈希 |
+
+**发现 1（需要记录）**：`RapidOcrError::Download(String)` 原来有**两个**来源——模型
+下载器（本阶段删除）与"远端图片取不回"（`ImageInput::Url` 路径，本阶段保留）。
+后者现在用同一个 `DownloadError::Network`，serve 侧状态码/`code` **不变**
+（502 `download_failed`），只有 `detail.kind` 从 `"download"` 变成 `"network"`；
+`src/evaluation/formula/report.rs::classify_error` 的 `Download → ImageDecode`
+也保持不变（该层只从本地路径加载模型，不会触发模型下载），并加了注释说明原因。
+
+**发现 2**：`src/bin/rapidocr.rs` **没有**独立的下载子命令（命令面是
+`run` / `report` / `evaluate` / `check`）。CLI 触发的下载全部经由管线
+（`EngineConfig::allow_download` → detector/classifier/recognizer 的构造），也就是上表的
+4 个调用点。因此"CLI 下载路径"的迁移已经由上表覆盖，不存在第五个入口。
+
+**发现 3**：`resolve_model_path` / `resolve_character_path` 的参数类型从 `&PathBuf`
+改为 `&Path`（clippy `ptr_arg`；新下载器接受 `&Path`，`&PathBuf` 只会多一个间接层）。
+这是纯类型收窄，调用点不变。
+
+---
+
+### 交付物 3：`--max-download-mb` 语义（§6.2）
+
+- **默认值同源**：`serve::limits::DEFAULT_MAX_DOWNLOAD_MB` 现在等于
+  `rapid_ocr_rs::DEFAULT_MAX_DOWNLOAD_MB`（1024），库内调用方与 CLI 不再各写一个 1024；
+  `cli::tests::every_default_matches_the_document` 仍逐项断言 1024（测试未放松）；
+- **0 值在启动期被拒**：既有 `RawServeLimits::validate` 的 `mib_to_bytes` 已覆盖
+  （`zero_mib_limits_are_rejected_with_the_flag_name` 含 `--max-download-mb`），本阶段未改；
+- **单文件上限 = 整批总量额度**：`ServeLimits::download_budget()` →
+  `DownloadBudget::new(max_download_bytes)`；`download_model_set` 对每个文件用
+  `budget.per_file_cap()`（= 剩余额度）作为该文件的 `max_bytes`，下载完成后再
+  `charge(实际字节数)`，因此**剩余额度按文件递减**；
+- **已知体积的提前拒绝**：`size_bytes > 剩余额度` → 在**发请求之前**返回 `TooLarge`
+  （错误里带 `limit_bytes` 与 `observed_bytes` 两个数值）；
+- **未知体积仍然受限**：`size_bytes: None` 只是跳过"提前预检"，该文件的
+  `max_bytes` 依然是剩余额度，因此仍被流式上限保护。
+
+测试：`limits::tests::the_download_budget_starts_at_the_single_file_cap_and_decreases_per_file`
+（默认预算 1024 MiB；记 593,915,961 字节后 `per_file_cap == remaining`；一次超限的
+`charge` **不消耗**预算）、`model_store::tests::a_download_budget_never_overspends_and_a_failed_charge_costs_nothing`、
+`a_set_download_charges_every_file_against_one_running_budget`（3 个文件共用 100,000 预算，
+请求 3 次、`spent == 6000`、`remaining == 94_000`）、
+`a_set_download_refuses_a_file_whose_size_exceeds_the_remaining_budget_without_requesting_it`
+（第 2 个文件声明 40 KiB > 剩余 10 KiB → **请求数 1**，第二个文件不存在）、
+`a_set_download_bounds_an_unknown_size_file_by_the_remaining_streaming_cap`
+（`None` 体积 + 1 KiB 预算 → `TooLarge{limit:1024, observed:1025}` 且临时文件已删）、
+`a_set_download_skips_files_that_are_already_valid`（缓存命中不计预算、不发请求）。
+
+`download_model_set` 还额外把 §5 的"文件名 = URL 末段"不变量变成**显式错误**
+（`the two names must agree`），因为下载器按 URL 末段落盘，两者漂移会让逐文件状态校验
+指向不存在的路径（M0a 已记录该规则）：
+`a_set_download_refuses_unverifiable_unsourced_and_misnamed_files`。
+
+---
+
+### 交付物 4：本机 fixture 服务器的验证（§12「测试不得依赖公网」）
+
+`src/test_support.rs` 新增 `HttpFixture`：`TcpListener::bind("127.0.0.1:0")` + 手写响应
+（零依赖），每个响应带 `Connection: close`，因此 `request_count()` =
+**网络请求次数**（单飞的证据）。可构造的响应：正常体 / 任意状态行 / 302+Location /
+`Transfer-Encoding: chunked`（无 `Content-Length`）/ 关闭定界（无长度、不 chunked）/
+发头后停住（读超时）/ 接受后完全静默。测试通过 `DownloadPolicy` 的
+`#[cfg(test)]` 口子把这个服务器接进下载器：**生产构建里没有这个字段**
+（`DownloadPolicy::production` 是生产路径的唯一构造点，白名单只认编译期常量、scheme 只认
+`https`），因此"仅 HTTPS + 编译期白名单"是编译期保证，而传输/落盘/预算/单飞逻辑
+在生产代码路径上被真实执行。
+
+| 覆盖项 | 结果 |
+| --- | --- |
+| 正确哈希 → 落盘 + 无 `.part` 残留 + 1 次请求 | ✅ `a_verified_download_writes_the_file_and_leaves_no_temp_file` |
+| 哈希不符 → 删除临时文件、目标不存在 | ✅ `a_hash_mismatch_deletes_the_temp_file_and_leaves_no_target` |
+| 3xx → `RedirectRejected`（带 Location） | ✅ `a_redirect_is_rejected_and_nothing_is_written` |
+| `http://` → `SchemeRejected` | ✅ 公开入口测试（不产生任何 I/O） |
+| 白名单外 host → `HostRejected`（含伪装域名） | ✅ `the_public_entry_point_rejects_scheme_and_host_before_any_side_effect`、`a_local_manifest_cannot_widen_the_download_host_allow_list` |
+| `Content-Length` 超限 → 未写任何文件 | ✅ `a_declared_length_above_the_cap_is_rejected_before_anything_is_written` |
+| chunked / 无长度超限 → `TooLarge` + 删临时文件 | ✅ 两条（`observed_bytes == 1025`） |
+| 目标已存在且**损坏** → 原子替换成功（§6.7 回归） | ✅ `an_existing_corrupt_target_is_replaced` |
+| 目标已存在且正确 → 0 次网络请求 | ✅ `an_existing_valid_target_is_returned_without_any_request` |
+| 替换失败 → 原文件存活、临时文件删除 | ✅ `a_failed_replace_keeps_the_original_file_and_drops_the_temp_file`（用 `share_mode(FILE_SHARE_READ)` 精确制造共享冲突失败；断言错误含 Win32 错误码与 `left untouched`） |
+| 两个并发下载同一目标 → **恰好 1 次**请求 | ✅ `two_concurrent_downloads_of_one_target_fetch_exactly_once` |
+| 磁盘空间分支（注入的空间来源） | ✅ 两条（已知长度 / 未知长度按 `max_bytes` 计） |
+| 读取超时（发头后停住 / 完全不响应） | ✅ 两条端到端 |
+| 非 2xx（404）→ `Network` | ✅ `a_non_success_status_is_a_network_error` |
+| 不安全文件名（URL 末段 `..`） | ✅ 且断言 **0 次**请求 |
+
+**fixture 自身的一个真实缺陷（已修 + 已加回归测试）**：Windows 上 `accept()` 返回的
+套接字**继承监听套接字的非阻塞属性**（监听套接字为了可关闭被设成非阻塞）。第一版
+fixture 没有把连接改回阻塞模式，于是"请求稍晚到达"时 `read` 立刻返回 `WouldBlock`，
+服务器在没有响应的情况下关闭连接，客户端看到的是 `WSAECONNABORTED (10053)` ——
+一个只在时序巧合下出现的假失败（实测在 150 次连续连接的压测里命中 4 次，分别在第
+14 / 28 / 68 / 73 次，因此 `cargo test --all-targets` 会偶发失败）。修复是
+`serve_connection` 里的 `stream.set_nonblocking(false)`，并把这条要求固化成 fixture
+自己的回归测试 `test_support::tests::an_accepted_connection_waits_for_a_late_request`
+（先连上、等 150 ms、再发请求）。**该测试做过变异验证**：把
+`set_nonblocking(false)` 注释掉后它必然失败（已实测），因此它不是"永远为真"的测试。
+
+---
+
+### 交付物 5：`docs/05` §13 参考命令的媒体类型修正
+
+`--data-binary` 会让 curl 发送 `Content-Type: application/x-www-form-urlencoded`，
+而 §4.4 的准入顺序用**媒体类型白名单**（只接受 `application/octet-stream`），
+该示例必然被拒。修正方式是**给示例补头**（并加注说明为什么必须显式声明），
+**没有**放宽 `admit.rs` 的白名单：
+
+```powershell
+curl.exe -s -X POST --data-binary "@…\01基础多位置文本.png" `
+  "http://127.0.0.1:8760/api/ocr?max_side=2000" `
+  -H "Content-Type: application/octet-stream" `
+  -H "X-RapidOCR-Token: <token>" -H "Origin: http://127.0.0.1:8760"
+```
+
+---
+
+### 验证命令与结果（`docs/05` §12 要求）
+
+在本 crate（`crates/rapid-ocr-rs`）执行；日志：`target/m0b-verify.log`（1–3 号）、
+`target/m0b-clippy-default.log` / `m0b-clippy-serve.log`、`target/m0b-test-default.log` /
+`m0b-test-serve.log`、`target/m0b-build-release.log`、`target/m0b-formula-integration.log`、
+`target/m0b-gate/`、`target/m0b-tree-default.txt` / `m0b-tree-serve.txt`。
+
+| # | 命令 | 结果 | 退出码 |
+| --- | --- | --- | --- |
+| 1 | `cargo fmt --all` + `cargo fmt --all -- --check` | 无输出 | 0 |
+| 2 | `cargo clippy --all-targets -- -D warnings` | `Finished dev profile`，无 warning | 0 |
+| 3 | `cargo clippy --features serve --all-targets -- -D warnings` | `Finished dev profile`，无 warning | 0 |
+| 4 | `cargo test --all-targets` | 369 + 2 + 4 + 14 + 0 = **389 passed, 0 failed** | 0 |
+| 5 | `cargo test --features serve --all-targets` | 369 + 2 + 4 + 14 + **106** = **495 passed, 0 failed** | 0 |
+| 6 | `cargo build --release --bins` | `Finished release profile in 17.46s`；`rapidocr.exe` 33,420,800 B、`bench_warm_e2e.exe` 33,269,760 B、`formula_eval.exe` 28,419,072 B、`formula_bench.exe` 27,727,360 B | 0 |
+| 7 | `cargo test --lib formula_integration_tests -- --test-threads=1`（`RAPID_OCR_MODEL_ROOT` / `RAPID_OCR_FORMULA_TEST_ROOT` 已设置） | **11 passed, 0 failed**（61.62 s；日志里 `skipping test` 出现 **0** 次 → 真的加载了真实模型与真实页面） | 0 |
+| 8 | `cargo tree -e normal -p rapid-ocr-rs`（默认 / `--features serve`） | 各 606 行，SHA-256 **相同**（`BD2AB5E4…C3F6FC`，与 M0c 记录的哈希**逐位相同**）；`tiny_http` 出现 0 次 | 0 |
+
+**基线对比（AGENTS.md §6：修改前建立基线 → 实施 → 验证）**
+
+| 项目 | 修改前（`1144ddb`） | 修改后 |
+| --- | --- | --- |
+| `cargo test --all-targets` | 354 + 0 = **354 passed** | **389 passed**（+35：`model_store` +34、`test_support` +1） |
+| `cargo test --features serve --all-targets` | **459 passed** | **495 passed**（+36：再加 `serve::limits` +1） |
+| 删除/跳过/弱化的测试 | — | **0**。修改的既有测试只有 `serve::error` 的两张表（`DownloadError` 的变体名随库类型改名，**断言逐项不变**，并新增了一条 `ReadTimeout → 504 download_timeout` 的映射断言），以及 `transform` 前就存在的 `sha256_file` 测试（原样保留） |
+| 默认构建依赖图 | 606 行 / `BD2AB5E4…C3F6FC` | **逐位相同**（`MoveFileExW` / `GetDiskFreeSpaceExW` 是 raw Win32 绑定，**未新增任何依赖**） |
+
+**测试数量与文件规模**：`src/model_store.rs` 35 个测试、`src/test_support.rs` 1 个测试、
+`src/bin/serve/limits.rs` 7 个测试、`src/bin/serve/error.rs` 7 个测试。
+修复 fixture 的非阻塞缺陷之后，`cargo test --all-targets` 又连续跑了 **5** 次
+（含一次 3 连跑），全部 0 failed。
+
+---
+
+### 12 图硬门槛
+
+本阶段**重跑了两个门槛**，输出写在 `target/m0b-gate/`（**没有覆盖** `tests/baseline/`，
+`git status --porcelain -- tests/baseline` 为空），比较方式是原始 JSON 里的**数字字面量**
+精确字符串比较（不是浮点近似）：
+
+| 门槛 | 文档要求 | 本次实测（release） | 已提交基线 | 结论 |
+| --- | --- | --- | --- | --- |
+| 12 图 mean CER | `0.44765135645866394` | **`0.44765135645866394`**（12 例） | `0.44765135645866394` | 字面量逐位相同 |
+| 12 图区域数均值 | `34.833333333333336` | **`34.833333333333336`**（12 图 × 3 轮 = 36 样本） | `34.833333333333336` | 字面量逐位相同 |
+
+命令（**与 §13 的 CLI 对照一致**）：
+
+```powershell
+target\release\bench_warm_e2e.exe --config <OCR-Model>\test-config-small.yaml `
+  --images-dir <OCR-test-image> --warmup-rounds 1 --rounds 3 --max-side-len 2000 `
+  --intra-threads 16 --output target\m0b-gate\bench-cpu-2000.json
+target\release\rapidocr.exe evaluate --manifest <OCR-test-image>\golden-manifest.json `
+  --config <OCR-Model>\test-config-small.yaml --output target\m0b-gate\evaluation-cpu.json
+```
+
+为什么**必须**重跑：本阶段改了 `resolve_character_path`（`recognizer.rs`）与
+`resolve_model_path`，虽然 12 图基准与公式集成测试都通过配置显式给出
+`model_path` / `rec_keys_path`（不进下载分支），但"改了识别路径"这一点必须用**实测**
+而不是推理来排除影响。结果与硬门槛逐位相同。
+
+---
+
+### 关键行为对比（AGENTS.md §9）
+
+| 项目 | 修改前（`ensure_downloaded`） | 修改后（`download_verified`） | 预期结果 |
+| --- | --- | --- | --- |
+| 哈希 | `Option<&str>`，`None` 时**下载但不校验** | `&str` 必填；空串在 I/O 前拒绝 | §6.4 的硬要求：不允许无校验下载 |
+| 重定向 | 默认 client **自动跟随**（可被跳到任意 host） | `Policy::none()`；3xx → `RedirectRejected` | §6.1 第 2 条 |
+| host | 无白名单概念 | 编译期常量白名单，清单/URL 不能扩大 | §6.1 第 3 条（OWASP） |
+| 体积 | 无上限、无长度预检 | `Content-Length` 预检 + `take(max+1)` 流式上限 | §6.1 第 4、5 条 |
+| 临时文件 | `target.with_extension("part")`（**固定名**）；失败路径上残留 | `.part-<pid>-<seq>`（唯一）+ `PartFile` 的 `Drop` 保证删除 | 并发/崩溃残留不再互撞，且"可疑文件"不会留下 |
+| 覆盖 | `remove_file(target)` 后 `fs::rename`（崩溃窗口） | `MoveFileExW(MOVEFILE_REPLACE_EXISTING \| MOVEFILE_WRITE_THROUGH)`；失败保留原文件 | §6.7 |
+| 并发 | 无锁 | 目标路径单飞 | §6.1 第 8 条 |
+| 磁盘空间 | 无检查（写满才报 io 错误） | `GetDiskFreeSpaceExW` 预检 → `InsufficientSpace`（可注入，可单测） | §6.1 第 10 条 |
+| 超时 | 单一 60 s 总超时 | 连接 / 读取分项（10 s / 30 s），错误分类区分 | §6.1 第 11 条 |
+| 错误表示 | `RapidOcrError::Download(String)`（serve 侧另有一套 `DownloadError`） | 库内唯一的 `DownloadError` 十二类；`RapidOcrError::Download(DownloadError)`；serve 只做 HTTP 映射 | 同一失败原因不可能有两种表示 |
+| `RapidOcrError::Download` 在 OCR 路径上的映射 | 一律 502 `download_failed` / kind `"download"` | 原样沿用下载分类（超时 → 504 `download_timeout`） | 更精确，且不新增 `code` |
+| 性能 | — | 无热路径改动；单文件下载多了一次"连接预算/读取预算"的构造与一次磁盘查询（微秒级）；12 图门槛逐位相同 | 无退化 |
+
+---
+
+### 未覆盖风险与**做不到的事**（如实记录）
+
+1. **真实的连接阶段超时无法在环回上端到端复现**。实测：环回 TCP 连接约 0.4 ms 完成，
+   而 reqwest/tokio 的定时器粒度是 1 ms 量级——把 `connect_timeout` 压到 1 ns，
+   连接仍然先完成，最终失败的是"等待响应"的读取预算（`is_timeout()==true`、
+   `is_connect()==false`、耗时 ≈ 读取预算）。真实连接错误（拒绝连接）则是
+   `is_connect()==true`、`is_timeout()==false`。因此 `ConnectTimeout` 这一分支是通过
+   **判定函数** `classify_send_timeout` 验证的（喂入**真实的** reqwest 超时错误 +
+   连接阶段应有的耗时），而 `ReadTimeout` 有两条端到端测试；我用的是一个绑定了端口但
+   从不 accept 的监听者做过对照实验（结果同上：报的是读取预算）。**"真实网络下的
+   连接超时"没有被端到端验证**，这是本阶段明确未覆盖的一点。
+2. **TLS/HTTPS 本身没有被 fixture 覆盖**：fixture 是明文 HTTP（无证书依赖），因此
+   "真实 TLS 握手 + 证书校验"这条路径只在生产构建里存在、没有被自动化测试执行。
+   生产入口的作用域（仅 https + 编译期白名单）由公开入口测试覆盖；测试策略里
+   `insecure_http` 字段是 `#[cfg(test)]`，**生产构建里不存在**。
+3. **磁盘空间预检在"长度未知"时是保守的**：按 §6.5 用 `max_bytes` 计入需求。默认
+   1024 MiB 的上限下，若磁盘剩余空间介于"实际文件大小"与"1024 MiB"之间，一个长度
+   未知的小文件会被提前拒绝（`InsufficientSpace`）。这是有意选择（宁可提前拒绝也不写
+   半个文件），但**能构造出误拒**；M2 侧可以用已知的 `size_bytes` 或更小的剩余额度
+   收紧它。
+4. **`read_timeout` 同时约束"等待响应头"**：reqwest 的 blocking `timeout()` 是"每次
+   阻塞等待"的超时（不是整批下载的总时长，因此 600 MB 的持续推进不会超时），但它也
+   覆盖等待响应头的阶段。这一点已在代码注释与本文档写明，未做进一步拆分（那需要
+   自建 HTTP 栈）。
+5. **`DownloadError::Cancelled` 只有类型，没有生产者**：§6.6 的"文件边界取消"属于
+   M2 的下载 worker；本阶段只固定它的分类与 HTTP 映射（409 `download_cancelled`）。
+6. **serve 的下载 worker / `--allow-download-host` 接线未做**（M2）：`--allow-download-host`
+   是"用户显式扩大白名单"的入口，本阶段的库函数**只认编译期常量**，因此即使传了该参数，
+   库也不会放宽（这正是 §6.1 第 3 条要的默认行为）；M2 需要把 `allowed_hosts` 作为
+   **显式参数**接进来（并与启动警告绑定），那是新增的 API，不在本阶段。
+7. **`http://` 明文 fixture 与 `DownloadPolicy` 的 `#[cfg(test)]` 口子**：单测覆盖的是
+   生产代码的传输/落盘/预算/单飞路径，但**不是**生产策略的 scheme/host 判定分支
+   （那两个分支由公开入口测试覆盖）。两者合起来覆盖全部要求，但没有一条测试同时
+   经过"https + 编译期白名单 + 真实传输"（需要真实证书/真实站点）。
+8. **未提交、未在干净 clone 上验证**：按要求不 commit；证据来自当前工作树。
+   `git diff` 只包含上表列出的改动（`git diff --numstat`：#文件行数改动量与
+   "注释中提到的旧函数名"一致，没有整文件行尾翻转）。
+9. **行尾**：本机 `core.autocrlf=true` 且工作树本来就混用 LF/CRLF（84 LF / 47 CRLF）。
+   本阶段新写/改写的若干文件在工作树里是 LF，git 因此在 `git diff` 时提示
+   "LF will be replaced by CRLF"；仓库里存的是 LF，且改动行数与预期一致（例如
+   `src/error.rs` 只有 6 增 2 删 / 58 行），不存在整文件行尾改写。
+10. **M2 的端到端"点击下载 → 进度 → 模型齐备"未验证**：本阶段没有任何 HTTP 端点，
+    因此 §12 里"下载"那一行（重定向拒绝、非 https 拒绝、白名单拒绝、长度超限、
+    流式超限、哈希失败、单飞、磁盘不足 507、损坏重下）在本阶段是**库级**验证，
+    507/502/504 这些**状态码**仍只有 M0c 的映射单元测试，没有经过真实响应。
+
+---
+
+### 与 `docs/05` §11「M0」验收清单的对照（M0b 范围内的条目）
+
+| §11 M0 条目 | 本阶段 | 证据 |
+| --- | --- | --- |
+| 加固下载器 + `MoveFileExW` 原子替换（§6） | ✅ 完成 | 交付物 1：12 条要求逐条有测试；**36 个新测试**（`model_store` +34、`test_support` +1、`limits` +1） |
+| 迁移 CLI 调用方、删除可传 `None` 的入口（§6.4） | ✅ 完成 | 交付物 2：4 个调用点迁移；`ensure_downloaded` 与 serve 侧重复的 `DownloadError` 均已删除且无兼容层 |
+| `--max-download-mb`（§6.2） | ✅ 完成 | 交付物 3：默认 1024（单一来源）、0 值启动期拒绝、单文件 = 总量额度、剩余额度递减、未知体积仍受限 |
+| `DownloadError` 十二类 + serve 复用同一类型（§6.1 第 12 条） | ✅ 完成 | `every_download_error_class_has_a_stable_kind`、`every_download_error_maps_to_a_documented_status_and_code`、`every_rapid_ocr_error_variant_is_mapped` |
+| 「测试不得依赖公网」 | ✅ 完成 | 交付物 4：fixture 只在 `127.0.0.1:0`；联网测试 0 条（`a_refused_connection_is_a_network_error` 用的是本机已释放端口） |
+| **M0 验收**：以上每项都有单元测试；`cargo test` 全绿；文档与实现一致 | ✅ 本阶段范围内成立 | 389 / 495 passed，0 failed；两个硬门槛逐位相同；本文件 + `docs/05` §13 已同步 |
+| §6.6 下载取消、M1/M2 的 HTTP 与 worker | ⛔ 不在 M0b | 见"未覆盖风险"第 5、6、10 条 |

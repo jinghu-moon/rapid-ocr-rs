@@ -261,10 +261,17 @@ impl LoadImage {
             .build()?;
         let response = client.get(url).send()?;
         if !response.status().is_success() {
-            return Err(RapidOcrError::Download(format!(
-                "failed to fetch image from url {url}: HTTP {}",
-                response.status()
-            )));
+            // 这是"远端图片取不回来"，不是模型下载；两者共用同一套传输失败分类
+            // （`DownloadError::Network` → serve 侧 502 `download_failed` / kind `network`），
+            // 因此不需要第二个错误类型。
+            return Err(RapidOcrError::Download(
+                crate::model_store::DownloadError::Network {
+                    detail: format!(
+                        "failed to fetch image from url {url}: HTTP {}",
+                        response.status()
+                    ),
+                },
+            ));
         }
         if let Some(content_length) = response.content_length() {
             ensure_encoded_bytes(content_length, max_encoded_bytes)?;

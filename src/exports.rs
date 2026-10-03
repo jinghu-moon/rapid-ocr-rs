@@ -58,8 +58,13 @@ pub use crate::model_source::{
     MANIFEST_FILE_NAME, ManifestFile, ModelManifest, ModelRequest, ModelSource, ModelSourceKind,
     SUPPORTED_MANIFEST_SCHEMA_VERSION,
 };
+// 加固下载器（`docs/05` §6）：库侧的**唯一**下载入口与唯一的错误分类。
+// `ensure_downloaded`（可传 `None` 哈希的旧入口）已按 §6.4 删除，不保留兼容层。
 pub use crate::model_store::{
-    default_model_store_dir, ensure_downloaded, sha256_file, verify_existing_file,
+    ALLOWED_DOWNLOAD_HOSTS, DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_DOWNLOAD_BYTES,
+    DEFAULT_MAX_DOWNLOAD_MB, DEFAULT_READ_TIMEOUT, DownloadBudget, DownloadError, DownloadRequest,
+    default_model_store_dir, download_model_set, download_verified, require_model_hash,
+    sha256_file, verify_existing_file,
 };
 pub use crate::ocr::config::{ModelConfig, RecognizeOptions, RecognizerConfig};
 pub use crate::ocr::pipeline::{

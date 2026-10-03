@@ -31,7 +31,7 @@
 //! | `EngineUnavailable` | 503 | `engine_unavailable` | §7.6 |
 //! | `InsufficientDiskSpace` | 507 | `insufficient_disk_space` | §11.1 |
 //! | `UnsupportedInput` | 422 | `unsupported_input` | §11.1 |
-//! | `Download(..)` | 502/504/507/413/409 | 见 [`DownloadError`] | §6.1 |
+//! | `Download(..)` | 502/504/507/413/409 | 见 [`DownloadErrorMapping`] | §6.1 |
 //! | `Ocr(..)` | 见 [`classify_ocr_error`] | 见 [`classify_ocr_error`] | §11.1 |
 //! | `Internal` | 500 | `internal` | §11.1 |
 //!
@@ -44,103 +44,81 @@
 //!   而 §11.1 的清单里没有能表达 408 的变体；把它降级成 400 会掩盖真实原因。
 //!
 //! 其余变体与 §11.1 逐项一致。`engine_unavailable` 的 `reason` 字段来自 §7.6。
+//!
+//! # 下载错误的来源
+//!
+//! [`DownloadError`] **定义在库里**（`model_store::DownloadError`，十二类，§6.1 第 12 条），
+//! serve 侧只有 [`DownloadErrorMapping`] 这一层 HTTP 映射；因此 M0c 报告的接缝
+//! （"同一件事有两套错误表示"）在这里被彻底消除。
 
-use rapid_ocr_rs::RapidOcrError;
+use rapid_ocr_rs::{DownloadError, RapidOcrError};
 use serde::Serialize;
 
 use super::state::OcrAdmission;
 
-/// 加固下载器的错误分类（§6.1 第 11 条列出的十类）。
+/// serve 侧对库 [`DownloadError`] 的 HTTP 映射（§11.1）。
 ///
-/// **接缝**：M0b 的库侧下载器落地后，本类型必须与 `model_store` 的错误表示统一
-/// （要么把它移进库里，要么让库返回可转换的类型）；M0c 先定义 serve 侧需要的最小集合，
-/// 因此 `ServeError::Download` 不会被迫做字符串匹配。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DownloadError {
-    /// 非 HTTPS（§6.1 第 1 条）。
-    Scheme { scheme: String },
-    /// 收到 3xx（禁止自动重定向，§6.1 第 2 条）。
-    Redirect { location: Option<String> },
-    /// host 不在可信白名单内（§6.1 第 3 条）。
-    Host { host: String },
-    /// 超过单文件/单任务上限（§6.1 第 4、5 条）。
-    TooLarge {
-        limit_bytes: u64,
-        observed_bytes: Option<u64>,
-    },
-    /// 传输失败。
-    Network { detail: String },
-    /// 连接超时。
-    ConnectTimeout { timeout_ms: u64 },
-    /// 读取超时。
-    ReadTimeout { timeout_ms: u64 },
-    /// 磁盘空间不足（§6.5）。
-    InsufficientSpace {
-        required_bytes: u64,
-        available_bytes: u64,
-    },
-    /// SHA-256 不匹配（§6.1 第 9 条）。
-    HashMismatch { expected: String, actual: String },
-    /// 在文件边界被取消（§6.6）。
-    Cancelled,
+/// **错误分类只有一个定义处**：十二类在库里（`model_store::DownloadError`），
+/// serve 只补状态码/`code`/`detail`——HTTP 语义不进库（§2.1）。因此 M0c 的
+/// "同一件事有两套错误表示"这个接缝被彻底消除，`ServeError::Download` 也不需要
+/// 任何字符串匹配。
+///
+/// 映射规则（§11.1 只给下载规定了三个 `code`，更细的原因进 `detail.kind`）：
+///
+/// | `DownloadError` | 状态码 | `code` | `detail.kind` |
+/// | --- | --- | --- | --- |
+/// | `SchemeRejected` / `RedirectRejected` / `HostRejected` / `Network` / `HashMismatch` | 502 | `download_failed` | `scheme` / `redirect` / `host` / `network` / `hash_mismatch` |
+/// | `ConnectTimeout` / `ReadTimeout` | 504 | `download_timeout` | `connect_timeout` / `read_timeout` |
+/// | `TooLarge` | 413 | `payload_too_large` | `too_large` |
+/// | `InsufficientSpace` | 507 | `insufficient_disk_space` | `insufficient_space` |
+/// | `Cancelled` | 409 | `download_cancelled` | `cancelled` |
+pub trait DownloadErrorMapping {
+    /// HTTP 状态码。
+    fn status_code(&self) -> u16;
+    /// 机器可读的 `code`。
+    fn code(&self) -> &'static str;
+    /// 人类可读说明（serve 侧措辞：包含 serve 的开关名与排障提示）。
+    fn message(&self) -> String;
+    /// `detail` 载荷：始终带 `kind`（`kind` 本身来自库，不在这里重复实现），
+    /// 其余字段按变体给出。
+    fn detail(&self) -> serde_json::Value;
 }
 
-impl DownloadError {
-    /// 变体名（机器可读，进 `detail.kind`）。
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Scheme { .. } => "scheme",
-            Self::Redirect { .. } => "redirect",
-            Self::Host { .. } => "host",
-            Self::TooLarge { .. } => "too_large",
-            Self::Network { .. } => "network",
-            Self::ConnectTimeout { .. } => "connect_timeout",
-            Self::ReadTimeout { .. } => "read_timeout",
-            Self::InsufficientSpace { .. } => "insufficient_space",
-            Self::HashMismatch { .. } => "hash_mismatch",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    /// 状态码。§11.1 只规定了 `download_failed`(502) / `download_timeout`(504) /
-    /// `insufficient_disk_space`(507)，其余下载失败一律落在 502，
-    /// 由 `detail.kind` 区分具体原因（不另造一堆 `code`）。
-    pub fn status_code(&self) -> u16 {
+impl DownloadErrorMapping for DownloadError {
+    fn status_code(&self) -> u16 {
         match self {
             Self::ConnectTimeout { .. } | Self::ReadTimeout { .. } => 504,
             Self::InsufficientSpace { .. } => 507,
             Self::TooLarge { .. } => 413,
             Self::Cancelled => 409,
-            Self::Scheme { .. }
-            | Self::Redirect { .. }
-            | Self::Host { .. }
+            Self::SchemeRejected { .. }
+            | Self::RedirectRejected { .. }
+            | Self::HostRejected { .. }
             | Self::Network { .. }
             | Self::HashMismatch { .. } => 502,
         }
     }
 
-    /// `code`。
-    pub fn code(&self) -> &'static str {
+    fn code(&self) -> &'static str {
         match self {
             Self::ConnectTimeout { .. } | Self::ReadTimeout { .. } => "download_timeout",
             Self::InsufficientSpace { .. } => "insufficient_disk_space",
             Self::TooLarge { .. } => "payload_too_large",
             Self::Cancelled => "download_cancelled",
-            Self::Scheme { .. }
-            | Self::Redirect { .. }
-            | Self::Host { .. }
+            Self::SchemeRejected { .. }
+            | Self::RedirectRejected { .. }
+            | Self::HostRejected { .. }
             | Self::Network { .. }
             | Self::HashMismatch { .. } => "download_failed",
         }
     }
 
-    /// 人类可读说明。
-    pub fn message(&self) -> String {
+    fn message(&self) -> String {
         match self {
-            Self::Scheme { scheme } => {
+            Self::SchemeRejected { scheme } => {
                 format!("only https model downloads are allowed, got scheme `{scheme}`")
             }
-            Self::Redirect { location } => match location {
+            Self::RedirectRejected { location } => match location {
                 Some(location) => format!(
                     "the model host answered with a redirect to `{location}`; automatic redirects \
                      are disabled"
@@ -148,7 +126,7 @@ impl DownloadError {
                 None => "the model host answered with a redirect; automatic redirects are disabled"
                     .to_string(),
             },
-            Self::Host { host } => format!(
+            Self::HostRejected { host } => format!(
                 "`{host}` is not in the trusted download host allow-list; pass \
                  --allow-download-host to extend it explicitly"
             ),
@@ -183,15 +161,16 @@ impl DownloadError {
         }
     }
 
-    /// `detail` 载荷：始终带 `kind`，其余字段按变体给出。
-    pub fn detail(&self) -> serde_json::Value {
+    fn detail(&self) -> serde_json::Value {
         let kind = self.kind();
         match self {
-            Self::Scheme { scheme } => serde_json::json!({ "kind": kind, "scheme": scheme }),
-            Self::Redirect { location } => {
+            Self::SchemeRejected { scheme } => {
+                serde_json::json!({ "kind": kind, "scheme": scheme })
+            }
+            Self::RedirectRejected { location } => {
                 serde_json::json!({ "kind": kind, "location": location })
             }
-            Self::Host { host } => serde_json::json!({ "kind": kind, "host": host }),
+            Self::HostRejected { host } => serde_json::json!({ "kind": kind, "host": host }),
             Self::TooLarge {
                 limit_bytes,
                 observed_bytes,
@@ -200,9 +179,7 @@ impl DownloadError {
                 "limit_bytes": limit_bytes,
                 "observed_bytes": observed_bytes,
             }),
-            Self::Network { detail } => {
-                serde_json::json!({ "kind": kind, "error": detail })
-            }
+            Self::Network { detail } => serde_json::json!({ "kind": kind, "error": detail }),
             Self::ConnectTimeout { timeout_ms } => {
                 serde_json::json!({ "kind": kind, "timeout_ms": timeout_ms })
             }
@@ -226,14 +203,6 @@ impl DownloadError {
         }
     }
 }
-
-impl std::fmt::Display for DownloadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.code(), self.message())
-    }
-}
-
-impl std::error::Error for DownloadError {}
 
 /// serve 层的统一错误（§11.1）。
 #[derive(Debug)]
@@ -285,7 +254,7 @@ struct OcrErrorClass {
 /// | `Config` | 500 | `internal` | 配置在启动期已校验（§7.6 第 2 步），请求期再出现即内部不一致 |
 /// | `ModelResolve` | 409 | `models_missing` | 模型文件解析不到 |
 /// | `FileNotFound` | 409 | `models_missing` | 同上（模型文件缺失） |
-/// | `Download` | 502 | `download_failed` | 库侧旧下载入口的失败（§6.4 迁移后消失） |
+/// | `Download` | 见 [`DownloadErrorMapping`] | 见 [`DownloadErrorMapping`] | 库侧下载器（§6.1）的分类被原样沿用，不降级成字符串 |
 /// | `InvalidImage` | 422 | `unsupported_input` | 图片无法解码/超限 |
 /// | `InvalidInput` | 422 | `unsupported_input` | 输入不满足契约 |
 /// | `Decode` | 422 | `unsupported_input` | 识别结果解码失败（输入导致） |
@@ -316,10 +285,13 @@ fn classify_ocr_error(error: &RapidOcrError) -> OcrErrorClass {
             kind: "file_not_found",
             reason_is_message: false,
         },
-        RapidOcrError::Download(_) => OcrErrorClass {
-            status: 502,
-            code: "download_failed",
-            kind: "download",
+        // 库侧下载失败：分类信息不丢——状态码/`code`/`kind` 由**同一套**下载映射给出
+        // （例如 ReadTimeout → 504 `download_timeout` / kind `read_timeout`），
+        // 而不是被压成 502 + 一个笼统的字符串。
+        RapidOcrError::Download(error) => OcrErrorClass {
+            status: error.status_code(),
+            code: error.code(),
+            kind: error.kind(),
             reason_is_message: false,
         },
         RapidOcrError::InvalidImage(_) => OcrErrorClass {
@@ -580,7 +552,7 @@ mod tests {
 
     use rapid_ocr_rs::RapidOcrError;
 
-    use super::{DownloadError, ServeError};
+    use super::{DownloadError, DownloadErrorMapping, ServeError};
 
     /// 每个变体的 (状态码, code) 都被逐项锁住。
     #[test]
@@ -625,12 +597,12 @@ mod tests {
         assert_eq!(ServeError::Internal.code(), "internal");
     }
 
-    /// 每个下载错误类都有确定的状态码与 code（§6.1 的十类）。
+    /// 每个下载错误类都有确定的状态码与 code（§6.1 的十类；类型来自库里）。
     #[test]
     fn every_download_error_maps_to_a_documented_status_and_code() {
         let cases: [(DownloadError, u16, &str, &str); 10] = [
             (
-                DownloadError::Scheme {
+                DownloadError::SchemeRejected {
                     scheme: "http".to_string(),
                 },
                 502,
@@ -638,7 +610,7 @@ mod tests {
                 "scheme",
             ),
             (
-                DownloadError::Redirect {
+                DownloadError::RedirectRejected {
                     location: Some("https://evil.example/m.onnx".to_string()),
                 },
                 502,
@@ -646,7 +618,7 @@ mod tests {
                 "redirect",
             ),
             (
-                DownloadError::Host {
+                DownloadError::HostRejected {
                     host: "evil.example".to_string(),
                 },
                 502,
@@ -754,7 +726,7 @@ mod tests {
             .get("http://127.0.0.1:99999/")
             .send()
             .expect_err("an out-of-range port must fail before any connection");
-        let cases: [(RapidOcrError, u16, &str, &str); 14] = [
+        let cases: [(RapidOcrError, u16, &str, &str); 15] = [
             (
                 RapidOcrError::Config("bad".to_string()),
                 500,
@@ -773,11 +745,22 @@ mod tests {
                 "models_missing",
                 "file_not_found",
             ),
+            // 库侧下载失败被原样分类：状态码/`code`/`kind` 来自同一套下载映射
+            // （`Network` 是"传输失败/非 2xx"这一类，仍是 502 `download_failed`）。
             (
-                RapidOcrError::Download("boom".to_string()),
+                RapidOcrError::Download(DownloadError::Network {
+                    detail: "boom".to_string(),
+                }),
                 502,
                 "download_failed",
-                "download",
+                "network",
+            ),
+            // 超时不降级：连接/读取超时是 504 `download_timeout`，而不是笼统的下载失败。
+            (
+                RapidOcrError::Download(DownloadError::ReadTimeout { timeout_ms: 30_000 }),
+                504,
+                "download_timeout",
+                "read_timeout",
             ),
             (
                 RapidOcrError::InvalidImage("truncated".to_string()),

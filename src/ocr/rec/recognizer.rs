@@ -1,4 +1,7 @@
-use std::{path::PathBuf, time::Instant};
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use ndarray::ArrayView4;
 use rayon::prelude::*;
@@ -7,7 +10,10 @@ use crate::{
     config::{LangRec, RecImage, RuntimeConfig},
     error::{RapidOcrError, Result},
     model_registry::{ModelRegistry, ResolvedRecModel},
-    model_store::{default_model_store_dir, ensure_downloaded, verify_existing_file},
+    model_store::{
+        DownloadRequest, default_model_store_dir, download_verified, require_model_hash,
+        verify_existing_file,
+    },
     ocr::config::{RecognizeOptions, RecognizerConfig},
     ocr::rec::{
         bidi::reorder_bidi_for_display,
@@ -247,7 +253,7 @@ impl Recognizer {
 fn resolve_model_path(
     config: &RecognizerConfig,
     resolved: &ResolvedRecModel,
-    model_store_dir: &PathBuf,
+    model_store_dir: &Path,
 ) -> Result<PathBuf> {
     if let Some(model_path) = &config.model.model_path {
         return verify_existing_file(model_path);
@@ -259,17 +265,19 @@ fn resolve_model_path(
         ));
     }
 
-    ensure_downloaded(
+    // §6.4：哈希必填（默认表的 rec 条目都记录了 SHA-256）。
+    let expected = require_model_hash(resolved.sha256.as_deref(), &resolved.model_url)?;
+    download_verified(&DownloadRequest::new(
         &resolved.model_url,
-        resolved.sha256.as_deref(),
+        expected,
         model_store_dir,
-    )
+    ))
 }
 
 fn resolve_character_path(
     config: &RecognizerConfig,
     resolved: &ResolvedRecModel,
-    model_store_dir: &PathBuf,
+    model_store_dir: &Path,
 ) -> Result<Option<PathBuf>> {
     if let Some(path) = &config.model.rec_keys_path {
         return Ok(Some(verify_existing_file(path)?));
@@ -286,11 +294,13 @@ fn resolve_character_path(
     }
 
     // 字典和权重一样必须校验哈希：默认表里每个字典都记录了 SHA-256，
-    // 因此这里不再传 `None`（“可传 None 的下载入口”本身就是 §1.2 记录的缺口）。
-    let path = ensure_downloaded(
+    // 因此这里不再传 `None`（"可传 None 的下载入口"本身就是 §1.2 记录的缺口，
+    // 已在 §6.4 删除）。
+    let expected = require_model_hash(dictionary.sha256.as_deref(), &dictionary.url)?;
+    let path = download_verified(&DownloadRequest::new(
         &dictionary.url,
-        dictionary.sha256.as_deref(),
+        expected,
         model_store_dir,
-    )?;
+    ))?;
     Ok(Some(path))
 }

@@ -35,8 +35,10 @@
 //!
 //! M0c 不解析模型清单，只通过 [`state::ModelReadiness`] 接收"模型是否齐备、缺哪些文件"
 //! 这一事实；M1 的填充点是库侧的共享逐文件校验函数（`ModelSet` / `ModelSetStatus`）。
-//! `ServeError::Download` 的 [`error::DownloadError`] 同理：M0b 的加固下载器落地后
-//! 必须与 `model_store` 的错误表示统一，避免两套下载错误类型长期并存。
+//!
+//! **下载错误的接缝已经在 M0b 关闭**：`ServeError::Download` 的载荷是库里的
+//! `rapid_ocr_rs::DownloadError`（十二类，§6.1 第 12 条），serve 侧只有
+//! [`error::DownloadErrorMapping`] 这一层 HTTP 映射，不再有第二套下载错误类型。
 //!
 //! # 关于下面这条 `allow`
 //!

@@ -33,7 +33,10 @@ pub const DEFAULT_MAX_RESULT_MB: u64 = 8;
 /// `--max-export-mb`：单个导出文档上限（含内嵌图片），默认 32 MiB（§9.5）。
 pub const DEFAULT_MAX_EXPORT_MB: u64 = 32;
 /// `--max-download-mb`：单文件下载上限，默认 1024 MiB（必须大于 566 MB 公式模型，§6.2）。
-pub const DEFAULT_MAX_DOWNLOAD_MB: u64 = 1024;
+///
+/// **唯一来源是库常量**：库内调用方（`EngineConfig::allow_download` 分支）也要用同一个默认
+/// 上限，因此这里引用 `rapid_ocr_rs::DEFAULT_MAX_DOWNLOAD_MB`，而不是再写一遍 1024。
+pub const DEFAULT_MAX_DOWNLOAD_MB: u64 = rapid_ocr_rs::DEFAULT_MAX_DOWNLOAD_MB;
 /// `--max-queue-text`：普通 OCR 队列上限，默认 4。
 pub const DEFAULT_MAX_QUEUE_TEXT: usize = 4;
 /// `--max-queue-formula`：公式 OCR 队列上限，默认 2。
@@ -251,6 +254,12 @@ impl ServeLimits {
         RawServeLimits::default()
             .validate()
             .expect("the documented serve defaults must be valid")
+    }
+
+    /// 下载任务的预算：`--max-download-mb` 同时是**单文件上限**与**整批下载的总量额度**
+    /// （§6.2）。多文件集合由 [`rapid_ocr_rs::download_model_set`] 按剩余额度递减。
+    pub fn download_budget(&self) -> rapid_ocr_rs::DownloadBudget {
+        rapid_ocr_rs::DownloadBudget::new(self.max_download_bytes)
     }
 }
 
@@ -481,5 +490,42 @@ mod tests {
         .validate()
         .expect("7 MiB is valid");
         assert_eq!(seven.max_body_bytes, 7 * 1_048_576);
+    }
+
+    /// §6.2：`--max-download-mb` **同时**是单文件上限与整批下载的总量额度；
+    /// 剩余额度按文件递减，且一次失败的记账不吃掉预算。
+    #[test]
+    fn the_download_budget_starts_at_the_single_file_cap_and_decreases_per_file() {
+        let limits = ServeLimits::defaults();
+        let mut budget = limits.download_budget();
+
+        assert_eq!(budget.total_bytes(), 1024 * MIB);
+        assert_eq!(budget.remaining_bytes(), 1024 * MIB);
+        assert_eq!(
+            budget.per_file_cap(),
+            1024 * MIB,
+            "the per-file cap is the whole budget until something is downloaded"
+        );
+
+        // 566 MB 的公式模型必须能放进默认预算（§6.2）。
+        budget
+            .charge(593_915_961)
+            .expect("the formula model must fit the default budget");
+        assert_eq!(budget.remaining_bytes(), 1024 * MIB - 593_915_961);
+        assert_eq!(
+            budget.per_file_cap(),
+            budget.remaining_bytes(),
+            "the next file's cap is the remaining budget"
+        );
+
+        let error = budget
+            .charge(1024 * MIB)
+            .expect_err("a file larger than the remaining budget must be refused");
+        assert_eq!(
+            budget.remaining_bytes(),
+            1024 * MIB - 593_915_961,
+            "a refused charge must not consume the budget: {error}"
+        );
+        assert!(error.to_string().contains("byte limit"), "{error}");
     }
 }

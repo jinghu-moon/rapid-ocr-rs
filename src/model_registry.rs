@@ -235,8 +235,9 @@ impl ModelRegistry {
     ///
     /// 文件名**从 URL 推导**（唯一实现是 `model_store::extract_file_name`），因为
     /// 默认表的键不是文件名（例如键 `multi_PP-OCRv6_det_small` 对应
-    /// `PP-OCRv6_det_small.onnx`），而 `ensure_downloaded` 落盘时用的正是 URL 的
-    /// 最后一段；两处推导一致才能让状态校验命中同一个文件。
+    /// `PP-OCRv6_det_small.onnx`），而 `model_store::download_verified` 落盘时用的正是
+    /// URL 的最后一段；两处推导一致才能让状态校验命中同一个文件
+    /// （`download_model_set` 会把这条一致性当断言检查）。
     ///
     /// 字典缺失时**不在这里报错**：集合只是缺少 `Dictionary` role，由
     /// `ModelSet::require_roles` 统一报“缺哪些 role”，避免两处各有一套缺失判定。

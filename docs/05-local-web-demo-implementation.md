@@ -687,8 +687,12 @@ curl.exe -s -D - -o NUL http://127.0.0.1:8760/
 curl.exe -s -i http://127.0.0.1:8760/api/models -H "X-RapidOCR-Token: <token>"
 
 # 提交任务（202 + job_id）
+# 必须显式声明 Content-Type：curl 的 --data-binary 会把类型设成
+# application/x-www-form-urlencoded，而准入顺序里的媒体类型白名单只接受
+# application/octet-stream（§4.4、src/bin/serve/admit.rs）。
 curl.exe -s -X POST --data-binary "@D:\100_Projects\110_Daily\SnapClip\OCR-test-image\01基础多位置文本.png" `
   "http://127.0.0.1:8760/api/ocr?max_side=2000" `
+  -H "Content-Type: application/octet-stream" `
   -H "X-RapidOCR-Token: <token>" -H "Origin: http://127.0.0.1:8760"
 
 # 轮询 / 取结果 / 导出

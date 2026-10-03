@@ -8,7 +8,10 @@ use crate::{
     config::{LangCls, ModelType, OcrVersion, RecImage, RuntimeConfig},
     error::{RapidOcrError, Result},
     model_registry::ModelRegistry,
-    model_store::{default_model_store_dir, ensure_downloaded, verify_existing_file},
+    model_store::{
+        DownloadRequest, default_model_store_dir, download_verified, require_model_hash,
+        verify_existing_file,
+    },
     ocr::session::{OcrSession, OcrSessionKind},
     runtime::provider::ProviderResolution,
     vision::resize::LinearResizeScratch,
@@ -84,11 +87,13 @@ impl Classifier {
             let registry = ModelRegistry::from_default_yaml()?;
             let resolved =
                 registry.resolve_cls(config.ocr_version, config.lang, config.model_type)?;
-            ensure_downloaded(
+            // §6.4：哈希必填（默认表的 cls 条目都记录了 SHA-256）。
+            let expected = require_model_hash(resolved.sha256.as_deref(), &resolved.model_url)?;
+            download_verified(&DownloadRequest::new(
                 &resolved.model_url,
-                resolved.sha256.as_deref(),
-                model_store_dir,
-            )?
+                expected,
+                &model_store_dir,
+            ))?
         } else {
             return Err(RapidOcrError::Config(
                 "classifier model_path is not set and allow_download=false".to_string(),

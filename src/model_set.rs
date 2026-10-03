@@ -34,7 +34,7 @@
 //!
 //! [`validate_model_file_name`] 是路径安全的唯一实现：`name` 必须是**裸相对文件名**，
 //! 拒绝绝对路径、路径分隔符、`.`/`..` 与盘符前缀。模型目录是**扁平**的
-//! （`model_store::ensure_downloaded` 只按 URL 的最后一个路径段落盘），因此带分隔符的
+//! （`model_store::download_verified` 只按 URL 的最后一个路径段落盘），因此带分隔符的
 //! 名字在磁盘上不可能与下载产物对应，与其让它静默不匹配，不如直接拒绝。
 
 use std::path::{Component, Path};

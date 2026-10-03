@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::model_store::DownloadError;
+
 #[derive(Debug, Error)]
 pub enum RapidOcrError {
     #[error("invalid configuration: {0}")]
@@ -10,8 +12,10 @@ pub enum RapidOcrError {
     #[error("model resolution failed: {0}")]
     ModelResolve(String),
 
-    #[error("download failed: {0}")]
-    Download(String),
+    /// 下载失败。载荷是**分类**（`docs/05` §6.1 第 12 条的十二类），不是字符串：
+    /// serve 侧靠它给出状态码/`code`/`kind`，因此同一个失败原因不可能有两种表示。
+    #[error(transparent)]
+    Download(#[from] DownloadError),
 
     #[error("file not found: {0}")]
     FileNotFound(PathBuf),
