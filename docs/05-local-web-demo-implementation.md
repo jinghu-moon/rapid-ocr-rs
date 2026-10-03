@@ -708,17 +708,17 @@ img-src 'self' blob: data:; connect-src 'self'; base-uri 'none'; form-action 'no
 
 ### M0：冻结协议与安全（先决条件）
 
-- [ ] 删除 `--host`；监听地址**硬编码** `127.0.0.1`（无参数/配置/环境变量可改）；启动断言监听地址属 loopback；Host/Origin 允许集合含实际端口（§7.1）
-- [ ] tombstone 表（容量 + TTL）+ 404/410 区分（§4.5）
-- [ ] `ModelSet`/`ModelFileSpec`/`ModelRole`/`ModelSetStatus` + **共享逐文件校验函数**（§5.1/5.2）
-- [ ] `ModelManifest` 通用化（`schema_version` + `files: Vec<ManifestFile>`）+ **单一来源选择规则**（§5.3）
-- [ ] 字典补 SHA-256；无哈希不得 `complete`（§1.2、§5.2）
-- [ ] 加固下载器 + `--max-download-mb` + `MoveFileExW` 原子替换 + 迁移 CLI 调用方（§6）
-- [ ] provider 回退语义 + **启动期配置校验** + 引擎创建期可用性判定 + `/api/status` 三字段（§7.5）
-- [ ] `ServiceState` / `EngineState` 状态机与全部转换（§7.6）
-- [ ] `ServeError` 与状态码映射（§11.1，含 `engine_unavailable` / `export_too_large`）
-- [ ] 准入顺序（§4.4）与 `--max-result-mb`（§4.6）
-- [ ] 双队列容量与**双向**公平调度参数（`--max-consecutive-text` / `--max-consecutive-formula`，§8.3）
+- [x] 删除 `--host`；监听地址**硬编码** `127.0.0.1`（无参数/配置/环境变量可改）；启动断言监听地址属 loopback；Host/Origin 允许集合含实际端口（§7.1）
+- [x] tombstone 表（容量 + TTL）+ 404/410 区分（§4.5）
+- [x] `ModelSet`/`ModelFileSpec`/`ModelRole`/`ModelSetStatus` + **共享逐文件校验函数**（§5.1/5.2）
+- [x] `ModelManifest` 通用化（`schema_version` + `files: Vec<ManifestFile>`）+ **单一来源选择规则**（§5.3）
+- [x] 字典补 SHA-256；无哈希不得 `complete`（§1.2、§5.2）
+- [x] 加固下载器 + `--max-download-mb` + `MoveFileExW` 原子替换 + 迁移 CLI 调用方（§6）
+- [x] provider 回退语义 + **启动期配置校验** + 引擎创建期可用性判定 + `/api/status` 三字段（§7.5）
+- [x] `ServiceState` / `EngineState` 状态机与全部转换（§7.6）
+- [x] `ServeError` 与状态码映射（§11.1，含 `engine_unavailable` / `export_too_large`）
+- [x] 准入顺序（§4.4）与 `--max-result-mb`（§4.6）
+- [x] 双队列容量与**双向**公平调度参数（`--max-consecutive-text` / `--max-consecutive-formula`，§8.3）
 
 **M0 验收**：以上每项都有单元测试；`cargo test` 全绿；文档与实现一致。
 
@@ -752,35 +752,35 @@ pub enum ServeError {
 
 ### M1：最小闭环
 
-- [ ] `serve` 子命令 + feature 隔离 + 未启用 feature 的可定位错误
-- [ ] provider 启动期解析（§7.5）；`GET /`、`/api/status`、`POST /api/ocr`、`/api/jobs/{id}`、`/result`
-- [ ] 单图上传（XHR + 进度 + 取消上传）、异步任务与轮询
-- [ ] 预览与 polygon 叠框、区域列表、复制全文、JSON 导出
-- [ ] 模型缺失提示（消费 `ModelSetStatus`；**不含下载动作**）
-- [ ] 测试：状态机、tombstone（容量+TTL）、双队列 503、公平调度、准入顺序、Host/Origin/token、安全头与 nonce CSP
+- [x] `serve` 子命令 + feature 隔离 + 未启用 feature 的可定位错误
+- [x] provider 启动期解析（§7.5）；`GET /`、`/api/status`、`POST /api/ocr`、`/api/jobs/{id}`、`/result`
+- [x] 单图上传（XHR + 进度 + 取消上传）、异步任务与轮询
+- [x] 预览与 polygon 叠框、区域列表、复制全文、JSON 导出
+- [x] 模型缺失提示（消费 `ModelSetStatus`；**不含下载动作**）
+- [x] 测试：状态机、tombstone（容量+TTL）、双队列 503、公平调度、准入顺序、Host/Origin/token、安全头与 nonce CSP
 
 **M1 验收**：真实 12 图经 HTTP 的 `regions` 数量与文本与 `rapidocr run --json` **逐张一致**；空 `--model-dir` 下 `/api/models` 与 `/api/ocr` 的缺失字段一致；公式洪水下普通 OCR 不被饿死、普通洪水下公式也不被饿死；空模型目录下服务仍为 `Ready` 且 `EngineState::BlockedModelsMissing`（OCR 409，字段与 `/api/models` 一致）；CLI 中不存在任何可改变监听地址的选项，也不存在 `--ocr-workers`。
 
 ### M2：模型管理
 
-- [ ] `GET /api/models`、`POST /api/models/download`、下载任务进度
-- [ ] 单飞、空间检查、强制 SHA-256、失败清理、`MoveFileExW` 原子替换、重定向逐跳校验（§6.1 第 2 条）
-- [ ] 下载取消（文件边界）与"目标已损坏时重新下载"（§6.3）
-- [ ] 模型齐备后惰性创建 engine 并显示耗时
+- [x] `GET /api/models`、`POST /api/models/download`、下载任务进度
+- [x] 单飞、空间检查、强制 SHA-256、失败清理、`MoveFileExW` 原子替换、重定向逐跳校验（§6.1 第 2 条）
+- [x] 下载取消（文件边界）与"目标已损坏时重新下载"（§6.3）
+- [x] 模型齐备后惰性创建 engine 并显示耗时
 
 ### M3：诊断与导出
 
-- [ ] 时间账本、ORT/provider 指纹、内存信息进入诊断面板（含口径说明）
-- [ ] `annotated.png`、Markdown/HTML 导出（HTML 走 `ReportMode::Static` + 独立 CSP，§9.5）
-- [ ] provider 运行期切换：暂停新任务 → 排空 → 销毁旧 engine → 创建新 engine → `rebuilding`；失败恢复旧 engine 或明确 `failed`
-- [ ] 测试：导出 HTML 可用且不含 `<script>`、CSP 头正确
+- [x] 时间账本、ORT/provider 指纹、内存信息进入诊断面板（含口径说明）
+- [x] `annotated.png`、Markdown/HTML 导出（HTML 走 `ReportMode::Static` + 独立 CSP，§9.5）
+- [x] provider 运行期切换：暂停新任务 → 排空 → 销毁旧 engine → 创建新 engine → `rebuilding`；失败恢复旧 engine 或明确 `failed`
+- [x] 测试：导出 HTML 可用且不含 `<script>`、CSP 头正确
 
 ### M4：公式与评估
 
-- [ ] 公式模型下载（566 MB，显式点击 + 体积提示）
-- [ ] 公式 OCR 走独立队列（§8.3）
-- [ ] 公式区域展示与诊断
-- [ ] 上传标注样本 → CER / 精确匹配（复用 `evaluation`，不另写指标）
+- [x] 公式模型下载（566 MB，显式点击 + 体积提示）
+- [x] 公式 OCR 走独立队列（§8.3）
+- [x] 公式区域展示与诊断
+- [x] 上传标注样本 → CER / 精确匹配（复用 `evaluation`，不另写指标）
 
 ---
 
@@ -903,3 +903,29 @@ curl.exe -s -X POST http://127.0.0.1:8760/api/engine/reload `
 - [`tiny_http::Server`](https://docs.rs/tiny_http/latest/tiny_http/struct.Server.html)（`recv_timeout`、`unblock`）
 - OWASP：[SSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html)
 - WCAG 2.2：[Dragging Movements](https://www.w3.org/WAI/WCAG22/Understanding/dragging-movements) · [Focus Visible](https://www.w3.org/WAI/WCAG22/Understanding/focus-visible) · [Focus Not Obscured](https://www.w3.org/WAI/WCAG22/Understanding/focus-not-obscured-enhanced.html)
+
+
+---
+
+## 实施完成记录（M0-M4）
+
+上面的 M0-M4 清单已全部勾选，每项的证据在 docs/06-local-web-demo-reports.md 对应里程碑记录里（命令、结果、前后行为对比、未覆盖风险）。提交序列：
+
+| 里程碑 | 提交 |
+| --- | --- |
+| M0a 库内前置（ModelSet / 单一来源 / 30 个字典 SHA-256） | 1144ddb |
+| M0c serve 核心纯逻辑（状态机 / ServeError / job+tombstone / 双队列 / 准入 / loopback 安全 / CLI 面） | 1144ddb |
+| M0b 加固下载器（download_verified / DownloadError / 预算 / 调用方迁移） | dbab12e |
+| M1 serve HTTP 层 + 内联页面接入 | 06bd0af |
+| M2 模型管理（真实下载 / 进度 / 文件边界取消 / host opt-in / 惰性建引擎） | 8532fd8 |
+| M2b 下载重定向逐跳校验（解 M2 阻塞） | dcf8583 |
+| M3 诊断与导出（annotated.png / 三格式 / 时间账本 / provider 切换） | c2f35d6 |
+| M4 公式集 / 真实第二队列 / 公式区域 / 评估 | ef9c005 |
+
+### 三处如实保留的缺口（勾选不等于全部验证过）
+
+1. 公式模型 566 MB 的真实下载没有重跑：/api/models 的大小、哈希与来源，以及页面上的下载按钮（含体积提示）都验证过，但该文件本机已存在；同一套与集合无关的下载路径已在 M2b 用真实网络验证（v6-tiny 权重集 3/3 文件、三个 SHA-256 全部匹配）。
+2. 评估以 manifest 路径而非浏览器上传：POST /api/evaluate 接收 manifest 路径，因为设计明确不引入 multipart；数值与 CLI 逐位一致（12 张标注图 mean CER 0.44765135645866394）。
+3. 没有真实浏览器手工点击闭环：交互只在数据层，以及"在 node 里直接运行页面自身的 modelsReadyFor / renderBanner"层面验证过。
+
+其他已记录的未覆盖风险见各里程碑记录（真实加速器上的 provider 切换成功路径、original_evicted 只能由单任务超预算触发、M2 的目标损坏重下只在库层验证等）。
