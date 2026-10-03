@@ -63,9 +63,9 @@ pub use crate::model_source::{
 pub use crate::model_store::{
     ALLOWED_DOWNLOAD_HOSTS, DEFAULT_ALLOWED_HOSTS, DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_MAX_DOWNLOAD_BYTES, DEFAULT_MAX_DOWNLOAD_MB, DEFAULT_READ_TIMEOUT, DownloadBudget,
-    DownloadError, DownloadObserver, DownloadRequest, NoObserver, available_disk_bytes,
-    default_model_store_dir, download_model_set, download_model_set_observed, download_verified,
-    require_model_hash, sha256_file, verify_existing_file,
+    DownloadError, DownloadObserver, DownloadRequest, MAX_REDIRECT_HOPS, NoObserver,
+    available_disk_bytes, default_model_store_dir, download_model_set, download_model_set_observed,
+    download_verified, require_model_hash, sha256_file, verify_existing_file,
 };
 pub use crate::ocr::config::{ModelConfig, RecognizeOptions, RecognizerConfig};
 pub use crate::ocr::pipeline::{

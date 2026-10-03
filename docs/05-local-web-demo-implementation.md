@@ -58,7 +58,7 @@
 | 逐文件状态不可得 | `validate_files()` **遇到第一个错误即返回** | 抽出共享的逐文件校验函数（§5.2） |
 | 字典无哈希 | `ResolvedRecModel { model_url, sha256: Option<String>, dict_url: Option<String> }` | 字典补 SHA-256，且作为 `ModelFileSpec` |
 | 哈希可选 | `ensure_downloaded(.., expected_sha256: Option<&str>, ..)` | 模型/字典文件**不允许** `None` |
-| 下载跟随重定向 | 默认 `reqwest::blocking::Client` | 禁用重定向（§6） |
+| 下载跟随重定向 | 默认 `reqwest::blocking::Client` | **禁止盲从**；改为手工逐跳校验（§6.1 第 2 条） |
 | 无体积上限 / 无长度预检 | 直接流式写文件 | 预检 + `take(max+1)`（§6） |
 | `.part` 固定名 | `target_path.with_extension("part")` | 唯一临时名 + 原子替换（§6） |
 | 无并发下载锁 | 无 | 同文件单飞（§6） |
@@ -322,9 +322,17 @@ pub fn download_verified(req: &DownloadRequest<'_>) -> Result<PathBuf>;
 
 ### 6.1 硬性要求
 
-1. **仅 HTTPS**；否则 `SchemeRejected`；
-2. **禁止自动重定向**（`redirect(Policy::none())`），收到 3xx → `RedirectRejected`（未来若要支持必须逐跳校验 host/path）；
-3. **host 允许列表必须来自可信配置，不得来自模型清单**：默认是**编译期固定**白名单（当前为 `www.modelscope.cn`）；本地 `manifest.json` 可以提供 URL，但**不能扩大**该白名单，越界即 `HostRejected`；确需其他来源时必须显式传 `--allow-download-host <HOST>` 并打印高风险警告（OWASP：allowlist 必须来自可信配置，而不是资源描述自身）；
+1. **仅 HTTPS**；初始 URL 与**每一跳**都适用，否则 `SchemeRejected`（`https` → `http` 的降级也是 `SchemeRejected`）；
+2. **禁止盲从重定向；只允许手工逐跳跟随**（`redirect(Policy::none())` 关掉客户端自动跟随，由下载器自己实现跟随循环）。规则逐条冻结如下：
+   - **每一跳都重新校验** scheme 与 host：scheme 必须是 `https`；host 必须属于**生效白名单**（编译期常量 ∪ 显式 `--allow-download-host`，见第 3 条）。越界即 `HostRejected`，错误里给出**那个** host；
+   - **跳数上界 N = 5**（`MAX_REDIRECT_HOPS`）。超过上界仍是 3xx → `RedirectRejected`（带那次的 `Location`）；3xx 缺少可用的 `Location` 同样是 `RedirectRejected`；
+   - **相对 `Location` 按当前 URL 解析**（`Url::join`，RFC 9110 允许相对引用）；
+   - **不携带任何凭据跨跳**：每个 hop 都用同一个请求形状（自己的 `User-Agent` + `Referer`，无 `Authorization`、无 cookie、无自定义令牌头）；
+   - **路径也要一致**：跳转目标的 URL 末段必须与初始 URL 的末段相同（否则落盘文件名会与模型表声明的名字错位）→ `RedirectRejected`；
+   - **不跟随非 3xx**：2xx 才进入长度预检/流式上限/哈希校验，其它状态码仍按"非 2xx"报 `Network`；
+   - 跟随**不改变**其它任何保证：`Content-Length` 预检、`take(max_bytes + 1)` 流式上限、唯一临时名、`MoveFileExW` 原子替换、强制 SHA-256、单飞、磁盘预检、分项超时全部作用在**最终**响应体上（超时按跳计）。
+   理由（OWASP SSRF Prevention）：重定向是绕过白名单的经典路径——盲从等于把"下载哪个地址"的决定权交给上游；只有逐跳校验才能在保留白名单语义的前提下接通真实来源（ModelScope 对 ONNX 权重应答 **302 → `cdn-lfs-cn-1.modelscope.cn`**，M2/M2b 实测）；
+3. **host 允许列表必须来自可信配置，不得来自模型清单**：默认是**编译期固定**白名单（当前为 `www.modelscope.cn` 与 ModelScope LFS CDN `cdn-lfs-cn-1.modelscope.cn`，后者只作为重定向目标出现）；本地 `manifest.json` 可以提供 URL，但**不能扩大**该白名单，越界即 `HostRejected`；确需其他来源时必须显式传 `--allow-download-host <HOST>` 并打印高风险警告（OWASP：allowlist 必须来自可信配置，而不是资源描述自身）；host 比较是**整串精确**匹配（大小写不敏感），不做后缀/子域放宽；
 4. **`Content-Length` 预检**：超过 `max_bytes` 在写入前拒绝；
 5. **流式上限**：无长度时 `take(max_bytes + 1)`，超限失败并删除临时文件；
 6. **唯一临时文件名**（`.part-<pid>-<seq>`）；
@@ -394,6 +402,7 @@ pub fn download_verified(req: &DownloadRequest<'_>) -> Result<PathBuf>;
 | CORS | **不发送任何** `Access-Control-Allow-Origin`；绝不 `*` |
 | Cookie | **不使用** |
 | 下载 | 同时要求 `--allow-download` **与** token；请求体**不得**携带 URL（防 SSRF） |
+| 下载的跳转（出站 SSRF） | 重定向**不得盲从**：逐跳校验 scheme（仅 `https`）与 host（编译期白名单 ∪ 显式 `--allow-download-host`），上限 5 跳，相对 `Location` 按当前 URL 解析，凭据不跨跳，越界/超限是可定位错误（§6.1 第 2 条） |
 | 路径 | 一律经 `ModelSet` / 共享校验函数 / `model_store`，禁止用请求内容拼路径 |
 
 ### 7.3 响应头
@@ -637,7 +646,7 @@ pub enum ServeError {
 ### M2：模型管理
 
 - [ ] `GET /api/models`、`POST /api/models/download`、下载任务进度
-- [ ] 单飞、空间检查、强制 SHA-256、失败清理、`MoveFileExW` 原子替换、重定向拒绝
+- [ ] 单飞、空间检查、强制 SHA-256、失败清理、`MoveFileExW` 原子替换、重定向逐跳校验（§6.1 第 2 条）
 - [ ] 下载取消（文件边界）与"目标已损坏时重新下载"（§6.3）
 - [ ] 模型齐备后惰性创建 engine 并显示耗时
 
@@ -675,7 +684,7 @@ pub enum ServeError {
 | 公平性（双向） | 公式洪水下普通 OCR 等待有上界；**普通洪水下公式任务等待有上界** |
 | 导出可用性 | 导出 HTML **不含任何外部引用**（无相对 `src`、无 `/api` 链接），图片为 `data:`；超 `--max-export-mb` → 413 `export_too_large` |
 | 下载白名单来源 | manifest 声明白名单外的 host → `HostRejected`；加 `--allow-download-host` 后才放行并打印警告 |
-| 下载 | 重定向拒绝、非 https 拒绝、host 白名单拒绝、`Content-Length` 超限拒绝、无长度流式超限拒绝、哈希失败删临时文件、单飞只下一份、磁盘不足 507、**目标已损坏时原子替换成功** |
+| 下载 | **重定向逐跳校验（允许白名单内、拒绝越界/超限/降级/改名，最终体仍受上限约束）**、非 https 拒绝、host 白名单拒绝、`Content-Length` 超限拒绝、无长度流式超限拒绝、哈希失败删临时文件、单飞只下一份、磁盘不足 507、**目标已损坏时原子替换成功** |
 | Provider | 请求 directml/cuda 但实际回退 → 默认启动即失败；加 `--allow-provider-fallback` 时 `/api/status` 三字段如实反映 |
 | 模型集 | 字典缺哈希 → `complete=false`；损坏 → `Corrupt`；manifest 缺 role → 报错列出缺失 role；旧 schema manifest → 可定位错误 |
 | 导出 | HTML 导出含 `Content-Disposition: attachment`、导出 CSP、正文无 `<script>` |

@@ -124,10 +124,13 @@ impl DownloadErrorMapping for DownloadError {
             }
             Self::RedirectRejected { location } => match location {
                 Some(location) => format!(
-                    "the model host answered with a redirect to `{location}`; automatic redirects \
-                     are disabled"
+                    "the model host answered with a redirect to `{location}` whose chain is not \
+                     trusted (only https, an allow-listed host, the same file name, and at most \
+                     {} hops are followed; see docs/05 §6.1 item 2)",
+                    rapid_ocr_rs::MAX_REDIRECT_HOPS
                 ),
-                None => "the model host answered with a redirect; automatic redirects are disabled"
+                None => "the model host answered with a redirect that carries no usable \
+                         `Location` header"
                     .to_string(),
             },
             Self::HostRejected { host } => format!(

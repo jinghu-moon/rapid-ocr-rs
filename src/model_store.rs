@@ -12,7 +12,7 @@
 //! | 要求 | 实现 | 测试 |
 //! | --- | --- | --- |
 //! | 1 仅 HTTPS | 非 `https` → [`DownloadError::SchemeRejected`]，且在任何文件系统/网络动作**之前**判定 | `an_http_url_is_rejected_by_the_public_entry_point` |
-//! | 2 禁止自动重定向 | `ClientBuilder::redirect(Policy::none())`；3xx → [`DownloadError::RedirectRejected`] | `a_redirect_is_rejected` |
+//! | 2 手工逐跳重定向 | `ClientBuilder::redirect(Policy::none())` + `follow_redirect`：最多 [`MAX_REDIRECT_HOPS`] 跳，**每一跳**都按"仅 https + 生效白名单"重验，相对 `Location` 按当前 URL 解析；越界/超限 → [`DownloadError::RedirectRejected`] | `a_redirect_to_an_allowed_host_is_followed_and_verified`、`a_redirect_to_a_host_outside_the_allow_list_is_rejected`、`a_redirect_chain_longer_than_the_hop_limit_is_rejected`、`a_redirect_that_downgrades_to_http_is_rejected`、`a_redirect_target_receives_no_credential_header`、`a_redirected_body_above_the_cap_is_still_rejected`、`a_cdn_style_redirect_with_a_hash_path_still_lands_under_the_original_name` |
 //! | 3 host 白名单来自可信配置 | [`ALLOWED_DOWNLOAD_HOSTS`] 是编译期常量；本地 `manifest.json` **只能提供 URL，不能扩大它**；扩展必须经 [`DownloadRequest::allowed_hosts`] 这个**显式参数**传入 | `the_allowed_download_hosts_are_exactly_the_declared_set`、`a_local_manifest_cannot_widen_the_download_host_allow_list`、`an_explicit_host_allow_list_extends_the_compiled_in_one` |
 //! | 4 `Content-Length` 预检 | 超过 `max_bytes` 在**创建临时文件之前**拒绝 | `a_declared_length_above_the_cap_is_rejected_before_anything_is_written` |
 //! | 5 流式上限 | 无可用长度时 `take(max_bytes + 1)`；超限删除临时文件 | `a_chunked_body_above_the_cap_is_rejected_and_leaves_no_temp_file`、`a_close_delimited_body_above_the_cap_is_rejected` |
@@ -46,6 +46,23 @@
 //! （测试不得依赖公网，见 `src/test_support.rs` 的 `HttpFixture`），因此策略里那个
 //! "放行 `http://`"的口子是 `#[cfg(test)]` 字段：**生产构建里它不存在**，
 //! 也不可能被 `serve` 或清单打开。
+//!
+//! # 为什么手工逐跳跟随重定向（而不是 `Policy::limited(n)`）
+//!
+//! 默认表里的 ONNX 权重在 ModelScope 上不是直链：真实主机对 `onnx/**` 应答 **302** 到
+//! `cdn-lfs-cn-1.modelscope.cn`（M2 实测，M2b 复核：1 跳、1,829,618 B、哈希与默认表一致）。
+//! 因此"收到 3xx 就拒绝"会让**所有权重**都下载不了。两种做法里：
+//!
+//! - `reqwest` 的 `Policy::limited(n)` 会**盲目**跟随：它不检查下一跳的 scheme/host，
+//!   因此一个被控的主机可以把下载器指到任意地址（OWASP SSRF：重定向是绕过白名单的经典
+//!   路径），也可能把 `https` 降级成 `http`；
+//! - [`follow_redirect`] 自己读 `Location`、自己校验、自己发下一个请求：**每一跳**都
+//!   重跑与初始 URL 完全相同的那两条判定（仅 `https` + 生效白名单），相对 `Location` 按
+//!   当前 URL 解析，跳数上界是 [`MAX_REDIRECT_HOPS`]。
+//!
+//! 白名单本身没有被放宽：跳转到白名单外的 host 仍然是 [`DownloadError::HostRejected`]
+//! （指出那个 host），跳数超限或缺少 `Location` 是 [`DownloadError::RedirectRejected`]。
+//! 重定向只改变"从哪里取字节"，不改变"字节必须匹配声明的 SHA-256"。
 //!
 //! # 为什么不用 `fs::rename`
 //!
@@ -110,11 +127,20 @@ pub fn verify_existing_file(path: impl AsRef<Path>) -> Result<PathBuf> {
 /// 因此它们只能提供 URL，**不能扩大**这份白名单：越界的 host 一律
 /// [`DownloadError::HostRejected`]。
 ///
+/// # 为什么有第二项（ModelScope 的 LFS CDN）
+///
+/// 默认表里的 ONNX 权重在 ModelScope 上是 **302 → `cdn-lfs-cn-1.modelscope.cn`**（M2 与
+/// M2b 两次实测：`…/onnx/PP-OCRv6/det/PP-OCRv6_det_tiny.onnx` 与另外四个权重全部 302 到
+/// 同一个 host）。`§6.1` 第 2 条允许的"逐跳校验"因此必须真的有一份**可信**的 hop 白名单，
+/// 否则跟随重定向只是把 URL 的判断权交给上游。这一项是**显式审查**的结果：
+/// 它是 ModelScope 自己的对象存储域名，只作为 `Location` 目标出现，权重内容仍然必须匹配
+/// 默认表声明的 SHA-256。
+///
 /// **扩大这份白名单必须改这一个常量**：`the_allowed_download_hosts_are_exactly_the_declared_set`
 /// 把它逐项锁死，新增一项就会让测试失败，从而强制一次显式审查。serve 层的
 /// `--allow-download-host`（§6.1 第 3 条、M2 接线）是**用户显式选择**的入口，
 /// 不会让库放宽这里的常量：库永远只认这份声明。
-pub const ALLOWED_DOWNLOAD_HOSTS: [&str; 1] = ["www.modelscope.cn"];
+pub const ALLOWED_DOWNLOAD_HOSTS: [&str; 2] = ["www.modelscope.cn", "cdn-lfs-cn-1.modelscope.cn"];
 
 /// [`DownloadRequest::new`] 使用的默认允许列表：**就是**编译期白名单本身。
 ///
@@ -133,6 +159,19 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 库内默认的读取阶段超时。
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 一次下载**最多**跟随的重定向跳数（§6.1 第 2 条的"逐跳校验"）。
+///
+/// 取值理由（不是照抄某个默认值）：
+///
+/// - 真实来源只需要 **1 跳**（`www.modelscope.cn` → `cdn-lfs-cn-1.modelscope.cn`，M2/M2b
+///   实测），5 跳留出了 CDN 换名/加一跳的余量；
+/// - 每多一跳就多一次网络往返，而跳数的唯一作用是"到达最终响应"；把上界压到 5 意味着
+///   一个恶意的 302 环最多只能让下载器多发 5 次请求（每次仍受
+///   [`DownloadRequest::connect_timeout`] / [`DownloadRequest::read_timeout`] 约束），
+///   同时超限本身就是可定位的 [`DownloadError::RedirectRejected`]；
+/// - 与"仅 https + 白名单"一起，这构成 §6.1 第 2 条要求的完整跟随策略。
+pub const MAX_REDIRECT_HOPS: usize = 5;
+
 // ---------------------------------------------------------------------------
 // 错误分类（唯一定义处）
 // ---------------------------------------------------------------------------
@@ -149,7 +188,12 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum DownloadError {
     /// 非 HTTPS（§6.1 第 1 条）。
     SchemeRejected { scheme: String },
-    /// 收到 3xx；自动重定向已禁用（§6.1 第 2 条）。
+    /// 重定向被拒绝：跳数超过 [`MAX_REDIRECT_HOPS`]，或 3xx 没有可解析的 `Location`
+    /// （§6.1 第 2 条）。`location` 是**未经改动**的 `Location` 头（缺失时为 `None`），
+    /// 因此错误里能看到"上游到底把我们指到哪里"。
+    ///
+    /// 跳转目标的 scheme 不合法是 [`Self::SchemeRejected`]，host 不在生效白名单内是
+    /// [`Self::HostRejected`]——"超限/无目标"与"目标本身不可信"是两类不同的定位信息。
     RedirectRejected { location: Option<String> },
     /// host 不在 [`ALLOWED_DOWNLOAD_HOSTS`] 内（§6.1 第 3 条）。
     HostRejected { host: String },
@@ -202,12 +246,13 @@ impl std::fmt::Display for DownloadError {
             Self::RedirectRejected { location } => match location {
                 Some(location) => write!(
                     f,
-                    "the model host answered with a redirect to `{location}`; automatic redirects \
-                     are disabled"
+                    "the model host answered with a redirect to `{location}` that would exceed the \
+                     {MAX_REDIRECT_HOPS}-hop redirect limit"
                 ),
                 None => write!(
                     f,
-                    "the model host answered with a redirect; automatic redirects are disabled"
+                    "the model host answered with a redirect that carries no usable `Location` \
+                     header"
                 ),
             },
             Self::HostRejected { host } => {
@@ -656,6 +701,136 @@ fn target_lock(target: &Path) -> Arc<Mutex<()>> {
     locks.entry(target.to_path_buf()).or_default().clone()
 }
 
+// ---------------------------------------------------------------------------
+// 重定向：手工逐跳（§6.1 第 2 条）
+// ---------------------------------------------------------------------------
+
+/// 一次跳转的校验：scheme 必须是 `https`（测试策略下才允许明文），host 必须在**生效**
+/// 白名单（编译期常量 ∪ 调用方显式传入的扩展）内。
+///
+/// **初始 URL 与每一跳都走这一条**（[`download_verified_with`] 先调它一次，再在
+/// [`follow_redirect`] 里对每个 `Location` 调一次）：这就是"逐跳校验"的实现，
+/// 也是"白名单不因为跟随重定向而被放宽"的结构性保证。
+fn validate_hop(url: &reqwest::Url, policy: &DownloadPolicy<'_>, allowed: &[&str]) -> Result<()> {
+    if !policy.scheme_is_acceptable(url.scheme()) {
+        return Err(DownloadError::SchemeRejected {
+            scheme: url.scheme().to_string(),
+        }
+        .into());
+    }
+    let host = url.host_str().ok_or_else(|| {
+        RapidOcrError::from(DownloadError::Network {
+            detail: format!("`{url}` has no host"),
+        })
+    })?;
+    if !host_is_allowed(host, allowed) {
+        return Err(DownloadError::HostRejected {
+            host: host.to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// 发一个 GET（唯一的请求形状：自己的 `User-Agent` + `Referer`，**不带任何凭据**）。
+///
+/// 重定向的每一个 hop 都经过这里，因此"初始请求"与"跳转请求"的形状不可能漂移；
+/// 也正因为形状是这一份，`Authorization`/token 头**在类型上**没有来源
+/// （见 `a_redirect_target_receives_no_credential_header`）。
+fn send_request(
+    client: &Client,
+    url: &str,
+    req: &DownloadRequest<'_>,
+) -> Result<reqwest::blocking::Response> {
+    let send_started = Instant::now();
+    client
+        .get(url)
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (compatible; rapid-ocr-rs model downloader)",
+        )
+        .header(reqwest::header::REFERER, "https://www.modelscope.cn/")
+        .send()
+        .map_err(|error| {
+            classify_send_error(
+                error,
+                send_started.elapsed(),
+                req.connect_timeout,
+                req.read_timeout,
+            )
+        })
+}
+
+/// [`send_request`] 的封装：收到 3xx 时**手工**跟随，最多 [`MAX_REDIRECT_HOPS`] 跳。
+///
+/// # 规则（每一条都是可定位的错误，而不是静默行为）
+///
+/// 1. **不盲从**：客户端是 `Policy::none()`，因此这里看到的每个 3xx 都是上游的原始应答；
+/// 2. **逐跳校验**：`Location` 先按当前 URL 解析（相对引用合法），然后与初始 URL 同样
+///    判定 scheme（非 `https` → [`DownloadError::SchemeRejected`]）与 host
+///    （越界 → [`DownloadError::HostRejected`]，错误里带**那个** host）；
+/// 3. **不把跳转目标的 URL 当成落盘名字**：落盘名字来自**初始 URL** 的末段（在进入这里之前
+///    就已经确定并校验过），跳转只改变"从哪里取字节"。这不是"少校验一条"，而是**唯一正确的
+///    语义**：真实 CDN 用的是 LFS 对象路径
+///    （`https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/f4/2c/0fbd…?filename=PP-OCRv6_det_tiny.onnx`），
+///    末段是对象哈希而不是文件名——把"末段必须等于文件名"当规则会让**所有权重**都下载不了
+///    （M2b 实测），而它对安全性没有任何贡献：写盘路径与必须匹配的内容都由初始 URL +
+///    模型表声明的 SHA-256 决定（§6.4），跳转改变不了其中任何一个；
+/// 4. **跳数上界**：已经跟随了 [`MAX_REDIRECT_HOPS`] 跳之后还收到 3xx →
+///    [`DownloadError::RedirectRejected`]（`location` 是那个 `Location` 原文）；
+/// 5. **3xx 没有 `Location`** → [`DownloadError::RedirectRejected { location: None }]`；
+/// 6. **非 3xx 一律不再跟随**：2xx 返回给调用方（长度预检/流式上限/哈希校验照旧），
+///    4xx/5xx 也会被返回，由调用方按"非 2xx"报 [`DownloadError::Network`]；
+/// 7. **凭据不跨跳**：每个 hop 都用 [`send_request`] 的固定形状（无 `Authorization`、
+///    无 cookie、无自定义头）；
+/// 8. **超时按跳计**：每跳各自受 `connect_timeout` / `read_timeout` 约束，与
+///    "阻塞等待计时而不是整次传输计时"的既有口径一致；一个停在 3xx 上不推进的链，
+///    最坏情况是 `MAX_REDIRECT_HOPS` 个连接/读取预算，然后以跳数上界失败。
+fn follow_redirect(
+    client: &Client,
+    mut response: reqwest::blocking::Response,
+    initial: &reqwest::Url,
+    policy: &DownloadPolicy<'_>,
+    req: &DownloadRequest<'_>,
+) -> Result<reqwest::blocking::Response> {
+    let mut current = initial.clone();
+    let mut hops = 0_usize;
+    loop {
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        let next_location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let Some(next_location) = next_location else {
+            return Err(DownloadError::RedirectRejected { location: None }.into());
+        };
+        if hops >= MAX_REDIRECT_HOPS {
+            return Err(DownloadError::RedirectRejected {
+                location: Some(next_location),
+            }
+            .into());
+        }
+        // 相对 `Location` 按**当前** URL 解析（RFC 9110：Location 可以是相对引用）。
+        let next = current.join(&next_location).map_err(|error| {
+            RapidOcrError::from(DownloadError::Network {
+                detail: format!(
+                    "the model host answered with an unusable `Location` value \
+                     `{next_location}` (from {current}): {error}"
+                ),
+            })
+        })?;
+        validate_hop(&next, policy, req.allowed_hosts)?;
+        // 上一跳的响应体在这里被丢弃（`Response` 的 `Drop`），再发下一跳。
+        drop(response);
+        response = send_request(client, next.as_str(), req)?;
+        current = next;
+        hops += 1;
+    }
+}
+
 fn download_verified_with(
     req: &DownloadRequest<'_>,
     policy: &DownloadPolicy<'_>,
@@ -671,28 +846,13 @@ fn download_verified_with(
     }
 
     // 1/3：scheme 与 host 的判定在**任何**副作用之前（§6.1 第 1、3 条）。
+    // 重定向的**每一跳**都复用同一条判定（[`validate_hop`]），因此这里不是"只查初始 URL"。
     let url = reqwest::Url::parse(req.url).map_err(|error| {
         RapidOcrError::from(DownloadError::Network {
             detail: format!("`{}` is not a valid URL: {error}", req.url),
         })
     })?;
-    if !policy.scheme_is_acceptable(url.scheme()) {
-        return Err(DownloadError::SchemeRejected {
-            scheme: url.scheme().to_string(),
-        }
-        .into());
-    }
-    let host = url.host_str().ok_or_else(|| {
-        RapidOcrError::from(DownloadError::Network {
-            detail: format!("`{}` has no host", req.url),
-        })
-    })?;
-    if !host_is_allowed(host, req.allowed_hosts) {
-        return Err(DownloadError::HostRejected {
-            host: host.to_string(),
-        }
-        .into());
-    }
+    validate_hop(&url, policy, req.allowed_hosts)?;
 
     fs::create_dir_all(req.save_dir)?;
     let file_name = extract_file_name(req.url)?;
@@ -728,33 +888,12 @@ fn download_verified_with(
             })
         })?;
 
-    let send_started = Instant::now();
-    let response = client
-        .get(req.url)
-        .header(
-            reqwest::header::USER_AGENT,
-            "Mozilla/5.0 (compatible; rapid-ocr-rs model downloader)",
-        )
-        .header(reqwest::header::REFERER, "https://www.modelscope.cn/")
-        .send()
-        .map_err(|error| {
-            classify_send_error(
-                error,
-                send_started.elapsed(),
-                req.connect_timeout,
-                req.read_timeout,
-            )
-        })?;
+    // §6.1 第 1、3 条 + 本模块文档的"手工逐跳重定向"：初始请求与所有跳转都经过
+    // `send_request`（同一个请求形状）与 `validate_hop`（同一条 scheme/host 判定）。
+    let response = send_request(&client, req.url, req)?;
+    let response = follow_redirect(&client, response, &url, policy, req)?;
 
     let status = response.status();
-    if status.is_redirection() {
-        let location = response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        return Err(DownloadError::RedirectRejected { location }.into());
-    }
     if !status.is_success() {
         return Err(DownloadError::Network {
             detail: format!("the model host answered HTTP {status} for {}", req.url),
@@ -1275,21 +1414,45 @@ mod tests {
 
     /// 白名单是**编译期**常量：新增一项必须改这个常量，因此必然让这条测试失败，
     /// 从而强制一次显式审查。清单与 CLI 都不能绕过它。
+    ///
+    /// M2b：第二项（`cdn-lfs-cn-1.modelscope.cn`）是 ModelScope 权重 302 的**目标**，
+    /// 它进入白名单是"逐跳校验"能成立的前提——注意它只作为 `Location` 目标出现，
+    /// 内容仍然必须匹配默认表声明的 SHA-256。
     #[test]
     fn the_allowed_download_hosts_are_exactly_the_declared_set() {
         assert_eq!(
             ALLOWED_DOWNLOAD_HOSTS,
-            ["www.modelscope.cn"],
+            ["www.modelscope.cn", "cdn-lfs-cn-1.modelscope.cn"],
             "widening the download host allow-list requires changing the constant and this test"
         );
-        assert_eq!(ALLOWED_DOWNLOAD_HOSTS.len(), 1);
+        assert_eq!(ALLOWED_DOWNLOAD_HOSTS.len(), 2);
+
+        // 每一项都必须是"裸主机名"：带 scheme/端口/路径的写法会让 host 比较永远不成立
+        // （那是一个静默失效的白名单）。
+        for host in ALLOWED_DOWNLOAD_HOSTS {
+            assert!(
+                !host.is_empty()
+                    && !host.contains(['/', ':', '@', '?', '#'])
+                    && !host.starts_with('.')
+                    && host.contains('.'),
+                "`{host}` must be a bare host name"
+            );
+        }
 
         assert!(host_is_allowed(
             "www.modelscope.cn",
             &ALLOWED_DOWNLOAD_HOSTS
         ));
+        assert!(host_is_allowed(
+            "cdn-lfs-cn-1.modelscope.cn",
+            &ALLOWED_DOWNLOAD_HOSTS
+        ));
         assert!(
             host_is_allowed("WWW.ModelScope.CN", &ALLOWED_DOWNLOAD_HOSTS),
+            "host comparison must be case-insensitive"
+        );
+        assert!(
+            host_is_allowed("CDN-LFS-CN-1.ModelScope.CN", &ALLOWED_DOWNLOAD_HOSTS),
             "host comparison must be case-insensitive"
         );
         for host in [
@@ -1298,6 +1461,10 @@ mod tests {
             "evil-www.modelscope.cn",
             "www.modelscope.com",
             "wwwxmodelscope.cn",
+            // CDN host 的**兄弟**不能被后缀放宽放进来：白名单是逐串精确比较。
+            "cdn-lfs-cn-2.modelscope.cn",
+            "cdn-lfs-cn-1.modelscope.cn.evil.example",
+            "evil-cdn-lfs-cn-1.modelscope.cn",
             "127.0.0.1",
             "localhost",
             "",
@@ -1534,12 +1701,138 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // 重定向：手工逐跳（§6.1 第 2 条）
+    //
+    // 这些用例全部在环回地址上：**零公网**。两个 listener 分别扮演"来源主机"与"CDN"，
+    // 因此"跳到另一个 host 并成功"与"跳到白名单外的 host 被拒"都是真实的两台服务器。
+    // -----------------------------------------------------------------------
+
+    /// 静态断言：跟随上限是一个**小**数（跳数越多越像"盲从"），并且断言 1 跳。
     #[test]
-    fn a_redirect_is_rejected_and_nothing_is_written() {
-        let server = HttpFixture::start(|_| {
-            FixtureResponse::redirect("https://www.modelscope.cn/mirror/model.onnx")
+    fn the_redirect_hop_limit_is_small_and_fixed() {
+        assert_eq!(
+            MAX_REDIRECT_HOPS, 5,
+            "changing the hop limit is a security decision; update docs/05 §6.1 item 2 as well"
+        );
+        const {
+            assert!(MAX_REDIRECT_HOPS >= 1);
+            assert!(MAX_REDIRECT_HOPS <= 8);
+        }
+    }
+
+    /// 1) 跳到**允许的** host（另一台 fixture 服务器）→ 成功，落盘文件的哈希匹配。
+    ///
+    /// 这条用例同时覆盖"相对 `Location` 的解析"：第一跳用绝对 URL 换到第二台服务器，
+    /// 第二台再发一个**相对** `Location`（`/mirror/model.onnx`，只有路径），下载器必须把
+    /// 它解析成"当前服务器上的那个路径"，而不是当成绝对 URL 或失败。
+    #[test]
+    fn a_redirect_to_an_allowed_host_is_followed_and_verified() {
+        let body = b"rapid-ocr-rs weight bytes behind a 302".to_vec();
+        let expected = sha256_hex(&body);
+        // 第二台服务器：`/cdn/model.onnx` 回一个**相对**引用（RFC 9110 允许），
+        // `/mirror/model.onnx`（或任何别的路径）才给内容。相对引用只能解析成
+        // "当前 URL 上的 /mirror/…"，也就是这台服务器自己——而不是来源主机的同名路径。
+        let middle_body = body.clone();
+        let middle = HttpFixture::start(move |request| match request.target.as_str() {
+            "/cdn/model.onnx" => FixtureResponse::redirect("/mirror/model.onnx"),
+            _ => FixtureResponse::ok(middle_body.clone()),
         });
-        let dir = TempDir::new("download-redirect");
+        let middle_addr = middle.addr();
+        // 一台**从未被访问**的服务器：用来证明"每一跳都真的落在解析出来的 host 上"，
+        // 而不是被哪个兜底路径顺手取走。
+        let untouched = HttpFixture::start(|_| FixtureResponse::ok(b"never".to_vec()));
+        // 第一跳：绝对 URL，指向另一台（仍在白名单内的）服务器。
+        let entry = HttpFixture::start(move |_| {
+            FixtureResponse::redirect(&format!("http://{middle_addr}/cdn/model.onnx"))
+        });
+        let dir = TempDir::new("download-redirect-allowed");
+        let url = entry.url("/model.onnx");
+
+        let path = download_verified_with(
+            &fixture_request(&url, &expected, dir.path(), 1 << 20),
+            &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
+        )
+        .expect("a redirect inside the allow-list must be followed");
+
+        assert_eq!(path, dir.path().join("model.onnx"));
+        assert_eq!(
+            sha256_file(&path).expect("hash the landed file"),
+            expected,
+            "the redirected body must still match the declared SHA-256"
+        );
+        assert_eq!(
+            entries(dir.path()),
+            vec!["model.onnx".to_string()],
+            "no temporary file may survive a redirected download"
+        );
+        // 证据强度：每台该被访问的服务器都真的被访问过（入口 1 次 + 中间站 2 次）。
+        assert_eq!(entry.request_count(), 1);
+        assert_eq!(middle.request_count(), 2);
+        assert_eq!(untouched.request_count(), 0);
+    }
+
+    /// 2) 跳到**白名单之外**的 host → `HostRejected`（指名那个 host），**一个字节都不写**。
+    ///
+    /// `localhost:{port}` 是同一台 fixture 服务器的另一个名字：它**可解析**（因此若是
+    /// "盲从"就会真的把内容拿回来），唯一的问题是它不在生效白名单里。这正是
+    /// `Policy::limited(n)` 的失败模式，因此这条用例锁住"不盲从"。
+    #[test]
+    fn a_redirect_to_a_host_outside_the_allow_list_is_rejected() {
+        let worker = HttpFixture::start(|_| FixtureResponse::ok(b"must never be fetched".to_vec()));
+        let port = worker.addr().port();
+        let origin = HttpFixture::start(move |_| {
+            FixtureResponse::redirect(&format!("http://localhost:{port}/model.onnx"))
+        });
+        let dir = TempDir::new("download-redirect-off-list");
+        let url = origin.url("/model.onnx");
+
+        let error = download_verified_with(
+            &fixture_request(&url, UNMATCHED_HASH, dir.path(), 1 << 20),
+            &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
+        )
+        .expect_err("a redirect outside the allow-list must be rejected");
+
+        match download_error(error) {
+            DownloadError::HostRejected { host } => assert_eq!(host, "localhost"),
+            other => panic!("expected HostRejected, got {other:?}"),
+        }
+        assert!(
+            entries(dir.path()).is_empty(),
+            "a rejected hop must not write anything: {:?}",
+            entries(dir.path())
+        );
+        assert_eq!(
+            origin.request_count(),
+            1,
+            "the origin is asked once; the off-list host never is"
+        );
+        assert_eq!(
+            worker.request_count(),
+            0,
+            "the downloader must not even connect to the off-list host"
+        );
+    }
+
+    /// 3) 链长超过 [`MAX_REDIRECT_HOPS`] → `RedirectRejected`（带那个 `Location`），不写文件。
+    ///
+    /// 服务器把 `/model.onnx` 永远指回它自己：链是无限的，因此"停下来"这件事只有跳数上界
+    /// 一个来源。请求数必须是"上限 + 1"（最后一跳只被**判定**，不被请求）。
+    #[test]
+    fn a_redirect_chain_longer_than_the_hop_limit_is_rejected() {
+        let port_holder: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
+        let recorded = Arc::clone(&port_holder);
+        let server = HttpFixture::start(move |_| {
+            let port = recorded
+                .lock()
+                .expect("the port lock")
+                .expect("the port is recorded before any request arrives");
+            FixtureResponse::redirect(&format!("http://127.0.0.1:{port}/model.onnx"))
+        });
+        *port_holder.lock().expect("the port lock") = Some(server.addr().port());
+        let dir = TempDir::new("download-redirect-loop");
         let url = server.url("/model.onnx");
 
         let error = download_verified_with(
@@ -1547,19 +1840,217 @@ mod tests {
             &fixture_policy(&huge_free_space()),
             &mut NoObserver,
         )
-        .expect_err("a 3xx response must be rejected");
+        .expect_err("an endless redirect chain must hit the hop limit");
 
         match download_error(error) {
             DownloadError::RedirectRejected { location } => {
-                assert_eq!(
-                    location.as_deref(),
-                    Some("https://www.modelscope.cn/mirror/model.onnx")
-                );
+                let location = location.expect("the offending Location must be reported");
+                assert!(location.ends_with("/model.onnx"), "{location}");
             }
             other => panic!("expected RedirectRejected, got {other:?}"),
         }
         assert!(entries(dir.path()).is_empty());
+        assert_eq!(
+            server.request_count(),
+            MAX_REDIRECT_HOPS + 1,
+            "the limit bounds the number of requests, not just the number of jumps"
+        );
+    }
+
+    /// 一种**不能**被跟随的 3xx：没有 `Location`。它的错误也必须可定位（`location: None`）。
+    #[test]
+    fn a_redirect_without_a_location_header_is_rejected() {
+        let server = HttpFixture::start(|_| FixtureResponse::status(302, "Found", Vec::new()));
+        let dir = TempDir::new("download-redirect-no-location");
+        let url = server.url("/model.onnx");
+
+        let error = download_verified_with(
+            &fixture_request(&url, UNMATCHED_HASH, dir.path(), 1 << 20),
+            &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
+        )
+        .expect_err("a 3xx without Location cannot be followed");
+
+        assert_eq!(
+            download_error(error),
+            DownloadError::RedirectRejected { location: None }
+        );
+        assert!(entries(dir.path()).is_empty());
         assert_eq!(server.request_count(), 1);
+    }
+
+    /// 4) 降级到 `http` 的跳转 → `SchemeRejected`，且**不发**那个明文请求。
+    ///
+    /// 用的端口上确有服务器在监听（因此"拒绝"不是因为连不上）：它是**生产**策略
+    /// （只放行 `https`），因为"测试策略放行明文"绝不能顺延到跳转目标上。
+    #[test]
+    fn a_redirect_that_downgrades_to_http_is_rejected() {
+        let plain = HttpFixture::start(|_| FixtureResponse::ok(b"plaintext".to_vec()));
+        let port = plain.addr().port();
+        let origin = HttpFixture::start(move |_| {
+            FixtureResponse::redirect(&format!("http://127.0.0.1:{port}/model.onnx"))
+        });
+        let dir = TempDir::new("download-redirect-downgrade");
+        let url = origin.url("/model.onnx");
+
+        let error = download_verified_with(
+            &fixture_request(&url, UNMATCHED_HASH, dir.path(), 1 << 20),
+            &DownloadPolicy::production(&huge_free_space()),
+            &mut NoObserver,
+        )
+        .expect_err("an https -> http downgrade must be rejected");
+
+        match download_error(error) {
+            DownloadError::SchemeRejected { scheme } => assert_eq!(scheme, "http"),
+            other => panic!("expected SchemeRejected, got {other:?}"),
+        }
+        assert!(entries(dir.path()).is_empty());
+        assert_eq!(
+            plain.request_count(),
+            0,
+            "the plaintext host must not be contacted at all"
+        );
+    }
+
+    /// 5) 跳转目标**收不到任何凭据头**：`Authorization` / `Proxy-Authorization` / cookie /
+    ///    token 一个都不能出现在第二跳上（第一跳也一并断言，证明"本来就没有"）。
+    #[test]
+    fn a_redirect_target_receives_no_credential_header() {
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let body = b"credential-free body".to_vec();
+        let expected = sha256_hex(&body);
+        let worker = HttpFixture::start(move |request| {
+            recorder.lock().expect("the recorder lock").push(
+                request
+                    .headers
+                    .iter()
+                    .map(|(name, _)| name.to_ascii_lowercase())
+                    .collect(),
+            );
+            FixtureResponse::ok(body.clone())
+        });
+        let worker_addr = worker.addr();
+        let origin = HttpFixture::start(move |_| {
+            FixtureResponse::redirect(&format!("http://{worker_addr}/cdn/model.onnx"))
+        });
+        let dir = TempDir::new("download-redirect-credentials");
+        let url = origin.url("/model.onnx");
+
+        let path = download_verified_with(
+            &fixture_request(&url, &expected, dir.path(), 1 << 20),
+            &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
+        )
+        .expect("the redirect must be followed");
+
+        let recorded = seen.lock().expect("the recorder lock");
+        assert_eq!(recorded.len(), 1, "the target is asked exactly once");
+        for header in &recorded[0] {
+            for credential in [
+                "authorization",
+                "proxy-authorization",
+                "cookie",
+                "x-rapidocr-token",
+                "x-auth-token",
+            ] {
+                assert_ne!(
+                    header, credential,
+                    "a redirected request must not carry `{header}`; headers: {:?}",
+                    recorded[0]
+                );
+            }
+        }
+        assert!(
+            recorded[0].iter().any(|name| name == "user-agent"),
+            "the target must still see the downloader's own User-Agent: {:?}",
+            recorded[0]
+        );
+        assert_eq!(sha256_file(&path).expect("hash"), expected);
+    }
+
+    /// 6) **最终**响应体超过上限时，跳转不改变上限：仍然是流式上限（`TooLarge`）+
+    ///    临时文件被删除。这条响应刻意是 chunked（没有 `Content-Length`），因此
+    ///    `Content-Length` 预检不可能"顺手"挡住它。
+    #[test]
+    fn a_redirected_body_above_the_cap_is_still_rejected() {
+        let worker = HttpFixture::start(|_| FixtureResponse::chunked(vec![6_u8; 64 * 1024]));
+        let chunked_addr = worker.addr();
+        let origin = HttpFixture::start(move |_| {
+            // 末段仍是 `big.onnx`：**改名**在这里不是被检验的东西（有专门的用例）。
+            FixtureResponse::redirect(&format!("http://{chunked_addr}/cdn/big.onnx"))
+        });
+        let dir = TempDir::new("download-redirect-cap");
+        let url = origin.url("/big.onnx");
+        let expected = sha256_hex(&vec![6_u8; 64 * 1024]);
+
+        let error = download_verified_with(
+            &fixture_request(&url, &expected, dir.path(), 4096),
+            &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
+        )
+        .expect_err("the streaming cap must bound the redirected body");
+
+        match download_error(error) {
+            DownloadError::TooLarge {
+                limit_bytes,
+                observed_bytes,
+            } => {
+                assert_eq!(limit_bytes, 4096);
+                assert_eq!(
+                    observed_bytes,
+                    Some(4097),
+                    "the redirected body is read at most max_bytes + 1 bytes"
+                );
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        assert!(
+            entries(dir.path()).is_empty(),
+            "the temporary file must be deleted: {:?}",
+            entries(dir.path())
+        );
+        assert_eq!(origin.request_count(), 1);
+        assert_eq!(worker.request_count(), 1);
+    }
+
+    /// **真实 CDN 的形状**：跳转目标的末段是 LFS 对象哈希（文件名只在 `?filename=` 里），
+    /// 而落盘名字必须仍然是**初始 URL** 的末段。
+    ///
+    /// 这条用例锁住一个 M2b 实测到的坑：最初把"跳转目标末段必须等于文件名"当成
+    /// §6.1 第 2 条的 path 校验，结果真实权重**全部**下载失败
+    /// （`https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/…?filename=PP-OCRv6_det_tiny.onnx`）。
+    /// 正确的语义是：跳转只决定**从哪里取字节**，写盘路径与内容仍由初始 URL +
+    /// 声明的 SHA-256 决定（§6.4）——因此哈希目录段必须被接受，落盘名必须是 `model.onnx`。
+    #[test]
+    fn a_cdn_style_redirect_with_a_hash_path_still_lands_under_the_original_name() {
+        let body = b"lfs object bytes".to_vec();
+        let expected = sha256_hex(&body);
+        let worker = HttpFixture::start(move |_| FixtureResponse::ok(body.clone()));
+        let worker_addr = worker.addr();
+        let origin = HttpFixture::start(move |_| {
+            FixtureResponse::redirect(&format!(
+                "http://{worker_addr}/prod/lfs-objects/f4/2c/0fbd\
+                 ?filename=model.onnx&namespace=test&repository=test&tag=model"
+            ))
+        });
+        let dir = TempDir::new("download-redirect-cdn-path");
+        let url = origin.url("/model.onnx");
+
+        let path = download_verified_with(
+            &fixture_request(&url, &expected, dir.path(), 1 << 20),
+            &fixture_policy(&huge_free_space()),
+            &mut NoObserver,
+        )
+        .expect("a CDN-style hash path must be followable");
+
+        assert_eq!(
+            path,
+            dir.path().join("model.onnx"),
+            "the local name comes from the initial URL, never from the redirect target"
+        );
+        assert_eq!(sha256_file(&path).expect("hash"), expected);
+        assert_eq!(entries(dir.path()), vec!["model.onnx".to_string()]);
     }
 
     #[test]
@@ -2685,7 +3176,10 @@ mod tests {
     #[test]
     fn an_explicit_host_allow_list_extends_the_compiled_in_one() {
         // 常量本身逐项锁死（与 the_allowed_download_hosts_are_exactly_the_declared_set 同源）。
-        assert_eq!(ALLOWED_DOWNLOAD_HOSTS, ["www.modelscope.cn"]);
+        assert_eq!(
+            ALLOWED_DOWNLOAD_HOSTS,
+            ["www.modelscope.cn", "cdn-lfs-cn-1.modelscope.cn"]
+        );
         assert_eq!(DEFAULT_ALLOWED_HOSTS, ALLOWED_DOWNLOAD_HOSTS);
 
         let body = vec![5_u8; 64];

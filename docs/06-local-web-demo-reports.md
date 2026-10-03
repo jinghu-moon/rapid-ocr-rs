@@ -461,7 +461,8 @@ Diff in …\src\exports.rs:85         ← M0c 工作流新增的那条 `pub use 
 
 ### 本阶段**不做**的事（范围边界，全部留给 M0b/M0c/M1）
 
-- 加固下载器（§6）：`DownloadRequest` / `download_verified`、禁止重定向、host 白名单、
+- 加固下载器（§6）：`DownloadRequest` / `download_verified`、禁用自动重定向（M2b 起改为
+  **手工逐跳校验**，见文末 M2b）、host 白名单、
   `Content-Length` 预检、`take(max+1)`、唯一 `.part` 名、`MoveFileExW` 原子替换、单飞、
   磁盘空间预检、错误分类；`ensure_downloaded` 的 `Option<&str>` 签名仍然存在
   （§6.4 的“删除可传 `None` 哈希的入口”留给 M0b）。
@@ -1272,7 +1273,7 @@ impl DownloadError { pub const fn kind(&self) -> &'static str }   // 机器可�
 | # | 要求 | 实现 | 测试（实测结果） |
 | --- | --- | --- | --- |
 | 1 | 仅 HTTPS | `url.scheme() != "https"` → `SchemeRejected`，在**任何**文件系统/网络动作之前 | `the_public_entry_point_rejects_scheme_and_host_before_any_side_effect`（走公开入口，断言 `save_dir` **未被创建**） |
-| 2 | 禁止自动重定向 | `ClientBuilder::redirect(Policy::none())`；3xx → `RedirectRejected{location}` | `a_redirect_is_rejected_and_nothing_is_written`（302 + Location，目录为空，请求数 1） |
+| 2 | 禁止自动重定向（**M2b 起改为逐跳跟随**，见文末 M2b 记录） | `ClientBuilder::redirect(Policy::none())`；3xx → `RedirectRejected{location}` | `a_redirect_is_rejected_and_nothing_is_written`（302 + Location，目录为空，请求数 1；**该用例已在 M2b 被 6 条 fixture 重定向用例取代**） |
 | 3 | host 白名单来自可信配置 | `ALLOWED_DOWNLOAD_HOSTS` 编译期常量；整串大小写不敏感精确比较 | `the_allowed_download_hosts_are_exactly_the_declared_set`（逐项锁死 + 8 个越界 host）、`a_local_manifest_cannot_widen_the_download_host_allow_list`（`manifest.json` 声明 `https://evil.example/...` → 仍 `HostRejected`） |
 | 4 | `Content-Length` 预检 | 在 `File::create` **之前**判定 | `a_declared_length_above_the_cap_is_rejected_before_anything_is_written`（目录里连 `.part` 都没有） |
 | 5 | 流式上限 | `response.take(max_bytes + 1)`，累计超限即停 | `a_chunked_body_above_the_cap_...`（`observed_bytes == Some(1025)`）、`a_close_delimited_body_above_the_cap_...`，两者都断言临时文件已删除 |
@@ -1409,7 +1410,7 @@ reqwest 0.12 的 blocking 客户端**不区分**"连接阶段超时"与"等待�
 | --- | --- |
 | 正确哈希 → 落盘 + 无 `.part` 残留 + 1 次请求 | ✅ `a_verified_download_writes_the_file_and_leaves_no_temp_file` |
 | 哈希不符 → 删除临时文件、目标不存在 | ✅ `a_hash_mismatch_deletes_the_temp_file_and_leaves_no_target` |
-| 3xx → `RedirectRejected`（带 Location） | ✅ `a_redirect_is_rejected_and_nothing_is_written` |
+| 3xx → `RedirectRejected`（带 Location） | ✅ `a_redirect_is_rejected_and_nothing_is_written`（**M2b 起**：白名单内跟随 / 越界 host 拒 / 超限拒 / 降级拒 / 不带凭据 / 最终体仍受上限） |
 | `http://` → `SchemeRejected` | ✅ 公开入口测试（不产生任何 I/O） |
 | 白名单外 host → `HostRejected`（含伪装域名） | ✅ `the_public_entry_point_rejects_scheme_and_host_before_any_side_effect`、`a_local_manifest_cannot_widen_the_download_host_allow_list` |
 | `Content-Length` 超限 → 未写任何文件 | ✅ `a_declared_length_above_the_cap_is_rejected_before_anything_is_written` |
@@ -1519,7 +1520,7 @@ target\release\rapidocr.exe evaluate --manifest <OCR-test-image>\golden-manifest
 | 项目 | 修改前（`ensure_downloaded`） | 修改后（`download_verified`） | 预期结果 |
 | --- | --- | --- | --- |
 | 哈希 | `Option<&str>`，`None` 时**下载但不校验** | `&str` 必填；空串在 I/O 前拒绝 | §6.4 的硬要求：不允许无校验下载 |
-| 重定向 | 默认 client **自动跟随**（可被跳到任意 host） | `Policy::none()`；3xx → `RedirectRejected` | §6.1 第 2 条 |
+| 重定向 | 默认 client **自动跟随**（可被跳到任意 host） | `Policy::none()`；3xx → `RedirectRejected`（**M2b**：手工逐跳，白名单内最多 5 跳） | §6.1 第 2 条 |
 | host | 无白名单概念 | 编译期常量白名单，清单/URL 不能扩大 | §6.1 第 3 条（OWASP） |
 | 体积 | 无上限、无长度预检 | `Content-Length` 预检 + `take(max+1)` 流式上限 | §6.1 第 4、5 条 |
 | 临时文件 | `target.with_extension("part")`（**固定名**）；失败路径上残留 | `.part-<pid>-<seq>`（唯一）+ `PartFile` 的 `Drop` 保证删除 | 并发/崩溃残留不再互撞，且"可疑文件"不会留下 |
@@ -2111,7 +2112,7 @@ pub(super) fn worker(runtime: Arc<ServeShared>, inbox: Receiver<DownloadCommand>
 
 | 项目 | 修改前（M1） | 修改后 |
 | --- | --- | --- |
-| `POST /api/models/download`（开 `--allow-download`） | 建真实任务，worker 立即判失败并写"未实现、无网络 I/O" | **真实下载**：按集合逐文件走库的加固下载器（HTTPS/拒绝重定向/host 白名单/体积上限/唯一临时名/`MoveFileExW`/单飞/空间预检） |
+| `POST /api/models/download`（开 `--allow-download`） | 建真实任务，worker 立即判失败并写"未实现、无网络 I/O" | **真实下载**：按集合逐文件走库的加固下载器（HTTPS/重定向逐跳校验/host 白名单/体积上限/唯一临时名/`MoveFileExW`/单飞/空间预检） |
 | 未知 `set_id` | 400 `bad_request`（不说明已知集合） | 404 `model_set_not_found` + `detail.{set_id, known_sets}` |
 | 集合解析 | 在响应里现查 status，但 worker 只拿到 id 不解析 | 提交与执行**都用** `set_by_id`；执行期集合消失 → 同一个 404（可定位），不换集合 |
 | 下载完成后的集合状态 | 交付物不存在 | `/api/models` 立刻看到 `present`（每次重新读盘+哈希，M1 已记录该设计） |
@@ -2424,6 +2425,14 @@ FIELDS_MATCH_API_MODELS=True     engine.state equals blocked_models_missing: Tru
 
 ### 验证 4：真实网络（opt-in，`RAPID_OCR_ALLOW_NETWORK=1`）与一条**未解决**的发现
 
+> **【M2b 已解决】** 本节 (b) 记录的阻塞项（默认表 ONNX 权重 302 → CDN 被拒绝）已由 M2b
+> 修复：§6.1 第 2 条改写为"禁止盲从 + 手工逐跳校验"，`ALLOWED_DOWNLOAD_HOSTS` 增加
+> `cdn-lfs-cn-1.modelscope.cn`，`a_real_network_weight_download_is_rejected_because_the_host_redirects`
+> 被替换为成功路径用例
+> `a_real_network_weight_download_through_the_cdn_redirect_lands_and_verifies`。
+> 证据、命令与实测跳转链见文末 **【M2b】**（本节其余内容按当时事实**原样保留**，不覆盖）。
+> 本节表格里的"重定向（真实主机）"一行因此只在"当时"成立，现状见 M2b 记录。
+
 日志：`target/m2-verify/network-test.log`（命令
 `$env:RAPID_OCR_ALLOW_NETWORK='1'; cargo test --features serve --bin rapidocr a_real_network -- --nocapture --test-threads=1`）。
 
@@ -2460,14 +2469,15 @@ error: the model host answered with a redirect to
 | `…/paddle/PP-OCRv6/rec/PP-OCRv6_rec_small/ppocrv6_dict.txt` | 200，74,947 B，`num_redirects=0` |
 | `…/paddle/PP-OCRv4/rec/arabic_PP-OCRv4_rec_infer/arabic_dict.txt` | 200，405 B，`num_redirects=0` |
 
-即：**字典/词表类来源是直连的，ONNX 权重走 LFS 的 302 跳转**。加固下载器按冻结契约拒绝它
+即：**字典/词表类来源是直连的，ONNX 权重走 LFS 的 302 跳转**。加固下载器按当时冻结的契约拒绝它
 （`a_real_network_weight_download_is_rejected_because_the_host_redirects` 就是这条结论的
-opt-in 回归测试：真实主机 302 → 502 `download_failed`/`redirect`，目录里一个字节都没落）。
-后果必须如实写清：**今天 `POST /api/models/download` 对"含权重的默认表集合"必然失败**，
+opt-in 回归测试：真实主机 302 → 502 `download_failed`/`redirect`，目录里一个字节都没落；
+**M2b 已用成功路径用例取代它**）。
+后果必须如实写清：**当时 `POST /api/models/download` 对"含权重的默认表集合"必然失败**，
 用户看到的是一条可定位的 `redirect` 错误；这不是 M2 的接线缺陷，而是"默认表来源 + 拒绝重定向"
 两条冻结决策的合成结果。两条出路（都需要先改 `docs/05` §6.1 第 2 条）：
-① 逐跳校验 host/path 后放行重定向（§6.1 已经写明这是"未来若要支持"的方式，需要新增
-`cdn-lfs-*.modelscope.cn` 之类的**逐跳**校验与固定 host 集合）；② 把 CDN 直链写进默认表
+① **【M2b 已采纳】** 逐跳校验 host/path 后放行重定向（§6.1 已经写明这是"未来若要支持"的方式，
+新增 `cdn-lfs-cn-1.modelscope.cn` 这一项**逐跳**校验的固定 host）；② 把 CDN 直链写进默认表
 （auth_key 会过期，不可行）。**M2 不做这个决定**，把它作为 M3/发布前的阻塞项上报。
 
 ---
@@ -2488,7 +2498,8 @@ opt-in 回归测试：真实主机 302 → 502 `download_failed`/`redirect`，�
 `POST /api/engine/reload` 的三种结论/**惰性建引擎**与 `loading` 可见/集合齐备后任务成功且 `/api/models` 变 `complete`。
 
 **两层都覆盖**：真实网络（opt-in）里，生产下载器经 HTTP 端点下载真实字典（成功 + 哈希 + complete），
-以及真实主机的 302 → 结构化 `redirect` 失败。
+**以及真实权重经 302 → CDN 的逐跳跟随**（M2b：成功 + 哈希 + complete，取代了原先"真实主机的
+302 → 结构化 `redirect` 失败"这条拒绝路径证据）。
 
 **未覆盖（如实）**：
 
@@ -2539,7 +2550,7 @@ opt-in 回归测试：真实主机 302 → 502 `download_failed`/`redirect`，�
 | §11 M2 条目 | 本阶段 | 证据 |
 | --- | --- | --- |
 | `GET /api/models`、`POST /api/models/download`、下载任务进度 | ✅ 完成 | 交付物 1/2；`/api/models` 未改形状（M1 已有），下载端点真实化 + `download` 进度字段 |
-| 单飞、空间检查、强制 SHA-256、失败清理、`MoveFileExW` 原子替换、重定向拒绝 | ✅ 完成（库层为唯一实现，M0b 起；M2 把前四条经 HTTP 真实驱动） | 库层 40 个 `model_store` 测试 + HTTP 层 413/507/哈希失败/重定向（真实主机） |
+| 单飞、空间检查、强制 SHA-256、失败清理、`MoveFileExW` 原子替换、重定向逐跳校验 | ✅ 完成（库层为唯一实现，M0b 起；M2 把前四条经 HTTP 真实驱动；M2b 把重定向改为逐跳校验并经真实 CDN 驱动） | 库层 48 个 `model_store` 测试（其中 7 条是重定向用例）+ HTTP 层 413/507/哈希失败/真实权重 302（M2b） |
 | 下载取消（文件边界）与"目标已损坏时重新下载"（§6.3） | ✅ 取消（库 + HTTP 两层）；⚠️ §6.3 的替换只在库层 | 交付物 2；库 `an_existing_corrupt_target_is_replaced` |
 | 模型齐备后惰性创建 engine 并显示耗时 | ✅ 完成 | 交付物 4；`/api/status.engine_load_ms` + reload 的 `load_ms` |
 | **M2 验收**：无网络可验证的接缝 + 一个 opt-in 真实网络测试 | ✅ 完成 | 20 个 serve 测试（脚本化下载器 + 注入空间探测 + 闸门）与 2 个 opt-in 网络测试 |
@@ -2549,10 +2560,14 @@ opt-in 回归测试：真实主机 302 → 502 `download_failed`/`redirect`，�
 
 ### 接缝（留给 M3 / M4 / 发布前）
 
-1. **【发布前阻塞项】默认表的 ONNX 权重不可下载**（本阶段的真实发现，见验证 4b）：ModelScope
+1. ~~**【发布前阻塞项】默认表的 ONNX 权重不可下载**（本阶段的真实发现，见验证 4b）：ModelScope
    对 `onnx/**` 返回 302 到 `cdn-lfs-cn-*.modelscope.cn`，而 §6.1 第 2 条禁止自动重定向。要打通
    "点下载 → 模型齐备 → 识别"这条主线，必须先改 `docs/05` §6.1 第 2 条并实现**逐跳** host/path
-   校验（或给出另一个可信的直连来源）。M2 不擅自放宽这条冻结契约。
+   校验（或给出另一个可信的直连来源）。M2 不擅自放宽这条冻结契约。~~
+   **【M2b 已解决，2026-10-04】** §6.1 第 2 条已改写为"禁止盲从 + 手工逐跳校验"，
+   `ALLOWED_DOWNLOAD_HOSTS` 增加 `cdn-lfs-cn-1.modelscope.cn`，真实链路已跑通（见文末 M2b 记录）。
+   保留的残余风险：CDN host 名变更时需要显式加一项（这是"白名单必须被审查"的设计后果，
+   不是缺陷）。
 2. **M3 的 provider 运行期切换**：`EngineState::Rebuilding` 与 `begin_rebuild` 仍无生产者；
    M2 的 `POST /api/engine/reload` **故意不经过它**（显式 reload = "按磁盘当前文件重建会话"，
    与"切换 provider"是两件事）。M3 需要"暂停新任务 → 排空 → 销毁旧 engine → 创建新 engine"，
@@ -2592,3 +2607,241 @@ opt-in 回归测试：真实主机 302 → 502 `download_failed`/`redirect`，�
    真正的逐文件判定仍在库侧（§6.5 的原文）。
 7. **并发工作流**：父仓库工作树里还有其它工作流的未提交改动（`src-tauri/**` 等），与本阶段
    无关；本阶段的验证全部在 `crates/rapid-ocr-rs` 内取得。
+
+---
+
+# 【M2b】逐跳校验的重定向：解决 M2 的发布前阻塞项
+
+- **时间**：2026-10-04（本机）
+- **工作范围**：`crates/rapid-ocr-rs`（父仓库 `.gitignore` 的既有改动与本阶段无关）
+- **未提交**：按要求不 commit；证据全部来自当前工作树
+- **被解决的条目**：M2 的"【发布前阻塞项】默认表的 ONNX 权重不可下载"（见本文"验证 4b"与
+  "接缝"第 1 条，两处已就地标注"已解决"）
+- **改动文件**：`src/model_store.rs`、`src/exports.rs`、`src/bin/serve/error.rs`、
+  `src/bin/serve/tests.rs`、`docs/05-local-web-demo-implementation.md`、本文件
+- **`Cargo.toml` / 依赖**：未改（默认依赖图与 M2 快照 606 行逐字节相同）
+
+## 1. 根因
+
+不是"少了一个开关"，而是**契约与真实来源的合成结果**：
+
+- `docs/05` §6.1 第 2 条冻结了 `redirect(Policy::none())`，实现里 3xx 一律
+  `DownloadError::RedirectRejected`；
+- 而 ModelScope 对**所有权重**（`onnx/**`）应答 **302 → `cdn-lfs-cn-1.modelscope.cn`**
+  （LFS 对象存储），字典/词表才是直连 200。
+
+因此 `POST /api/models/download` 对任何"含权重的默认表集合"必然在第一个文件失败
+（502 `download_failed` / `detail.kind=redirect`）。§6.1 第 2 条本身已经写明未来要做的方式：
+"必须逐跳校验 host/path"，M2b 就是把这句括号里的话实现出来，并把它写回契约。
+
+## 2. 实现（`src/model_store.rs`）
+
+### 2.1 重定向语义（逐条可定位）
+
+| 规则 | 行为 |
+| --- | --- |
+| 不盲从 | 客户端仍是 `redirect(Policy::none())`；每个 3xx 都由 `follow_redirect` 自己读、自己判定 |
+| 跳数上界 | `MAX_REDIRECT_HOPS = 5`（公开常量）。已跟随 5 跳后再收到 3xx → `RedirectRejected{location}`；`location` 是那次的 `Location` 原文 |
+| 每跳 scheme | 必须是 `https`；`https → http` 降级 → `SchemeRejected{scheme:"http"}`（**测试策略放行明文的口子不顺延到跳转目标**：跳转判定用生产语义，即只认 `https`） |
+| 每跳 host | 必须在**生效白名单**（编译期常量 ∪ 显式 `allowed_hosts`）内；否则 `HostRejected{host}`，错误里是**那个** host |
+| 相对 Location | `current.join(location)`（RFC 9110 允许相对引用；绝对 URL / 绝对路径 / 相对路径三种形式都有用例） |
+| 缺 Location | 3xx 没有可用的 `Location` → `RedirectRejected{location:None}` |
+| 非 3xx | 立即返回响应：2xx 进入长度预检/流式上限/哈希校验；4xx/5xx 由调用方报 `Network` |
+| 凭据 | 每个 hop 都走同一个 `send_request`（自己的 `User-Agent` + `Referer`），**没有**任何 `Authorization`/cookie/token 头的来源；有用例断言跳转目标收到的头里没有它们 |
+| 落盘名字 | 来自**初始 URL** 的末段（不变）；跳转目标只决定"从哪里取字节" |
+| 其余保证 | 全部作用在**最终**响应体上：`Content-Length` 预检、`take(max_bytes + 1)` 流式上限、唯一临时名、RAII 清理、强制 SHA-256、`MoveFileExW` 原子替换、单飞、磁盘预检、分项超时（超时按跳计） |
+
+`DownloadError::RedirectRejected { location }` 保留（serve 侧仍是 502 `download_failed` /
+`detail.kind=redirect`），只是语义从"任何 3xx"收窄为"超限或没有可用 `Location`"。
+
+### 2.2 白名单：新增一项，而不是放宽规则
+
+`ALLOWED_DOWNLOAD_HOSTS` 从 1 项变为 2 项：
+
+```rust
+pub const ALLOWED_DOWNLOAD_HOSTS: [&str; 2] = ["www.modelscope.cn", "cdn-lfs-cn-1.modelscope.cn"];
+```
+
+- 这是**逐串精确**比较（大小写不敏感），**没有**后缀/子域通配：
+  `cdn-lfs-cn-2.modelscope.cn`、`cdn-lfs-cn-1.modelscope.cn.evil.example` 都不通过（有用例）；
+- 它只作为 `Location` 目标出现，内容仍然必须匹配默认表声明的 SHA-256；
+- "扩大白名单必须改常量 + 改测试"这条机制没有变：
+  `the_allowed_download_hosts_are_exactly_the_declared_set` 现在逐项锁死这 2 项；
+- 本地 `manifest.json` 仍然只能提供 URL，不能扩大白名单（原用例保持通过）。
+
+### 2.3 一个**被实测否掉的**设计（如实记录）
+
+最初实现把 §6.1 第 2 条的 "host/path 校验" 理解成"跳转目标的 URL 末段必须等于初始 URL 的末段"。
+真实运行立刻否掉了它：真实 CDN 是 LFS 对象布局
+
+```text
+https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/f4/2c/0fbd…?filename=PP-OCRv6_det_tiny.onnx
+```
+
+末段是**对象哈希**，文件名只在 `?filename=` 查询参数里。该规则会让所有权重都下载失败
+（真实网络测试观测到的错误是 `redirect`，`location` 正是上面这条 URL）。它被删除，理由不是
+"为了通过测试"，而是**它本来就不承担安全责任**：写盘路径由初始 URL 决定、内容由声明的
+SHA-256 决定，跳转改变不了其中任何一个。落盘名字的正确性由
+`a_cdn_style_redirect_with_a_hash_path_still_lands_under_the_original_name` 锁住
+（跳转到哈希路径 → 仍然写成 `model.onnx`）。
+
+### 2.4 一个**被否掉的**测试观测方案（如实记录）
+
+曾尝试加一个 `redirect_observation`（跳数 + 最终 host）供真实网络测试断言"确实跟随了 302"。
+它在 `serve` 测试里恒为 0：`src/bin/serve/tests.rs` 属于 **bin** 目标，链接的是**未开 `cfg(test)`**
+的库，因此库里所有 `#[cfg(test)]` 记录点都不存在。要让它在 bin 测试里生效，只能在**生产路径**上
+无条件插入观测代码——为测试方便改生产路径在这个项目里不可接受。因此该方案被整体删除，
+"跟随了 302" 改用**库外部**的 `curl.exe` 观测 + 内容哈希这两件互相独立的事实来证明（见第 4 节）。
+
+## 3. 契约文档（`docs/05`）
+
+- §6.1 第 1 条：明确"初始 URL 与**每一跳**都适用仅 HTTPS"；
+- §6.1 第 2 条：由"禁止自动重定向"改写为"**禁止盲从** + 手工逐跳跟随"，并逐条冻结
+  每跳校验、`N = 5`、相对 `Location` 解析、不携带凭据、不跟随非 3xx、跟随不改变其它保证；
+  保留 OWASP SSRF 理由（"盲从等于把下载哪个地址的决定权交给上游"）；
+- §6.1 第 3 条：白名单数值更新为 2 项并说明 CDN 只作为跳转目标；补"整串精确比较、不做后缀放宽"；
+- §1.2 表格、§11 M2 清单、§12 验证计划的"下载"一行同步（重定向逐跳校验）；
+- §7.2 安全模型：新增一行"下载的跳转（出站 SSRF）"，把规则写进安全表。
+
+## 4. 测试
+
+### 4.1 本机 fixture（库层，零公网；新增 8 条 `model_store` 用例）
+
+| # | 用例 | 断言 |
+| --- | --- | --- |
+| 1 | `a_redirect_to_an_allowed_host_is_followed_and_verified` | 三台 fixture 服务器（入口 → 中间站 → 终点）；第一跳是绝对 URL、第二跳是**相对** `Location`；成功落盘且哈希匹配；入口 1 次 / 中间站 2 次 / 一台从未被访问的服务器 0 次 |
+| 2 | `a_redirect_to_a_host_outside_the_allow_list_is_rejected` | 跳向 `localhost:{port}`（**可解析**，因此"盲从"会真的取到内容）→ `HostRejected{host:"localhost"}`；目录为空；越界 host **一次都没被连**（`request_count()==0`） |
+| 3 | `a_redirect_chain_longer_than_the_hop_limit_is_rejected` | 服务器把 `/model.onnx` 永远指回自己 → `RedirectRejected{location}`；请求数恰好 `MAX_REDIRECT_HOPS + 1` |
+| 4 | `a_redirect_without_a_location_header_is_rejected` | `302` 无 `Location` → `RedirectRejected{location:None}` |
+| 5 | `a_redirect_that_downgrades_to_http_is_rejected` | `https → http`（明文端口上**确实有**服务器在监听）→ `SchemeRejected{scheme:"http"}`，且明文主机 `request_count()==0` |
+| 6 | `a_redirect_target_receives_no_credential_header` | 记录跳转目标收到的**全部**头名：`authorization` / `proxy-authorization` / `cookie` / `x-rapidocr-token` / `x-auth-token` 一个都不在；`user-agent` 仍在 |
+| 7 | `a_redirected_body_above_the_cap_is_still_rejected` | 跳转目标回 **chunked**（无 `Content-Length`，预检不可能顺手挡住）64 KiB，上限 4096 → `TooLarge{4096, Some(4097)}`，目录为空 |
+| 8 | `a_cdn_style_redirect_with_a_hash_path_still_lands_under_the_original_name` | 真实 CDN 形状（哈希目录段 + `?filename=`）→ 接受，落盘名仍是 `model.onnx`，哈希匹配 |
+| — | `the_redirect_hop_limit_is_small_and_fixed` | 静态断言 `MAX_REDIRECT_HOPS == 5` 且在 `[1,8]` 内（改它必须同时改 §6.1 第 2 条） |
+
+被替换/改写的 1 条：`a_redirect_is_rejected_and_nothing_is_written`（旧的"任何 3xx 都拒绝"）
+按**新行为**删除，由上面 8 条覆盖（不是弱化：旧断言是"拒绝一切跳转"，新断言是"白名单内放行、
+越界/超限/降级/无目标拒绝、最终体仍受上限约束"）。
+
+### 4.2 真实网络（opt-in）
+
+命令（日志：`target/m2b-verify/network-test.log`）：
+
+```powershell
+$env:RAPID_OCR_ALLOW_NETWORK='1'
+cargo test --features serve --bin rapidocr a_real_network -- --nocapture --test-threads=1
+```
+
+**(a) 权重：302 → CDN（M2b 打通的那条路径）**
+`a_real_network_weight_download_through_the_cdn_redirect_lands_and_verifies` 走**默认表**
+（不是夹具）的 v6-tiny 集合（det + rec + dict，三个真实文件，6,346,587 B）：
+
+```text
+real network download (default-table v6 tiny): {"cancel_requested":false,"download":{"bytes_done":6346587,"bytes_total":6346587,"current_file":null,"files_done":3,"files_total":3},"elapsed_ms":1006,"error":null,"failure":null,"id":"job-0000000000000000","kind":"model_download","position":null,"queue":"download","queued_ms":655,"started_ms":655,"state":"succeeded"}
+real network download (weights): files_total=3 bytes_total=6346587 elapsed_ms=1006 max_hops=5 expected_weight_host=cdn-lfs-cn-1.modelscope.cn
+real network download (weights): PP-OCRv6_det_tiny.onnx = 1829618 bytes, sha256 f42c0fbd294d95eac1a550e131b277dac97462c8025fa4b6c3cec1b7894bd3d5
+real network download (weights): PP-OCRv6_rec_tiny.onnx = 4489813 bytes, sha256 e16e242de5937ad92609223f19bc2aff3727ee40b095f996907c24749bad251b
+real network download (weights): ppocrv6_tiny_dict.txt = 27156 bytes, sha256 c5cbe34ef40c29c4df07ed012bf96569cb69a2d2a01a07027e9f13cb832bd9cd
+test serve::tests::a_real_network_weight_download_through_the_cdn_redirect_lands_and_verifies ... ok
+```
+
+断言：任务 `succeeded`、3 个文件全部落盘、每个文件的 SHA-256 与默认表声明**逐位一致**、
+`PP-OCRv6_det_tiny.onnx` 的内容等于默认表声明值、`/api/models` 变 `complete` 且 `missing:[]`、
+无 `.part-*` 残留。**裸跳数**由库外部的 curl 独立观测（下节），测试只断言"内容来自那条 URL 的
+302 之后"（字节哈希对上）。
+
+**(b) 字典：直连 200（对照组）**
+`a_real_network_download_of_the_default_table_dictionary_lands_and_verifies` 保持原样（本地
+manifest + 一个真实字典 + 两个已就位夹具），仍成功：`bytes_done=74947 elapsed_ms=435`，
+SHA-256 `b5f2bfe2…401c5d` 与默认表一致。
+
+**(c) 独立观测（`curl.exe` 8.19.0，不带 `-L`；日志：`target/m2b-verify/curl-redirect-chain.log`）**
+
+| URL | 结果 |
+| --- | --- |
+| `…/v3.9.1/onnx/PP-OCRv6/det/PP-OCRv6_det_tiny.onnx` | **302**，跳转体 345 B → `https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/f4/2c/0fbd…?filename=PP-OCRv6_det_tiny.onnx&…&auth_key=…` |
+| `…/v3.9.1/onnx/PP-OCRv6/rec/PP-OCRv6_rec_tiny.onnx` | **302**，跳转体 345 B → `https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/e1/6e/242d…?filename=PP-OCRv6_rec_tiny.onnx&…` |
+| `…/v3.9.1/paddle/PP-OCRv6/rec/PP-OCRv6_rec_tiny/ppocrv6_tiny_dict.txt` | **200**，27,156 B（`num_redirects=0`） |
+
+结论（观测到的跳转链）：**来源 `www.modelscope.cn` ——1 跳→ 终点
+`cdn-lfs-cn-1.modelscope.cn`**，跳数 1，远小于上界 5；字典 0 跳。与下载器"把 302 跟随到同一
+host"的行为一致。
+
+## 5. 门禁（`target/m2b-verify/m2b-gates.log`）
+
+| # | 命令 | 结果 | 退出码 |
+| --- | --- | --- | --- |
+| 1 | `cargo fmt --all -- --check` | 无输出 | 0 |
+| 2 | `cargo clippy --all-targets -- -D warnings` | 无 warning | 0 |
+| 3 | `cargo clippy --features serve --all-targets -- -D warnings` | 无 warning | 0 |
+| 4 | `cargo test --all-targets` | 382 + 2 + 4 + 14 + 0 = **402 passed, 0 failed** | 0 |
+| 5 | `cargo test --features serve --all-targets` | 402 + **176** = **578 passed, 0 failed** | 0 |
+| 6 | `cargo build --release --bins` | 0 | 0 |
+| 7 | `cargo build --release --bins --features serve` | 0 | 0 |
+
+- 第一次跑 3 号时我并行执行了 `cargo tree`，clippy 因等待包缓存锁而中断（该次日志里
+  "exit=101 且无输出"）；随后**串行**重跑得到上面结果。另外 3 号第一次真实失败是
+  `clippy::print_literal`（我在 `eprintln!` 尾部直接写了字面量）——已按 lint 修好，
+  不是用 allow 掩盖。
+- **依赖图未变**（`target/m2b-verify/tree-*.txt`）：
+
+| 证据 | 值 |
+| --- | --- |
+| `cargo tree -e normal -p rapid-ocr-rs` | 606 行，SHA-256 `BD2AB5E41B1A6D649E2F80B0D3D3E55327B96EB7C6F861E55DFC7C8501C3F6FC`（与 M2 快照**逐行 0 差异**） |
+| 与 M0c 快照 `target/m0c-tree-default.txt` 比较 | 0 差异 |
+| `--no-default-features` | 605 行，与 `target/m0c-tree-no-default.txt` 0 差异 |
+| `--features serve` | 611 行，与 M2 快照 0 差异；`tiny_http` 出现 1 次 |
+| 默认树里的 `tiny_http` | 0 次 |
+| `Cargo.toml` | 未改 |
+
+## 6. 12 图硬门槛（输出写在 `target/m2b-gate/`，**没有**覆盖 `tests/baseline/`）
+
+```powershell
+target\release\bench_warm_e2e.exe --config ..\..\OCR-Model\test-config-small.yaml --images-dir ..\..\OCR-test-image `
+  --warmup-rounds 1 --rounds 3 --max-side-len 2000 --intra-threads 16 --output target\m2b-gate\bench-cpu-2000.json
+target\release\rapidocr.exe evaluate --manifest ..\..\OCR-test-image\golden-manifest.json `
+  --config ..\..\OCR-Model\test-config-small.yaml --output target\m2b-gate\evaluation-cpu.json
+```
+
+| 门槛 | 文档要求 | 本次实测（release） | 比较方式 | 结论 |
+| --- | --- | --- | --- | --- |
+| 12 图区域数均值 | `34.833333333333336` | **`34.833333333333336`**（36 样本） | 原始 JSON 的数字**字面量**字符串精确比较 | 逐位相同 |
+| 12 图 mean CER | `0.44765135645866394` | **`0.44765135645866394`**（12 例） | 同上 | 逐位相同 |
+
+两条命令退出码均为 0；`git status --porcelain -- tests/baseline` 为空。
+**为什么重跑**：下载路径不是推理路径（本次改动一行都没碰 `src/ocr/**`、`src/runtime/**`），
+所以"没跑"在原理上也说得通；但这两个数字是发布前的唯一数值关卡，"跑了且逐位相同"与"合理推断
+应该相同"是两种证据强度，而代价只有约 100 s，因此按要求实跑。
+
+## 7. 关键行为对比（AGENTS.md §9）
+
+| 项目 | 修改前（M2） | 修改后（M2b） | 预期结果 |
+| --- | --- | --- | --- |
+| 收到 3xx（修改功能） | 一律 `RedirectRejected` / 502 `redirect`；**默认表权重全部下载失败** | 白名单内、最多 5 跳、逐跳校验后跟随；越界/超限/降级/无目标仍是可定位拒绝 | 默认表权重可下载；SSRF 面不因跟随而扩大 |
+| `ALLOWED_DOWNLOAD_HOSTS`（修改数据） | 1 项 `["www.modelscope.cn"]`，测试逐项锁死 | 2 项（+`cdn-lfs-cn-1.modelscope.cn`），测试仍逐项锁死 | 新增 host 必须显式审查；仍然精确匹配、无通配 |
+| 落盘名字来源（原有功能） | 初始 URL 末段 | 初始 URL 末段（**不变**；跳转目标不参与命名） | 模型表声明名 = 磁盘名 |
+| 大小上限（原有功能） | `Content-Length` 预检 + `take(max+1)` | 同上，作用在**最终**响应体（有针对跳转的 chunked 超限用例） | 跳转不成为绕过上限的口子 |
+| host 白名单拒绝（原有功能） | 只可能发生在初始 URL | 初始 URL **与每一跳** 都发生 | 越界 host 一次都不被连 |
+| 凭据（原有功能） | 无凭据头 | 无凭据头，且**跨跳不新增**（有断言） | 跳转目标收不到任何凭据 |
+| 真实网络（新增证据） | 302 → 502 `redirect`（拒绝路径） | 302 → 3 个文件全部落盘 + 哈希一致 + `complete`（成功路径） | 主线"点下载 → 模型齐备"打通 |
+| 推理链路 / 12 图门槛（原有功能） | 逐位相同 | **逐位相同** | 无退化 |
+| 依赖（原有功能） | 606 行默认树 | 606 行，0 差异 | 未引入任何依赖 |
+
+## 8. 未覆盖风险（如实）
+
+1. **CDN host 名是硬编码的一项**：若 ModelScope 改到 `cdn-lfs-cn-2` 或其他域名，跳转会以
+   `HostRejected`（502 `download_failed` / `detail.kind=host`）变红——这是"白名单必须显式审查"
+   的设计后果，不是缺陷；修法是改常量 + 改锁死它的测试，或者由用户
+   `--allow-download-host` 显式放行。本次沿 `det`/`rec`/`cls`/`rec_small` 四个权重 URL实测都落在
+   `cdn-lfs-cn-1`，但没有"CDN 不会换名"的证据。
+2. **真实网络测试是 opt-in 且依赖上游内容 + `--test-threads=1`**：`RAPID_OCR_ALLOW_NETWORK=1`
+   才联网；上游替换同名文件会让哈希校验失败（这正是期望行为）。测试里没有"跳数"的内部断言
+   （见 §2.4 的原因），跳数是 curl 的外部观测。
+3. **跳转过程中的超时口径**：每跳各自受 `connect_timeout` / `read_timeout` 约束（与库原有
+   "按阻塞等待计时"一致），因此 5 跳的**最坏**耗时是 5 个读取预算，而不是"整次下载一个总预算"。
+   没有为整条链引入总时限（那会改变 §6.1 第 11 条的既有语义），如实记录。
+4. **多文件真实下载的成功路径只在这一次跑通**：v6-tiny 集合 6.3 MB 用了约 1.0 s；M2 记录过的
+   "第二个文件 10 s connect_timeout"是当时的偶发网络问题，本次没有复现，但也没有对它做加固
+   （超时值未改）。
+5. **未提交、未在干净 clone 上验证**：按要求不 commit；证据来自当前工作树。
+6. **`--allow-download-host` 的高风险警告仍是 stderr 文本**（M2 的既有结论，本阶段未改）。

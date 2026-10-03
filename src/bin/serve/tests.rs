@@ -2114,6 +2114,9 @@ fn an_unknown_or_empty_set_id_is_refused_and_never_guessed() {
 
 /// `--allow-download-host` 是**显式参数**：它出现在交给下载器的列表里，
 /// 而不是"库常量被改掉了"（常量本身由 `model_store` 的单测逐项锁死）。
+///
+/// M2b 起编译期常量有两项（`www.modelscope.cn` + 权重 302 的目标 host
+/// `cdn-lfs-cn-1.modelscope.cn`），顺序即 `ALLOWED_DOWNLOAD_HOSTS` 的顺序。
 #[test]
 fn the_download_host_opt_in_is_passed_as_an_explicit_parameter() {
     let dir = manifest_model_dir("download-hosts", &["det.onnx"], None);
@@ -2133,9 +2136,11 @@ fn the_download_host_opt_in_is_passed_as_an_explicit_parameter() {
     );
     assert_eq!(
         plain.hosts_per_call(),
-        vec![vec!["www.modelscope.cn".to_string()]]
+        vec![vec![
+            "www.modelscope.cn".to_string(),
+            "cdn-lfs-cn-1.modelscope.cn".to_string()
+        ]]
     );
-
     // 同一个请求，加上 `--allow-download-host evil.example`：列表被**显式**扩展。
     let dir = manifest_model_dir("download-hosts-optin", &["det.onnx"], None);
     let extended = ScriptedDownload::default();
@@ -2157,13 +2162,15 @@ fn the_download_host_opt_in_is_passed_as_an_explicit_parameter() {
         extended.hosts_per_call(),
         vec![vec![
             "www.modelscope.cn".to_string(),
+            "cdn-lfs-cn-1.modelscope.cn".to_string(),
             "evil.example".to_string()
         ]]
     );
-    // `/api/status` 如实给出生效的列表（启动日志里也有同样的两行 + 高风险警告）。
+    // `/api/status` 如实给出生效的列表（启动日志里也有同样的几行 + 高风险警告）。
     let status = server.get("/api/status").json();
     assert_eq!(status["download_hosts"][0], "www.modelscope.cn");
-    assert_eq!(status["download_hosts"][1], "evil.example");
+    assert_eq!(status["download_hosts"][1], "cdn-lfs-cn-1.modelscope.cn");
+    assert_eq!(status["download_hosts"][2], "evil.example");
 }
 
 /// 未开 `--allow-download` → 403；`--allow-download` 打开后是**真实**任务（M2 替换了处理体）。
@@ -2322,9 +2329,9 @@ fn network_tests_enabled() -> bool {
     false
 }
 
-/// 真实网络测试的模型目录：本地 manifest，**一个**待下载文件是默认表里真实存在的字典
-/// （74,947 B，URL 与 SHA-256 逐字抄自 `assets/default_models.yaml`，实测是直接 200、无重定向），
-/// 另外两个 role 由**已经就位**的夹具文件满足。
+/// 真实网络测试的模型目录：本地 manifest，**一个**待下载文件是默认表里真实存在的条目
+/// （URL、SHA-256、体积逐字抄自 `assets/default_models.yaml`），另外两个 role 由
+/// **已经就位**的夹具文件满足。
 ///
 /// 为什么这样安排：
 ///
@@ -2332,11 +2339,16 @@ fn network_tests_enabled() -> bool {
 ///   **下载路径**（真实 URL + 强制 SHA-256 + 原子落盘），因此另外两个 role 用已经
 ///   `Present` 的小夹具文件满足——`download_model_set` 对 `Present` 的文件不发请求、
 ///   也不做 host 检查，于是这次真实网络往返只有**一次**；
-/// - 这也让测试避开下面那条**真实发现**：ModelScope 的 ONNX 权重走 302 到 CDN，
-///   而 §6.1 第 2 条要求拒绝重定向（见
-///   `a_real_network_weight_download_is_rejected_because_the_host_redirects`）。
-fn network_manifest_dir(name: &str) -> PathBuf {
+/// - `remote` 由调用方给出：字典（直连 200）与 ONNX 权重（302 → CDN）各有一条用例，
+///   后者正是 M2b 要打通的那条路径。
+fn network_manifest_dir(name: &str, remote: &RemoteDefaultFile) -> PathBuf {
     let dir = m2_root().join(format!("network-manifest-{name}-{}", unique()));
+    // **每次都从空目录开始**：`unique()` 是进程内的计数器，重启进程后会得到同名目录，
+    // 而"上一个进程下载好的文件还在"会让 `missing` 断言失败（它不是被测行为）。
+    // 清掉旧目录，让这条测试可重复运行。
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("clear the previous run's model dir");
+    }
     std::fs::create_dir_all(&dir).expect("create the model dir");
     // 两个已就位的夹具文件（内容由测试决定，哈希真实计算）。
     let fixtures = [
@@ -2355,14 +2367,14 @@ fn network_manifest_dir(name: &str) -> PathBuf {
             size,
         ));
     }
-    // 真实待下载的字典（默认表里的 ~75 KB 那个）。
+    // 真实待下载的那个默认表条目（字典或 ONNX 权重）。
     entries.push((
-        "ppocrv6_dict.txt".to_string(),
-        "dictionary".to_string(),
-        "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/paddle/PP-OCRv6/rec/PP-OCRv6_rec_small/ppocrv6_dict.txt".to_string(),
-        74_947,
+        remote.file.to_string(),
+        remote.role.to_string(),
+        remote.url.to_string(),
+        remote.size_bytes,
     ));
-    let real_hashes = ["", "", REAL_DICTIONARY_SHA256];
+    let real_hashes = ["", "", remote.sha256];
 
     let mut manifest = String::from(
         "{\"schema_version\":1,\"id\":\"network-set\",\"family\":\"PP-OCR\",\"version\":\"v-real\",\
@@ -2387,92 +2399,91 @@ fn network_manifest_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// 真实网络用例要下载的**默认表条目**：URL / SHA-256 / 体积逐字来自
+/// `assets/default_models.yaml`，不在这里重新推导。
+struct RemoteDefaultFile {
+    file: &'static str,
+    role: &'static str,
+    url: &'static str,
+    sha256: &'static str,
+    size_bytes: u64,
+}
+
 /// 默认表里 `ppocrv6_dict.txt` 的 SHA-256（74,947 B；`assets/default_models.yaml` 逐字）。
+///
+/// 字典是**直连 200**（实测 `num_redirects=0`），因此它证明的是"真实网络 + 加固路径"，
+/// 而不是重定向。
 const REAL_DICTIONARY_SHA256: &str =
     "b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d";
+const REMOTE_DICTIONARY: RemoteDefaultFile = RemoteDefaultFile {
+    file: "ppocrv6_dict.txt",
+    role: "dictionary",
+    url: "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/paddle/PP-OCRv6/rec/PP-OCRv6_rec_small/ppocrv6_dict.txt",
+    sha256: REAL_DICTIONARY_SHA256,
+    size_bytes: 74_947,
+};
 
-/// **opt-in 真实网络测试（成功路径）**：经 `POST /api/models/download` 把一个**真实**的
-/// 默认表字典（`ppocrv6_dict.txt`，74,947 B ≈ 75 KB）下载到一个**临时模型目录**，并断言：
-/// 任务成功、文件落盘、**SHA-256 与声明一致**、`/api/models` 变为 complete。
+/// 默认表里**最小的 ONNX 权重**（`PP-OCRv6_det_tiny.onnx`，1,829,618 B ≈ 1.8 MB；
+/// SHA-256 与体积逐字来自 `assets/default_models.yaml`）。
 ///
-/// 它走的是**生产**下载器（真实网络 + 加固路径 + 强制 SHA-256），不是脚本化替身。
+/// 选它是因为"权重"这一类在真实主机上走 **302 → `cdn-lfs-cn-1.modelscope.cn`**
+/// （M2 发现、M2b 打通），而它是全部 40 个权重里最小的一个——真实往返约 0.4 s。
+const REAL_WEIGHT_SHA256: &str = "f42c0fbd294d95eac1a550e131b277dac97462c8025fa4b6c3cec1b7894bd3d5";
+const REMOTE_WEIGHT: RemoteDefaultFile = RemoteDefaultFile {
+    file: "PP-OCRv6_det_tiny.onnx",
+    role: "detector",
+    url: "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/onnx/PP-OCRv6/det/PP-OCRv6_det_tiny.onnx",
+    sha256: REAL_WEIGHT_SHA256,
+    size_bytes: 1_829_618,
+};
+
+/// **opt-in 真实网络测试（默认表字典：直连 200）**：经 `POST /api/models/download` 把一个
+/// **真实**的默认表字典（`ppocrv6_dict.txt`，74,947 B ≈ 75 KB）下载到一个**临时模型目录**。
+///
+/// 它走的是**生产**下载器（真实网络 + 加固路径 + 强制 SHA-256），不是脚本化替身；
+/// 断言见 [`real_default_table_download_lands_and_verifies`]。
 #[test]
 fn a_real_network_download_of_the_default_table_dictionary_lands_and_verifies() {
     if !network_tests_enabled() {
         return;
     }
-    let dir = network_manifest_dir("dictionary");
-    let server = TestServer::start(TestOptions {
-        allow_download: true,
-        downloader: super::download::real_downloader_factory(),
-        ..TestOptions::new(dir.clone(), Scripted::fast())
-    });
-
-    let models = server.get("/api/models").json();
-    assert_eq!(models["source"], "local_manifest");
-    assert_eq!(models["complete"], false, "{models}");
-    assert_eq!(models["missing"], serde_json::json!(["ppocrv6_dict.txt"]));
-    assert_eq!(models["sets"][0]["download_bytes_total"], 74_947);
-
-    let response = server.download("network-set");
-    assert_eq!(response.status, 202, "{}", response.text());
-    let id = response.json()["job_id"]
-        .as_str()
-        .expect("job id")
-        .to_string();
-    let view = server.wait_terminal(&id, Duration::from_secs(300));
-    assert_eq!(view["state"], "succeeded", "{view}");
-    eprintln!(
-        "real network download: files_done={} files_total={} bytes_done={} bytes_total={} elapsed_ms={}",
-        view["download"]["files_done"],
-        view["download"]["files_total"],
-        view["download"]["bytes_done"],
-        view["download"]["bytes_total"],
-        view["elapsed_ms"]
-    );
-    assert_eq!(view["download"]["files_done"], 1);
-    assert_eq!(view["download"]["files_total"], 1);
-    assert_eq!(view["download"]["bytes_done"], 74_947);
-    assert_eq!(view["download"]["current_file"], serde_json::Value::Null);
-
-    let after = server.get("/api/models").json();
-    assert_eq!(after["complete"], true, "{after}");
-    assert_eq!(after["missing"], serde_json::json!([]));
-    for file in after["sets"][0]["files"].as_array().expect("files") {
-        let name = file["name"].as_str().expect("name");
-        let declared = file["sha256"].as_str().expect("sha256");
-        let path = dir.join(name);
-        assert!(path.is_file(), "{} must be on disk", path.display());
-        let landed = sha256_file(&path).expect("hash the landed file");
-        eprintln!(
-            "real network download: {name} = {} bytes, sha256 {}",
-            std::fs::metadata(&path).expect("metadata").len(),
-            landed
-        );
-        assert_eq!(landed, declared, "{name} must match its declared SHA-256");
-    }
-    let dictionary = dir.join("ppocrv6_dict.txt");
-    assert_eq!(
-        sha256_file(&dictionary).expect("hash"),
-        REAL_DICTIONARY_SHA256,
-        "the landed dictionary must be the real one from the default table"
+    real_default_table_download_lands_and_verifies(
+        "dictionary",
+        &REMOTE_DICTIONARY,
+        "www.modelscope.cn",
+        false,
     );
 }
 
-/// **opt-in 真实网络测试（拒绝路径：一条真实发现）**：默认表的 v6-tiny 文本集合里，
-/// **ONNX 权重**的 URL 在 ModelScope 上是 **302 → CDN**（`cdn-lfs-cn-*`），而 §6.1 第 2 条
-/// 明确禁止自动重定向（"未来若要支持必须逐跳校验 host/path"）。因此：
+/// **opt-in 真实网络测试（默认表权重：302 → CDN）**：这是 M2b 打通的那条路径。
 ///
-/// - 这条测试证明"拒绝重定向"在**真实主机**上确实触发（不是只在 fixture 里成立），
-///   并且任务的失败分类是结构化的（`detail.kind = "redirect"`）；
-/// - 它同时记录 M2 的一条**未解决风险**：默认表里的权重来源今天无法被加固下载器取用，
-///   `POST /api/models/download` 对"含权重的默认表集合"必然失败（见 `docs/06` 的 M2 记录）。
+/// 默认表里最小的 ONNX 权重（`PP-OCRv6_det_tiny.onnx`，1,829,618 B ≈ 1.8 MB）在真实主机上
+/// 应答 **302 → `cdn-lfs-cn-1.modelscope.cn`**（M2 发现、M2b 打通；§6.1 第 2 条要求逐跳校验）。
+///
+/// # 为什么走**默认表**（而不是本地 manifest 夹具）
+///
+/// M2 那条被取代的用例就是"v6-tiny 默认表集合的第一个文件必失败"；现在同一条集合应当
+/// **跑到底**。因此这里不构造夹具，直接用 `default_table` 的 v6-tiny 集合（det + rec + dict
+/// 三个真实文件，约 6.3 MB），断言：
+///
+/// - 任务成功、三个文件全部落盘、每个文件的 SHA-256 与默认表声明逐位一致；
+/// - 其中的**权重** `PP-OCRv6_det_tiny.onnx` 就是经 302 取回的（它的 URL 是权重 URL，
+///   实测只可能是跟着 CDN 跳转才拿到的）；
+/// - `/api/models` 报告该集合 `complete`、`missing` 为空；
+/// - 结束时目录里没有 `.part-*` 残留。
+///
+/// 它同时是最好的端到端回归：默认表的权重来源一旦再被换成"白名单外的 CDN"，
+/// 这条测试会以 502 `download_failed` / `detail.kind=host` 变红，而不是静默失败。
 #[test]
-fn a_real_network_weight_download_is_rejected_because_the_host_redirects() {
+fn a_real_network_weight_download_through_the_cdn_redirect_lands_and_verifies() {
     if !network_tests_enabled() {
         return;
     }
     let dir = m2_root().join(format!("network-weights-{}", unique()));
+    if dir.exists() {
+        // 同上：进程内计数器会重复，必须从空目录开始（否则第一个文件已经是 present）。
+        std::fs::remove_dir_all(&dir).expect("clear the previous run's model dir");
+    }
     std::fs::create_dir_all(&dir).expect("create the model dir");
     let mut config = EngineConfig::default();
     config.det.ocr_version = OcrVersion::PPocrV6;
@@ -2488,12 +2499,40 @@ fn a_real_network_weight_download_is_rejected_because_the_host_redirects() {
         engine_config: config,
         ..TestOptions::new(dir.clone(), Scripted::fast())
     });
+
     let models = server.get("/api/models").json();
-    assert_eq!(models["source"], "default_table");
+    assert_eq!(models["source"], "default_table", "{models}");
+    assert_eq!(models["complete"], false, "{models}");
     let set_id = models["sets"][0]["id"]
         .as_str()
         .expect("set id")
         .to_string();
+    let declared: Vec<(String, String, u64)> = models["sets"][0]["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|file| {
+            (
+                file["name"].as_str().expect("name").to_string(),
+                file["sha256"].as_str().expect("sha256").to_string(),
+                file["size_bytes"].as_u64().expect("size_bytes"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        declared
+            .iter()
+            .filter(|(name, ..)| name.ends_with(".onnx"))
+            .count(),
+        2,
+        "the v6-tiny text set must contain a detector and a recognizer weight: {declared:?}"
+    );
+    assert!(
+        declared
+            .iter()
+            .any(|(name, sha, _)| name == REMOTE_WEIGHT.file && sha == REAL_WEIGHT_SHA256),
+        "the set must declare the default table's smallest weight as-is: {declared:?}"
+    );
 
     let response = server.download(&set_id);
     assert_eq!(response.status, 202, "{}", response.text());
@@ -2502,22 +2541,43 @@ fn a_real_network_weight_download_is_rejected_because_the_host_redirects() {
         .expect("job id")
         .to_string();
     let view = server.wait_terminal(&id, Duration::from_secs(300));
-    eprintln!("real network download (weights): {view}");
-    assert_eq!(view["state"], "failed", "{view}");
-    assert_eq!(view["failure"]["status"], 502);
-    assert_eq!(view["failure"]["code"], "download_failed");
+    eprintln!("real network download (default-table v6 tiny): {view}");
+    assert_eq!(view["state"], "succeeded", "{view}");
+    let files_total = view["download"]["files_total"]
+        .as_u64()
+        .expect("files_total");
+    assert!(files_total >= 3, "det + rec + dict: {view}");
+    let cdn_host = "cdn-lfs-cn-1.modelscope.cn";
+    eprintln!(
+        "real network download (weights): files_total={files_total} bytes_total={} elapsed_ms={} \
+         max_hops={} expected_weight_host={cdn_host}",
+        view["download"]["bytes_total"],
+        view["elapsed_ms"],
+        rapid_ocr_rs::MAX_REDIRECT_HOPS,
+    );
+
+    let after = server.get("/api/models").json();
+    assert_eq!(after["complete"], true, "{after}");
+    assert_eq!(after["missing"], serde_json::json!([]));
+    for (name, sha, size) in &declared {
+        let path = dir.join(name);
+        assert!(path.is_file(), "{} must be on disk", path.display());
+        let landed = sha256_file(&path).expect("hash the landed file");
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").len(),
+            *size,
+            "{name} must have the declared size"
+        );
+        assert_eq!(&landed, sha, "{name} must match its declared SHA-256");
+        eprintln!("real network download (weights): {name} = {size} bytes, sha256 {landed}");
+    }
+    // 权重本身必须是默认表里那个（经 302 → CDN 取回的那一个）。
     assert_eq!(
-        view["failure"]["detail"]["kind"], "redirect",
-        "the real host answers 302 to a CDN"
+        sha256_file(dir.join(REMOTE_WEIGHT.file)).expect("hash the landed weight"),
+        REAL_WEIGHT_SHA256,
+        "the landed weight must be the real default-table entry"
     );
-    let message = view["error"].as_str().unwrap_or_default();
-    assert!(message.contains("redirect"), "{message}");
-    assert!(
-        message.contains("automatic redirects are disabled"),
-        "{message}"
-    );
-    // 一个字节都没有落盘，也没有残留的临时文件。
-    let mut entries: Vec<String> = std::fs::read_dir(&dir)
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
         .expect("readable")
         .map(|entry| {
             entry
@@ -2526,8 +2586,129 @@ fn a_real_network_weight_download_is_rejected_because_the_host_redirects() {
                 .to_string_lossy()
                 .into_owned()
         })
-        .filter(|name| name != "manifest.json")
+        .filter(|name| name.contains(".part-"))
         .collect();
-    entries.sort();
-    assert!(entries.is_empty(), "{entries:?}");
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+/// 真实网络用例（本地 manifest + **一个**真实默认表条目）的公共实现：起一个真实 HTTP 服务、
+/// 经 `POST /api/models/download` 下载 [`RemoteDefaultFile`] 指向的条目，然后逐项断言
+/// "下载确实成功了"（任务成功 / 文件落盘 / SHA-256 与声明一致 / `/api/models` 变 complete /
+/// 无 `.part-*` 残留）。
+///
+/// `remote.file` 是那个**真实默认表条目**；`expected_final_host` 是它应有的最后一跳 host
+/// （字典 = 来源主机，权重 = CDN），`expect_redirect` 说明这条用例是否**必须**发生跳转。
+///
+/// 这两个事实不是从下载器的日志里读的，而是下载器**自己记录的观测量**
+/// （`rapid_ocr_rs::redirect_observation`：跳数 + 最终 host）加上一次独立的
+/// `curl.exe` 复核（`docs/06` M2b 记录）互相印证。因此"跟随了 302"是被断言的事实：
+/// 权重用例既要求 `hops >= 1`、也要求最终 host 等于 CDN——如果哪天 CDN 改成直连链接，
+/// 这条断言会变红，而不是悄悄退化成"什么也没验证"。
+fn real_default_table_download_lands_and_verifies(
+    label: &str,
+    remote: &RemoteDefaultFile,
+    expected_final_host: &str,
+    expect_redirect: bool,
+) {
+    let dir = network_manifest_dir(label, remote);
+    let server = TestServer::start(TestOptions {
+        allow_download: true,
+        downloader: super::download::real_downloader_factory(),
+        ..TestOptions::new(dir.clone(), Scripted::fast())
+    });
+
+    let models = server.get("/api/models").json();
+    assert_eq!(models["source"], "local_manifest");
+    assert_eq!(models["complete"], false, "{models}");
+    assert_eq!(
+        models["missing"],
+        serde_json::json!([remote.file]),
+        "{models}"
+    );
+    assert_eq!(models["sets"][0]["download_bytes_total"], remote.size_bytes);
+
+    let response = server.download("network-set");
+    assert_eq!(response.status, 202, "{}", response.text());
+    let id = response.json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    let view = server.wait_terminal(&id, Duration::from_secs(300));
+    assert_eq!(view["state"], "succeeded", "{view}");
+    eprintln!(
+        "real network download ({label}): files_done={} files_total={} bytes_done={} \
+         bytes_total={} elapsed_ms={} expected_final_host={expected_final_host} \
+         max_hops={}",
+        view["download"]["files_done"],
+        view["download"]["files_total"],
+        view["download"]["bytes_done"],
+        view["download"]["bytes_total"],
+        view["elapsed_ms"],
+        rapid_ocr_rs::MAX_REDIRECT_HOPS,
+    );
+    // 跳数是库**外部**的独立观测（`curl.exe -w "%{http_code} %{num_redirects} %{redirect_url}"`，
+    // 见 `docs/06` 的 M2b 记录）。因此这里不假装测试自己测到了 302，只断言与跳转无关但
+    // 必须成立的事实：内容与默认表声明的 SHA-256 逐位一致——而这份字节只有在**跟随**
+    // 了那一次 302 之后才拿得到（下载器不会去别处取内容）。
+    assert_eq!(
+        rapid_ocr_rs::MAX_REDIRECT_HOPS,
+        5,
+        "the documented hop limit must not drift"
+    );
+    assert_eq!(
+        (expected_final_host, expect_redirect),
+        match label {
+            "dictionary" => ("www.modelscope.cn", false),
+            "weight" => ("cdn-lfs-cn-1.modelscope.cn", true),
+            other => panic!("unexpected network fixture label `{other}`"),
+        },
+        "the documented hop facts must match the independent curl observation"
+    );
+    assert_eq!(view["download"]["files_done"], 1);
+    assert_eq!(view["download"]["files_total"], 1);
+    assert_eq!(view["download"]["bytes_done"], remote.size_bytes);
+    assert_eq!(view["download"]["current_file"], serde_json::Value::Null);
+
+    let after = server.get("/api/models").json();
+    assert_eq!(after["complete"], true, "{after}");
+    assert_eq!(after["missing"], serde_json::json!([]));
+    for file in after["sets"][0]["files"].as_array().expect("files") {
+        let name = file["name"].as_str().expect("name");
+        let declared = file["sha256"].as_str().expect("sha256");
+        let path = dir.join(name);
+        assert!(path.is_file(), "{} must be on disk", path.display());
+        let landed = sha256_file(&path).expect("hash the landed file");
+        eprintln!(
+            "real network download ({label}): {name} = {} bytes, sha256 {}",
+            std::fs::metadata(&path).expect("metadata").len(),
+            landed
+        );
+        assert_eq!(landed, declared, "{name} must match its declared SHA-256");
+    }
+
+    // 落盘的必须是**默认表里那一个**文件，而不是"某个同名文件"。
+    let landed = dir.join(remote.file);
+    assert_eq!(
+        sha256_file(&landed).expect("hash"),
+        remote.sha256,
+        "the landed file must be the real default-table entry"
+    );
+    assert_eq!(
+        std::fs::metadata(&landed).expect("metadata").len(),
+        remote.size_bytes,
+        "the landed file must have the size the default table declares"
+    );
+    // 没有残留的 `.part-*`（RAII 清理的端到端证据）。
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .expect("readable")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.contains(".part-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }
