@@ -23,7 +23,7 @@
 
 | 非目标 | 原因 |
 | --- | --- |
-| **远程 / 局域网访问** | 见 §7.1：安全模型只对 loopback 成立，因此**不提供 `--host`** |
+| **远程 / 局域网访问** | **永久非目标**：安全模型只对 loopback 成立；不提供任何可绑定其他地址的参数，也不提供远程模式 |
 | 公网托管站点 | 库在非 Windows 目标上 `compile_error!`（Linux 服务器无法构建），且服务器无 DirectML/CUDA |
 | 多用户 / 账号 / cookie 会话 | 单用户本地工具；**不引入 cookie 认证** |
 | 模型后台自动下载 | 读请求不应产生 600+ MB 网络与磁盘副作用 |
@@ -105,7 +105,7 @@ rapidocr (bin)                        ← 唯一引入 HTTP 依赖的地方
 rapidocr serve [OPTIONS]
 
   --port <PORT>              默认 8760；占用时报可定位错误，不静默换端口
-                             （**没有 --host**：始终绑定 127.0.0.1，见 §7.1）
+                             （**没有 --host**：监听地址硬编码 127.0.0.1，见 §7.1）
   --model-dir <DIR>          默认 model_store::default_model_store_dir()
   --config <FILE>            EngineConfig YAML（与 run/evaluate 一致）
   --provider <PROV>          cpu | directml | cuda（默认 cpu）；非 cpu 时默认强制不回退（§7.5）
@@ -357,14 +357,16 @@ pub fn download_verified(req: &DownloadRequest<'_>) -> Result<PathBuf>;
 
 ## 7. 安全模型
 
-### 7.1 只绑定 loopback（**删除 `--host`**）
+### 7.1 仅本机：监听地址**硬编码**（无参数可改）
 
-上一版允许 `--host` 绑定其他地址，同时又把 Host/Origin 限制在 loopback，二者矛盾：绑定 `192.168.x.x` 后正常浏览器请求会被自己的校验拒掉。
+**本项目仅支持本地**：监听地址硬编码为 `127.0.0.1`，**不提供任何**可绑定其他地址的参数、配置项或环境变量；**也不提供"远程模式"**。
 
-**结论：本项目坚持仅本机，不提供 `--host`。** 始终绑定 `127.0.0.1`：
+上一版的 `--host` 与 Host/Origin 校验自相矛盾（绑定 `192.168.x.x` 后，正常浏览器请求会被自己的校验拒掉），因此整条路径删除，**而不是**加一个警告了事。
 
 - Host/Origin 允许集合 = `{127.0.0.1, localhost, [::1]}` 与**实际绑定端口**；
-- 若未来确需 LAN 访问，必须新增**显式远程模式**（动态生成允许集合 + 高风险警告 + token 强制），而**不是**放开一个 `--host` 参数。
+- 启动时**断言**实际监听地址属于 loopback 集合，否则立即退出并报可定位错误（防御将来被误改）；
+- 启动日志打印实际监听地址与允许的 Host/Origin 集合，便于排查；
+- 该限制是**永久设计**，不是本轮临时收敛。
 
 ### 7.2 校验与令牌
 
@@ -512,7 +514,7 @@ img-src 'self' blob: data:; connect-src 'self'; base-uri 'none'; form-action 'no
 
 ### M0：冻结协议与安全（先决条件）
 
-- [ ] 删除 `--host`，固定 loopback；Host/Origin 允许集合含实际端口（§7.1）
+- [ ] 删除 `--host`；监听地址**硬编码** `127.0.0.1`（无参数/配置/环境变量可改）；启动断言监听地址属 loopback；Host/Origin 允许集合含实际端口（§7.1）
 - [ ] tombstone 表（容量 + TTL）+ 404/410 区分（§4.5）
 - [ ] `ModelSet`/`ModelFileSpec`/`ModelRole`/`ModelSetStatus` + **共享逐文件校验函数**（§5.1/5.2）
 - [ ] `ModelManifest` 通用化（`schema_version` + `files: Vec<ManifestFile>`）+ **单一来源选择规则**（§5.3）
@@ -561,7 +563,7 @@ pub enum ServeError {
 - [ ] 模型缺失提示（消费 `ModelSetStatus`；**不含下载动作**）
 - [ ] 测试：状态机、tombstone（容量+TTL）、双队列 503、公平调度、准入顺序、Host/Origin/token、安全头与 nonce CSP
 
-**M1 验收**：真实 12 图经 HTTP 的 `regions` 数量与文本与 `rapidocr run --json` **逐张一致**；空 `--model-dir` 下 `/api/models` 与 `/api/ocr` 的缺失字段一致；公式洪水下普通 OCR 不被饿死。
+**M1 验收**：真实 12 图经 HTTP 的 `regions` 数量与文本与 `rapidocr run --json` **逐张一致**；空 `--model-dir` 下 `/api/models` 与 `/api/ocr` 的缺失字段一致；公式洪水下普通 OCR 不被饿死；CLI 参数列表中不存在任何可改变监听地址的选项。
 
 ### M2：模型管理
 
@@ -598,6 +600,7 @@ pub enum ServeError {
 | 队列 | 双队列各自 503；**公式洪水不饿死普通 OCR**；`--max-consecutive-formula` 生效 |
 | 结果 | `--max-result-mb` 超限 → 413 `result_too_large`（序列化即中止，不先建大 String） |
 | 安全 | 缺 token→401；错 `Origin`→403；错 `Host`→421；安全头齐备；主页面 CSP 含 nonce 且无 `unsafe-inline` |
+| 仅本机 | 监听地址硬编码 `127.0.0.1`：对 CLI 参数做**枚举断言**（不存在任何地址类选项）；启动断言监听地址属 loopback；绑定非 loopback 的路径在代码中不存在 |
 | 下载 | 重定向拒绝、非 https 拒绝、host 白名单拒绝、`Content-Length` 超限拒绝、无长度流式超限拒绝、哈希失败删临时文件、单飞只下一份、磁盘不足 507、**目标已损坏时原子替换成功** |
 | Provider | 请求 directml/cuda 但实际回退 → 默认启动即失败；加 `--allow-provider-fallback` 时 `/api/status` 三字段如实反映 |
 | 模型集 | 字典缺哈希 → `complete=false`；损坏 → `Corrupt`；manifest 缺 role → 报错列出缺失 role；旧 schema manifest → 可定位错误 |
