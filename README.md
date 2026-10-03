@@ -169,7 +169,11 @@ How routing works:
    independent of candidate order.
 3. Formula pixels are painted white **before** the ordinary text pipeline runs,
    so CTC never executes on them. "Formula regions skip CTC" is an execution
-   guarantee, not post-hoc filtering.
+   guarantee, not post-hoc filtering. Whitening is **per region**, not a
+   per-text-box overlap rule: there is no text-detection-coverage threshold, and
+   `FormulaPolicy` deliberately exposes no such knob (an earlier draft documented
+   a `text_overlap_skip_ratio` that never affected behavior; it was removed
+   rather than left as a fake API).
 4. Each formula region is cropped from the untouched original image, recognized
    by `FormulaRecognizer`, and appended as a `RegionKind::Formula` region that
    keeps its polygon, detector score, and model id. Formula regions never carry
@@ -199,6 +203,12 @@ Known limitations (explicit, and pinned by tests):
   `confidence_threshold`/`min_area_ratio` to trade recall for precision; at
   `0.95` the integration test shows the output returns to the
   formula-disabled baseline.
+- Whitening changes the pixels the text detector sees, so text regions **outside**
+  the formula region can be re-segmented. Measured on `08数字公式与符号.png`:
+  whitening one row merges/splits a distant row (`42.7 ms` becomes `42.7` + `ms`).
+  Content is not lost, but region boundaries and line grouping can change.
+  Callers that require byte-stable text segmentation should not enable formula
+  routing.
 - A **missed** formula (below threshold, or a detector that returned nothing)
   stays in the text channel, so ordinary CTC will emit garbage for it. There is
   no cross-model arbitration.
@@ -417,7 +427,30 @@ pwsh -NoProfile -File tools/run_formula_evaluation.ps1
 
 `formula_eval --expect-manifest` fails if the current selection does not hash to
 the recorded manifest, so a re-run either reproduces the same sample set or
-reports the difference instead of silently evaluating a different subset.
+reports the difference instead of silently evaluating a different subset. It also
+verifies the image-content digest when the recorded manifest has one. Add
+`--manifest-only` to do this check without loading the model (see "Verification
+tiers").
+
+Long datasets can be split across processes and merged back:
+
+```powershell
+# 5 shards, each evaluating every 5th manifest entry.
+foreach ($i in 0..4) {
+  Start-Process cargo -ArgumentList @('run','--release','--bin','formula_eval','--',
+    '--model',$Model,'--dataset-root',$TestSet,'--dataset','unimer','--subset','cpe',
+    '--shard',"$i/5",'--expect-manifest',"target/formula-eval/manifest-unimer-cpe.json",
+    '--output',"target/formula-eval/unimer-cpe.shard$i.json")
+}
+# Merge reorders records by manifest and recomputes metrics with the same summarizer.
+cargo run --release --bin formula_eval -- --merge-shards target/formula-eval/unimer-cpe.shard*.json `
+  --output target/formula-eval/unimer-cpe.json
+```
+
+The merge refuses to combine reports whose `model.sha256`, provider, `batch_size`,
+dataset/split/subset, manifest, or Python reference disagree, and it aggregates a
+Python comparison across all shards rather than keeping the first shard's partial
+counts.
 
 Benchmark:
 
@@ -479,6 +512,47 @@ cargo check --features directml-provider,cuda-provider,cann-provider
 
 `--all-features` additionally enables `opencv-backend`; that build requires an
 OpenCV installation and is not part of the checks above.
+
+### Verification tiers: what to run, and when
+
+Full-dataset evaluation is **not** a routine regression step. A complete run over
+`val` + `im2latex` + all four UniMER subsets is ~40,000 images and takes hours
+(UniMER-CPE alone is ~3 h with sharding, because its mean label is 658 characters
+and the in-graph autoregressive `Loop` dominates). Run the cheapest tier that can
+actually falsify your change.
+
+| Change | Required verification | Cost |
+| --- | --- | --- |
+| Ordinary code, docs, refactors with no formula behavior change | `cargo test --all-targets` (fixtures only, no external assets) + `cargo fmt`/`clippy` | seconds |
+| Formula routing, outputs, input limits, detector decoding | above + `cargo test --all-targets` with `RAPID_OCR_MODEL_ROOT`/`RAPID_OCR_TEST_IMAGES` set (page-level integration tests) + one real page through the CLI | ~1 min |
+| Tokenizer, post-processing, model invocation, batch/EOS logic | above + **100-image im2latex smoke** + **501-image `val` with the Rust/Python link comparison** | ~15 min |
+| Model file, preprocessing, decode/EOS semantics, metric implementation | above + the affected **full dataset(s)**; re-record the baseline | hours |
+| Release acceptance | full datasets + `formula_bench` on every available provider, serially and uncontended | hours |
+
+Commands for each tier are in "Formula benchmark and evaluation" above. The
+committed baseline `tests/baseline/formula-evaluation-2026-10-03.json` may be
+**reused** instead of re-running a full dataset only while all of the following
+are unchanged: the model file, image preprocessing, the tokenizer, post-processing,
+batch inference and EOS handling, and the metric implementation. If any of them
+changes, the stored numbers no longer describe the current code and the affected
+full run must be repeated.
+
+Two properties make the cheap tiers meaningful:
+
+- `--manifest-only` resolves the dataset and writes the manifest (including
+  image content hashes) **without loading the model**, so a data-integrity check
+  costs seconds instead of hours:
+  `formula_eval --manifest-only --dataset-root $TestSet --dataset latexocr --split validate --expect-manifest <manifest.json>`
+- `--expect-manifest` verifies both the sample-selection digest (`manifest_sha256`)
+  and the image-content digest (`content_sha256`), so replacing an image file
+  without changing its path or label is detected. Manifests recorded before
+  `content_sha256` existed still pin the sample set, and `--expect-manifest` says
+  so explicitly instead of pretending to verify content.
+
+Long datasets can be sharded across processes when a full run is genuinely
+required (`--shard INDEX/COUNT` + `--merge-shards`); the manifest still covers the
+whole set, the merge reuses the same summarizer, and it refuses to merge reports
+from different models, providers, batch sizes, or Python references.
 
 ## Provider feature verification
 

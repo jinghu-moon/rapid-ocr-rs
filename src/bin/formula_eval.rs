@@ -72,8 +72,8 @@ enum SampleArg {
     about = "Evaluate PP-FormulaNet_plus over im2latex / latexocr / UniMER with stable manifests"
 )]
 struct Cli {
-    /// 公式识别模型；合并分片报告时不需要。
-    #[arg(long, required_unless_present = "merge_shards")]
+    /// 公式识别模型；`--merge-shards` 与 `--manifest-only` 不需要。
+    #[arg(long, required_unless_present_any = ["merge_shards", "manifest_only"])]
     model: Option<PathBuf>,
     /// 公式测试集根目录，例如 `<workspace>/Formula-TestSet`；合并分片报告时不需要。
     #[arg(long = "dataset-root")]
@@ -114,6 +114,12 @@ struct Cli {
     /// 不在报告中写入逐样本记录（仅保留汇总）；失败样本将无法逐个审查。
     #[arg(long = "no-records")]
     no_records: bool,
+    /// 只解析数据集并写出 manifest（含图像内容摘要），不加载模型、不推理。
+    ///
+    /// 用于数据完整性检查与固定子集复现：配合 `--expect-manifest` 可以在几秒内
+    /// 确认图像文件没有被替换，而不需要重跑全量评测。
+    #[arg(long = "manifest-only")]
+    manifest_only: bool,
     /// 只评测 `INDEX/COUNT` 这一片（按 manifest 顺序取模分片）。
     ///
     /// manifest 与抽样仍然覆盖**完整**集合，因此所有分片写出同一个
@@ -127,7 +133,7 @@ struct Cli {
 }
 
 /// 分片信息。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct ShardInfo {
     index: usize,
     count: usize,
@@ -224,8 +230,15 @@ struct EvaluationReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReferenceComparison {
     reference_path: String,
+    /// 参考文件中的记录总数；分片运行时用于把 `missing_in_rust` 还原为全局口径。
+    #[serde(default)]
+    reference_total: usize,
     compared: usize,
     missing_in_reference: usize,
+    /// 参考文件中未被本次**全部**评测样本覆盖的记录数。
+    ///
+    /// 分片运行下每个分片只评测一部分样本，因此单个分片的该字段不代表全局；
+    /// `--merge-shards` 会用 `reference_total - compared` 重新计算。
     missing_in_rust: usize,
     /// 完整 token 行逐项一致（不做 EOS 截断）。
     full_token_sequence_matches: usize,
@@ -238,6 +251,56 @@ struct ReferenceComparison {
     both_wrong: usize,
     /// Rust 与 Python 链路不一致的样本（链路差异），必须逐个给出。
     link_differences: Vec<LinkDifference>,
+}
+
+impl ReferenceComparison {
+    /// 聚合多个分片的对比结果。
+    ///
+    /// 计数类字段相加；`missing_in_rust` 只有全局量才有意义，因此用
+    /// `reference_total - compared` 重算；`link_differences` 汇总后按
+    /// `relative_path` 排序，保证合并结果与分片执行顺序无关。
+    fn aggregate(shards: &[&ReferenceComparison]) -> Option<Self> {
+        let first = shards.first()?;
+        let mut merged = Self {
+            reference_path: first.reference_path.clone(),
+            reference_total: first.reference_total,
+            compared: 0,
+            missing_in_reference: 0,
+            missing_in_rust: 0,
+            full_token_sequence_matches: 0,
+            eos_prefix_token_matches: 0,
+            eos_index_matches: 0,
+            truncated_matches: 0,
+            latex_matches: 0,
+            both_wrong: 0,
+            link_differences: Vec::new(),
+        };
+        for shard in shards {
+            merged.compared += shard.compared;
+            merged.missing_in_reference += shard.missing_in_reference;
+            merged.full_token_sequence_matches += shard.full_token_sequence_matches;
+            merged.eos_prefix_token_matches += shard.eos_prefix_token_matches;
+            merged.eos_index_matches += shard.eos_index_matches;
+            merged.truncated_matches += shard.truncated_matches;
+            merged.latex_matches += shard.latex_matches;
+            merged.both_wrong += shard.both_wrong;
+            merged
+                .link_differences
+                .extend(shard.link_differences.iter().cloned());
+        }
+        merged.link_differences.sort_by(|a, b| {
+            a.relative_path
+                .cmp(&b.relative_path)
+                .then_with(|| a.rust_tokens.cmp(&b.rust_tokens))
+        });
+        merged.missing_in_rust = merged.reference_total.saturating_sub(merged.compared);
+        Some(merged)
+    }
+
+    /// 分片之间必须引用同一份参考文件，否则聚合没有意义。
+    fn same_source(&self, other: &Self) -> bool {
+        self.reference_path == other.reference_path && self.reference_total == other.reference_total
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,9 +432,13 @@ fn error_record(path: &Path, expected: &str, error: &RapidOcrError) -> SampleRec
 /// 这是分片运行保持“单一实现”的关键：分片只改变执行方式，汇总口径仍然只有
 /// `evaluation::formula::report::summarize` 一份。合并会校验：
 ///
-/// - 所有分片的 `manifest_sha256` 一致；
+/// - 所有分片的 `manifest_sha256` 一致（同一批样本）；
+/// - **模型身份一致**：`model.sha256`、provider（请求/解析/回退）、`batch_size`、
+///   dataset/split/subset 必须完全相同。否则不同模型或不同运行配置的结果会被
+///   合成为一个看似有效的报告；
 /// - 每个分片都带有 `records`（`--no-records` 的报告无法合并）；
-/// - 分片集合恰好覆盖 manifest 的每个条目且无重复、无缺失。
+/// - 分片集合恰好覆盖 manifest 的每个条目且无重复、无缺失；
+/// - 若分片带了 Python 参考对比，必须先引用同一份参考文件，再做全局聚合。
 fn merge_shard_reports(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mut reports = Vec::with_capacity(cli.merge_shards.len());
     for path in &cli.merge_shards {
@@ -403,14 +470,72 @@ fn merge_shard_reports(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         if report.records.is_none() {
             return Err(format!("{} has no per-sample records", path.display()).into());
         }
-        if report.dataset != first.dataset || report.split != first.split {
+        if report.dataset != first.dataset
+            || report.split != first.split
+            || report.subset != first.subset
+        {
             return Err(format!(
-                "{} covers {}/{} but the first report covers {}/{}",
+                "{} covers {}/{}/{:?} but the first report covers {}/{}/{:?}",
                 path.display(),
                 report.dataset,
                 report.split,
+                report.subset,
                 first.dataset,
-                first.split
+                first.split,
+                first.subset
+            )
+            .into());
+        }
+        // 模型身份：sha256 是决定性标识；path 只用于展示，不参与比较。
+        if !report
+            .model
+            .sha256
+            .eq_ignore_ascii_case(&first.model.sha256)
+        {
+            return Err(format!(
+                "{} was produced with a different model ({} vs {})",
+                path.display(),
+                report.model.sha256,
+                first.model.sha256
+            )
+            .into());
+        }
+        if report.provider.requested != first.provider.requested
+            || report.provider.resolved != first.provider.resolved
+            || report.provider.fallback_used != first.provider.fallback_used
+        {
+            return Err(format!(
+                "{} ran on a different provider ({:?}/{:?}/fallback={}) than the first report \
+                 ({:?}/{:?}/fallback={})",
+                path.display(),
+                report.provider.requested,
+                report.provider.resolved,
+                report.provider.fallback_used,
+                first.provider.requested,
+                first.provider.resolved,
+                first.provider.fallback_used
+            )
+            .into());
+        }
+        if report.batch_size != first.batch_size {
+            return Err(format!(
+                "{} used batch_size {} but the first report used {}",
+                path.display(),
+                report.batch_size,
+                first.batch_size
+            )
+            .into());
+        }
+        if let (Some(expected), Some(actual)) = (
+            first.reference_comparison.as_ref(),
+            report.reference_comparison.as_ref(),
+        ) && !expected.same_source(actual)
+        {
+            return Err(format!(
+                "{} compared against a different Python reference ({} vs {})",
+                path.display(),
+                actual.reference_path,
+                expected.reference_path
             )
             .into());
         }
@@ -446,6 +571,21 @@ fn merge_shard_reports(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             positioned[position] = Some((record, position));
         }
     }
+    // 参考对比必须覆盖全部分片：只保留第一个分片会给出“看起来完整”的部分结果。
+    let reference_shards: Vec<&ReferenceComparison> = reports
+        .iter()
+        .filter_map(|(_, report)| report.reference_comparison.as_ref())
+        .collect();
+    if !reference_shards.is_empty() && reference_shards.len() != reports.len() {
+        return Err(format!(
+            "only {} of {} shards carry a Python reference comparison; re-run every shard with \
+             --python-reference before merging",
+            reference_shards.len(),
+            reports.len()
+        )
+        .into());
+    }
+    let reference_comparison = ReferenceComparison::aggregate(&reference_shards);
     let missing: Vec<&str> = positioned
         .iter()
         .enumerate()
@@ -517,7 +657,7 @@ fn merge_shard_reports(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             source: peak_memory_source().to_string(),
         },
         summary,
-        reference_comparison: first.reference_comparison.clone(),
+        reference_comparison,
         shard: None,
         merged_from: Some(
             reports
@@ -566,7 +706,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--batch-size must be greater than zero".into());
     }
     let split = parse_split(&cli.split)?;
-    let model = cli.model.clone().ok_or("--model is required")?;
     let dataset_root = cli
         .dataset_root
         .clone()
@@ -617,6 +756,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
+        // 样本集合一致还不够：图像文件被替换（路径与标签不变）时样本选择不会变，
+        // 必须比较内容摘要才能发现数据已变化。
+        match (&expected_manifest.content_sha256, &manifest.content_sha256) {
+            (Some(expected), Some(actual)) if expected != actual => {
+                return Err(format!(
+                    "manifest content mismatch: {} was recorded with image content {}, current \
+                     images hash to {}",
+                    path.display(),
+                    expected,
+                    actual
+                )
+                .into());
+            }
+            (Some(_), None) => {
+                return Err(format!(
+                    "manifest content check failed: {} records image content hashes but the \
+                     current images could not be hashed",
+                    path.display()
+                )
+                .into());
+            }
+            (None, _) => eprintln!(
+                "note: {} has no `content_sha256`; image content is not verified \
+                 (regenerate it with --manifest-output)",
+                path.display()
+            ),
+            _ => {}
+        }
     }
     if let Some(path) = &cli.manifest_output {
         if let Some(parent) = path
@@ -627,11 +794,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         std::fs::write(path, serde_json::to_string_pretty(&manifest)?)?;
     }
+    if cli.manifest_only {
+        println!(
+            "manifest-only: dataset={} entries={} manifest={} content={}",
+            manifest.dataset,
+            manifest.entry_count,
+            &manifest.manifest_sha256[..16],
+            manifest
+                .content_sha256
+                .as_deref()
+                .map(|hash| &hash[..16])
+                .unwrap_or("n/a")
+        );
+        return Ok(());
+    }
 
     let shard = match cli.shard.as_deref() {
         Some(raw) => Some(parse_shard(raw)?),
         None => None,
     };
+    // `--model` 只在真正要推理时才必填：`--manifest-only` 与 `--merge-shards`
+    // 都不需要加载模型。
+    let model = cli.model.clone().ok_or("--model is required")?;
     let runtime = runtime_config(&cli);
     let loaded_start = Instant::now();
     let mut recognizer =
@@ -903,6 +1087,7 @@ fn compare_with_reference(
 
     let mut comparison = ReferenceComparison {
         reference_path: path.display().to_string(),
+        reference_total: by_image.len(),
         compared: 0,
         missing_in_reference: 0,
         missing_in_rust: 0,
@@ -968,12 +1153,360 @@ fn compare_with_reference(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use clap::Parser;
     use rapid_ocr_rs::evaluation::formula::fixture::{FormulaSplit, UniMerSubset};
 
     use super::{
         DatasetArg, SubsetArg, dataset_name, dataset_subdir, load_fixture, parse_shard,
         parse_split, subset_name, unimer_subset,
     };
+
+    /// 构造一个可用于合并测试的最小分片报告。
+    ///
+    /// `manifest_entries` 是**完整**集合（真实分片运行的 manifest 覆盖全部样本），
+    /// `records` 是本分片实际评测的那一部分。
+    #[allow(clippy::too_many_arguments)]
+    fn shard_report(
+        model_sha256: &str,
+        provider: &str,
+        batch_size: usize,
+        reference: Option<super::ReferenceComparison>,
+        manifest_entries: &[&str],
+        records: &[&str],
+    ) -> super::EvaluationReport {
+        use rapid_ocr_rs::evaluation::formula::{
+            report::{FailureKind, SampleRecord},
+            sampling::{Manifest, ManifestEntry, SampleStrategy},
+        };
+
+        let manifest_entries: Vec<ManifestEntry> = manifest_entries
+            .iter()
+            .map(|path| ManifestEntry {
+                relative_path: (*path).to_string(),
+                ground_truth_sha256: format!("truth-{path}"),
+                has_ground_truth: true,
+                image_sha256: Some(format!("image-{path}")),
+            })
+            .collect();
+        let manifest = Manifest {
+            dataset: "im2latex".to_string(),
+            split: "test".to_string(),
+            subset: None,
+            strategy: SampleStrategy::Hash,
+            limit: 0,
+            entry_count: manifest_entries.len(),
+            scored_count: manifest_entries.len(),
+            manifest_sha256: "manifest-hash".to_string(),
+            content_sha256: Some("content-hash".to_string()),
+            entries: manifest_entries,
+        };
+        let records: Vec<SampleRecord> = records
+            .iter()
+            .map(|path| SampleRecord {
+                image: format!("/root/{path}"),
+                relative_path: (*path).to_string(),
+                expected: "x".to_string(),
+                actual: Some("x".to_string()),
+                token_ids: vec![0, 82, 2],
+                eos_index: Some(2),
+                truncated: Some(false),
+                elapsed_ms: 10.0,
+                batch_size,
+                failure: FailureKind::None,
+                error: None,
+                exact_match: true,
+                normalized_match: true,
+                edit_distance: 0,
+                cer: 0.0,
+                python_token_match: None,
+                python_latex_match: None,
+            })
+            .collect();
+        super::EvaluationReport {
+            tool: "formula_eval".to_string(),
+            model: super::ModelInfo {
+                path: "/models/model.onnx".to_string(),
+                size_bytes: 1,
+                sha256: model_sha256.to_string(),
+                load_ms: 1.0,
+            },
+            provider: super::ProviderInfo {
+                requested: provider.to_string(),
+                resolved: provider.to_string(),
+                fallback_used: false,
+                intra_threads: None,
+                inter_threads: None,
+                auto_tune_threads: true,
+                physical_cpus: 8,
+            },
+            dataset: "im2latex".to_string(),
+            split: "test".to_string(),
+            subset: None,
+            batch_size,
+            manifest,
+            throughput: super::ThroughputInfo {
+                images_per_second: 1.0,
+                total_wall_ms: 1000.0,
+                per_image_ms: rapid_ocr_rs::evaluation::stats::Stats::default(),
+                per_batch_ms: rapid_ocr_rs::evaluation::stats::Stats::default(),
+                batch_size,
+            },
+            memory: super::MemoryInfo {
+                peak_working_set_start_bytes: None,
+                peak_working_set_end_bytes: None,
+                delta_bytes: None,
+                source: "test".to_string(),
+            },
+            summary: rapid_ocr_rs::evaluation::formula::report::summarize(records.iter()),
+            reference_comparison: reference,
+            shard: Some(super::ShardInfo { index: 0, count: 2 }),
+            merged_from: None,
+            records: Some(records),
+        }
+    }
+
+    fn reference(
+        path: &str,
+        total: usize,
+        compared: usize,
+        links: &[&str],
+    ) -> super::ReferenceComparison {
+        super::ReferenceComparison {
+            reference_path: path.to_string(),
+            reference_total: total,
+            compared,
+            missing_in_reference: 0,
+            missing_in_rust: total.saturating_sub(compared),
+            full_token_sequence_matches: compared,
+            eos_prefix_token_matches: compared,
+            eos_index_matches: compared,
+            truncated_matches: compared,
+            latex_matches: compared,
+            both_wrong: 0,
+            link_differences: links
+                .iter()
+                .map(|link| super::LinkDifference {
+                    relative_path: (*link).to_string(),
+                    rust_tokens: vec![1],
+                    python_tokens: vec![2],
+                    rust_latex: Some("a".to_string()),
+                    python_latex: "b".to_string(),
+                    rust_error: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn write_report(
+        dir: &std::path::Path,
+        name: &str,
+        report: &super::EvaluationReport,
+    ) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, serde_json::to_string(report).expect("serialize"))
+            .expect("write report");
+        path
+    }
+
+    fn merge_cli(paths: Vec<PathBuf>) -> super::Cli {
+        super::Cli::parse_from(
+            std::iter::once("formula_eval".to_string())
+                .chain(["--merge-shards".to_string()])
+                .chain(paths.iter().map(|path| path.display().to_string()))
+                .chain(["--output".to_string(), "unused.json".to_string()]),
+        )
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rapid-ocr-rs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// 分片必须来自同一个模型、同一个 provider、同一个 batch 配置。
+    #[test]
+    fn merge_rejects_mismatched_model_identity() {
+        let dir = temp_dir("merge-identity");
+        let first = write_report(
+            &dir,
+            "a.json",
+            &shard_report(
+                "sha-A",
+                "Cpu",
+                8,
+                None,
+                &["a.png", "b.png", "c.png", "d.png"],
+                &["a.png", "b.png"],
+            ),
+        );
+        let other_model = write_report(
+            &dir,
+            "b.json",
+            &shard_report(
+                "sha-B",
+                "Cpu",
+                8,
+                None,
+                &["a.png", "b.png", "c.png", "d.png"],
+                &["c.png", "d.png"],
+            ),
+        );
+        let error = super::merge_shard_reports(&merge_cli(vec![first, other_model]))
+            .expect_err("different models must not merge");
+        assert!(
+            error.to_string().contains("different model"),
+            "error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_rejects_mismatched_provider_and_batch() {
+        let dir = temp_dir("merge-provider");
+        let first = write_report(
+            &dir,
+            "a.json",
+            &shard_report(
+                "sha-A",
+                "Cpu",
+                8,
+                None,
+                &["a.png", "b.png", "c.png", "d.png"],
+                &["a.png", "b.png"],
+            ),
+        );
+        let other_provider = write_report(
+            &dir,
+            "b.json",
+            &shard_report(
+                "sha-A",
+                "DirectMl",
+                8,
+                None,
+                &["a.png", "b.png", "c.png", "d.png"],
+                &["c.png", "d.png"],
+            ),
+        );
+        let error = super::merge_shard_reports(&merge_cli(vec![first, other_provider]))
+            .expect_err("different providers must not merge");
+        assert!(error.to_string().contains("provider"), "error: {error}");
+
+        let first = write_report(
+            &dir,
+            "c.json",
+            &shard_report(
+                "sha-A",
+                "Cpu",
+                8,
+                None,
+                &["a.png", "b.png", "c.png", "d.png"],
+                &["a.png", "b.png"],
+            ),
+        );
+        let other_batch = write_report(
+            &dir,
+            "d.json",
+            &shard_report(
+                "sha-A",
+                "Cpu",
+                4,
+                None,
+                &["a.png", "b.png", "c.png", "d.png"],
+                &["c.png", "d.png"],
+            ),
+        );
+        let error = super::merge_shard_reports(&merge_cli(vec![first, other_batch]))
+            .expect_err("different batch sizes must not merge");
+        assert!(error.to_string().contains("batch_size"), "error: {error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 参考对比必须做全局聚合，而不是沿用第一个分片的部分结果。
+    #[test]
+    fn reference_comparison_aggregates_across_shards() {
+        let first = reference("python.json", 4, 2, &["a.png"]);
+        let second = reference("python.json", 4, 2, &["c.png"]);
+        let merged = super::ReferenceComparison::aggregate(&[&first, &second])
+            .expect("aggregate must produce a value");
+        assert_eq!(merged.compared, 4);
+        assert_eq!(merged.reference_total, 4);
+        assert_eq!(merged.eos_prefix_token_matches, 4);
+        assert_eq!(merged.latex_matches, 4);
+        assert_eq!(
+            merged.missing_in_rust, 0,
+            "missing_in_rust is a global count: reference_total - compared"
+        );
+        let links: Vec<&str> = merged
+            .link_differences
+            .iter()
+            .map(|link| link.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            links,
+            vec!["a.png", "c.png"],
+            "links must be merged in order"
+        );
+    }
+
+    #[test]
+    fn reference_comparison_rejects_a_partial_reference_source() {
+        let first = reference("python.json", 4, 2, &[]);
+        let other = reference("other.json", 4, 2, &[]);
+        assert!(!first.same_source(&other));
+        assert!(first.same_source(&first));
+    }
+
+    /// 合并结果必须与串行结果一致：指标、记录顺序与状态。
+    #[test]
+    fn merge_produces_manifest_ordered_records() {
+        let dir = temp_dir("merge-order");
+        let first = write_report(
+            &dir,
+            "a.json",
+            &shard_report(
+                "sha-A",
+                "Cpu",
+                8,
+                None,
+                &["a.png", "b.png", "c.png", "d.png"],
+                &["a.png", "b.png"],
+            ),
+        );
+        let second = write_report(
+            &dir,
+            "b.json",
+            &shard_report(
+                "sha-A",
+                "Cpu",
+                8,
+                None,
+                &["a.png", "b.png", "c.png", "d.png"],
+                &["c.png", "d.png"],
+            ),
+        );
+        super::merge_shard_reports(&merge_cli(vec![second.clone(), first.clone()]))
+            .expect("merge must succeed");
+        let merged: super::EvaluationReport =
+            serde_json::from_str(&std::fs::read_to_string("unused.json").expect("read merged"))
+                .expect("parse merged");
+        let paths: Vec<&str> = merged
+            .records
+            .as_ref()
+            .expect("records")
+            .iter()
+            .map(|record| record.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["a.png", "b.png", "c.png", "d.png"]);
+        assert_eq!(merged.summary.total, 4);
+        assert_eq!(merged.summary.scored, 4);
+        assert_eq!(merged.shard, None);
+        assert_eq!(merged.merged_from.as_ref().map(Vec::len), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file("unused.json");
+    }
 
     #[test]
     fn split_parsing_accepts_val_and_validate() {

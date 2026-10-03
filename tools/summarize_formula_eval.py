@@ -139,6 +139,26 @@ def compact_benchmark(report: dict) -> dict:
     }
 
 
+def compact_manifest(path: Path) -> dict:
+    """从 `--manifest-output` 写出的 manifest 文件中提取数据指纹。
+
+    这些文件由 `formula_eval --manifest-only` 重新生成（几秒级，不加载模型），
+    因此 `content_sha256` 反映的是**当前磁盘上的图像内容**。
+    """
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        "dataset": manifest["dataset"],
+        "split": manifest["split"],
+        "subset": manifest.get("subset"),
+        "strategy": manifest["strategy"],
+        "limit": manifest["limit"],
+        "entry_count": manifest["entry_count"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "content_sha256": manifest.get("content_sha256"),
+        "source": path.name,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dir", default="target/formula-eval")
@@ -171,8 +191,15 @@ def main() -> int:
             "note": (
                 "由 formula_eval / formula_bench 的报告精简而来；原始报告不随仓库提交。"
                 "分片运行的吞吐是并发下界，权威性能数据来自串行无争用的 bench-*.json。"
+                "dataset_manifests 记录每个数据集的内容摘要（content_sha256），"
+                "可用 `formula_eval --manifest-only --expect-manifest <manifest>` 在几秒内"
+                "确认图像文件没有被替换，而不需要重跑全量评测。"
             ),
             "evaluations": [compact_entry(report) for report in reports],
+            "dataset_manifests": sorted(
+                (compact_manifest(path) for path in directory.glob("manifest-*.json")),
+                key=lambda entry: (entry["dataset"], entry["limit"], entry["entry_count"]),
+            ),
             "reference_comparison": [
                 {
                     "dataset": report["dataset"],

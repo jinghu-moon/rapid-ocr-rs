@@ -1681,8 +1681,8 @@ cargo test --all-targets        # 不设置任何模型/测试集环境变量
 | 命令 | 结果 |
 | --- | --- |
 | `cargo test --lib formula::route` | 8 passed（重叠/嵌套消解、误检面积与越界过滤、显式区域旁路、顺序无关与上限、抹白像素与尺寸） |
-| `cargo test --lib formula::detect` | 15 passed（含 golden 多边形 `max_delta = 0`、与 Python 参考 IoU 1.0000） |
-| `cargo test --lib formula_integration` | 7 passed（缺省关闭=无公式、漏检=文本逐字一致、严格阈值=回到基线、检测到的区域 typed 且带 LaTeX、显式区域无需检测器、`roi`/`tile` 拒绝、缺 `model_path` 拒绝） |
+| `cargo test --lib formula::detect` | 17 passed（含 golden 多边形 `max_delta = 0`、与 Python 参考 IoU 1.0000、NaN/Inf 坐标与退化宽高被丢弃） |
+| `cargo test --lib formula_integration` | 9 passed（缺省关闭=无公式、漏检=文本逐字一致、严格阈值=回到基线、检测到的区域 typed 且带 LaTeX、显式区域无需检测器、`roi`/`tile` 拒绝、缺 `model_path` 拒绝、**内存像素/图像输入同样受 `max_decode_pixels` 限制**、**抹白区域内文本消失且远处文本内容保留**） |
 | CLI 端到端 | `rapidocr run --img-path 08数字公式与符号.png --formula-model … --formula-detector …` → `regions=50 formulas=8`，LaTeX 正确（`\sqrt{2}\approx1.414`、`\pi\approx3.14159`、`a^2+b^2=c^2`、定积分等），总耗时 7.6 s |
 
 阅读顺序核验：8 个公式区域在全局阅读顺序中的位置为“顶部一项 → 左栏 4 项 →
@@ -1868,8 +1868,132 @@ Rust/Python 三方对比（同一 manifest、同一批样本；Python 使用 Rap
 （`model_mismatch` / `truncated_no_eos`）分开记录，每条包含图片、期望、实际、
 token 序列、EOS 与 CER。
 
-### 29.11 提交
+### 29.11 第三轮审核修复（P1/P2 逐项）
 
+第三轮审核提出 7 项问题，全部处理如下。
+
+#### 29.11.1 P1 `text_overlap_skip_ratio` 完全未生效
+
+**根因**：文档描述的是“先跑文本检测，再按覆盖率跳过落在公式区域内的文本框”，
+但实现是“把整块公式区域抹白后重跑文本管线”。实现本身是正确的（执行层面跳过 CTC），
+**错的是接口**：`FormulaPolicy` 暴露了一个不参与任何计算、也无法参与计算的阈值。
+
+**处理**：删除 `text_overlap_skip_ratio`（及其 `validate()` 校验项），并在
+`FormulaPolicy` 文档注释、README 中明确写出真实语义与两条实测限制：
+
+1. 误检区域会把区域内**全部**像素（含普通文字）从文本通道移除；
+2. 抹白改变了文本检测的输入，因此区域**外**的分割也可能变化——
+   实测 `08数字公式与符号.png` 上抹白一行会把远处的 `42.7 ms` 重新切成
+   `42.7` 与 `ms`（内容不丢、边界变化）。
+
+**为什么不实现“按覆盖率过滤”**：那需要在文本识别前额外跑一次检测前向，属于为
+一个无人使用的参数增加一次模型推理；审核给出的三个选项中“删除”同样满足一致性要求。
+
+**验证**：新增 `formula_integration_tests::whitening_removes_text_inside_the_region_and_keeps_distant_text`
+——目标区域内文本必须消失、远处文本内容（忽略空白，因为会被重新分割）必须保留、
+显式区域必须仍被识别为公式。
+
+| 项目 | 修改前 | 修改后 | 预期 |
+| --- | --- | --- | --- |
+| `text_overlap_skip_ratio` | 字段存在、取任意值行为不变 | 字段删除 | 不再存在“看似可调、实际无效”的参数 |
+| 抹白语义文档 | 声称按文本框覆盖率跳过 CTC | 明确“整区域抹白”＋重新分割限制 | 文档与实现一致 |
+
+#### 29.11.2 P1 公式路由绕过内存输入的像素限制
+
+**根因**：`decode_formula_source` 只对 `Encoded/File/Url` 调用受限加载，
+`Pixels` 与 `Image` 直接转换，绕过了 `preprocess.max_decode_pixels`。
+
+**处理**：两条分支都调用共享的 `ensure_decode_pixels`，限制逻辑仍只有一份实现。
+**验证**：`formula_routing_enforces_the_pixel_limit_for_in_memory_inputs`
+——同一张真实页面，`File`/`Pixels`/`Image` 三种输入在 `width*height-1` 的限制下都必须
+返回 `InvalidImage`；放宽到 `width*height` 后 `Pixels` 必须正常跑完并 `validate()` 通过。
+
+#### 29.11.3 P1 `formula_bench` 的 batch 稳定性判断仍然错误
+
+**根因**：基线与测量口径不一致——基线保存**完整模型输出行**（含 batch padding），
+测量侧已截断到 EOS，两者比较必然把 padding 差异误报为结果差异。
+
+**处理**：抽出 `eos_prefix` 与 `batch_matches_baselines` 两个纯函数，基线与测量
+统一使用 EOS 前（含 EOS）序列。
+**验证**：4 个单元测试，其中 `padding_after_eos_does_not_count_as_a_difference`
+直接构造“短序列 vs 长 padding 行”，并断言未截断时**会**得到相反结论，
+从而证明这条回归测试真的覆盖了原缺陷；另有顺序错位、内容变化、空基线等用例。
+真实数据上 `formula_bench` 的 batch=1/2/4 仍为 `deterministic_tokens = true`。
+
+#### 29.11.4 P1 `--merge-shards` 未校验模型身份
+
+**根因**：合并只比较 manifest/dataset/split，然后**沿用第一个分片的模型信息**，
+因此不同模型的报告可以被合成为一个看似有效的报告。
+
+**处理**：合并前强制校验 `model.sha256`、provider（请求/解析/回退）、`batch_size`、
+dataset/split/subset；任一不一致即返回结构化错误且不写出文件。
+**验证**：3 个单元测试（模型不一致、provider 不一致、batch 不一致均拒绝）；
+真实数据上重新合并 5 个 CPE 分片得到与原来完全相同的指标
+（exact 0.1819 / normalized 0.1849 / CER 0.1009 / 失败 0 / 模型错误 4819 / truncated 25），
+而把其中一个分片的 `model.sha256` 改为全 0 后 CLI 报错退出且不写输出文件。
+
+#### 29.11.5 P1 `--merge-shards` 未合并 `reference_comparison`
+
+**根因**：合并直接复制第一个分片的对比结果，分片场景下“完整 Rust/Python 对比”
+实际上只是部分样本；`missing_in_rust` 在分片下也不代表全局。
+
+**处理**：`ReferenceComparison` 新增 `reference_total`，`aggregate()` 汇总所有计数、
+按 `relative_path` 排序合并 `link_differences`，并用
+`reference_total - compared` 重算 `missing_in_rust`；若分片引用了不同的参考文件，
+或只有部分分片带对比信息，合并直接失败。
+**验证**：新增 `reference_comparison_aggregates_across_shards`（跨分片计数与链路差异合并）、
+`reference_comparison_rejects_a_partial_reference_source`（不同参考文件拒绝）。
+
+#### 29.11.6 P2 manifest 缺少图像文件哈希
+
+**根因**：抽样键与 manifest 只覆盖“路径 + 标签”，替换图像文件不会改变
+`manifest_sha256`，`--expect-manifest` 无法发现数据变化。
+
+**处理**：`ManifestEntry` 新增 `image_sha256`；`Manifest` 新增 `content_sha256`
+（在样本选择摘要之上再纳入每个样本的图像摘要）。`--expect-manifest` 同时校验两者。
+选择摘要保持原方案，因此历史记录仍然有效。
+新增 `--manifest-only`：解析数据集并写出 manifest，**不加载模型**，用于秒级数据完整性检查。
+**验证**：
+
+- 单元测试 `content_hash_detects_replaced_image_files`（替换文件后选择摘要不变、
+  内容摘要改变）、`missing_images_do_not_produce_a_content_digest`（不伪造摘要）；
+- 真实数据：对全部 7 个数据集重新生成 manifest（共 40,374 条）
+  `--expect-manifest` 全部通过，说明记录指标所对应的样本集合未变；
+  新的内容摘要已写入 `tests/baseline/formula-evaluation-2026-10-03.json`
+  的 `dataset_manifests`，例如 `im2latex-full` 为
+  `2312fe3da7779ff0…`（10,355 条图像）、`unimer-cpe` 为 `81a8eabfbda096a8…`（5,921 条）；
+  最慢的 im2latex-full 也只需 4.5 s。
+
+#### 29.11.7 P2 公式检测输出未校验坐标与尺寸
+
+**根因**：只过滤 NaN 分数，`cx/cy/w/h` 未做有限性与正值检查，异常模型输出会产生
+NaN/负宽高/退化框并传播为非法 `FormulaBox`。
+
+**处理**：解码阶段丢弃非有限坐标、非正宽高，以及 `scale_back` 裁剪后仍退化的框。
+**验证**：`decode_output_drops_non_finite_and_degenerate_boxes`
+（9 个用例：NaN cx/cy、Inf w、负 w/h、0 h 等，对照组必须保留）、
+`decode_output_drops_boxes_that_collapse_after_scale_back`。
+
+#### 29.11.8 P2 测试资产路径解析重复实现
+
+**根因**：`detect.rs` 测试模块自己实现了一套环境变量解析与缺失资产处理，
+且把 `RAPID_OCR_MODEL_ROOT` 指向的任意文件当作检测模型（共享实现不会这样）。
+
+**处理**：删除本地实现，统一调用 `test_support::formula_detector_path()`。
+**验证**：`cargo test --lib formula::detect` 17 passed；设置
+`RAPID_OCR_MODEL_ROOT` 与 `RAPID_OCR_REQUIRE_EXTERNAL_ASSETS=1` 时真实模型测试正常执行。
+
+#### 29.11.9 验证分层（本轮同时更新文档）
+
+第三轮审核指出不应每次修改都跑完整数据集。已在 README 增加
+“Verification tiers: what to run, and when”：按修改范围分五档（纯代码 / 公式路由与输出 /
+tokenizer 与后处理 / 模型与解码 / 发布验收），并明确
+`tests/baseline/formula-evaluation-2026-10-03.json` 仅在
+模型文件、图像预处理、tokenizer、后处理、batch/EOS 逻辑、指标实现
+六项都未变时才可以复用。本轮全部修复都属于代码逻辑问题，
+因此按第 1–3 档验证，**没有重跑全量评测**；全量结果是复用既有基线的。
+
+### 29.12 提交
 | 内容 | 提交 | 说明 |
 | --- | --- | --- |
 | 第二轮审核修复 | `9db5dda` | `fix(formula): close the review gaps in the PP-FormulaNet integration` |
@@ -1880,3 +2004,4 @@ token 序列、EOS 与 CER。
 | 分片/合并评测能力 | `bf734d8` | `feat(eval): add --shard/--merge-shards for parallel long-dataset evaluation` |
 | CPE 分片执行与文档 | `5322a53` | `docs(formula): record the CPE sharding approach and its verified equivalence` |
 | 阶段 9/10 全部结果 | 见本节表格 | 提交在 `tests/baseline/formula-evaluation-2026-10-03.json` |
+| 第三轮审核修复 | 见 §29.11 | 删除无效参数、内存输入像素限制、benchmark 口径、分片身份校验与对比聚合、manifest 内容摘要、检测器有限性校验、测试资产定位去重 |

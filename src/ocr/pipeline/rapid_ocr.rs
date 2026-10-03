@@ -1206,6 +1206,13 @@ impl RapidOcrEngine {
             )?,
             ImageInput::Pixels(view) => {
                 view.validate()?;
+                // 内存像素输入同样受 `max_decode_pixels` 约束：公式路由不能成为
+                // 绕过普通 OCR 限制的旁路。
+                ensure_decode_pixels(
+                    view.width as usize,
+                    view.height as usize,
+                    request.preprocess.max_decode_pixels,
+                )?;
                 let (bgr, size, _) = view.to_bgr(None)?;
                 let rec = crate::config::RecImage::from_bgr_u8(
                     size.width as usize,
@@ -1214,7 +1221,14 @@ impl RapidOcrEngine {
                 )?;
                 rec_image_to_dynamic(&rec)?
             }
-            ImageInput::Image(rec) => rec_image_to_dynamic(rec)?,
+            ImageInput::Image(rec) => {
+                ensure_decode_pixels(
+                    rec.width(),
+                    rec.height(),
+                    request.preprocess.max_decode_pixels,
+                )?;
+                rec_image_to_dynamic(rec)?
+            }
         };
         Ok(image)
     }
@@ -2045,6 +2059,187 @@ rec:
         assert!(
             formula.token_ids.is_some(),
             "include_token_ids must keep the raw token sequence"
+        );
+    }
+
+    /// 内存像素/内存图像输入必须与编码输入一样受 `max_decode_pixels` 约束。
+    ///
+    /// 公式路由不能成为绕过解码像素上限的旁路。
+    #[test]
+    fn formula_routing_enforces_the_pixel_limit_for_in_memory_inputs() {
+        let Some(mut assets) = assets() else {
+            return;
+        };
+        let page = image::open(&assets.page_with_formula).expect("page readable");
+        let (width, height) = (page.width(), page.height());
+        let tight_limit = u64::from(width) * u64::from(height) - 1;
+
+        // 1) 编码输入（File）——基线：已经受限制。
+        let mut from_file = request(Vec::new(), formula_policy(&assets));
+        from_file.input = ImageInput::File(assets.page_with_formula.clone());
+        from_file.preprocess.max_decode_pixels = tight_limit;
+        let error = assets
+            .engine
+            .recognize(from_file)
+            .expect_err("encoded input must respect the pixel limit");
+        assert!(
+            matches!(error, crate::error::RapidOcrError::InvalidImage(_)),
+            "unexpected error: {error}"
+        );
+
+        // 2) 内存像素输入（Pixels）——回归：曾经绕过限制。
+        let rgb = page.to_rgb8();
+        let mut from_pixels = request(Vec::new(), formula_policy(&assets));
+        from_pixels.input = ImageInput::Pixels(crate::api::OwnedPixelBuffer {
+            data: Arc::from(rgb.as_raw().as_slice()),
+            width,
+            height,
+            stride: (width * 3) as usize,
+            format: crate::api::PixelFormat::Rgb8,
+            bottom_up: false,
+        });
+        from_pixels.preprocess.max_decode_pixels = tight_limit;
+        let error = assets
+            .engine
+            .recognize(from_pixels)
+            .expect_err("in-memory pixel input must respect the pixel limit");
+        assert!(
+            matches!(error, crate::error::RapidOcrError::InvalidImage(_)),
+            "unexpected error: {error}"
+        );
+
+        // 3) 内存图像输入（Image）——回归：曾经绕过限制。
+        let rec = crate::config::RecImage::from_bgr_u8(width as usize, height as usize, {
+            let mut bgr = Vec::with_capacity((width * height * 3) as usize);
+            for pixel in rgb.pixels() {
+                bgr.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+            }
+            bgr
+        })
+        .expect("rec image");
+        let mut from_image = request(Vec::new(), formula_policy(&assets));
+        from_image.input = ImageInput::Image(rec);
+        from_image.preprocess.max_decode_pixels = tight_limit;
+        let error = assets
+            .engine
+            .recognize(from_image)
+            .expect_err("in-memory image input must respect the pixel limit");
+        assert!(
+            matches!(error, crate::error::RapidOcrError::InvalidImage(_)),
+            "unexpected error: {error}"
+        );
+
+        // 放宽限制后同一条内存输入必须能正常跑完，证明上面的失败来自限制而不是输入本身。
+        let rgb_again = page.to_rgb8();
+        let mut allowed = request(Vec::new(), formula_policy(&assets));
+        allowed.input = ImageInput::Pixels(crate::api::OwnedPixelBuffer {
+            data: Arc::from(rgb_again.as_raw().as_slice()),
+            width,
+            height,
+            stride: (width * 3) as usize,
+            format: crate::api::PixelFormat::Rgb8,
+            bottom_up: false,
+        });
+        allowed.preprocess.max_decode_pixels = u64::from(width) * u64::from(height);
+        let output = assets
+            .engine
+            .recognize(allowed)
+            .expect("pixel input within the limit must succeed");
+        output.validate().expect("output must validate");
+    }
+
+    /// 抹白是**按区域**进行的：区域内的文本消失，远处文本的内容仍然保留。
+    ///
+    /// 这条测试把 `FormulaPolicy` 文档里描述的“整区域抹白”语义固定下来：
+    /// 它不是“按文本框覆盖比例跳过 CTC”，而是先移除区域像素再跑文本管线。
+    ///
+    /// 同时固定两个实测事实（`tests/` 中没有对应断言，因此写在这里）：
+    ///
+    /// 1. 抹白改变了文本检测的输入，因此**远处**区域的**分割**也可能变化
+    ///    （实测：“42.7 ms” 被重新切成 “42.7” 与 “ms” 两个区域），所以断言按
+    ///    去除空白后的内容比较，而不是要求区域边界不变；
+    /// 2. 区域**内部**的文本不再出现在文本通道里——这是抹白的核心语义。
+    #[test]
+    fn whitening_removes_text_inside_the_region_and_keeps_distant_text() {
+        let Some(mut assets) = assets() else {
+            return;
+        };
+        let bytes = std::fs::read(&assets.page_with_formula).expect("page readable");
+        let baseline = assets
+            .engine
+            .recognize(request(bytes.clone(), FormulaPolicy::default()))
+            .expect("baseline recognize");
+        let text_regions: Vec<_> = baseline
+            .regions
+            .iter()
+            .filter(|region| region.kind == RegionKind::Text)
+            .filter_map(|region| {
+                let polygon = region.polygon?;
+                let text = region.recognition.as_ref()?.text.clone();
+                (!text.trim().is_empty()).then_some((polygon, text))
+            })
+            .collect();
+        assert!(
+            text_regions.len() >= 3,
+            "baseline must produce several non-empty text regions"
+        );
+
+        let centroid = |polygon: &crate::api::Polygon| {
+            let points = polygon.points;
+            let sum_x: f32 = points.iter().map(|point| point[0]).sum();
+            let sum_y: f32 = points.iter().map(|point| point[1]).sum();
+            (sum_x / points.len() as f32, sum_y / points.len() as f32)
+        };
+        let compact = |text: &str| {
+            text.chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+        };
+
+        // 取中间一个文本框作为显式公式区域，再挑出离它最远的文本框。
+        let (target_polygon, target_text) = text_regions[text_regions.len() / 2].clone();
+        let target_centroid = centroid(&target_polygon);
+        let (distant_polygon, distant_text) = text_regions
+            .iter()
+            .max_by(|left, right| {
+                let distance = |candidate: &(crate::api::Polygon, String)| {
+                    let (x, y) = centroid(&candidate.0);
+                    (x - target_centroid.0).hypot(y - target_centroid.1)
+                };
+                distance(left)
+                    .partial_cmp(&distance(right))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("at least one distant region")
+            .clone();
+        assert_ne!(distant_polygon, target_polygon);
+
+        let policy = FormulaPolicy {
+            enabled: true,
+            model_path: Some(assets.formula_model.clone()),
+            detector_path: None,
+            input_regions: vec![target_polygon],
+            ..FormulaPolicy::default()
+        };
+        let routed = assets
+            .engine
+            .recognize(request(bytes, policy))
+            .expect("routed recognize");
+        let routed_text = compact(&routed.plain_text(TextOrder::Reading));
+
+        assert!(
+            !routed_text.contains(&compact(&target_text)),
+            "text covered by the whitened region must disappear: {target_text:?}"
+        );
+        assert!(
+            routed_text.contains(&compact(&distant_text)),
+            "content far from the whitened region must survive (whitespace-insensitive, because \
+             whitening can re-segment distant regions): {distant_text:?}"
+        );
+        assert_eq!(
+            routed.formula_count(),
+            1,
+            "the explicit region must still be recognized as a formula"
         );
     }
 }

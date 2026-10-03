@@ -544,9 +544,28 @@ fn decode_output(
         let cy = output[[1, anchor]];
         let w = output[[2, anchor]];
         let h = output[[3, anchor]];
+        // 模型输出不受信任：坐标必须是有限值，且宽高必须为正。非有限值会让
+        // `scale_back`/`clamp` 产生 NaN 框并一路传播成非法 `FormulaBox`。
+        if !cx.is_finite() || !cy.is_finite() || !w.is_finite() || !h.is_finite() {
+            continue;
+        }
+        if w <= 0.0 || h <= 0.0 {
+            continue;
+        }
         let xyxy = [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0];
+        if !xyxy.iter().all(|value| value.is_finite()) {
+            continue;
+        }
+        let scaled = scale_back(xyxy, lb, original);
+        // 缩放/裁剪后仍要求是有效正值矩形；退化框直接丢弃。
+        if !scaled.iter().all(|value| value.is_finite())
+            || scaled[2] <= scaled[0]
+            || scaled[3] <= scaled[1]
+        {
+            continue;
+        }
         detections.push(Detection {
-            xyxy: scale_back(xyxy, lb, original),
+            xyxy: scaled,
             score: best_score,
             class_id: best_class,
         });
@@ -697,39 +716,10 @@ mod tests {
         image::open(&path).unwrap_or_else(|error| panic!("open {}: {error}", path.display()))
     }
 
-    /// 模型定位：`RAPID_OCR_FORMULA_DETECT_MODEL` 优先，其次 `RAPID_OCR_MODEL_ROOT` 下的
-    /// 标准相对路径；缺失时返回 `None` 让测试跳过（不 panic、不写死开发机路径）。
+    /// 模型定位统一走 `crate::test_support`：环境变量解析、缺失资产处理与
+    /// `RAPID_OCR_REQUIRE_EXTERNAL_ASSETS` 语义只有一份实现，避免测试之间语义分叉。
     fn detect_model_path() -> Option<PathBuf> {
-        fn env_path(name: &str) -> Option<PathBuf> {
-            let raw = std::env::var(name).ok()?;
-            let trimmed = raw.trim().trim_matches('"');
-            (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
-        }
-        let candidate = env_path("RAPID_OCR_FORMULA_DETECT_MODEL")
-            .filter(|path| path.is_file())
-            .or_else(|| {
-                let root = env_path("RAPID_OCR_MODEL_ROOT")?;
-                if root.is_file() {
-                    return Some(root);
-                }
-                let direct = root.join("Formula-Detection-Model/pix2text-mfd-1.5.onnx");
-                direct.is_file().then_some(direct)
-            });
-        match candidate {
-            Some(path) => Some(path),
-            None => {
-                if std::env::var("RAPID_OCR_REQUIRE_EXTERNAL_ASSETS").as_deref() == Ok("1") {
-                    panic!(
-                        "missing external test asset: pix2text-mfd-1.5.onnx; set \
-                         RAPID_OCR_MODEL_ROOT or RAPID_OCR_FORMULA_DETECT_MODEL"
-                    );
-                }
-                eprintln!(
-                    "skipping test: pix2text-mfd-1.5.onnx is not available in this environment"
-                );
-                None
-            }
-        }
+        crate::test_support::formula_detector_path()
     }
 
     fn rgb_image(width: u32, height: u32, color: [u8; 3]) -> DynamicImage {
@@ -1267,6 +1257,76 @@ mod tests {
         assert!(
             decode_output(output.view(), &meta, (768, 384), &options, &class_names).is_empty(),
             "NaN scores must be dropped"
+        );
+    }
+
+    /// 模型输出不受信任：非有限坐标与退化宽高必须在解码阶段被丢弃，
+    /// 不能生成非法 `FormulaBox`。
+    #[test]
+    fn decode_output_drops_non_finite_and_degenerate_boxes() {
+        let class_names = ["embedding".to_string(), "isolated".to_string()];
+        let meta = LetterboxMeta {
+            scale: 1.0,
+            left: 0.0,
+            top: 0.0,
+            new_size: (768, 768),
+        };
+        let options = FormulaDetectOptions::default();
+
+        // 每条 case 只放一个高置信度 anchor，其它 anchor 全部低于阈值。
+        let cases: [(&str, [f32; 4]); 9] = [
+            ("finite control", [100.0, 100.0, 40.0, 40.0]),
+            ("NaN cx", [f32::NAN, 100.0, 40.0, 40.0]),
+            ("NaN cy", [100.0, f32::NAN, 40.0, 40.0]),
+            ("infinite w", [100.0, 100.0, f32::INFINITY, 40.0]),
+            ("negative w", [100.0, 100.0, -40.0, 40.0]),
+            ("zero h", [100.0, 100.0, 40.0, 0.0]),
+            ("negative h", [100.0, 100.0, 40.0, -1.0]),
+            ("NaN w", [100.0, 100.0, f32::NAN, 40.0]),
+            (
+                "negative infinity h",
+                [100.0, 100.0, 40.0, f32::NEG_INFINITY],
+            ),
+        ];
+
+        for (name, values) in cases {
+            let mut output = ndarray::Array2::<f32>::zeros((6, 1));
+            output[[0, 0]] = values[0];
+            output[[1, 0]] = values[1];
+            output[[2, 0]] = values[2];
+            output[[3, 0]] = values[3];
+            output[[4, 0]] = 0.05;
+            output[[5, 0]] = 0.9;
+            let boxes = decode_output(output.view(), &meta, (768, 768), &options, &class_names);
+            if name == "finite control" {
+                assert_eq!(boxes.len(), 1, "{name} must be kept");
+                continue;
+            }
+            assert!(boxes.is_empty(), "{name} must be dropped, got {boxes:?}");
+        }
+    }
+
+    /// 退化框（缩放到原图后宽或高为 0）也必须被丢弃。
+    #[test]
+    fn decode_output_drops_boxes_that_collapse_after_scale_back() {
+        let class_names = ["embedding".to_string(), "isolated".to_string()];
+        let meta = LetterboxMeta {
+            scale: 2.0,
+            left: 0.0,
+            top: 0.0,
+            new_size: (768, 768),
+        };
+        let options = FormulaDetectOptions::default();
+        let mut output = ndarray::Array2::<f32>::zeros((6, 1));
+        // 0.1 像素宽 -> 除以 scale 后仍然大于 0，但中心落在左边界外会被裁剪成 0 宽。
+        output[[0, 0]] = -500.0;
+        output[[1, 0]] = 100.0;
+        output[[2, 0]] = 40.0;
+        output[[3, 0]] = 40.0;
+        output[[5, 0]] = 0.9;
+        assert!(
+            decode_output(output.view(), &meta, (768, 768), &options, &class_names).is_empty(),
+            "a box clipped to zero width must be dropped"
         );
     }
 

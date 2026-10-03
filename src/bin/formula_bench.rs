@@ -193,6 +193,30 @@ struct Measurement {
     tokens: Vec<Vec<i64>>,
 }
 
+/// 把模型输出行截断到 **EOS 之前（含 EOS）**。
+///
+/// 模型图内 `Loop` 会把整个 batch 补齐到同一宽度，因此完整 token 行的尾部 padding
+/// 会随 batch 组成变化。判定“batch 是否改变结果”时，基线与测量必须使用同一种
+/// 截断口径，否则会把 padding 差异误报成结果差异。
+fn eos_prefix(token_ids: &[i64], eos_index: Option<usize>) -> Vec<i64> {
+    match eos_index {
+        Some(index) if index < token_ids.len() => token_ids[..=index].to_vec(),
+        _ => token_ids.to_vec(),
+    }
+}
+
+/// 判定一次 batch 的每行是否与同图单图基线一致。
+///
+/// `rows[i]` 对应 `baselines[i % baselines.len()]`（图片按顺序循环取样）。
+fn batch_matches_baselines(baselines: &[Vec<i64>], rows: &[Vec<i64>]) -> bool {
+    if baselines.is_empty() {
+        return false;
+    }
+    rows.iter()
+        .enumerate()
+        .all(|(index, row)| *row == baselines[index % baselines.len()])
+}
+
 fn measure(
     preprocessor: &FormulaPreprocessor,
     session: &mut FormulaSession,
@@ -212,11 +236,7 @@ fn measure(
     for row in output.axis_iter(ndarray::Axis(0)) {
         let row = row.to_vec();
         let decoded = tokenizer.decode_ids(&row)?;
-        let mut prefix = decoded.token_ids;
-        if let Some(eos_index) = decoded.eos_index {
-            prefix.truncate(eos_index + 1);
-        }
-        tokens.push(prefix);
+        tokens.push(eos_prefix(&decoded.token_ids, decoded.eos_index));
     }
     let decode_ms = ms(decode_start);
 
@@ -269,18 +289,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // 首次推理单独测量，不进入 warm 统计；同时为每张图建立“单图 token 基线”，
     // 用于判定 batch 是否改变结果（不能拿第一张的基线去比对其它图片的行）。
+    // 基线与 `measure` 使用同一个 `eos_prefix` 口径，否则完整行的 padding 会被
+    // 误报成结果差异。
     let first_input = preprocessor.preprocess(&images[0])?;
     let first_start = Instant::now();
     let first_output = session.run(first_input.view())?;
     let first_inference_ms = ms(first_start);
     let mut baselines: Vec<Vec<i64>> = Vec::with_capacity(images.len());
-    baselines.push(first_output.row(0).to_vec());
+    let first_decoded = tokenizer.decode_ids(&first_output.row(0).to_vec())?;
+    let baseline_latex = first_decoded.latex.clone();
+    baselines.push(eos_prefix(
+        &first_decoded.token_ids,
+        first_decoded.eos_index,
+    ));
     for image in images.iter().skip(1) {
         let input = preprocessor.preprocess(image)?;
         let output = session.run(input.view())?;
-        baselines.push(output.row(0).to_vec());
+        let decoded = tokenizer.decode_ids(&output.row(0).to_vec())?;
+        baselines.push(eos_prefix(&decoded.token_ids, decoded.eos_index));
     }
-    let baseline_latex = tokenizer.decode_ids(&baselines[0])?.latex;
 
     // 预热。
     for _ in 0..cli.warmup {
@@ -319,10 +346,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // 复用本次测量解码出的 token 行做稳定性判定，避免额外推理扭曲耗时。
             let measurement = measure(&preprocessor, &mut session, &tokenizer, &selected)?;
             rounds.push(measurement.sample);
-            for (row, tokens) in measurement.tokens.iter().enumerate() {
-                if *tokens != baselines[row % baselines.len()] {
-                    deterministic = false;
-                }
+            if !batch_matches_baselines(&baselines, &measurement.tokens) {
+                deterministic = false;
             }
         }
 
@@ -427,7 +452,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::Stats;
+    use super::{Stats, batch_matches_baselines, eos_prefix};
 
     #[test]
     fn stats_are_wired_to_the_shared_implementation() {
@@ -436,5 +461,69 @@ mod tests {
         assert!((stats.mean_ms - 2.5).abs() < 1e-12);
         assert!((stats.p50_ms - 2.5).abs() < 1e-12);
         assert!(Stats::from_samples(Vec::new()).samples == 0);
+    }
+
+    /// EOS 截断：有 EOS 时保留到 EOS（含），无 EOS 时保留全部 token。
+    #[test]
+    fn eos_prefix_truncates_at_eos_and_keeps_unanchored_sequences() {
+        assert_eq!(
+            eos_prefix(&[0, 82, 1769, 2, 1, 1], Some(3)),
+            vec![0, 82, 1769, 2]
+        );
+        assert_eq!(eos_prefix(&[0, 82, 1769], None), vec![0, 82, 1769]);
+        // 越界 eos_index 不得 panic，按“无 EOS”处理。
+        assert_eq!(eos_prefix(&[0, 1], Some(9)), vec![0, 1]);
+        assert_eq!(eos_prefix(&[], None), Vec::<i64>::new());
+    }
+
+    /// batch 稳定性判定：必须按图片顺序与基线逐行比较，并且只比较 EOS 前内容。
+    #[test]
+    fn batch_determinism_compares_eos_prefixes_per_image() {
+        let baselines = vec![vec![0, 82, 2], vec![0, 99, 2]];
+
+        // 同图同序 -> 稳定。
+        assert!(batch_matches_baselines(
+            &baselines,
+            &[vec![0, 82, 2], vec![0, 99, 2]]
+        ));
+
+        // 顺序错位必须被判为不稳定（不能拿第一张的基线比第二张的行）。
+        assert!(!batch_matches_baselines(
+            &baselines,
+            &[vec![0, 99, 2], vec![0, 82, 2]]
+        ));
+
+        // 行数超过图片数时按 `index % len` 循环对齐（batch 复用图片）。
+        assert!(batch_matches_baselines(
+            &baselines,
+            &[vec![0, 82, 2], vec![0, 99, 2], vec![0, 82, 2]]
+        ));
+
+        // token 内容变化必须被发现。
+        assert!(!batch_matches_baselines(
+            &baselines,
+            &[vec![0, 82, 2], vec![0, 98, 2]]
+        ));
+
+        // 空基线集合无法判定，返回 false 而不是 panic。
+        assert!(!batch_matches_baselines(&[], &[vec![0, 2]]));
+    }
+
+    /// 回归测试：batch 内被 `Loop` 补齐的 padding 不得造成“不稳定”的误判。
+    ///
+    /// 基线与测量都先做 EOS 截断，因此 batch=1 的短序列与 batch=2 中同图的长 padding
+    /// 行必须判定为一致。
+    #[test]
+    fn padding_after_eos_does_not_count_as_a_difference() {
+        let single = [0, 82, 1769, 2];
+        let padded_batch_row = [0, 82, 1769, 2, 1, 1, 1, 1];
+        let baselines = vec![eos_prefix(&single, Some(3))];
+        let rows = vec![eos_prefix(&padded_batch_row, Some(3))];
+        assert!(
+            batch_matches_baselines(&baselines, &rows),
+            "padding after EOS must be ignored"
+        );
+        // 如果直接比较未截断的行，就会得到相反（错误）的结论。
+        assert_ne!(single.to_vec(), padded_batch_row.to_vec());
     }
 }

@@ -79,6 +79,9 @@ pub struct ManifestEntry {
     pub relative_path: String,
     pub ground_truth_sha256: String,
     pub has_ground_truth: bool,
+    /// 图像文件内容的 SHA-256；文件不可读时为 `None`（不阻塞 manifest 生成）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,7 +93,20 @@ pub struct Manifest {
     pub limit: usize,
     pub entry_count: usize,
     pub scored_count: usize,
+    /// 样本选择摘要：数据集 / 切分 / 子集 / 抽样策略 / 数量 + 每个样本的
+    /// `relative_path` 与真值摘要。
+    ///
+    /// 该值只取决于“选了哪些样本”，与图像文件内容无关，因此可以用它固定子集、
+    /// 复现历史结果。
     pub manifest_sha256: String,
+    /// 图像内容摘要：在 `manifest_sha256` 的基础上再纳入每个样本的图像文件
+    /// SHA-256。
+    ///
+    /// 路径与标签不变、但图像文件被替换时，`manifest_sha256` 不变而本字段变化，
+    /// 因此 `--expect-manifest` 能发现数据被改动。旧 manifest（本字段为 `None`）
+    /// 仍可用来固定样本集合，只是不校验内容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
     pub entries: Vec<ManifestEntry>,
 }
 
@@ -102,6 +118,9 @@ fn relative_path(root: &Path, path: &Path) -> String {
 }
 
 /// 构建 manifest 并计算稳定哈希。
+///
+/// 会为每个样本计算图像文件 SHA-256（`content_sha256` 用），文件不可读时该条目
+/// 的图像摘要为 `None`，并且不写入 `content_sha256`（避免给出“已校验”的假象）。
 pub fn build_manifest(
     dataset: &str,
     split: &str,
@@ -117,6 +136,7 @@ pub fn build_manifest(
             relative_path: relative_path(root, &sample.image_path),
             ground_truth_sha256: digest_hex(sample.ground_truth.as_bytes()),
             has_ground_truth: sample.has_ground_truth(),
+            image_sha256: crate::model_store::sha256_file(&sample.image_path).ok(),
         })
         .collect();
 
@@ -137,6 +157,19 @@ pub fn build_manifest(
         canonical.push_str(&entry.ground_truth_sha256);
     }
 
+    // 内容摘要复用同一份 canonical 前缀，再追加图像摘要，便于审查“只差图像内容”。
+    let content_sha256 = entries
+        .iter()
+        .all(|entry| entry.image_sha256.is_some())
+        .then(|| {
+            let mut content = canonical.clone();
+            for entry in &entries {
+                content.push('\u{1e}');
+                content.push_str(entry.image_sha256.as_deref().unwrap_or(""));
+            }
+            digest_hex(content.as_bytes())
+        });
+
     Manifest {
         dataset: dataset.to_string(),
         split: split.to_string(),
@@ -149,6 +182,7 @@ pub fn build_manifest(
             .filter(|entry| entry.has_ground_truth)
             .count(),
         manifest_sha256: digest_hex(canonical.as_bytes()),
+        content_sha256,
         entries,
     }
 }
@@ -210,6 +244,103 @@ mod tests {
         let all = samples(20);
         assert_eq!(select_samples(&all, SampleStrategy::Hash, 0).len(), 20);
         assert_eq!(select_samples(&all, SampleStrategy::First, 0).len(), 20);
+    }
+
+    /// 图像内容变化必须改变 `content_sha256`，但**不**改变样本选择摘要。
+    #[test]
+    fn content_hash_detects_replaced_image_files() {
+        let workspace = std::env::temp_dir().join(format!(
+            "rapid-ocr-rs-manifest-content-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).expect("temp dir");
+        let image = workspace.join("image.png");
+        std::fs::write(&image, b"first-bytes").expect("write image");
+
+        let sample = FormulaSample::new(
+            image.clone(),
+            "x".to_string(),
+            FormulaDataset::Im2Latex,
+            FormulaSplit::Test,
+            Some(0),
+        )
+        .expect("sample");
+        let selected = [&sample];
+        let before = build_manifest(
+            "im2latex",
+            "test",
+            None,
+            SampleStrategy::Hash,
+            0,
+            &workspace,
+            &selected,
+        );
+        assert!(
+            before.content_sha256.is_some(),
+            "readable images must produce a content digest"
+        );
+        assert_eq!(
+            before.entries[0].image_sha256.as_deref(),
+            before.content_sha256.as_deref().map(|_| before.entries[0]
+                .image_sha256
+                .as_deref()
+                .expect("image hash"))
+        );
+
+        // 路径与标签不变，只替换文件内容。
+        std::fs::write(&image, b"second-bytes").expect("rewrite image");
+        let after = build_manifest(
+            "im2latex",
+            "test",
+            None,
+            SampleStrategy::Hash,
+            0,
+            &workspace,
+            &selected,
+        );
+
+        assert_eq!(
+            before.manifest_sha256, after.manifest_sha256,
+            "replacing image bytes must not change the sample-selection digest"
+        );
+        assert_ne!(
+            before.entries[0].image_sha256, after.entries[0].image_sha256,
+            "the per-entry image digest must change"
+        );
+        assert_ne!(
+            before.content_sha256, after.content_sha256,
+            "the content digest must change so --expect-manifest can detect it"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// 图像不可读时不得伪造内容摘要。
+    #[test]
+    fn missing_images_do_not_produce_a_content_digest() {
+        let sample = FormulaSample::new(
+            PathBuf::from("root/does-not-exist.png"),
+            "x".to_string(),
+            FormulaDataset::Im2Latex,
+            FormulaSplit::Test,
+            None,
+        )
+        .expect("sample");
+        let manifest = build_manifest(
+            "im2latex",
+            "test",
+            None,
+            SampleStrategy::First,
+            0,
+            Path::new("root"),
+            &[&sample],
+        );
+        assert!(manifest.entries[0].image_sha256.is_none());
+        assert!(
+            manifest.content_sha256.is_none(),
+            "a manifest with unreadable images must not claim content verification"
+        );
     }
 
     #[test]

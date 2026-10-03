@@ -483,15 +483,27 @@ pub struct FormulaOutcome {
 
 /// 页面级公式路由策略。
 ///
-/// `enabled = false` 时页面 OCR 行为与不含公式功能时完全一致；启用后：
+/// `enabled = false` 时页面 OCR 行为与不含公式功能时完全一致；启用后的实际流程：
 ///
 /// 1. 用 `detector_path` 指定的公式检测模型（可选）在整页上检测公式区域，
 ///    并合并调用方通过 `input_regions` 显式声明的区域；
-/// 2. 检测区域先做去重/包含消解，再按 `text_overlap_skip_ratio` 判断哪些
-///    **文本检测框**落在公式区域内，这些框在送入普通 CTC 之前从图像上抹白，
-///    因此不会产生 CTC 文本（真正“跳过 CTC”，而不是事后丢弃结果）；
-/// 3. 公式区域使用原图（未抹白）裁剪后交给 `FormulaRecognizer` 识别；
-/// 4. 结果是独立的 [`RegionKind::Formula`] 区域，保留 crop 坐标与模型信息。
+/// 2. 候选区域先按 `min_area_ratio` 过滤、再按 `iou_threshold` 与包含关系消解重叠、
+///    按分数排序并由 `max_regions` 截断（见 `formula::route`）；
+/// 3. **整块公式区域**在送入普通文本管线之前被抹白，因此该区域内的像素根本不会
+///    进入检测/识别，也就不会产生 CTC 文本（执行层面跳过 CTC，而不是事后丢弃结果）；
+/// 4. 公式区域使用原图（未抹白）裁剪后交给 `FormulaRecognizer` 识别；
+/// 5. 结果是独立的 [`RegionKind::Formula`] 区域，保留 crop 坐标与模型信息。
+///
+/// 抹白是**按区域**而非“按文本检测框覆盖比例”进行的：实现不会先跑一遍文本检测再
+/// 逐个文本框判断覆盖率（那需要额外的检测前向）。因此：
+///
+/// - 一个误检的公式区域会把区域内的**全部**像素（含其中的普通文字）从文本通道移除，
+///   不只是其中被检测到的文本框；召回/精度取舍只能通过 `confidence_threshold` 与
+///   `min_area_ratio` 完成（README 的公式限制一节记录了实测误检率）；
+/// - 区域内没有被文本检测器识别为文本的内容同样会消失；
+/// - 由于文本检测的输入像素被改变，**区域外**的文本也可能被重新分割
+///   （实测：“42.7 ms” 被重新切成 “42.7” 与 “ms” 两个区域，内容不丢但区域边界变化）。
+///   需要严格保持文本切分的调用方不应启用公式路由。
 ///
 /// 不支持 `roi` 与 `tile` 同时启用（坐标映射语义会分叉），此时返回结构化错误。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,8 +525,6 @@ pub struct FormulaPolicy {
     pub min_area_ratio: f32,
     /// 调用方显式声明的公式区域（原图像素坐标）。
     pub input_regions: Vec<Polygon>,
-    /// 文本检测框被公式区域覆盖的比例达到该值时跳过其 CTC 识别。
-    pub text_overlap_skip_ratio: f32,
     /// 是否在输出中保留原始 token IDs。
     pub include_token_ids: bool,
 }
@@ -531,7 +541,6 @@ impl Default for FormulaPolicy {
             max_regions: 64,
             min_area_ratio: 0.000_05,
             input_regions: Vec::new(),
-            text_overlap_skip_ratio: 0.6,
             include_token_ids: false,
         }
     }
@@ -551,7 +560,6 @@ impl FormulaPolicy {
             ("confidence_threshold", self.confidence_threshold),
             ("iou_threshold", self.iou_threshold),
             ("min_area_ratio", self.min_area_ratio),
-            ("text_overlap_skip_ratio", self.text_overlap_skip_ratio),
         ] {
             if !value.is_finite() || !(0.0..=1.0).contains(&value) {
                 return Err(RapidOcrError::InvalidInput(format!(
