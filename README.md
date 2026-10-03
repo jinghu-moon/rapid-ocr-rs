@@ -273,10 +273,28 @@ RapidDoc's post-processing.
 
 ## Model integrity
 
-`ModelManifest::validate_files` verifies every detector, recognizer, dictionary,
-and optional classifier file with SHA-256. Keep model weights outside the
-crate source tree and record their upstream URL, revision, checksum, and
-redistribution terms in the consuming application's manifest.
+The single model inventory is `ModelSet` (`src/model_set.rs`): one entry per file
+with its `role`, expected SHA-256 and size. `validate_model_files` returns the
+state of **every** file (`missing` / `present` / `corrupt`) in one pass, and
+`ModelManifest::validate_files` is a thin wrapper over it that fails on the first
+file that is not `present`. A set is `complete` only when every file is present
+**and** every file carries a hash, so an unhashed entry can never report a
+complete set. File names must be bare relative names: absolute paths, path
+separators and `..` are rejected by one shared rule.
+
+There is exactly **one** authoritative source per model directory
+(`src/model_source.rs`): if `<model-dir>/manifest.json` exists it is the only
+source and `assets/default_models.yaml` is not consulted at all; otherwise the
+default table is the only source. There is no merge and no optional override. A
+manifest must declare `schema_version: 1` and a `files` array; the legacy
+four-field shape (`detector`/`recognizer`/`dictionary`/`classifier`) and any other
+`schema_version` produce a locating error. If the selected source lacks a role
+the requested pipeline needs, the error lists the missing roles instead of
+degrading silently.
+
+Keep model weights outside the crate source tree and record their upstream URL,
+revision, checksum, and redistribution terms in the consuming application's
+manifest (see `assets/manifest.example.json`).
 
 ## CLI and benchmark
 

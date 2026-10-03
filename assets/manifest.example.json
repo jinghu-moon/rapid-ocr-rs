@@ -1,22 +1,30 @@
 {
+  "schema_version": 1,
   "id": "pp-ocrv6-medium-multilingual",
   "family": "PP-OCR",
-  "version": "v6",
-  "languages": ["ch", "en", "ja", "latin"],
-  "detector": {
-    "file_name": "PP-OCRv6_det_medium.onnx",
-    "sha256": "<sha256>",
-    "source_url": "https://www.modelscope.cn/models/RapidAI/RapidOCR"
-  },
-  "recognizer": {
-    "file_name": "PP-OCRv6_rec_medium.onnx",
-    "sha256": "<sha256>",
-    "source_url": "https://www.modelscope.cn/models/RapidAI/RapidOCR"
-  },
-  "dictionary": {
-    "file_name": "ppocrv6_dict.txt",
-    "sha256": "<sha256>",
-    "source_url": "https://www.modelscope.cn/models/RapidAI/RapidOCR"
-  },
-  "classifier": null
+  "version": "PP-OCRv6",
+  "languages": ["ch", "en", "japan", "latin"],
+  "files": [
+    {
+      "name": "PP-OCRv6_det_medium.onnx",
+      "role": "detector",
+      "sha256": "92078b7355007ccfffcd4c8cd441a3afd4538904d06881b29a155e1e679907c2",
+      "size_bytes": 62119454,
+      "source_url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/onnx/PP-OCRv6/det/PP-OCRv6_det_medium.onnx"
+    },
+    {
+      "name": "PP-OCRv6_rec_medium.onnx",
+      "role": "recognizer",
+      "sha256": "eef444829dbbe18d7fea59a3f6eb75647518d2b3a9568d27c92e42940204894b",
+      "size_bytes": 76629984,
+      "source_url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/onnx/PP-OCRv6/rec/PP-OCRv6_rec_medium.onnx"
+    },
+    {
+      "name": "ppocrv6_dict.txt",
+      "role": "dictionary",
+      "sha256": "b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d",
+      "size_bytes": 74947,
+      "source_url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/paddle/PP-OCRv6/rec/PP-OCRv6_rec_medium/ppocrv6_dict.txt"
+    }
+  ]
 }

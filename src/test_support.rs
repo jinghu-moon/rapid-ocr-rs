@@ -125,3 +125,40 @@ pub fn formula_dataset_root() -> Option<PathBuf> {
         candidate,
     )
 }
+
+/// 单元测试用的临时目录：进程内唯一，`Drop` 时删除。
+///
+/// 模型清单的逐文件状态、来源选择都需要真实文件系统行为（存在 / 缺失 / 哈希不匹配），
+/// 因此这些测试用同一个小工具建目录，而不是各自实现一遍临时目录命名与清理。
+pub struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    pub fn new(label: &str) -> Self {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rapid-ocr-rs-{label}-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("temp dir should be creatable");
+        Self { path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn write(&self, name: &str, contents: &[u8]) {
+        std::fs::write(self.path.join(name), contents).expect("fixture should be writable");
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}

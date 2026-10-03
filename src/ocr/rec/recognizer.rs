@@ -275,7 +275,7 @@ fn resolve_character_path(
         return Ok(Some(verify_existing_file(path)?));
     }
 
-    let Some(dict_url) = &resolved.dict_url else {
+    let Some(dictionary) = &resolved.dictionary else {
         return Ok(None);
     };
 
@@ -285,6 +285,12 @@ fn resolve_character_path(
         ));
     }
 
-    let path = ensure_downloaded(dict_url, None, model_store_dir)?;
+    // 字典和权重一样必须校验哈希：默认表里每个字典都记录了 SHA-256，
+    // 因此这里不再传 `None`（“可传 None 的下载入口”本身就是 §1.2 记录的缺口）。
+    let path = ensure_downloaded(
+        &dictionary.url,
+        dictionary.sha256.as_deref(),
+        model_store_dir,
+    )?;
     Ok(Some(path))
 }

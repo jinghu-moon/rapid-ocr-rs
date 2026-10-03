@@ -328,7 +328,9 @@ pub fn require_requested_provider(resolution: ProviderResolution) -> Result<Prov
     Ok(resolution)
 }
 
-fn format_provider_preference(preference: ProviderPreference) -> String {
+/// provider 偏好的唯一展示文本（`/api/status` 的 `requested` 字段、
+/// `serve` 的启动日志与严格模式错误都引用它，避免出现两套措辞）。
+pub fn format_provider_preference(preference: ProviderPreference) -> String {
     match preference {
         ProviderPreference::Cpu => "cpu".to_string(),
         ProviderPreference::Cuda { device_id } => format!("cuda(device_id={device_id})"),

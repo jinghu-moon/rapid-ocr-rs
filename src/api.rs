@@ -1126,57 +1126,6 @@ pub trait OcrEngine {
     fn recognize(&mut self, request: OcrRequest) -> Result<OcrOutput>;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelArtifact {
-    pub file_name: String,
-    pub sha256: String,
-    pub source_url: Option<String>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelManifest {
-    pub id: String,
-    pub family: String,
-    pub version: String,
-    pub languages: Vec<String>,
-    pub detector: ModelArtifact,
-    pub recognizer: ModelArtifact,
-    pub dictionary: ModelArtifact,
-    pub classifier: Option<ModelArtifact>,
-}
-impl ModelManifest {
-    pub fn validate_files(&self, root: impl AsRef<std::path::Path>) -> Result<()> {
-        let root = root.as_ref();
-        let mut all = vec![&self.detector, &self.recognizer, &self.dictionary];
-        if let Some(v) = &self.classifier {
-            all.push(v);
-        }
-        for a in all {
-            let p = std::path::Path::new(&a.file_name);
-            if p.is_absolute() || p.components().any(|c| c == std::path::Component::ParentDir) {
-                return Err(RapidOcrError::ModelResolve(format!(
-                    "model artifact path escapes manifest root: {}",
-                    a.file_name
-                )));
-            }
-            let path = root.join(&a.file_name);
-            let actual = crate::model_store::sha256_file(&path)?;
-            if !actual.eq_ignore_ascii_case(&a.sha256) {
-                return Err(RapidOcrError::HashMismatch {
-                    path,
-                    expected: a.sha256.clone(),
-                    actual,
-                });
-            }
-        }
-        Ok(())
-    }
-}
-#[derive(Debug, Clone)]
-pub enum ModelSource {
-    Path(std::path::PathBuf),
-    Bytes(Arc<[u8]>),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -118,7 +118,11 @@ fn build_http_client() -> Result<Client> {
         .map_err(Into::into)
 }
 
-fn extract_file_name(url: &str) -> Result<String> {
+/// 从下载 URL 推导落盘文件名（唯一实现）。
+///
+/// `pub(crate)`：默认模型表也用同一个推导，否则“表里写的文件名”与
+/// “下载器实际落盘的文件名”会漂移，逐文件状态校验就会指向不存在的路径。
+pub(crate) fn extract_file_name(url: &str) -> Result<String> {
     let trimmed = url.split('?').next().unwrap_or(url);
     let file_name = trimmed
         .rsplit('/')

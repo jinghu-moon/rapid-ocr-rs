@@ -49,6 +49,12 @@ download-binaries = ["ort/download-binaries"]
 copy-dylibs = ["ort/copy-dylibs"]
 directml-provider = ["ort/directml"]
 cuda-provider = ["ort/cuda"]
+# `rapidocr serve`（本地 Web 评估界面，docs/05）。
+#
+# 当前是**空 feature**：M0c 只落地服务端纯逻辑与骨架，`tiny_http` 由 M1 引入，
+# 并必须保持 `optional = true`。`serve` **不进 `default`**，因此默认构建的依赖图
+# 与发布内容不受影响（证据见 docs/06-local-web-demo-reports.md 的 cargo tree 对比）。
+serve = []
 
 [lints.rust]
 # `ort` 链接的预编译原生库在 MSVC 下会偶发报告

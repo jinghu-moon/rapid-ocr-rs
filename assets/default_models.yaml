@@ -21,59 +21,101 @@ onnxruntime:
       arabic_PP-OCRv4_rec_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/arabic_PP-OCRv4_rec_infer.onnx
         SHA256: 4a9011bef71687bb84288dc86ad2471bd5d37b717ddf672dd156f9e7a5601bac
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/arabic_PP-OCRv4_rec_infer/arabic_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/arabic_PP-OCRv4_rec_infer/arabic_dict.txt
+          SHA256: 637c27c88512c22089bef927b34ada08f748dc132ac70facd68d8202384c2726
+          size_bytes: 405
       ch_PP-OCRv4_rec_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/ch_PP-OCRv4_rec_infer.onnx
         SHA256: 48fc40f24f6d2a207a2b1091d3437eb3cc3eb6b676dc3ef9c37384005483683b
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/ch_PP-OCRv4_rec_infer/ppocr_keys_v1.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/ch_PP-OCRv4_rec_infer/ppocr_keys_v1.txt
+          SHA256: 28b2362ad4ab2dc38769aa72feb535e3a9ddb3fd2a7585a05920e6393b1dc7f7
+          size_bytes: 26249
       ch_PP-OCRv4_rec_server_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/ch_PP-OCRv4_rec_server_infer.onnx
         SHA256: 6a2676219be9907c7fc9cf61ebaa843bf2898777def567925b78886fcd90c07a
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/ch_PP-OCRv4_rec_infer/ppocr_keys_v1.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/ch_PP-OCRv4_rec_infer/ppocr_keys_v1.txt
+          SHA256: 28b2362ad4ab2dc38769aa72feb535e3a9ddb3fd2a7585a05920e6393b1dc7f7
+          size_bytes: 26249
       ch_doc_PP-OCRv4_rec_server_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/ch_doc_PP-OCRv4_rec_server_infer.onnx
         SHA256: 7062242cd57ec40b6583c3e0a5d4a674accbd710eed90bad9f52b9dd341d43b3
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/ch_doc_PP-OCRv4_rec_server_infer/ppocrv4_doc_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/ch_doc_PP-OCRv4_rec_server_infer/ppocrv4_doc_dict.txt
+          SHA256: cf98472458ea87e020c0da18475a04bbeec2952b2b4e6c35c559b624182e3669
+          size_bytes: 62345
       chinese_cht_PP-OCRv3_rec_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/chinese_cht_PP-OCRv3_rec_infer.onnx
         SHA256: 779656d044ce388045e02ea9244724616194e63928606436cdfc6dc3c9528cc6
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/chinese_cht_PP-OCRv3_rec_infer/chinese_cht_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/chinese_cht_PP-OCRv3_rec_infer/chinese_cht_dict.txt
+          SHA256: 832551fee1f2fbc97508772d81ebdc8dba12c00de97a35c71c9ddf43ddac1a83
+          size_bytes: 33443
       cyrillic_PP-OCRv3_rec_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/cyrillic_PP-OCRv3_rec_infer.onnx
         SHA256: 1efb65bdc460af1c0e8733d005b20952b17ca5aac10ddb56c968333791c5eaa3
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/cyrillic_PP-OCRv3_rec_infer/cyrillic_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/cyrillic_PP-OCRv3_rec_infer/cyrillic_dict.txt
+          SHA256: 369a82c6c8c479784a5d726448b83b1eafb5fef0a4129a5eaa3929625ddcd132
+          size_bytes: 410
       devanagari_PP-OCRv4_rec_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/devanagari_PP-OCRv4_rec_infer.onnx
         SHA256: a62b6148303187907aa0b0d3a0125bdc62557d07966468cab9056949e36035e8
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/devanagari_PP-OCRv4_rec_infer/devanagari_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/devanagari_PP-OCRv4_rec_infer/devanagari_dict.txt
+          SHA256: b5f1be6d8bbff1a19fb96c5d4ca96a423380234bb7d2ce0e07b5838adb4d18ea
+          size_bytes: 508
       en_PP-OCRv4_rec_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/en_PP-OCRv4_rec_infer.onnx
         SHA256: e8770c967605983d1570cdf5352041dfb68fa0c21664f49f47b155abd3e0e318
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/en_PP-OCRv4_rec_infer/en_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/en_PP-OCRv4_rec_infer/en_dict.txt
+          SHA256: 5662df9d2d03f0e8ca0d3b0649d6acbab904b6a14b3d3521463c71c37c668ce3
+          size_bytes: 190
       japan_PP-OCRv4_rec_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/japan_PP-OCRv4_rec_infer.onnx
         SHA256: e1075a67dba758ecfc7ebc78a10ae61c95ac8fb66a9c86fab5541e33f085cb7a
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/japan_PP-OCRv4_rec_infer/japan_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/japan_PP-OCRv4_rec_infer/japan_dict.txt
+          SHA256: 1dcfcb41eec90576a945b3084f22ade11ced506e24f14879245b071698f308e8
+          size_bytes: 17332
       ka_PP-OCRv4_rec_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/ka_PP-OCRv4_rec_infer.onnx
         SHA256: 9c1e186ea1d13cf6c853e57b42d382c3961fdd6acc2409e0d0dc44defc9f152b
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/kannada_PP-OCRv4_rec_infer/ka_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/kannada_PP-OCRv4_rec_infer/ka_dict.txt
+          SHA256: fad3f765943275eec2134a6fbc9b52785426641104d4e7db3a159dc73f341dde
+          size_bytes: 452
       korean_PP-OCRv4_rec_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/korean_PP-OCRv4_rec_infer.onnx
         SHA256: ab151ba9065eccd98f884cf4d927db091be86137276392072edd4f9d43ad7426
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/korean_PP-OCRv4_rec_infer/korean_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/korean_PP-OCRv4_rec_infer/korean_dict.txt
+          SHA256: aa1fdc8ae8f7cd40a0ec4edb472eb0421e11427e6ccfee9915440742c18b0a20
+          size_bytes: 14480
       latin_PP-OCRv3_rec_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/latin_PP-OCRv3_rec_infer.onnx
         SHA256: e9d7a33667e8aaa702862975186adf2012e3f390cc0f9422865957125f8071cf
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/latin_PP-OCRv3_rec_infer/latin_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/latin_PP-OCRv3_rec_infer/latin_dict.txt
+          SHA256: 8e6d4e3629788c35c31f7e530287d6147b549bb7a265bd6708bb281134429e2c
+          size_bytes: 468
       ta_PP-OCRv4_rec_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/ta_PP-OCRv4_rec_infer.onnx
         SHA256: f78d752148873c5fa6e4294002bfd162dbba54236e406a39665ebbda766161b5
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/ta_PP-OCRv4_rec_infer/ta_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/ta_PP-OCRv4_rec_infer/ta_dict.txt
+          SHA256: e93e694814afd9ff1e918b6f4bb4267fb4c65a9344ee5d7464f9135b90c0a270
+          size_bytes: 352
       te_PP-OCRv4_rec_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv4/rec/te_PP-OCRv4_rec_infer.onnx
         SHA256: e608c3be00c8a9ea2f5c667d90f379403e2568bd5c8183308a49ca093def8eff
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/te_PP-OCRv4_rec_infer/te_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv4/rec/te_PP-OCRv4_rec_infer/te_dict.txt
+          SHA256: ee9946a60d7701977474e89883694a4ca20eaa3868a23334bf7940dcd008f0f9
+          size_bytes: 429
   PP-OCRv5:
     det:
       ch_PP-OCRv5_mobile_det.onnx:
@@ -86,76 +128,144 @@ onnxruntime:
       arabic_PP-OCRv5_rec_mobile_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/arabic_PP-OCRv5_rec_mobile_infer.onnx
         SHA256: c1192e632d0baa9146ae5b756a0e635e3dc63c1733737ebfd1629e87144e9295
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/arabic_PP-OCRv5_rec_mobile_infer/ppocrv5_arabic_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/arabic_PP-OCRv5_rec_mobile_infer/ppocrv5_arabic_dict.txt
+          SHA256: 7f92f7dbb9b75a4787a83bfb4f6d14a8ab515525130c9d40a9036f61cf6999e9
+          size_bytes: 2369
       ch_PP-OCRv5_rec_mobile_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer.onnx
         SHA256: 5825fc7ebf84ae7a412be049820b4d86d77620f204a041697b0494669b1742c5
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer/ppocrv5_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer/ppocrv5_dict.txt
+          SHA256: d1979e9f794c464c0d2e0b70a7fe14dd978e9dc644c0e71f14158cdf8342af1b
+          size_bytes: 74012
       ch_PP-OCRv5_rec_server_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_server_infer.onnx
         SHA256: e09385400eaaaef34ceff54aeb7c4f0f1fe014c27fa8b9905d4709b65746562a
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_server_infer/ppocrv5_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_server_infer/ppocrv5_dict.txt
+          SHA256: d1979e9f794c464c0d2e0b70a7fe14dd978e9dc644c0e71f14158cdf8342af1b
+          size_bytes: 74012
       cyrillic_PP-OCRv5_rec_mobile_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/cyrillic_PP-OCRv5_rec_mobile_infer.onnx
         SHA256: 90f761b4bfcce0c8c561c0cb5c887b0971d3ec01c32164bdf7374a35b0982711
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/cyrillic_PP-OCRv5_rec_mobile_infer/ppocrv5_cyrillic_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/cyrillic_PP-OCRv5_rec_mobile_infer/ppocrv5_cyrillic_dict.txt
+          SHA256: db40aa52ceb112055be80c694afdf655d5d2c4f7873704524cc16a447ca913ba
+          size_bytes: 2781
       devanagari_PP-OCRv5_rec_mobile_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/devanagari_PP-OCRv5_rec_mobile_infer.onnx
         SHA256: d6f0a906580e3fa6b324a318718f1f31f268b6ea8ef985f91c2012a37f52c91e
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/devanagari_PP-OCRv5_rec_mobile_infer/ppocrv5_devanagari_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/devanagari_PP-OCRv5_rec_mobile_infer/ppocrv5_devanagari_dict.txt
+          SHA256: 09c7440bfc5477e5c41052304b6b185aff8c4a5e8b2b4c23c1c706f6fe1ee9fc
+          size_bytes: 1943
       el_PP-OCRv5_rec_mobile_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/el_PP-OCRv5_rec_mobile_infer.onnx
         SHA256: b4368bccd557123c702b7549fee6cd1e94b581337d1c9b65310f109131542b7f
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/el_PP-OCRv5_rec_mobile_infer/ppocrv5_el_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/el_PP-OCRv5_rec_mobile_infer/ppocrv5_el_dict.txt
+          SHA256: 31defc62c0c3ad3674a82da6192226a2ba98ef4ff014a7045cb88d59f9c3de31
+          size_bytes: 1103
       en_PP-OCRv5_rec_mobile_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/en_PP-OCRv5_rec_mobile_infer.onnx
         SHA256: c3461add59bb4323ecba96a492ab75e06dda42467c9e3d0c18db5d1d21924be8
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/en_PP-OCRv5_rec_mobile_infer/ppocrv5_en_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/en_PP-OCRv5_rec_mobile_infer/ppocrv5_en_dict.txt
+          SHA256: e025a66d31f327ba0c232e03f407ae8d105e1e709e7ccb3f408aa778c24e70d6
+          size_bytes: 1416
       eslav_PP-OCRv5_rec_mobile_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/eslav_PP-OCRv5_rec_mobile_infer.onnx
         SHA256: 08705d6721849b1347d26187f15a5e362c431963a2a62bfff4feac578c489aab
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/eslav_PP-OCRv5_rec_mobile_infer/ppocrv5_eslav_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/eslav_PP-OCRv5_rec_mobile_infer/ppocrv5_eslav_dict.txt
+          SHA256: 3e95f1581557162870cacdba5af91a4c6be2890710d395b0c3c7578e7ee5e6eb
+          size_bytes: 1663
       korean_PP-OCRv5_rec_mobile_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/korean_PP-OCRv5_rec_mobile_infer.onnx
         SHA256: cd6e2ea50f6943ca7271eb8c56a877a5a90720b7047fe9c41a2e541a25773c9b
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/korean_PP-OCRv5_rec_mobile_infer/ppocrv5_korean_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/korean_PP-OCRv5_rec_mobile_infer/ppocrv5_korean_dict.txt
+          SHA256: a88071c68c01707489baa79ebe0405b7beb5cca229f4fc94cc3ef992328802d7
+          size_bytes: 47451
       latin_PP-OCRv5_rec_mobile_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/latin_PP-OCRv5_rec_mobile_infer.onnx
         SHA256: b20bd37c168a570f583afbc8cd7925603890efbcdc000a59e22c269d160b5f5a
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/latin_PP-OCRv5_rec_mobile_infer/ppocrv5_latin_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/latin_PP-OCRv5_rec_mobile_infer/ppocrv5_latin_dict.txt
+          SHA256: 3c0a8a79b612653c25f765271714f71281e4e955962c153e272b7b8c1d2b13ff
+          size_bytes: 1634
       ta_PP-OCRv5_rec_mobile_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/ta_PP-OCRv5_rec_mobile_infer.onnx
         SHA256: a42448808b7dea87597336f12438935f40353f1949e8360acd9e06b4da21bfe1
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/ta_PP-OCRv5_rec_mobile_infer/ppocrv5_ta_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/ta_PP-OCRv5_rec_mobile_infer/ppocrv5_ta_dict.txt
+          SHA256: 85b541352ae18dc6ba6d47152d8bf8adff6b0266e605d2eef2990c1bf466117b
+          size_bytes: 1723
       te_PP-OCRv5_rec_mobile_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/te_PP-OCRv5_rec_mobile_infer.onnx
         SHA256: a3690451b50028a09a3316a1274f7c05728151ea3f8fd392696397a7fefcbd92
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/te_PP-OCRv5_rec_mobile_infer/ppocrv5_te_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/te_PP-OCRv5_rec_mobile_infer/ppocrv5_te_dict.txt
+          SHA256: 42f83f5d3fdb50778e4fa5b66c58d99a59ab7792151c5e74f34b8ffd7b61c9d6
+          size_bytes: 1831
       th_PP-OCRv5_rec_mobile_infer.onnx:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/onnx/PP-OCRv5/rec/th_PP-OCRv5_rec_mobile_infer.onnx
         SHA256: de541dd83161c241ff426f7ecfd602a0ba77d686cf3ab9a6c255ea82fd08006e
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/th_PP-OCRv5_rec_mobile_infer/ppocrv5_th_dict.txt
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.6.0/paddle/PP-OCRv5/rec/th_PP-OCRv5_rec_mobile_infer/ppocrv5_th_dict.txt
+          SHA256: 57f5406f94bb6688fb7077f7be65f08bbd71cecf48c01ea26c522cb5c4836b7a
+          size_bytes: 1767
   PP-OCRv6:
     det:
       multi_PP-OCRv6_det_tiny:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/onnx/PP-OCRv6/det/PP-OCRv6_det_tiny.onnx
         SHA256: f42c0fbd294d95eac1a550e131b277dac97462c8025fa4b6c3cec1b7894bd3d5
+        size_bytes: 1829618
       multi_PP-OCRv6_det_small:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/onnx/PP-OCRv6/det/PP-OCRv6_det_small.onnx
         SHA256: 090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f
+        size_bytes: 9929594
       multi_PP-OCRv6_det_medium:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/onnx/PP-OCRv6/det/PP-OCRv6_det_medium.onnx
         SHA256: 92078b7355007ccfffcd4c8cd441a3afd4538904d06881b29a155e1e679907c2
+        size_bytes: 62119454
     rec:
       multi_PP-OCRv6_rec_tiny:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/onnx/PP-OCRv6/rec/PP-OCRv6_rec_tiny.onnx
         SHA256: e16e242de5937ad92609223f19bc2aff3727ee40b095f996907c24749bad251b
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/paddle/PP-OCRv6/rec/PP-OCRv6_rec_tiny/ppocrv6_tiny_dict.txt
+        size_bytes: 4489813
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/paddle/PP-OCRv6/rec/PP-OCRv6_rec_tiny/ppocrv6_tiny_dict.txt
+          SHA256: c5cbe34ef40c29c4df07ed012bf96569cb69a2d2a01a07027e9f13cb832bd9cd
+          size_bytes: 27156
       multi_PP-OCRv6_rec_small:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/onnx/PP-OCRv6/rec/PP-OCRv6_rec_small.onnx
         SHA256: 6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/paddle/PP-OCRv6/rec/PP-OCRv6_rec_small/ppocrv6_dict.txt
+        size_bytes: 21234383
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/paddle/PP-OCRv6/rec/PP-OCRv6_rec_small/ppocrv6_dict.txt
+          SHA256: b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d
+          size_bytes: 74947
       multi_PP-OCRv6_rec_medium:
         model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/onnx/PP-OCRv6/rec/PP-OCRv6_rec_medium.onnx
         SHA256: eef444829dbbe18d7fea59a3f6eb75647518d2b3a9568d27c92e42940204894b
-        dict_url: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/paddle/PP-OCRv6/rec/PP-OCRv6_rec_medium/ppocrv6_dict.txt
+        size_bytes: 76629984
+        dict:
+          model_dir: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/paddle/PP-OCRv6/rec/PP-OCRv6_rec_medium/ppocrv6_dict.txt
+          SHA256: b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d
+          size_bytes: 74947
+
+# 公式模型：与 ocr_version / 语言选择无关的固定集合。
+# 这里只登记**公式管线必需**的文件：页面公式检测模型（pix2text-mfd-1.5.onnx）在
+# FormulaPolicy 里是可选的，且没有可信的公开下载来源，因此不是集合成员。
+formula:
+  id: PP-FormulaNet_plus-M
+  family: RapidDoc
+  version: v1.0.0
+  files:
+    - name: pp_formulanet_plus_m.onnx
+      role: formula_recognizer
+      model_dir: https://www.modelscope.cn/models/RapidAI/RapidDoc/resolve/v1.0.0/formula/PP-FormulaNet_plus-M/pp_formulanet_plus_m.onnx
+      SHA256: 71b6d389cf7b857e45252a4b98cfced1a3ffca7bf24d9497d02d052a41d9493b
+      size_bytes: 593915961

@@ -10,12 +10,12 @@
 pub use crate::api::{
     ClassifierPlan, ClassifierPolicy, CoordinateSpace, DetectionOutcome, DetectionPolicy,
     EngineInfo, EnhancementPolicy, FormulaOutcome, FormulaPolicy, ImageInfo, ImageInput, ImageSize,
-    InputTimings, ModelArtifact, ModelManifest, ModelSource, OcrEngine, OcrOutput, OcrRegion,
-    OcrRequest, OcrTimings, OcrWord, OutputPolicy, OwnedPixelBuffer, PixelFormat, Polygon,
-    PreprocessPolicy, ProviderInfo, ProviderPreference as GenericProviderPreference,
-    ProviderResolutionInfo, RecognitionOutcome, RecognitionPolicy, RectU32, RegionKind,
-    RegionSource, ResolvedProvider, StagePlan, StageReport, StageReports, StageState, StageTiming,
-    TextOrder, TextOrientation, TilePolicy, WordKind, WordOutputMode,
+    InputTimings, OcrEngine, OcrOutput, OcrRegion, OcrRequest, OcrTimings, OcrWord, OutputPolicy,
+    OwnedPixelBuffer, PixelFormat, Polygon, PreprocessPolicy, ProviderInfo,
+    ProviderPreference as GenericProviderPreference, ProviderResolutionInfo, RecognitionOutcome,
+    RecognitionPolicy, RectU32, RegionKind, RegionSource, ResolvedProvider, StagePlan, StageReport,
+    StageReports, StageState, StageTiming, TextOrder, TextOrientation, TilePolicy, WordKind,
+    WordOutputMode,
 };
 pub use crate::config::{
     ColorOrder, LangCls, LangDet, LangRec, ModelType, OcrVersion, ProviderPreference, RecImage,
@@ -49,6 +49,15 @@ pub use crate::formula::tokenizer_metadata::{
     BOS_ID, BOS_TOKEN, EOS_ID, EOS_TOKEN, FormulaTokenizerMetadata, PAD_ID, PAD_TOKEN, UNK_ID,
     UNK_TOKEN,
 };
+pub use crate::model_registry::DefaultModelSelection;
+pub use crate::model_set::{
+    ModelFileSpec, ModelFileState, ModelRole, ModelSet, ModelSetStatus, model_set_status,
+    validate_model_file_name, validate_model_files,
+};
+pub use crate::model_source::{
+    MANIFEST_FILE_NAME, ManifestFile, ModelManifest, ModelRequest, ModelSource, ModelSourceKind,
+    SUPPORTED_MANIFEST_SCHEMA_VERSION,
+};
 pub use crate::model_store::{
     default_model_store_dir, ensure_downloaded, sha256_file, verify_existing_file,
 };
@@ -71,8 +80,13 @@ pub use crate::runtime::ort_runtime::{
     ort_runtime_fingerprint,
 };
 pub use crate::runtime::profile::{RuntimeProfile, ThreadPlan, ThreadSource};
+// `resolve_execution_providers` 与 `format_provider_preference` 是 serve 侧启动期
+// 校验运行配置（§7.5/§7.6）时**必须复用**的两个既有实现：前者给出"provider 名称/
+// feature 是否成立 + 运行库是否可用"的唯一判定，后者给出 provider 的唯一展示文本。
+// 导出的目的是让 `rapidocr serve` 不另写一套措辞（docs/05 §7.5 第 3 条）。
 pub use crate::runtime::provider::{
-    ProviderResolution, ResolvedExecutionProvider, ort_runtime_version,
+    ProviderResolution, ResolvedExecutionProvider, format_provider_preference, ort_runtime_version,
+    resolve_execution_providers,
 };
 pub use crate::runtime::session::OrtSession;
 pub use crate::runtime::timing::{LedgerConservation, LedgerShares, TimingLedger};

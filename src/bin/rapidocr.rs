@@ -12,6 +12,14 @@ use std::{
     sync::Arc,
 };
 
+/// `rapidocr serve` 的服务端核心（M0c：纯逻辑 + feature 骨架）。
+///
+/// 只在启用 `serve` feature 时参与编译；`serve` **不在** `default` 里，
+/// 因此默认构建的依赖图与代码路径都不受影响（§2.1 的硬性约束）。
+#[cfg(feature = "serve")]
+#[path = "serve/mod.rs"]
+mod serve;
+
 /// 页面级公式路由的 CLI 选项。
 #[derive(Debug, Clone, Default, clap::Args)]
 struct FormulaArgs {

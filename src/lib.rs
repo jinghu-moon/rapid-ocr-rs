@@ -56,6 +56,10 @@ mod input;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod model_registry;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+mod model_set;
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+mod model_source;
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod model_store;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod ocr;

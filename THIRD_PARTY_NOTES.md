@@ -92,8 +92,10 @@ license for transitive dependencies.
 The PP-OCRv6 detector, recognizer, and dictionary are model artifacts, not
 source code. Their upstream URL, exact revision, SHA-256, and redistribution
 terms must be recorded in the application model manifest before packaging.
-The crate verifies SHA-256 for every artifact through `ModelManifest::validate_files`;
-it does not invent or embed checksums for weights that are not present.
+The crate verifies SHA-256 for every artifact (weights **and** recognition
+dictionaries) through the shared per-file validator `model_set::validate_model_files`,
+which `ModelManifest::validate_files` wraps; it does not invent or embed
+checksums for artifacts that are not present.
 
 No cloud OCR service is used. Model downloads, when enabled by the application,
 must use HTTPS and an explicit expected SHA-256.
