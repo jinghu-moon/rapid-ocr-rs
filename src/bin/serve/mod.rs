@@ -1,4 +1,4 @@
-//! `rapidocr serve` 的服务端核心（M0c：纯逻辑 + 单元测试 + feature 骨架）。
+//! `rapidocr serve` 的服务端核心：HTTP 层、静态页、任务层与 M2 的下载接缝。
 //!
 //! # 分层（§2.1）
 //!
@@ -7,15 +7,15 @@
 //! ```text
 //! rapidocr (bin)
 //!   └── serve 子命令（feature = "serve"，非 default）
-//!         ├── http 层：路由 / 准入顺序 / ServeError → 状态码 / 安全头   ← M1
-//!         ├── 静态页：include_str! + nonce/token 注入                  ← M1
-//!         ├── job 层：双队列 + 固定 worker + 有界结果存储 + tombstone    ← 本模块（纯逻辑）
-//!         └── download 层：独立 worker + 单飞 + 加固下载器              ← M0b/M2
+//!         ├── http 层：路由 / 准入顺序 / ServeError → 状态码 / 安全头     ← http.rs
+//!         ├── 静态页：include_str!("web/index.html") + nonce/token 注入    ← run.rs
+//!         ├── job 层：双队列 + 固定 worker + 有界结果存储 + tombstone       ← queue/jobs/server
+//!         ├── download 层：独立 worker + 双队列之外的有界 channel           ← download.rs（M2 接缝）
+//!         └── rapid-ocr-rs（库，零 HTTP 依赖）
+//!               ModelSet / model_store（加固） / ImageInput → OcrRequest → OcrOutput
 //! ```
 //!
-//! # M0c 的范围
-//!
-//! 本模块**只**包含可以脱离 HTTP、线程与文件系统单测的纯逻辑：
+//! # 模块
 //!
 //! | 模块 | 内容 | 文档 |
 //! | --- | --- | --- |
@@ -27,94 +27,151 @@
 //! | [`security`] | 硬编码 loopback、Host/Origin、令牌、注入契约 | §7.1–§7.3、§9 |
 //! | [`admit`] | 准入顺序、有界读取、字节账本 | §4.4 |
 //! | [`cli`] | `serve` 的选项面与默认值（无行为） | §3 |
+//! | [`model_plan`] | 模型集的单一来源解析、逐文件状态、引擎路径绑定 | §5.3、§5.4、§7.6 |
+//! | [`engine`] | `OcrBackend` + 引擎工厂（测试可替换） | §8.2 |
+//! | [`results`] | 有界结果存储与有界序列化 | §4.5、§4.6 |
+//! | [`download`] | 独立下载 worker（M2 的处理体） | §8.1、§6 |
+//! | [`server`] | 运行期核心：共享状态、worker、TTL 清理、端点语义 | §4、§7.6、§8 |
+//! | [`http`] | `tiny_http` 接线：路由、准入、响应头 | §4.2、§4.4、§7 |
+//! | [`run`] | 启动编排、静态页注入、启动日志、`--open` | §3、§7.1、§7.6、§9 |
+//! | [`tests`] | 真实绑定端口的端到端测试（HTTP + 双队列 + 安全） | §12 |
 //!
-//! **不在**本模块内：HTTP 服务器与 `tiny_http`、路由表、`GET /`、前端、下载器的
-//! 库侧实现、`ModelSet`/`ModelManifest`（后者由并行的 M0a 在库里落地）。
+//! # HTTP 依赖的边界（M1 的硬约束）
 //!
-//! # 与并行 M0a 的接缝
-//!
-//! M0c 不解析模型清单，只通过 [`state::ModelReadiness`] 接收"模型是否齐备、缺哪些文件"
-//! 这一事实；M1 的填充点是库侧的共享逐文件校验函数（`ModelSet` / `ModelSetStatus`）。
-//!
-//! **下载错误的接缝已经在 M0b 关闭**：`ServeError::Download` 的载荷是库里的
-//! `rapid_ocr_rs::DownloadError`（十二类，§6.1 第 12 条），serve 侧只有
-//! [`error::DownloadErrorMapping`] 这一层 HTTP 映射，不再有第二套下载错误类型。
-//!
-//! # 关于下面这条 `allow`
-//!
-//! M0c 只交付纯逻辑与单元测试：HTTP 层（M1）尚未接线，因此本模块的多数项在
-//! **非 test 构建**里暂时没有调用点。这条 `allow` 只作用于 `serve` 子树，
-//! 且**必须在 M1 接线时删除**——M1 的验收要求 `cargo clippy` 在默认 lint 集下无警告。
-#![allow(dead_code)]
+//! `tiny_http` 是 `optional` 依赖且不进 `default`；它**只**能在 [`http`] 里被引用。
+//! 下面的 `dependency_boundary` 测试会扫描整个 `serve/` 子树的代码行并断言这一点，
+//! 同时断言 `Cargo.toml` 里它是 `optional = true` 且 `serve` feature 通过 `dep:`
+//! 引入——§12 的"依赖隔离"因此有编译期与源码级两条独立证据。
 
 mod admit;
 mod cli;
+mod download;
+mod engine;
 mod error;
+mod http;
 mod jobs;
 mod limits;
+mod model_plan;
 mod queue;
+mod results;
+mod run;
 mod security;
+mod server;
 mod state;
 
+/// `serve` 子命令的选项面（rapidocr.rs 的子命令表要用）。
+pub(crate) use cli::ServeArgs;
+/// `serve` 的启动入口与启动期错误（rapidocr.rs 只负责把错误打印出来）。
+pub(crate) use run::run as serve_main;
+
 #[cfg(test)]
-mod scope_tests {
+mod tests;
+
+#[cfg(test)]
+mod dependency_boundary {
     use std::path::{Path, PathBuf};
 
-    /// 本模块的**范围边界**也是被测对象：M0c 不允许引入 HTTP 服务器或 socket。
+    /// 本子树里**唯一**允许引用 `tiny_http` 的文件。
+    const ONLY_HTTP_MODULE: &str = "http.rs";
+
+    /// M1 的依赖边界：库零 HTTP 依赖，`tiny_http` 只出现在 `serve/http.rs`，
+    /// 且在 `Cargo.toml` 里是 optional、由 `serve` feature 用 `dep:` 引入。
     ///
-    /// 两条断言：
-    ///
-    /// 1. `serve/` 目录源码的**代码部分**（去掉行注释后）不得出现 HTTP 库的路径引用
-    ///    或 socket 类型——它们只可能出现在真正的 HTTP 层里，M1 才引入
-    ///    （§2.1：`tiny_http` 只能 optional 且不进 default）；
-    /// 2. `Cargo.toml` 的 `[dependencies]` 段不得声明 `tiny_http`。
-    ///
-    /// 注释里提到库名不构成依赖（本模块的文档正需要说明"为什么 M1 才引入它"），
-    /// 因此扫描前去掉行注释；被禁的名字按字面量拼出来，避免本文件命中自己。
+    /// M0c 的旧断言（"整个 serve 子树里不得出现 HTTP 库引用"）在那个阶段是对的：
+    /// 当时 HTTP 层还没写。M1 把它替换成**更强**的版本：不是"哪里都没有"，而是
+    /// "只允许在这一个文件里、且依赖必须 optional 且不进 default"。
     #[test]
-    fn the_scaffold_does_not_contain_an_http_server_yet() {
+    fn the_http_dependency_lives_only_in_the_http_module() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let directory = root.join("src/bin/serve");
         let mut sources = Vec::new();
         collect_sources(&directory, &mut sources);
         assert!(
-            sources.len() >= 8,
-            "expected the M0c modules, found {sources:?}"
+            sources.len() >= 14,
+            "expected the M1 modules, found {sources:?}"
         );
 
-        let forbidden = [
-            ["tiny", "_http::"].concat(),
-            ["Tcp", "Listener"].concat(),
-            ["Tcp", "Stream"].concat(),
-        ];
+        let needle = ["tiny", "_http"].concat();
         for path in &sources {
             let text = std::fs::read_to_string(path).expect("a serve source file must be readable");
             let code = strip_line_comments(&text);
-            for needle in &forbidden {
+            if path
+                .file_name()
+                .is_some_and(|name| name == ONLY_HTTP_MODULE)
+            {
                 assert!(
-                    !code.contains(needle.as_str()),
-                    "M0c must not pull in the HTTP layer yet: {} contains {needle}",
-                    path.display()
+                    code.contains(&needle),
+                    "the HTTP module must be the one that uses the HTTP library"
                 );
+                continue;
             }
+            assert!(
+                !code.contains(&needle),
+                "only serve/{ONLY_HTTP_MODULE} may reference the HTTP library: {} does",
+                path.display()
+            );
         }
 
+        // 库侧（`src/` 下除 `src/bin/`）不得出现同一个引用。
+        let mut library_sources = Vec::new();
+        collect_sources(&root.join("src"), &mut library_sources);
+        for path in &library_sources {
+            if path.starts_with(root.join("src/bin")) {
+                continue;
+            }
+            let text = std::fs::read_to_string(path).expect("a library source must be readable");
+            assert!(
+                !strip_line_comments(&text).contains(&needle),
+                "the library must stay HTTP-free: {} references it",
+                path.display()
+            );
+        }
+    }
+
+    /// `Cargo.toml` 的依赖隔离：optional + 只能由 `serve` 引入，且 `serve` 不在 default。
+    #[test]
+    fn the_http_dependency_is_optional_and_outside_the_default_feature() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let manifest = std::fs::read_to_string(root.join("Cargo.toml"))
             .expect("the crate manifest must be readable");
+        let name = ["tiny", "_http"].concat();
+
         let mut in_dependencies = false;
+        let mut dependency = None;
+        let mut default_features = None;
+        let mut serve_feature = None;
         for line in manifest.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with('[') {
                 in_dependencies = trimmed == "[dependencies]";
                 continue;
             }
-            if in_dependencies && !trimmed.starts_with('#') {
-                assert!(
-                    !trimmed.starts_with(["tiny", "_http"].concat().as_str()),
-                    "the default dependency graph must not gain an HTTP server: {trimmed}"
-                );
+            if in_dependencies && !trimmed.starts_with('#') && trimmed.starts_with(&name) {
+                dependency = Some(trimmed.to_string());
+            }
+            if let Some(value) = trimmed.strip_prefix("default =") {
+                default_features = Some(value.to_string());
+            }
+            if let Some(value) = trimmed.strip_prefix("serve =") {
+                serve_feature = Some(value.to_string());
             }
         }
+
+        let dependency = dependency.expect("the HTTP library must be a dependency");
+        assert!(
+            dependency.contains("optional = true"),
+            "the HTTP library must be optional: {dependency}"
+        );
+        let default_features = default_features.expect("a `default` feature list must exist");
+        assert!(
+            !default_features.contains(&name),
+            "the HTTP library must not be in `default`: {default_features}"
+        );
+        let serve_feature = serve_feature.expect("a `serve` feature must exist");
+        assert!(
+            serve_feature.contains(&format!("dep:{name}")),
+            "only the `serve` feature may enable the HTTP library: {serve_feature}"
+        );
     }
 
     /// 去掉行注释。本 crate 只用 `//` / `///` / `//!` 三种注释，没有块注释。
@@ -129,7 +186,7 @@ mod scope_tests {
     }
 
     fn collect_sources(directory: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(directory).expect("the serve directory must exist") {
+        for entry in std::fs::read_dir(directory).expect("the directory must exist") {
             let path = entry.expect("readable entry").path();
             if path.is_dir() {
                 collect_sources(&path, out);

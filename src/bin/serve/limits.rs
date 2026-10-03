@@ -98,7 +98,13 @@ impl ServeConfigError {
 
 impl fmt::Display for ServeConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid {}={}: {}", self.field, self.value, self.reason)
+        write!(
+            f,
+            "invalid {}={}: {}",
+            self.field(),
+            self.value,
+            self.reason()
+        )
     }
 }
 

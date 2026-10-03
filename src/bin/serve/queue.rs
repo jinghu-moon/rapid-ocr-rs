@@ -114,14 +114,18 @@ impl SchedulerConfig {
         })
     }
 
-    /// 从**已经校验过**的 [`ServeLimits`] 构造（不重复校验）。
+    /// 从**已经校验过**的 [`ServeLimits`] 构造。
+    ///
+    /// 仍然走 [`Self::new`]：四个取值的校验（≥ 1，否则 §8.3 的保底规则无法成立）
+    /// 只有一份实现。
     pub fn from_limits(limits: &ServeLimits) -> Self {
-        Self {
-            max_queue_text: limits.max_queue_text,
-            max_queue_formula: limits.max_queue_formula,
-            max_consecutive_text: limits.max_consecutive_text,
-            max_consecutive_formula: limits.max_consecutive_formula,
-        }
+        Self::new(
+            limits.max_queue_text,
+            limits.max_queue_formula,
+            limits.max_consecutive_text,
+            limits.max_consecutive_formula,
+        )
+        .expect("ServeLimits validates the same four bounds")
     }
 
     /// 一轮最多服务的任务数（§8.3 的调度粒度）。

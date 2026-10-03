@@ -40,6 +40,10 @@ rayon = "1.10"
 regex = "1"
 clap = { version = "4.5", features = ["derive"] }
 unicode-normalization = { version = "0.1.25", default-features = false }
+# `rapidocr serve` 的 HTTP 服务器（docs/05 §2.2）。**必须 optional 且不进 `default`**：
+# 库的依赖图与发布内容不受影响，只有 `--features serve` 的构建才引入它
+# （证据见 docs/06-local-web-demo-reports.md 的 M1 cargo tree 对比）。
+tiny_http = { version = "0.12", optional = true }
 
 [features]
 default = ["ort-runtime"]
@@ -51,10 +55,12 @@ directml-provider = ["ort/directml"]
 cuda-provider = ["ort/cuda"]
 # `rapidocr serve`（本地 Web 评估界面，docs/05）。
 #
-# 当前是**空 feature**：M0c 只落地服务端纯逻辑与骨架，`tiny_http` 由 M1 引入，
-# 并必须保持 `optional = true`。`serve` **不进 `default`**，因此默认构建的依赖图
-# 与发布内容不受影响（证据见 docs/06-local-web-demo-reports.md 的 cargo tree 对比）。
-serve = []
+# `serve` **不进 `default`**：默认构建的依赖图与发布内容不受影响
+# （证据见 docs/06-local-web-demo-reports.md 的 cargo tree 对比）。
+# M1 起它启用 `tiny_http`（`optional = true` + `dep:` 语法，因此它只可能出现在
+# 打开 `serve` 的构建里）；库依旧零 HTTP 依赖：`tiny_http` 只在
+# `src/bin/serve/*` 里被引用（`src/bin/serve/mod.rs` 的边界断言会扫描这一点）。
+serve = ["dep:tiny_http"]
 
 [lints.rust]
 # `ort` 链接的预编译原生库在 MSVC 下会偶发报告

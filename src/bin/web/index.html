@@ -1,0 +1,2100 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RapidOCR · 本地评估台</title>
+<!--
+  ── rapidocr serve 内联静态页（docs/05 §9 前端规范）──────────────────────────
+  · 服务端以 include_str! 读取本文件。占位符契约是**严格的**，实现方必须逐条满足：
+
+    (1) 全文**恰好**只有两种替换点，别无其它：
+          __CSP_NONCE__  ×4  →  本次启动随机 nonce。4 处分别是 GET / 响应头
+                                Content-Security-Policy 里的 nonce-<值>，以及本文件
+                                <style> ×1 与 <script> ×2 的 nonce 属性。
+          __SRV_TOKEN__  ×3  →  本次启动随机令牌（客户端经 X-RapidOCR-Token 头携带）。
+                                3 处分别是：script 里的 window.__RROCR__ 初始化、
+                                JS 顶部的环境判定注释、以及契约说明文字。
+        （本段说明文字自身也逐字写有这两个占位符名，属文档而非替换点，不计入上表；
+          服务端统计替换点时应按 nonce 属性 / 代码中的赋值点计数，不要用全文出现次数。
+          唯一允许的例外就是本注释块：它被替换后仍保留占位符字面量。）
+        两处替换值都必须断言**非空**（随机数生成失败 → 启动失败，不得下发空 nonce）。
+
+    (2) 替换完成后，服务端必须把整页**重新扫一遍**：正文里只要仍存在上述两个字面量
+        （即本注释块之外的任何一处），就立即报错退出（fail loudly），绝不允许把未注入
+        的页面发给浏览器。残留检查必须**精确匹配这两个字面量**，不得写成
+        "任意双下划线包裹的大写名"（如 /__[A-Z]+__/）这类模糊模式——本页还有 JS 全局名
+        window.__RROCR__，而 RROCR 恰好全大写，模糊模式会对已正确注入的页面误报。
+
+    (3) 响应头里的 nonce 必须与页面内每一个 nonce 属性**逐字节相同**：服务端在读取
+        本文件后，先把每个 nonce="…" 属性的值与待下发头部的值做**相等断言**，再开始
+        提供 GET /。一处不等价于 CSP 与文档不匹配，浏览器会**静默**拦掉全部脚本
+        （页面看起来"能打开但完全不动"），因此该断言不允许省略。
+
+    全文件只允许上述两种占位符写法，不得引入任何其它占位符形式（例如双花括号包裹的
+    变体、或同一名字的其它前后缀写法）。本注释内也不书写 script/style 标签字面量，
+    以免被"数标签"式的检查或工具误判为脚本块。
+
+    📌 本文件的最终归属是 `src/bin/web/index.html`（由 rapidocr serve 以 include_str!
+    内联）；`rapidocr serve` 落地时把本文件搬过去即可，**当前仍留在 Temp/ 下**。
+
+  · 零外部资源（§9.6）：图标为内联 SVG sprite，字体为系统字体栈；
+    无内联事件属性、无内联 style 属性（nonce CSP 不放行 style 属性，style 属性同样会被
+    拦掉），一切动态样式通过 CSSOM（element.style.*）或 class 切换完成。
+    缩放同理：显示尺寸由 JS 写入 element.style.width/height，标记里没有任何 style 属性。
+  · 占位符未被替换（直接以文件方式打开）时，自动进入"离线预览"演示模式，
+    界面与交互完整可用，数据为内置演示数据，页面顶部有常驻标识。
+-->
+<style nonce="__CSP_NONCE__">
+/* ============ 主题变量（黑白灰） ============ */
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#f2f2f0; --surface:#fafaf8; --fg:#141414; --fg2:#666668; --fg3:#9c9c9e;
+  --line:#dfdfdc; --shadow:0 12px 40px rgba(0,0,0,.10);
+}
+html[data-theme="dark"]{
+  --bg:#0e0e0e; --surface:#161616; --fg:#eaeae8; --fg2:#9a9a9c; --fg3:#5c5c5e;
+  --line:#242424; --shadow:0 12px 40px rgba(0,0,0,.5);
+}
+html{color-scheme:light}
+html[data-theme="dark"]{color-scheme:dark}
+*,*::before,*::after{transition:background-color .35s ease,border-color .35s ease,color .35s ease}
+body{
+  font-family:"Noto Sans SC","Source Han Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+  background:var(--bg);color:var(--fg);height:100vh;display:flex;flex-direction:column;
+  overflow:hidden;-webkit-font-smoothing:antialiased;
+}
+.mono{font-family:"JetBrains Mono","Cascadia Mono",Consolas,"Courier New",monospace}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:var(--line)}
+::-webkit-scrollbar-track{background:transparent}
+:focus-visible{outline:2px solid var(--fg);outline-offset:2px}
+button{font-family:inherit;color:inherit}
+[hidden]{display:none!important}
+
+/* View Transitions：主题切换圆形扩散 */
+::view-transition-old(root),::view-transition-new(root){animation:none;mix-blend-mode:normal}
+
+/* ============ 动画 ============ */
+@keyframes rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes scanMove{from{top:-2px}to{top:100%}}
+@keyframes toastIn{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
+@keyframes toastOut{to{opacity:0;transform:translateX(12px)}}
+@keyframes ind{from{margin-left:0}to{margin-left:70%}}
+@keyframes flashB{0%,100%{border-color:var(--line)}50%{border-color:var(--fg)}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+.spin{animation:spin .9s linear infinite}
+
+/* ============ 图标（内联 SVG sprite） ============ */
+.ic{width:1em;height:1em;display:inline-block;vertical-align:-0.14em;
+  fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+
+/* ============ 顶栏 ============ */
+header{height:58px;flex:none;border-bottom:1px solid var(--line);
+  display:flex;align-items:center;justify-content:space-between;padding:0 26px;
+  animation:rise .6s cubic-bezier(.22,1,.36,1) both}
+.brand{display:flex;align-items:center;gap:13px}
+.brand-mark{width:26px;height:26px;background:var(--fg);color:var(--bg);
+  display:grid;place-items:center;font-size:15px}
+.brand-name{font-family:"Noto Serif SC","Source Han Serif SC","Songti SC",SimSun,serif;
+  font-weight:700;font-size:16px;letter-spacing:.05em}
+.brand-en{font-family:"JetBrains Mono",Consolas,monospace;font-size:9.5px;
+  letter-spacing:.3em;color:var(--fg3);margin-top:2px}
+.head-right{display:flex;align-items:center;gap:16px}
+.engine-pill{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--fg2);
+  border:1px solid var(--line);padding:7px 13px}
+.engine-pill .ic{font-size:14px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--fg3);display:inline-block}
+.dot.ok{background:var(--fg);animation:blink 2.4s ease infinite}
+.head-sep{width:1px;height:20px;background:var(--line)}
+.icon-btn{width:36px;height:36px;border:1px solid var(--line);background:transparent;
+  color:var(--fg2);display:grid;place-items:center;cursor:pointer;position:relative;overflow:hidden}
+.icon-btn:hover{border-color:var(--fg2);color:var(--fg)}
+.icon-btn .ic{position:absolute;font-size:17px;transition:transform .5s cubic-bezier(.4,0,.2,1),opacity .25s}
+html[data-theme="light"] .icon-btn .i-moon{opacity:1;transform:none}
+html[data-theme="light"] .icon-btn .i-sun{opacity:0;transform:rotate(120deg) scale(.5)}
+html[data-theme="dark"] .icon-btn .i-moon{opacity:0;transform:rotate(-120deg) scale(.5)}
+html[data-theme="dark"] .icon-btn .i-sun{opacity:1;transform:none}
+
+/* ============ 演示条 / 模型横幅（流式，不遮挡焦点） ============ */
+.demo-strip{border-bottom:1px solid var(--line);padding:7px 26px;font-size:12px;
+  color:var(--fg2);display:flex;align-items:center;gap:8px}
+.demo-strip .ic{font-size:14px;flex:none}
+.banner{border-bottom:1px solid var(--line);padding:16px 26px}
+.banner.flash{animation:flashB .5s ease 2}
+.banner-main{display:flex;gap:16px;align-items:flex-start}
+.banner-ic{font-size:22px;color:var(--fg2);flex:none;margin-top:2px}
+.banner-info{flex:1;min-width:0}
+.banner-title{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 14px}
+.banner-title b{font-family:"Noto Serif SC","Songti SC",SimSun,serif;font-size:16px;font-weight:700}
+.banner-title span{font-size:12px;color:var(--fg2)}
+.banner-files{margin-top:10px;border-top:1px solid var(--line)}
+.bf-row{display:grid;grid-template-columns:auto 1fr auto auto;gap:4px 14px;align-items:baseline;
+  padding:7px 2px;border-bottom:1px solid var(--line);font-size:11.5px}
+.bf-state{border:1px solid var(--fg2);padding:1px 6px;font-size:10px;letter-spacing:.1em}
+.bf-state.bad{border-style:dashed}
+.bf-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)}
+.bf-role{color:var(--fg3)}
+.bf-size{color:var(--fg2)}
+.banner-note{font-size:11.5px;color:var(--fg3);margin-top:8px;line-height:1.7}
+.banner-act{flex:none;display:flex;flex-direction:column;align-items:flex-end;gap:8px}
+.banner-dl{margin-top:12px}
+/* 横幅内"按集合下载"按钮：禁用态用类而不是 disabled 属性——
+   真实服务端的 /api/models 里 source_url 可能不存在，缺 URL 时不能把按钮渲染成"可点"假象，
+   但禁用按钮又不会派发 click 事件，用户得不到解释。因此用 aria-disabled + 类 + 点击后 toast 说明。 */
+.btn-mini{height:auto;padding:8px 13px;font-size:11.5px;letter-spacing:.08em;flex:none}
+.banner-act .btn-mini{margin:0}
+.btn-mini[aria-disabled="true"]{opacity:.4;cursor:not-allowed;border-style:dashed}
+.dl-line{font-size:12px;color:var(--fg2);display:flex;justify-content:space-between;gap:16px;margin-bottom:8px}
+.dl-line b{font-weight:500;color:var(--fg)}
+.bar{height:2px;background:var(--line);position:relative;overflow:hidden}
+.bar i{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--fg);
+  transition:width .18s linear}
+.bar.ind i{width:30%!important;animation:ind 1.1s ease-in-out infinite alternate}
+
+/* ============ 通用按钮 ============ */
+.btn-primary{height:48px;border:none;background:var(--fg);color:var(--bg);cursor:pointer;
+  font-size:14px;font-weight:500;letter-spacing:.14em;padding:0 22px;
+  display:inline-flex;align-items:center;justify-content:center;gap:9px;
+  transition:transform .18s cubic-bezier(.22,1,.36,1),opacity .3s}
+.btn-primary:not(:disabled):hover{transform:translateY(-2px)}
+.btn-primary:disabled{opacity:.28;cursor:not-allowed}
+.btn-ghost{height:44px;border:1px solid var(--line);background:transparent;color:var(--fg2);
+  font-size:13px;letter-spacing:.1em;cursor:pointer;padding:0 18px;
+  display:inline-flex;align-items:center;gap:8px}
+.btn-ghost:hover:not(:disabled){border-color:var(--fg2);color:var(--fg)}
+.btn-ghost:disabled{opacity:.35;cursor:not-allowed}
+.text-btn{border:none;background:none;color:var(--fg3);font-size:12px;cursor:pointer;
+  display:inline-flex;align-items:center;gap:5px;padding:4px 6px}
+.text-btn:hover:not(:disabled){color:var(--fg)}
+.text-btn:disabled{opacity:.4;cursor:not-allowed}
+.text-btn .ic{font-size:13px}
+.sm{height:40px;font-size:12.5px;padding:0 16px}
+
+/* ============ 主体布局 ============ */
+main{flex:1;min-height:0;display:grid;grid-template-columns:minmax(400px,46fr) 54fr}
+.left{border-right:1px solid var(--line);display:flex;flex-direction:column;
+  gap:14px;padding:22px 24px;min-height:0;animation:rise .6s .08s cubic-bezier(.22,1,.36,1) both}
+.right{overflow-y:auto;padding:24px 32px 44px;min-height:0;
+  animation:rise .6s .16s cubic-bezier(.22,1,.36,1) both}
+.right-inner{max-width:720px}
+.sec-label{display:flex;align-items:center;gap:12px;font-size:11px;letter-spacing:.2em;
+  color:var(--fg2);font-weight:500;white-space:nowrap;min-width:0}
+.sec-label span{font-family:"JetBrains Mono",Consolas,monospace;font-size:9px;
+  letter-spacing:.26em;color:var(--fg3)}
+.sec-label::after{content:'';flex:1;height:1px;background:var(--line)}
+.gap{margin-top:30px}
+.panel-head{display:flex;align-items:center;gap:10px}
+.panel-head .sec-label{flex:1}
+
+/* ============ 左栏：输入 ============ */
+/* 缩放控件组（demo2 的 zoomOut/zoomLbl/zoomIn/zoomFit + 原始尺寸 1:1） */
+.zoom-group{display:flex;border:1px solid var(--line)}
+.zoom-group>*+*{border-left:1px solid var(--line)}
+.vt-btn{width:34px;height:32px;border:none;background:transparent;color:var(--fg3);
+  cursor:pointer;display:grid;place-items:center}
+.vt-btn.txt{font-family:"JetBrains Mono",Consolas,monospace;font-size:10.5px}
+.vt-btn:hover:not([aria-pressed="true"]){color:var(--fg)}
+.vt-btn[aria-pressed="true"]{background:var(--fg);color:var(--bg)}
+.vt-btn .ic{font-size:15px}
+.zoom-lbl{min-width:70px;padding:0 8px;display:grid;place-items:center;
+  font-family:"JetBrains Mono",Consolas,monospace;font-size:10.5px;color:var(--fg2);
+  font-variant-numeric:tabular-nums;white-space:nowrap}
+.drop{flex:1;min-height:0;position:relative;border:1px solid var(--line);cursor:pointer;
+  outline:none;overflow:hidden}
+.drop:hover,.drop:focus-visible{border-color:var(--fg3)}
+.drop.dragging{border-color:var(--fg);background:color-mix(in srgb,var(--fg) 4%,transparent)}
+.drop.no-click{cursor:default}
+.corner{position:absolute;width:15px;height:15px;border:0 solid var(--fg);
+  transition:all .35s cubic-bezier(.22,1,.36,1);z-index:2;pointer-events:none}
+.c-tl{top:-1px;left:-1px;border-top-width:1.5px;border-left-width:1.5px}
+.c-tr{top:-1px;right:-1px;border-top-width:1.5px;border-right-width:1.5px}
+.c-bl{bottom:-1px;left:-1px;border-bottom-width:1.5px;border-left-width:1.5px}
+.c-br{bottom:-1px;right:-1px;border-bottom-width:1.5px;border-right-width:1.5px}
+.drop:hover .corner,.drop.dragging .corner{width:20px;height:20px}
+.drop:hover .c-tl,.drop.dragging .c-tl{transform:translate(-5px,-5px)}
+.drop:hover .c-tr,.drop.dragging .c-tr{transform:translate(5px,-5px)}
+.drop:hover .c-bl,.drop.dragging .c-bl{transform:translate(-5px,5px)}
+.drop:hover .c-br,.drop.dragging .c-br{transform:translate(5px,5px)}
+.drop.has-image:hover .corner{transform:none}
+.empty-state{position:absolute;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:13px;text-align:center;padding:24px;pointer-events:none}
+.empty-state>.ic{font-size:44px;color:var(--fg3);transition:color .3s,transform .3s}
+.drop:hover .empty-state>.ic,.drop.dragging .empty-state>.ic{color:var(--fg);transform:translateY(-3px)}
+.drop.dragging .empty-state>.ic{transform:scale(1.1)}
+.empty-title{font-size:14.5px;font-weight:500;letter-spacing:.04em}
+.empty-sub{font-size:12.5px;color:var(--fg2)}
+.empty-sub kbd{font-family:"JetBrains Mono",Consolas,monospace;font-size:10.5px;
+  border:1px solid var(--line);padding:1px 5px;color:var(--fg2)}
+.empty-meta{font-family:"JetBrains Mono",Consolas,monospace;font-size:10px;
+  letter-spacing:.14em;color:var(--fg3);margin-top:5px}
+/* 预览 + 叠加画布 */
+/* 预览 + 叠加画布：stage 的像素尺寸 = 原图尺寸 × 当前缩放（由 JS 经 CSSOM 写入），
+   img 与 canvas 都以 100% 填满 stage → 叠框在任何缩放下都与图像严格对齐。
+   margin:auto 居中：内容小于容器时居中，大于容器时可正常滚动（不会被裁掉起始边）。
+   scrollbar-gutter:stable：滚动条槽位恒定保留，clientWidth/Height 不随是否溢出变化，
+   适应窗口（fitScale）的测量因此稳定，不会出现"适配后多出/少掉一条滚动条"的抖动。 */
+.stage-wrap{position:absolute;inset:16px;display:grid;overflow:auto;scrollbar-gutter:stable}
+.stage{position:relative;margin:auto;line-height:0}
+.stage img{display:block;width:100%;height:100%;animation:rise .4s cubic-bezier(.22,1,.36,1) both}
+.stage canvas{position:absolute;inset:0;cursor:crosshair}
+.scanline{position:absolute;left:0;right:0;top:-2px;height:1.5px;background:var(--fg);
+  opacity:0;pointer-events:none;z-index:2;
+  box-shadow:0 0 14px 1px color-mix(in srgb,var(--fg) 45%,transparent)}
+.stage.scanning .scanline{opacity:.9;animation:scanMove 2.6s cubic-bezier(.45,.05,.55,.95) infinite}
+/* 文件信息行 */
+.file-meta{display:flex;align-items:center;gap:9px;min-width:0;
+  font-family:"JetBrains Mono",Consolas,monospace;font-size:11.5px;color:var(--fg2)}
+.file-meta>.ic{font-size:14px;color:var(--fg3);flex:none}
+.file-meta .meta-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-meta .meta-text b{color:var(--fg);font-weight:500}
+/* 上传进度 / 任务行 */
+.prog{display:flex;flex-direction:column;gap:8px}
+.prog-row{display:flex;align-items:center;justify-content:space-between;gap:12px;
+  font-size:12.5px;color:var(--fg2)}
+.prog-row b{font-family:"JetBrains Mono",Consolas,monospace;font-weight:500;color:var(--fg)}
+.job-line{display:flex;align-items:center;justify-content:space-between;gap:12px;
+  border:1px solid var(--line);padding:10px 14px;font-size:12.5px;color:var(--fg2)}
+.job-line .jl-state{display:flex;align-items:center;gap:8px;min-width:0}
+.job-line .ic{font-size:14px;flex:none}
+.job-line b{color:var(--fg);font-weight:500}
+.actions{display:flex;align-items:center;gap:12px}
+.actions .btn-primary{flex:1}
+
+/* ============ 右上：引擎面板 ============ */
+.engine-panel{margin-top:14px}
+.eng-state{display:flex;align-items:center;gap:10px;font-size:15px;padding:13px 0 12px}
+.eng-state .ic{font-size:18px}
+.eng-state b{font-family:"Noto Serif SC","Songti SC",SimSun,serif;font-weight:700;letter-spacing:.04em}
+.eng-state .eng-note{font-family:"JetBrains Mono",Consolas,monospace;font-size:10.5px;
+  color:var(--fg3);letter-spacing:.08em;margin-left:4px}
+.eng-warn{font-size:12px;color:var(--fg2);line-height:1.8;border-left:2px solid var(--fg);
+  padding:2px 0 2px 12px;margin:2px 0 6px;display:flex;gap:8px;align-items:flex-start}
+.eng-warn .ic{font-size:14px;flex:none;margin-top:3px}
+.eng-kv{display:grid;grid-template-columns:repeat(3,1fr);gap:14px 20px;
+  border-top:1px solid var(--line);padding-top:14px}
+.eng-kv>div{min-width:0}
+.eng-kv dt{font-size:10px;letter-spacing:.14em;color:var(--fg3);margin-bottom:4px}
+.eng-kv dd{font-family:"JetBrains Mono",Consolas,monospace;font-size:12px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.eng-kv dd.warn-dd{font-weight:600;color:var(--fg)}
+.eng-kv dd.warn-dd .ic{font-size:13px}
+.eng-kv dd.ep-unknown{color:var(--fg3);border-bottom:1px dashed var(--line)}   /* 未知 ≠ 否：虚线标记，不只靠颜色 */
+.eng-retry{margin-top:14px}
+
+/* 队列就绪状态（docs/05 §8.1 双队列）：文本队列与公式队列**分别**给出结论。
+   公式缺失只影响公式队列，绝不呈现为"整页失败"；文字 + 图标 + 边框三重线索，不只靠颜色。 */
+.eng-q{display:flex;align-items:flex-start;gap:9px;margin-top:14px;
+  border-left:2px solid var(--line);padding:7px 0 7px 12px;font-size:12px;line-height:1.7}
+.eng-q .ic{font-size:14px;flex:none;margin-top:3px}
+.eng-q-txt{min-width:0;font-family:"JetBrains Mono",Consolas,monospace;font-size:11.5px}
+.eng-q-txt b{font-family:"Noto Sans SC","Microsoft YaHei",sans-serif;font-weight:600;
+  font-size:12px;letter-spacing:.04em}
+.eng-q-ok{border-left-style:solid;border-left-color:var(--fg)}
+.eng-q-warn{border-left-style:dashed;border-left-color:var(--fg)}      /* 警告=虚线，区分于实线就绪 */
+.eng-q-off{color:var(--fg2)}
+.eng-q-off .ic{color:var(--fg3)}
+
+/* 公式识别开关（docs/05 §10.8 公式路由默认关闭）。未选中状态下输入被禁用：
+   除颜色外，`.fx-cap` 用**虚线边框**标记不可用，并在行内给出缺失角色文字说明。 */
+.fx-row{display:flex;align-items:flex-start;gap:11px;margin-top:14px;
+  border:1px dashed var(--line);padding:11px 14px;cursor:pointer}
+.fx-row input{flex:none;width:15px;height:15px;margin-top:2px;accent-color:var(--fg);cursor:pointer}
+.fx-row.disabled{cursor:not-allowed}
+.fx-row.disabled input{cursor:not-allowed}
+.fx-txt{min-width:0;display:flex;flex-direction:column;gap:3px}
+.fx-txt b{font-size:12.5px;font-weight:600;letter-spacing:.04em}
+.fx-txt code{font-family:"JetBrains Mono",Consolas,monospace;font-size:11px;
+  border:1px dashed var(--line);padding:0 5px;color:var(--fg2)}
+.fx-cap{font-size:11.5px;color:var(--fg2);line-height:1.7}
+
+/* ============ 右中：区域列表 ============ */
+.region-list{margin-top:12px}
+.region-item{display:flex;gap:14px;width:100%;text-align:left;border:none;background:none;
+  border-left:3px solid transparent;border-bottom:1px solid var(--line);cursor:pointer;
+  padding:12px 10px 12px 12px;animation:rise .45s cubic-bezier(.22,1,.36,1) both}
+.region-item:first-child{border-top:1px solid var(--line)}
+.region-item:hover{background:color-mix(in srgb,var(--fg) 3%,transparent)}
+.region-item.sel{border-left-color:var(--fg);background:var(--surface)}
+.ri-idx{font-family:"JetBrains Mono",Consolas,monospace;font-size:11px;color:var(--fg3);
+  padding-top:2px;min-width:22px}
+.region-item.sel .ri-idx{background:var(--fg);color:var(--bg);padding:1px 4px}
+.ri-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:6px}
+.ri-line{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.tag{font-style:normal;font-size:10px;letter-spacing:.12em;border:1px solid var(--fg2);
+  padding:1px 6px;color:var(--fg2);flex:none}
+.tag-fx{border-style:dashed}
+.ri-text{font-size:14px;line-height:1.6;word-break:break-all}
+.ri-sub{font-family:"JetBrains Mono",Consolas,monospace;font-size:10.5px;color:var(--fg3)}
+.empty-inline{padding:52px 20px;text-align:center;color:var(--fg3);font-size:13px;line-height:2}
+.empty-inline .ic{font-size:36px;display:block;margin:0 auto 14px}
+
+/* 区域列表入场延迟（不用 style 属性，改用 nth-child） */
+.region-item:nth-child(1){animation-delay:.04s}
+.region-item:nth-child(2){animation-delay:.1s}
+.region-item:nth-child(3){animation-delay:.16s}
+.region-item:nth-child(4){animation-delay:.22s}
+.region-item:nth-child(5){animation-delay:.28s}
+.region-item:nth-child(6){animation-delay:.34s}
+.region-item:nth-child(7){animation-delay:.4s}
+.region-item:nth-child(8){animation-delay:.46s}
+.region-item:nth-child(n+9){animation-delay:.52s}
+
+/* ============ 右下：导出与诊断 ============ */
+.export-row{display:flex;gap:12px;margin-top:14px;flex-wrap:wrap}
+.export-row .btn-ghost{flex:1;min-width:120px}
+.diag{margin-top:22px;border:1px solid var(--line)}
+.diag summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;
+  padding:12px 16px;font-size:13px;color:var(--fg2);user-select:none}
+.diag summary::-webkit-details-marker{display:none}
+.diag summary:hover{color:var(--fg)}
+.diag summary .ic{font-size:15px}
+.diag .chev{margin-left:auto;transition:transform .3s}
+.diag[open] .chev{transform:rotate(180deg)}
+.diag-body{border-top:1px solid var(--line);padding:18px 18px 20px}
+.diag-sec{font-size:10.5px;letter-spacing:.18em;color:var(--fg3);margin:16px 0 10px}
+.diag-sec:first-child{margin-top:0}
+.diag-table{border-collapse:collapse;width:100%;font-size:12px}
+.diag-table td{border-bottom:1px solid var(--line);padding:7px 2px;color:var(--fg2)}
+.diag-table td:last-child{text-align:right;color:var(--fg)}
+.diag-table tr.total td{color:var(--fg);font-weight:600;border-bottom:none}
+.diag-line{font-family:"JetBrains Mono",Consolas,monospace;font-size:11.5px;
+  color:var(--fg2);line-height:1.9;word-break:break-all}
+.diag-note{font-size:11.5px;color:var(--fg3);line-height:1.9;margin-top:16px;
+  border-left:2px solid var(--line);padding-left:12px}
+.foot-note{font-family:"JetBrains Mono",Consolas,monospace;font-size:10px;
+  letter-spacing:.14em;color:var(--fg3);margin-top:30px}
+
+/* ============ Toast ============ */
+.toasts{position:fixed;right:20px;bottom:20px;display:flex;flex-direction:column;
+  gap:10px;z-index:80;max-width:min(360px,calc(100vw - 40px))}
+.toast{display:flex;align-items:flex-start;gap:10px;background:var(--surface);
+  border:1px solid var(--line);padding:12px 16px;font-size:13px;line-height:1.6;
+  box-shadow:var(--shadow);animation:toastIn .4s cubic-bezier(.22,1,.36,1) both}
+.toast .ic{font-size:15px;flex:none;margin-top:2px}
+.toast.out{animation:toastOut .35s ease forwards}
+
+/* ============ 响应式 ============ */
+@media (max-width:960px){
+  body{height:auto;overflow:auto}
+  main{grid-template-columns:1fr}
+  .left{border-right:none;border-bottom:1px solid var(--line)}
+  .drop{min-height:340px}
+  .eng-kv{grid-template-columns:repeat(2,1fr)}
+  .banner-main{flex-direction:column}
+  .banner-act{align-items:flex-start}
+}
+</style>
+<script nonce="__CSP_NONCE__">window.__RROCR__={token:"__SRV_TOKEN__"};</script>
+</head>
+<body>
+
+<!-- ============ 内联 SVG 图标（零外部资源） ============ -->
+<svg width="0" height="0" aria-hidden="true" focusable="false">
+  <symbol id="i-scan" viewBox="0 0 24 24"><path d="M4 8V6a2 2 0 0 1 2-2h2"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/><path d="M20 16v2a2 2 0 0 1-2 2h-2"/><path d="M8 20H6a2 2 0 0 1-2-2v-2"/><path d="M4 12h16"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/><path d="M7 9l5-5 5 5"/><path d="M12 4v12"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="M21 15.5l-4.5-4.5L7 20"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l5 5L20 7"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M3 12h1M20 12h1M12 3v1M12 20v1M5.6 5.6l.7.7M17.7 17.7l.7.7M18.4 5.6l-.7.7M6.3 17.7l-.7.7"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3c.13 0 .26 0 .39 0a7.5 7.5 0 0 0 7.92 12.44A9 9 0 1 1 12 3z"/></symbol>
+  <symbol id="i-cloud-off" viewBox="0 0 24 24"><path d="M3 3l18 18"/><path d="M6 17a4.5 4.5 0 0 1-.3-9A6 6 0 0 1 16.7 6.5c.22 0 .48.02.7.07"/><path d="M10.5 17H15"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.24 3.96L2.5 17.5a1.9 1.9 0 0 0 1.65 2.85h15.7a1.9 1.9 0 0 0 1.65-2.85L13.76 3.96a2 2 0 0 0-3.52 0z"/><path d="M12 9v4M12 17h.01"/></symbol>
+  <symbol id="i-loader" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v4h-4"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+  <symbol id="i-fit" viewBox="0 0 24 24"><path d="M4 8V6a2 2 0 0 1 2-2h2"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/><path d="M20 16v2a2 2 0 0 1-2 2h-2"/><path d="M8 20H6a2 2 0 0 1-2-2v-2"/><path d="M9 12h6"/></symbol>
+  <symbol id="i-zoom-in" viewBox="0 0 24 24"><circle cx="10" cy="10" r="7"/><path d="M21 21l-6-6"/><path d="M10 7v6M7 10h6"/></symbol>
+  <symbol id="i-zoom-out" viewBox="0 0 24 24"><circle cx="10" cy="10" r="7"/><path d="M21 21l-6-6"/><path d="M7 10h6"/></symbol>
+  <symbol id="i-clipboard" viewBox="0 0 24 24"><path d="M9 4H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-2"/><rect x="9" y="2" width="6" height="4" rx="1"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></symbol>
+</svg>
+
+<!-- ============ 顶栏 ============ -->
+<header>
+  <div class="brand">
+    <div class="brand-mark"><svg class="ic" aria-hidden="true" focusable="false"><use href="#i-scan"/></svg></div>
+    <div>
+      <div class="brand-name">RapidOCR · 本地评估台</div>
+      <div class="brand-en">LOCAL&nbsp;EVAL&nbsp;CONSOLE&nbsp;·&nbsp;LOOPBACK&nbsp;ONLY</div>
+    </div>
+  </div>
+  <div class="head-right">
+    <div class="engine-pill" id="enginePill" aria-live="polite"></div>
+    <div class="head-sep"></div>
+    <button class="icon-btn" id="themeBtn" aria-label="切换深浅色主题">
+      <svg class="ic i-moon" aria-hidden="true" focusable="false"><use href="#i-moon"/></svg>
+      <svg class="ic i-sun" aria-hidden="true" focusable="false"><use href="#i-sun"/></svg>
+    </button>
+  </div>
+</header>
+
+<!-- 离线预览标识（serve 注入令牌后不显示） -->
+<div class="demo-strip" id="demoStrip" hidden>
+  <svg class="ic" aria-hidden="true" focusable="false"><use href="#i-info"/></svg>
+  离线预览模式 — 本页未经 serve 注入令牌：界面与交互完整可用，数据为内置演示数据。
+</div>
+
+<!-- 模型状态横幅（缺失 / 损坏 / 下载进度，§9.2） -->
+<div class="banner" id="banner" role="region" aria-label="模型状态" hidden></div>
+
+<main>
+  <!-- ============ 左：输入图像 ============ -->
+  <section class="left" aria-label="输入图像">
+    <div class="panel-head">
+      <div class="sec-label">输入图像 <span>INPUT</span></div>
+      <!-- 缩放控件组（demo2 的 zoomOut/zoomLbl/zoomIn/zoomFit；1:1 即 demo3 原“原始尺寸”模式） -->
+      <div class="zoom-group" id="zoomGroup" role="group" aria-label="缩放与视图" hidden>
+        <button class="vt-btn" id="zoomOut" type="button" title="缩小（-）" aria-label="缩小">
+          <svg class="ic" aria-hidden="true" focusable="false"><use href="#i-zoom-out"/></svg>
+        </button>
+        <span class="zoom-lbl" id="zoomLbl" aria-live="polite" title="当前显示比例">100%</span>
+        <button class="vt-btn" id="zoomIn" type="button" title="放大（+）" aria-label="放大">
+          <svg class="ic" aria-hidden="true" focusable="false"><use href="#i-zoom-in"/></svg>
+        </button>
+        <button class="vt-btn" id="zoomFit" type="button" aria-pressed="true" title="适应窗口" aria-label="适应窗口">
+          <svg class="ic" aria-hidden="true" focusable="false"><use href="#i-fit"/></svg>
+        </button>
+        <button class="vt-btn txt" id="zoomActual" type="button" aria-pressed="false" title="原始尺寸 100%（0）" aria-label="原始尺寸（100%）">1:1</button>
+      </div>
+      <button class="text-btn" id="clearBtn" hidden title="移除图像">
+        <svg class="ic" aria-hidden="true" focusable="false"><use href="#i-x"/></svg>移除
+      </button>
+    </div>
+
+    <div class="drop" id="drop" tabindex="0" role="button" aria-label="拖入图像，或按 Enter 选择文件">
+      <span class="corner c-tl"></span><span class="corner c-tr"></span>
+      <span class="corner c-bl"></span><span class="corner c-br"></span>
+      <div class="empty-state" id="emptyState">
+        <svg class="ic" aria-hidden="true" focusable="false"><use href="#i-image"/></svg>
+        <div class="empty-title">拖拽图像至此处</div>
+        <div class="empty-sub">或点击选择文件 · 支持粘贴 <kbd>Ctrl</kbd> + <kbd>V</kbd></div>
+        <div class="empty-meta">IMAGE/*&nbsp;·&nbsp;识别全程在本机完成</div>
+      </div>
+      <div class="stage-wrap" id="stageWrap" hidden>
+        <div class="stage" id="stage">
+          <img id="view" alt="待识别图像预览">
+          <canvas id="overlay" aria-hidden="true"></canvas>
+          <div class="scanline"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="file-meta" id="fileMeta" hidden>
+      <svg class="ic" aria-hidden="true" focusable="false"><use href="#i-file"/></svg>
+      <span class="meta-text" id="metaText"></span>
+      <button class="text-btn" id="annotatedBtn" hidden title="下载叠加检测框的标注图">
+        <svg class="ic" aria-hidden="true" focusable="false"><use href="#i-download"/></svg>下载标注图
+      </button>
+    </div>
+
+    <!-- 上传进度：XHR upload.onprogress，取消上传 = xhr.abort()（§9.1） -->
+    <div class="prog" id="uploadProg" hidden>
+      <div class="prog-row">
+        <span>上传中 <b id="upPct">0%</b></span>
+        <button class="text-btn" id="abortUpBtn">
+          <svg class="ic" aria-hidden="true" focusable="false"><use href="#i-x"/></svg>取消上传
+        </button>
+      </div>
+      <div class="bar"><i id="upBar"></i></div>
+    </div>
+
+    <!-- 任务状态行：取消识别 = POST /api/jobs/{id}/cancel（与取消上传分开，§4.3） -->
+    <div class="job-line" id="jobLine" hidden aria-live="polite">
+      <span class="jl-state" id="jlText"></span>
+      <button class="text-btn" id="cancelJobBtn">取消识别</button>
+    </div>
+
+    <!-- 公式路由开关（§10.8 默认关闭）。禁用态由 renderFormulaToggle() 依据
+         modelsReadyFor('formula') 写入；disabled 时行内给出缺失角色文字说明，不只靠颜色。
+         放在提交按钮**之前**：公式模型未就绪时用户先看到原因，再看到按钮。 -->
+    <div class="fx-row" id="fxRow" hidden>
+      <input type="checkbox" id="fxToggle" aria-describedby="fxCap">
+      <span class="fx-txt">
+        <b>公式识别路由 <code>formula</code></b>
+        <span class="fx-cap" id="fxCap" aria-live="polite"></span>
+      </span>
+    </div>
+
+    <div class="actions">
+      <!-- 从剪贴板取图（demo2 的 pasteBtn）：与拖放/选择文件共用 handleFile 入口 -->
+      <button class="btn-ghost" id="pasteBtn" type="button" title="从剪贴板读取图像（等同 Ctrl+V）">
+        <svg class="ic" aria-hidden="true" focusable="false"><use href="#i-clipboard"/></svg>从剪贴板
+      </button>
+      <button class="btn-primary" id="ocrBtn" disabled>
+        <svg class="ic" aria-hidden="true" focusable="false" id="ocrIco"><use href="#i-scan"/></svg>
+        <span id="ocrLbl">等待图像输入</span>
+      </button>
+    </div>
+  </section>
+
+  <!-- ============ 右：状态 / 区域 / 导出诊断 ============ -->
+  <section class="right" aria-label="识别结果">
+    <div class="right-inner">
+      <div class="sec-label">引擎状态 <span>ENGINE</span></div>
+      <div class="engine-panel" id="enginePanel"></div>
+
+      <div class="sec-label gap">识别区域 <span>REGIONS&nbsp;·&nbsp;阅读顺序</span>
+        <button class="text-btn" id="copyAllBtn" disabled>
+          <svg class="ic" aria-hidden="true" focusable="false"><use href="#i-copy"/></svg>复制全文
+        </button>
+      </div>
+      <div class="region-list" id="regionList"></div>
+
+      <div class="sec-label gap">导出 <span>EXPORT</span></div>
+      <div class="export-row">
+        <button class="btn-ghost" id="expJson" disabled>JSON</button>
+        <button class="btn-ghost" id="expMd" disabled>Markdown</button>
+        <button class="btn-ghost" id="expHtml" disabled title="静态报告，不含脚本">HTML（静态）</button>
+      </div>
+
+      <details class="diag" id="diag">
+        <summary>
+          <svg class="ic" aria-hidden="true" focusable="false"><use href="#i-clock"/></svg>
+          诊断面板
+          <svg class="ic chev" aria-hidden="true" focusable="false"><use href="#i-chevron"/></svg>
+        </summary>
+        <div class="diag-body" id="diagBody"></div>
+      </details>
+
+      <p class="foot-note">RAPIDOCR&nbsp;SERVE&nbsp;·&nbsp;127.0.0.1&nbsp;·&nbsp;图像与模型不出本机</p>
+    </div>
+  </section>
+</main>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<input type="file" id="fileInput" accept="image/*" hidden>
+
+<script nonce="__CSP_NONCE__">
+(function(){
+'use strict';
+
+/* ================= 环境判定与常量 ================= */
+/* serve 启动时替换 __SRV_TOKEN__；若仍是占位符，说明页面未经 serve 注入 → 离线预览模式 */
+const INJ  = window.__RROCR__ || {};
+const TOKEN = INJ.token || '';
+const DEMO  = !TOKEN || TOKEN.indexOf('__') === 0;
+
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const ic = (n, cls) => `<svg class="ic ${cls||''}" aria-hidden="true" focusable="false"><use href="#i-${n}"/></svg>`;
+
+/* §11.1 错误码 → 用户可读文案 */
+const ERR_TEXT = {
+  unauthorized:'令牌校验失败，请通过 rapidocr serve --open 打开本页',
+  bad_origin:'Origin 校验失败（非本机来源）',
+  bad_host:'Host 校验失败（防 DNS rebinding）',
+  payload_too_large:'图像超出请求体上限（--max-body-mb）',
+  result_too_large:'结果序列化超出上限（--max-result-mb）',
+  busy:'队列已满（503 busy），请稍后重试',
+  models_missing:'模型文件缺失，请先在横幅中下载',
+  models_corrupt:'模型文件损坏，建议重新下载',
+  downloads_disabled:'服务未开启 --allow-download，无法下载模型',
+  insufficient_disk_space:'磁盘空间不足（507）',
+  unsupported_input:'无法解码该图像或超出像素上限（24 Mpx）',
+  job_not_finished:'识别尚未完成',
+  job_evicted:'结果已被淘汰（410），请重新识别',
+  not_cancellable:'推理进行中，当前版本不支持中断',
+  job_finished:'任务已结束，无法取消',
+  download_failed:'模型下载失败',
+  download_timeout:'模型下载超时',
+  internal:'服务内部错误'
+};
+
+const ROLE_ZH = {
+  detector:'检测', recognizer:'识别', classifier:'方向分类', dictionary:'字典',
+  tokenizer:'词表', formula_detector:'公式检测', formula_recognizer:'公式识别'
+};
+
+/* ================= 应用状态 ================= */
+const state = {
+  status:null,          /* 规范化后的 /api/status */
+  models:null,          /* 规范化后的 /api/models */
+  image:null,           /* {file,url,w,h} */
+  view:{ mode:'fit', scale:1 },   /* 显示缩放（唯一来源）：fit = 适应窗口，custom = 百分比 */
+  uploading:false,
+  xhr:null,             /* 当前上传 XHR（用于 abort） */
+  job:null,             /* {id,kind,queue,state,position,...} */
+  result:null,          /* {regions,plain,timings,raw} */
+  selected:-1,
+  dlActive:false,       /* 模型下载进行中（真实模式） */
+  dlSetId:null,         /* 正在下载的集合 id（决定哪个按钮禁用；绝不默认 sets[0]） */
+  dlJob:null,           /* 下载任务：{id, set_id, state, elapsed_ms, error} —— 与 OCR 任务同属 job 生命周期 */
+  formula:false,        /* 公式识别路由开关（§10.8 默认关闭） */
+  diag:[],              /* 协议/契约错误记录（渲染进诊断面板；同时 toast 一次） */
+  netFail:false         /* 真实模式：本地服务不可达 */
+};
+
+const demo = {           /* 离线预览模式的内部状态 */
+  phase:'boot',          /* boot → waitmodels → building → ready（公式模型不影响文本就绪） */
+  upAbort:false,
+  dlActive:false, dlPct:0, dlFile:'', dlSetId:null,
+  /* 文本模型集在离线预览里**已齐备**，公式集**不齐备** —— 这样"文本就绪 / 公式缺失"
+     这个关键区分在离线预览下直接可见（§10.8 公式路由默认关闭、M4 公式与普通 OCR 分离）。 */
+  textReady:true,
+  buildMs:1500
+};
+
+/* ================= 工具 ================= */
+function fmtBytes(b){
+  if(b == null) return '—';
+  if(b < 1024) return b + ' B';
+  const u = ['KB','MB','GB']; let i = -1;
+  do { b /= 1024; i++; } while(b >= 1024 && i < 2);
+  return b.toFixed(b >= 100 ? 0 : 1) + ' ' + u[i];
+}
+function hostOf(u){ try{ return new URL(u).host }catch{ return '' } }
+/* §7.5：/api/status 必须同时给出 requested / selected_ep / fallback_to_cpu。
+   字段缺失时必须能表达“未知”，不得用默认值冒充——fallback 的 null 与 false 语义不同。 */
+const firstText = (...vals) => {
+  for(const v of vals) if(v != null && String(v).trim() !== '') return String(v);
+  return null;                                   /* null = 未知 */
+};
+const firstBool = (...vals) => {
+  for(const v of vals){
+    if(typeof v === 'boolean') return v;
+    if(v === 'true') return true;
+    if(v === 'false') return false;
+  }
+  return null;                                   /* null = 未知（≠ false） */
+};
+function emptyStatus(engState){                   /* 规范化 status 的空壳：三字段均为未知 */
+  return { state: engState || 'unknown', requested:null, selected_ep:null, fallback:null,
+           ort:'—', fingerprint:null, memory:null, queues:null, limits:null };
+}
+function isTextField(el){                         /* 文本框聚焦时不得劫持按键 / 拦截粘贴（§9.4） */
+  if(!el || !el.tagName) return false;
+  const tag = el.tagName.toUpperCase();
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable === true;
+}
+function zhQueue(q){ return q === 'formula' ? '公式' : '文本'; }
+function jobActive(){ return !!(state.job && (state.job.state === 'queued' || state.job.state === 'running')); }
+
+/* ============ 队列就绪判定（docs/05 §8.1 双队列 / §10.8 公式路由默认关闭） ============
+  模型集的**就绪是按队列分别判定的**，不存在"任一集合不齐备就整页不可用"这种全局结论：
+    · text    → 只需普通 OCR 模型集齐备：detector + recognizer + dictionary；
+    · formula → 需要公式模型集齐备：formula_detector + formula_recognizer。
+  公式模型缺失（566 MB，默认不下载）绝不允许阻塞普通文本 OCR；反之亦然。
+  后端以 `files[].role` + `files[].state` 表达每个文件的状态（§5.4 / ModelSetStatus），
+  因此这里按**角色**取并集判定，而不是挑某一个集合 id —— 服务端将来拆/并集合都不影响。 */
+const QUEUE_ROLES = {
+  text:    ['detector', 'recognizer', 'dictionary'],
+  formula: ['formula_detector', 'formula_recognizer']
+};
+function modelFiles(){
+  const m = state.models;
+  if(!m || !Array.isArray(m.sets)) return null;         /* 尚未取到 /api/models */
+  if(m.error) return null;
+  return m.sets.flatMap(s => (s.files || []));
+}
+/* 返回 {ready, missing:[角色中文名], fatal:bool}。
+   fatal = 连模型清单都没有（请求失败 / 尚未返回）——此时才不允许提交任何队列。
+   损坏（corrupt）与缺失一样都是"不可用"，但文案必须区分（§5.2 损坏建议重新下载）。 */
+function modelsReadyFor(queue){
+  const files = modelFiles();
+  if(files === null) return { ready:false, missing:[], fatal:true };
+  const need = QUEUE_ROLES[queue] || QUEUE_ROLES.text;
+  const missing = [];
+  need.forEach(role => {
+    const f = files.find(x => x.role === role);
+    const zh = ROLE_ZH[role] || role;
+    if(!f) missing.push(zh);
+    else if(f.state === 'corrupt') missing.push(zh + '（损坏）');
+    else if(f.state !== 'present') missing.push(zh);
+  });
+  return { ready: missing.length === 0, missing, fatal:false };
+}
+
+function toast(msg, type, icon){
+  const el = document.createElement('div');
+  el.className = 'toast ' + (type || 'ok');
+  el.innerHTML = ic(icon || (type === 'err' ? 'alert' : 'check')) + `<span>${esc(msg)}</span>`;
+  $('toasts').appendChild(el);
+  setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 400); }, 3400);
+}
+function dismissToasts(){
+  [...$('toasts').children].forEach(t => { t.classList.add('out'); setTimeout(() => t.remove(), 350); });
+}
+function errText(e){
+  if(!e) return '请求失败';
+  if(e.aborted) return '已取消上传';
+  if(e.status === 0) return '无法连接本地服务，请确认 rapidocr serve 正在运行';
+  if(e.code && ERR_TEXT[e.code]) return ERR_TEXT[e.code];
+  return '请求失败' + (e.status ? `（HTTP ${e.status}）` : '');
+}
+function toastErr(e){ toast(errText(e), 'err'); }
+
+/* 保存附件（blob 下载，不经过 <a href>，因为 /api/* 均需令牌头） */
+function saveBlob(blob, name){
+  const a = document.createElement('a');
+  const u = URL.createObjectURL(blob);
+  a.href = u; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(u), 4000);
+}
+
+/* ================= API 层（XHR，统一携带令牌） ================= */
+function xhrSend(method, url, body, opts){
+  opts = opts || {};
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open(method, url, true);
+    x.setRequestHeader('X-RapidOCR-Token', TOKEN);
+    if(opts.contentType) x.setRequestHeader('Content-Type', opts.contentType);
+    else if(opts.octet)  x.setRequestHeader('Content-Type', 'application/octet-stream');
+    if(opts.onProgress) x.upload.onprogress = ev => {
+      if(ev.lengthComputable) opts.onProgress(ev.loaded / ev.total);
+    };
+    x.onload = () => {
+      let data = null;
+      try { data = JSON.parse(x.responseText); } catch{}
+      if(x.status >= 200 && x.status < 300) resolve(data);
+      else reject({ status:x.status, code:data && data.code, body:data });
+    };
+    x.onerror  = () => reject({ status:0 });
+    x.onabort  = () => reject({ aborted:true });
+    x.ontimeout = () => reject({ status:0 });
+    if(opts.getXhr) opts.getXhr(x);
+    x.send(body || null);
+  });
+}
+const apiJson = (m, p, b) => xhrSend(m, p, b);
+/* JSON 请求体：Content-Type 必须是 application/json（§4.2 契约），body 为已序列化字符串 */
+const apiSendJson = (m, p, obj) => xhrSend(m, p, JSON.stringify(obj), { contentType:'application/json' });
+function apiBlob(path){
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open('GET', path, true);
+    x.responseType = 'blob';
+    x.setRequestHeader('X-RapidOCR-Token', TOKEN);
+    x.onload = async () => {
+      if(x.status >= 200 && x.status < 300) return resolve(x.response);
+      let code = null, body = null;
+      try { body = JSON.parse(await x.response.text()); code = body.code; } catch{}
+      reject({ status:x.status, code, body });
+    };
+    x.onerror = () => reject({ status:0 });
+    x.send(null);
+  });
+}
+
+/* ================= 响应映射（**字段冻结**，不做别名兼容） =================
+  Rust 侧就是契约（src/api.rs）：
+    OcrOutput { schema_version, image, stages, regions: Vec<OcrRegion>, timings, engine }
+    OcrRegion { source, kind: "text"|"formula", polygon, detection, classification,
+                recognition: Option<RecognitionOutcome>, formula: Option<FormulaOutcome> }
+    Polygon   { points: [[f32;2]; 4] }   ← 恰好四点，原图像素坐标
+    RecognitionOutcome { text: String, score: f32, words }
+
+  因此这里**只接受** regions / kind / polygon.points / recognition.text /
+  recognition.score / formula 这几个名字。历史上为"容忍后端改名"而存在的
+  区域列表别名、多边形别名（box / coords / poly / 扁平四边形）、文本别名与分数别名
+  等回退分支已**全部删除**（详见本段下方 git 历史，本文件里不再保留任何别名标识符）：
+  字段改名必须在**页面可见地**失败，不允许被前端悄悄吞掉。
+  必需字段缺失或结构非法 → 记录 `响应字段缺失: <路径>`，toast + 诊断面板各出现一次。 */
+function pget(o, k){ return (o && typeof o === 'object') ? o[k] : undefined; }
+function checkFinite(v, path, errors){
+  if(typeof v !== 'number' || !Number.isFinite(v)){ errors.push(path); return null; }
+  return v;
+}
+/* RegionSource 是 Rust enum，serde 默认外部标签：Detected{..} → {"Detected":{"detector_index":n}}，
+   Input → {"Input":null}（单元变体序列化成 null）。因此"调用方声明区域"既能是 "Input" 字符串，
+   也能是 {Input:null} 对象 —— 两种都算 Input，其余一律按"检测出的区域"要求多边形。 */
+function isInputRegion(src){
+  if(src === 'Input') return true;
+  if(src && typeof src === 'object' && !Array.isArray(src))
+    return Object.prototype.hasOwnProperty.call(src, 'Input');
+  return false;
+}
+function parsePolygon(r, i, errors){
+  if(r == null || r.polygon === undefined || r.polygon === null){
+    /* Polygon 在 Rust 里是 Option：Input 区域允许没有多边形（调用方显式声明的区域就是多边形本身）；
+       检测出的区域没有多边形则无法叠框，必须如实报错而不是静默丢弃。 */
+    if(!isInputRegion(r && r.source)) errors.push(`regions[${i}].polygon`);
+    return null;
+  }
+  const pts = pget(r.polygon, 'points');
+  if(!Array.isArray(pts) || pts.length !== 4){      /* [[f32;2]; 4] —— 恰好四点 */
+    errors.push(`regions[${i}].polygon.points`);
+    return null;
+  }
+  const out = [];
+  for(let k = 0; k < 4; k++){
+    const p = pts[k];
+    if(!Array.isArray(p) || p.length !== 2){ errors.push(`regions[${i}].polygon.points[${k}]`); return null; }
+    const x = checkFinite(p[0], `regions[${i}].polygon.points[${k}][0]`, errors);
+    const y = checkFinite(p[1], `regions[${i}].polygon.points[${k}][1]`, errors);
+    if(x === null || y === null) return null;
+    out.push([x, y]);
+  }
+  return out;
+}
+function parseRecognition(r, i, errors){
+  const rec = r && r.recognition;
+  if(rec === undefined || rec === null){ errors.push(`regions[${i}].recognition`); return null; }
+  const text = pget(rec, 'text');
+  if(typeof text !== 'string') errors.push(`regions[${i}].recognition.text`);
+  const score = checkFinite(pget(rec, 'score'), `regions[${i}].recognition.score`, errors);
+  if(typeof text !== 'string' || score === null) return null;
+  return { text, score };
+}
+function parseFormula(r, i, errors){
+  const f = r && r.formula;
+  if(f === undefined || f === null){ errors.push(`regions[${i}].formula`); return null; }
+  const latex = pget(f, 'latex');
+  if(typeof latex !== 'string') errors.push(`regions[${i}].formula.latex`);
+  if(typeof latex !== 'string') return null;
+  return { latex: latex, model_id: pget(f, 'model_id') };
+}
+function normalizeResult(r){
+  const errors = [];
+  if(r === null || typeof r !== 'object' || Array.isArray(r)){
+    contractFail(['（响应体不是 JSON 对象）']);
+    return null;
+  }
+  if(!Array.isArray(r.regions)){
+    contractFail(['regions']);
+    return null;
+  }
+  const regions = r.regions.map((x, i) => {
+    if(x === null || typeof x !== 'object'){ errors.push(`regions[${i}]`); return null; }
+    const kind = pget(x, 'kind');
+    if(kind !== 'text' && kind !== 'formula') errors.push(`regions[${i}].kind`);
+    const polygon = parsePolygon(x, i, errors);
+    let text = '', conf = null, formula = null;
+    if(kind === 'formula'){
+      /* 公式区域**不携带** CTC 文本结果（RegionKind::Formula 语义，src/api.rs:460），
+         文本字段为空是正确行为，不是缺字段；真正必需的是 formula.latex。 */
+      formula = parseFormula(x, i, errors);
+      if(formula) text = formula.latex;
+    } else {
+      const rec = parseRecognition(x, i, errors);
+      if(rec){ text = rec.text; conf = rec.score; }
+    }
+    return (kind === 'text' || kind === 'formula')
+      ? { text, conf, polygon, kind, formula, order:i + 1 }
+      : null;
+  }).filter(Boolean);
+  if(errors.length){ contractFail(errors); return null; }
+  /* 诊断面板使用的其余字段（source / detection / classification 仅按需读取，
+     缺字段不影响结果渲染，因此不参与上面的必需字段校验） */
+  return {
+    regions,
+    plain: typeof r.plain_text === 'string'
+           ? r.plain_text
+           : regions.map(x => x.text).filter(s => s !== '').join('\n'),
+    timings: (r.timings && typeof r.timings === 'object') ? r.timings : {},
+    raw: r
+  };
+}
+/* 契约失败：**可见**（toast）+ **可查**（诊断面板），并明确点名出错的响应路径 */
+function contractFail(paths){
+  const list = paths.slice(0, 4);
+  const more = paths.length > list.length ? ` 等 ${paths.length} 处` : '';
+  state.diag = list.map(p => `响应字段缺失: ${p}`)
+    .concat(state.diag).slice(0, 12);
+  state.result = null;
+  renderDiag();
+  toast(`响应字段缺失: ${list.join('、')}${more} — 前端按冻结契约解析 /api/jobs/{id}/result，不做别名兼容`, 'err', 'alert');
+}
+function normalizeStatus(s){
+  const eng = s.engine || {}, prov = s.provider || {};
+  return {
+    state: eng.state || s.state || 'unknown',
+    requested:   firstText(prov.requested, s.requested_provider),      /* null = 未知 */
+    selected_ep: firstText(prov.selected_ep, s.selected_ep),           /* null = 未知 */
+    fallback:    firstBool(prov.fallback_to_cpu, s.fallback_to_cpu),   /* null = 未知 ≠ false */
+    ort: (s.ort && s.ort.version) || s.ort_version || '—',
+    fingerprint: (s.ort && s.ort.fingerprint) || s.ort_fingerprint || null,
+    memory: (s.memory && s.memory.peak_working_set_bytes) != null
+            ? s.memory.peak_working_set_bytes : s.peak_memory_bytes,
+    queues: s.queues || null,
+    limits: s.limits || null            /* §9.1 请求体上限：handleFile 的早期校验依赖该字段 */
+  };
+}
+function normalizeModels(m){
+  return {
+    source: m.source || 'default_table',
+    downloadsAllowed: !!m.downloads_allowed,
+    sets: (m.sets || []).map(s => ({
+      id: s.id, complete: !!s.complete, bytes: s.download_bytes_total,
+      files: (s.files || []).map(f => ({
+        name: f.name, role: f.role || '', state: f.state || 'missing',
+        size: f.size_bytes, url: f.source_url || '', sha: f.sha256 || ''
+      }))
+    }))
+  };
+}
+
+/* ================= 主题（View Transitions 圆形扩散） ================= */
+/* 初始主题：localStorage → 系统偏好；切换逻辑紧随其后，同属本文件唯一的 IIFE（此处不闭合） */
+const saved = localStorage.getItem('rrocr-theme');
+const t = saved || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+document.documentElement.dataset.theme = t;
+ $('themeBtn').addEventListener('click', e => {
+  const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+  const apply = () => {
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem('rrocr-theme', next);
+  };
+  const redraw = () => { if(state.result) drawOverlays(); };
+  if(!document.startViewTransition){ apply(); redraw(); return; }
+  const x = e.clientX || innerWidth - 40, y = e.clientY || 40;
+  const r = Math.hypot(Math.max(x, innerWidth - x), Math.max(y, innerHeight - y));
+  const vt = document.startViewTransition(apply);
+  vt.ready.then(() => {
+    document.documentElement.animate(
+      { clipPath:[`circle(0px at ${x}px ${y}px)`, `circle(${r}px at ${x}px ${y}px)`] },
+      { duration:600, easing:'cubic-bezier(.4,0,.2,1)', pseudoElement:'::view-transition-new(root)' }
+    );
+  });
+  vt.finished.then(redraw);
+});
+
+/* ================= 图像载入（createObjectURL + revoke，§9.3） ================= */
+const imgEl = $('view'), canvas = $('overlay'), stage = $('stage'), stageWrap = $('stageWrap'), drop = $('drop');
+const ctx = canvas.getContext('2d');
+
+function setImage(file){
+  if(!file || state.uploading) return false;
+  if(jobActive()){ toast('当前任务进行中，请等待完成后再更换图像', 'err', 'info'); return false; }
+  if(state.image) URL.revokeObjectURL(state.image.url);       /* 替换即释放 */
+  clearResult(false);
+  const url = URL.createObjectURL(file);
+  state.image = { file, url, w:0, h:0 };
+  imgEl.onerror = () => {                                     /* 文件头合法但无法解码 */
+    if(!state.image) return;
+    toast('无法解码该图像，请更换文件', 'err');
+    clearImage();
+  };
+  imgEl.onload = () => {
+    state.image.w = imgEl.naturalWidth;
+    state.image.h = imgEl.naturalHeight;
+    state.view = { mode:'fit', scale:1 };                     /* 新图先适应窗口（与既有行为一致） */
+    applyZoom();                                              /* 图像与叠加画布同时定尺寸并重绘 */
+    renderMeta(); renderButton();
+  };
+  imgEl.src = url;
+  $('emptyState').hidden = true;
+  $('stageWrap').hidden = false;
+  $('clearBtn').hidden = false;
+  $('zoomGroup').hidden = false;
+  $('fileMeta').hidden = false;
+  drop.classList.add('has-image');
+  return true;
+}
+function clearResult(resetList){
+  state.result = null; state.selected = -1; state.job = null;
+  scanOff(); renderJob(); drawOverlays();
+  ['copyAllBtn','expJson','expMd','expHtml'].forEach(id => $(id).disabled = true);
+  $('annotatedBtn').hidden = true;
+  if(resetList !== false){ renderRegions(); renderDiag(); }
+}
+function clearImage(){
+  if(state.uploading || jobActive()) return;
+  if(state.image) URL.revokeObjectURL(state.image.url);
+  state.image = null;
+  imgEl.onerror = null;
+  imgEl.removeAttribute('src');
+  clearResult();
+  stage.style.width = '';                       /* 撤销缩放尺寸（CSSOM，标记里无 style 属性） */
+  stage.style.height = '';
+  state.view = { mode:'fit', scale:1 };
+  $('emptyState').hidden = false;
+  $('stageWrap').hidden = true;
+  $('clearBtn').hidden = true;
+  $('zoomGroup').hidden = true;
+  $('fileMeta').hidden = true;
+  drop.classList.remove('has-image');
+  renderButton();
+}
+addEventListener('beforeunload', () => {           /* 离开页面释放 blob */
+  if(state.image) URL.revokeObjectURL(state.image.url);
+});
+
+/* ================= 叠加画布（devicePixelRatio + 原图坐标线性换算，§9.3） ================= */
+/* 画布与 stage 同尺寸（stage = 图像显示框），缩放放大后画布面积可能远超浏览器上限，
+   因此按面积上限压低采样率：叠框坐标系仍是 CSS 像素，缩放再大也与图像对齐，只是分辨率下降。 */
+const CANVAS_MAX_PX = 24e6;
+function layoutCanvas(){
+  const w = stage.clientWidth, h = stage.clientHeight;
+  if(!w || !h) return;
+  const q = Math.max(.1, Math.min(devicePixelRatio || 1, Math.sqrt(CANVAS_MAX_PX / (w * h))));
+  canvas.width  = Math.max(1, Math.round(w * q));  /* 像素尺寸 × 采样率 */
+  canvas.height = Math.max(1, Math.round(h * q));
+  canvas.style.width  = w + 'px';                  /* CSSOM 赋值，不受 CSP 限制 */
+  canvas.style.height = h + 'px';
+  ctx.setTransform(canvas.width / w, 0, 0, canvas.height / h, 0, 0);
+  drawOverlays();
+}
+function fgRGBA(a){
+  const c = getComputedStyle(document.documentElement).getPropertyValue('--fg').trim();
+  const n = parseInt(c.slice(1), 16);
+  return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`;
+}
+function drawOverlays(){
+  const w = stage.clientWidth, h = stage.clientHeight;
+  if(!w) return;
+  ctx.clearRect(0, 0, w, h);
+  if(!state.result || !state.image || !state.image.w) return;
+  const sx = w / state.image.w, sy = h / state.image.h;   /* 两轴分别换算：与 img 显示框严格一致 */
+  state.result.regions.forEach((r, i) => {
+    if(!r.polygon) return;
+    const pts = r.polygon.map(p => [p[0]*sx, p[1]*sy]);
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for(let k = 1; k < pts.length; k++) ctx.lineTo(pts[k][0], pts[k][1]);
+    ctx.closePath();
+    if(i === state.selected){
+      ctx.fillStyle = fgRGBA(.10); ctx.fill();
+      ctx.setLineDash([]); ctx.lineWidth = 2; ctx.strokeStyle = fgRGBA(.95);
+    } else {
+      ctx.setLineDash(r.kind === 'formula' ? [5,4] : []);   /* 公式虚线框（第二视觉线索） */
+      ctx.lineWidth = 1; ctx.strokeStyle = fgRGBA(.45);
+    }
+    ctx.stroke(); ctx.setLineDash([]);
+    if(i === state.selected){                      /* 选中：角点方块（不只靠颜色） */
+      ctx.fillStyle = fgRGBA(.95);
+      pts.forEach(p => ctx.fillRect(p[0]-2.5, p[1]-2.5, 5, 5));
+    }
+  });
+}
+/* stage 变化（缩放 / 换图）→ 重算画布；容器变化（窗口 resize）→ 适应模式重新适配、自定义缩放保持倍数 */
+new ResizeObserver(() => layoutCanvas()).observe(stage);
+new ResizeObserver(() => { if(state.image) applyZoom(); else layoutCanvas(); }).observe(stageWrap);
+
+/* 点击画布 → 命中区域 → 双向高亮 */
+canvas.addEventListener('click', e => {
+  if(!state.result || !state.image) return;
+  const r = canvas.getBoundingClientRect();
+  const px = (e.clientX - r.left) / r.width  * state.image.w;
+  const py = (e.clientY - r.top)  / r.height * state.image.h;
+  let hit = -1;
+  state.result.regions.forEach((g, i) => {
+    if(hit >= 0 || !g.polygon) return;
+    if(pointInPoly(px, py, g.polygon)) hit = i;
+  });
+  selectRegion(hit);                                /* -1 = 取消选中 */
+});
+function pointInPoly(x, y, p){
+  let inside = false;
+  for(let i = 0, j = p.length - 1; i < p.length; j = i++){
+    if((p[i][1] > y) !== (p[j][1] > y) &&
+       x < (p[j][0]-p[i][0])*(y-p[i][1])/(p[j][1]-p[i][1]) + p[i][0]) inside = !inside;
+  }
+  return inside;
+}
+function selectRegion(i){
+  state.selected = i;
+  const items = [...document.querySelectorAll('.region-item')];
+  items.forEach((el, idx) => {
+    el.classList.toggle('sel', idx === i);
+    el.setAttribute('aria-pressed', idx === i ? 'true' : 'false');
+  });
+  drawOverlays();
+  if(i >= 0 && items[i]) items[i].scrollIntoView({ block:'nearest', behavior:'smooth' });
+}
+
+/* ================= 输入事件（拖放 / 选择 / 粘贴 / 键盘，§9.4） ================= */
+let dragDepth = 0;
+drop.addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; drop.classList.add('dragging'); });
+drop.addEventListener('dragover',  e => e.preventDefault());
+drop.addEventListener('dragleave', () => { if(--dragDepth <= 0){ dragDepth = 0; drop.classList.remove('dragging'); } });
+drop.addEventListener('drop', e => {
+  e.preventDefault(); dragDepth = 0; drop.classList.remove('dragging');
+  const f = e.dataTransfer.files && e.dataTransfer.files[0];
+  if(f) handleFile(f);
+});
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop',     e => e.preventDefault());
+drop.addEventListener('click',   () => { if(!state.uploading) $('fileInput').click(); });
+drop.addEventListener('keydown', e => { if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); $('fileInput').click(); } });
+ $('fileInput').addEventListener('change', e => {
+  if(e.target.files[0]) handleFile(e.target.files[0]);
+  e.target.value = '';
+});
+document.addEventListener('paste', e => {          /* Ctrl+V 粘贴截图（demo2 的 paste 路径） */
+  if(isTextField(e.target)) return;                /* 文本框内粘贴不拦截 */
+  const items = e.clipboardData ? [...e.clipboardData.items] : [];
+  const item = items.find(i => i.type.startsWith('image/'));
+  if(!item) return toast('剪贴板中没有图像', 'err', 'info');   /* 明确提示，不静默失败 */
+  intakePaste(item.getAsFile(), 'key');
+});
+/* 从剪贴板取图按钮（navigator.clipboard.read；127.0.0.1 属安全上下文，需页面聚焦） */
+ $('pasteBtn').addEventListener('click', async () => {
+  if(!navigator.clipboard || !navigator.clipboard.read)
+    return toast('当前浏览器不支持读取剪贴板，请改用 Ctrl+V 粘贴', 'err', 'info');
+  try{
+    for(const it of await navigator.clipboard.read()){
+      const type = it.types.find(t => t.startsWith('image/'));
+      if(type) return intakePaste(await it.getType(type), 'button');
+    }
+    toast('剪贴板中没有图像', 'err', 'info');       /* 剪贴板为空 / 只有文本 */
+  }catch{
+    toast('无法读取剪贴板（需本页聚焦且已授权），请改用 Ctrl+V 粘贴', 'err', 'info');
+  }
+});
+/* 粘贴入口：与拖放 / 文件选择共用 handleFile → 校验、预览、上传进度、取消上传行为完全一致 */
+function intakePaste(f, from){
+  if(state.uploading) return toast('上传进行中，请等待完成后再粘贴', 'err', 'info');
+  if(handleFile(f)) toast(from === 'button' ? '已从剪贴板载入图像' : '已粘贴剪贴板图像', 'ok', 'image');
+}
+ $('clearBtn').addEventListener('click', clearImage);
+/* Esc：关闭高亮与提示（§9.4）；+ / - / 0 缩放（文本框内、带修饰键时不劫持，保留浏览器快捷键） */
+document.addEventListener('keydown', e => {
+  if(e.key === 'Escape'){ selectRegion(-1); dismissToasts(); return; }
+  if(!state.image || e.ctrlKey || e.metaKey || e.altKey || isTextField(e.target)) return;
+  if(e.key === '+' || e.key === '='){ e.preventDefault(); zoomBy(ZOOM_STEP); }
+  else if(e.key === '-' || e.key === '_'){ e.preventDefault(); zoomBy(1 / ZOOM_STEP); }
+  else if(e.key === '0'){ e.preventDefault(); setZoom(1, 'custom'); }
+});
+
+/* 统一的文件入口：拖放 / 文件选择 / 粘贴都走这里；返回是否真的载入成功（供粘贴提示） */
+function handleFile(f){
+  if(!f) return false;
+  if(!f.type.startsWith('image/')){ toast('仅支持图像文件', 'err'); return false; }
+  const max = state.status && state.status.limits && state.status.limits.max_body_bytes;
+  if(max && f.size > max){
+    toast(`图像 ${fmtBytes(f.size)} 超出请求体上限 ${fmtBytes(max)}`, 'err');
+    return false;
+  }
+  return setImage(f);
+}
+
+/* ================= 缩放 / 适应窗口（demo2 的 zoomOut/zoomLbl/zoomIn/zoomFit，§9.3） ================= */
+/* 显示尺寸只有一个来源：state.view.mode/scale。stage 的像素尺寸 = 原图尺寸 × scale，
+   img 与 canvas 都以 100% 填满 stage → 图像与叠加层永远一起缩放、严格对齐；
+   尺寸经 CSSOM（element.style.width/height）写入，标记里没有任何 style 属性（nonce CSP）。 */
+const ZOOM_MAX = 4;                  /* 相对原图的最大放大倍数 */
+const ZOOM_STEP = 1.25;              /* 与 demo2 相同：放大 ×1.25，缩小 ÷1.25 */
+function fitScale(){
+  const i = state.image;
+  if(!i || !i.w || !i.h) return 1;
+  const cw = stageWrap.clientWidth, ch = stageWrap.clientHeight;
+  if(!cw || !ch) return state.view.scale || 1;     /* 容器尚未布局：保持现值，不写入垃圾缩放 */
+  return Math.min(1, cw / i.w, ch / i.h);          /* 与既有「适应窗口」一致：不放大超过原始尺寸 */
+}
+function applyZoom(){
+  const i = state.image;
+  if(!i || !i.w || !i.h) return;
+  if(state.view.mode === 'fit') state.view.scale = fitScale();
+  stage.style.width  = Math.max(1, Math.round(i.w * state.view.scale)) + 'px';
+  stage.style.height = Math.max(1, Math.round(i.h * state.view.scale)) + 'px';
+  updateZoomUI();
+  layoutCanvas();                                  /* 画布随 stage 同步尺寸并重绘叠框 */
+}
+function setZoom(scale, mode){
+  const lo = fitScale() / 4;                       /* 下限：适应比例的 1/4，避免超大图被压到不可读 */
+  state.view = { mode: mode || 'custom', scale: Math.min(Math.max(scale, lo), ZOOM_MAX) };
+  applyZoom();
+}
+function zoomBy(f){ setZoom(state.view.scale * f); }
+function updateZoomUI(){
+  const i = state.image; if(!i) return;
+  const pct = Math.round(state.view.scale * 100);
+  const lbl = $('zoomLbl');
+  lbl.textContent = (state.view.mode === 'fit' ? '适应 · ' : '') + pct + '%';
+  lbl.title = `显示 ${Math.round(i.w * state.view.scale)}×${Math.round(i.h * state.view.scale)} px · ` +
+              `原图 ${i.w}×${i.h} px`;
+  $('zoomFit').setAttribute('aria-pressed', state.view.mode === 'fit' ? 'true' : 'false');
+  $('zoomActual').setAttribute('aria-pressed',
+    state.view.mode === 'custom' && pct === 100 ? 'true' : 'false');
+}
+ $('zoomIn').addEventListener('click', () => zoomBy(ZOOM_STEP));
+ $('zoomOut').addEventListener('click', () => zoomBy(1 / ZOOM_STEP));
+ $('zoomFit').addEventListener('click', () => setZoom(1, 'fit'));       /* 具体倍数由 fitScale() 决定 */
+ $('zoomActual').addEventListener('click', () => setZoom(1, 'custom')); /* demo3 原「原始尺寸」模式 */
+
+/* ================= 渲染：顶栏状态点 / 引擎面板 ================= */
+const ENG_MAP = {
+  loading:       ['loader','引擎加载中','load'],
+  ready:         ['ok','引擎就绪','ok'],
+  rebuilding:    ['refresh','引擎重建中','load'],
+  failed:        ['alert','引擎不可用','fail'],
+  waiting_models:['cloud-off','等待模型就绪','warn'],
+  /* 服务端（src/bin/serve/state.rs 的 EngineState）在模型不齐备时报的是
+     blocked_models_missing（docs/05 §7.6 的枚举名）；离线预览模式报 waiting_models。
+     两者是同一件事，展示必须一致，否则真实模式下会退化成"状态未知"。 */
+  blocked_models_missing:['cloud-off','等待模型就绪','warn'],
+  unknown:       ['info','状态未知','dim']
+};
+function engIcon(icn){
+  if(icn === 'ok') return '<span class="dot ok"></span>';
+  return ic(icn, (icn === 'loader' || icn === 'refresh') ? 'spin' : '');
+}
+function renderPill(){
+  const s = state.status || emptyStatus('loading');
+  const m = ENG_MAP[s.state] || ENG_MAP.unknown;
+  const label = state.netFail ? '服务未连接' : m[1];
+  $('enginePill').innerHTML = (state.netFail ? ic('alert') : engIcon(m[0])) + `<span>${label}</span>`;
+}
+/* §7.5：requested / selected_ep / fallback_to_cpu 三字段必须成组、分别出现。
+   字段缺失（旧响应、演示数据不全、服务不可达）时显式渲染「未知」，
+   不得留空、不得崩溃，更不得用 false 冒充缺失（false 只表示"明确未回退"）。 */
+const EP_UNKNOWN = '— · 未知';
+function epDd(id, v, what){
+  return v == null
+    ? `<dd id="${id}" class="ep-unknown" title="响应未提供 ${what} 字段（旧版服务 / 演示数据缺失）">${EP_UNKNOWN}</dd>`
+    : `<dd id="${id}">${esc(v)}</dd>`;
+}
+function epDl(s, extra){
+  const fb = s.fallback;
+  const fbCell =
+    fb === true  ? `<dd id="epFallback" class="warn-dd" title="请求的 provider 不可用，实际在 CPU 上执行">${ic('alert')} 是 · 已回退 CPU</dd>` :
+    fb === false ? '<dd id="epFallback" title="实际使用的 EP 与请求一致">否 · 未回退</dd>' :
+                   `<dd id="epFallback" class="ep-unknown" title="响应未提供 fallback_to_cpu 字段（旧版服务 / 演示数据缺失）">${EP_UNKNOWN}</dd>`;
+  return `<dl class="eng-kv">
+      <div><dt>REQUESTED</dt>${epDd('epRequested', s.requested, 'requested')}</div>
+      <div><dt>SELECTED_EP</dt>${epDd('epSelected', s.selected_ep, 'selected_ep')}</div>
+      <div><dt>FALLBACK_TO_CPU</dt>${fbCell}</div>${extra || ''}
+    </dl>`;
+}
+/* 队列就绪行：把"文本就绪 / 公式缺失"与"文本缺失"明确区分开。
+   公式集合缺失**只写成公式队列不可用**，绝不呈现为整页失败（§10.8 公式路由默认关闭）。 */
+function queueReadyHtml(){
+  const t = modelsReadyFor('text'), f = modelsReadyFor('formula');
+  if(t.fatal) return `<div class="eng-q eng-q-warn" id="qReady">
+      ${ic('alert')}<span class="eng-q-txt"><b>模型状态未知</b><br>尚未取得 /api/models 的模型集状态，无法判断任何队列是否可提交。</span></div>`;
+  const textCell = t.ready
+    ? '<b>文本队列 · 就绪</b><br>detector + recognizer + dictionary 齐备 → POST /api/ocr 可提交。'
+    : `<b>文本队列 · 不可用</b><br>缺少 ${esc(t.missing.join('、'))} → POST /api/ocr 会被服务端以 409 models_missing 拒绝。`;
+  const fxCell = f.ready
+    ? '<b>公式队列 · 就绪</b><br>公式模型集齐备，可在左侧开启公式识别路由。'
+    : `<b>公式队列 · 不可用（不影响普通 OCR）</b><br>缺少 ${esc(f.missing.join('、') || '公式模型')}；公式路由默认关闭（§10.8），普通文本 OCR 照常可用。`;
+  return `<div class="eng-q ${t.ready ? 'eng-q-ok' : 'eng-q-warn'}" id="qReady">
+      ${ic(t.ready ? 'check' : 'alert')}<span class="eng-q-txt">${textCell}</span></div>
+    <div class="eng-q eng-q-off ${f.ready ? 'eng-q-ok' : ''}" id="qReadyFormula">
+      ${ic(f.ready ? 'check' : 'info')}<span class="eng-q-txt">${fxCell}</span></div>`;
+}
+function renderEngine(){
+  const s = state.status, ep = $('enginePanel');
+  if(!s){
+    ep.innerHTML = '<div class="eng-state">' + ic('loader','spin') + '<b>正在连接本地服务…</b></div>' +
+                   epDl(emptyStatus('loading'));
+    return;
+  }
+  if(state.netFail){
+    ep.innerHTML =
+      '<div class="eng-state">' + ic('alert') + '<b>无法连接本地服务</b></div>' +
+      '<p class="eng-warn">' + ic('info') + '确认 rapidocr serve 正在运行（默认 127.0.0.1:8760），且本页由 serve --open 打开。</p>' +
+      epDl(s) +                                     /* 服务不可达：三字段如实显示为未知 */
+      '<div class="eng-retry"><button class="btn-ghost sm" id="retryStatus">' + ic('refresh') + '重试连接</button></div>';
+    return;
+  }
+  const m = ENG_MAP[s.state] || ENG_MAP.unknown;
+  const qs = s.queues;
+  const queueTxt = qs && qs.text
+    ? `${qs.text.used != null ? qs.text.used : '—'}/${qs.text.capacity != null ? qs.text.capacity : '—'} · ` +
+      `${qs.formula && qs.formula.used != null ? qs.formula.used : '—'}/${qs.formula && qs.formula.capacity != null ? qs.formula.capacity : '—'}`
+    : '—';
+  const tq = modelsReadyFor('text');
+  /* §7.6：引擎状态与模型状态是两件事。若服务端报模型不齐备（blocked_models_missing）
+     或离线预览报 waiting_models，而文本集合其实齐备（只差公式），这里必须改写成
+     "部分模型集不齐备"，不得让公式缺口看起来像全局失败。 */
+  const waiting = s.state === 'waiting_models' || s.state === 'blocked_models_missing';
+  const head = (tq.ready && waiting)
+    ? { icn:'info', txt:'引擎就绪（仅部分模型集不齐备）' }
+    : { icn:m[0], txt:m[1] };
+  ep.innerHTML =
+    `<div class="eng-state">${engIcon(head.icn)}<b>${head.txt}</b>` +
+    (DEMO && s.state === 'ready' ? `<span class="eng-note">ENGINE&nbsp;BUILD&nbsp;${(demo.buildMs/1000).toFixed(1)}S</span>` : '') +
+    `</div>` +
+    (s.fallback === true
+      ? `<p class="eng-warn">${ic('alert')}<span>已回退至 CPU 执行 — 仅表示请求的 provider 不可用，<b>不代表性能结论</b>；请以本页任务的实测耗时为准。</span></p>`
+      : '') +
+    queueReadyHtml() +
+    epDl(s,
+      `<div><dt>ORT&nbsp;RUNTIME</dt><dd>${esc(s.ort)}</dd></div>` +
+      `<div><dt>峰值内存</dt><dd>${s.memory != null ? fmtBytes(s.memory) : '—'}</dd></div>` +
+      `<div><dt>队列（文/式）</dt><dd>${queueTxt}</dd></div>`);
+}
+ $('enginePanel').addEventListener('click', e => {
+  if(e.target.closest('#retryStatus')) statusOnce();
+});
+
+/* ================= 渲染：模型横幅（§9.2） =================
+  每一个"不齐备"的模型集**各自**拥有一个下载按钮，按钮携带该集合的 id
+  （data-set-id），点击时把这份 id 原样送进 POST /api/models/download 的请求体。
+  页面上不存在"全局下载按钮"，因此不存在"默认下 sets[0]"这种语义歧义。 */
+function renderBanner(){
+  const box = $('banner');
+  const m = state.models;
+  if(m && m.error){
+    box.hidden = false;
+    box.innerHTML = `<div class="banner-main"><span class="banner-ic">${ic('alert')}</span>
+      <div class="banner-info"><div class="banner-title"><b>模型状态获取失败</b><span>${esc(errText(m.error))}</span></div></div>
+      <div class="banner-act"><button class="btn-ghost sm" id="retryModels">${ic('refresh')}重试</button></div></div>`;
+    return;
+  }
+  if(!m || !m.sets){ box.hidden = true; return; }
+  const bad = m.sets.filter(s => !s.complete);
+  if(!bad.length){ box.hidden = true; return; }
+  box.hidden = false;
+  let html = '';
+  bad.forEach(set => {
+    const pend = set.files.filter(f => f.state !== 'present');
+    const corrupt = pend.some(f => f.state === 'corrupt');
+    const hosts = [...new Set(pend.map(f => hostOf(f.url)).filter(Boolean))].join(' / ') || '—';
+    const busy = state.dlSetId === set.id;
+    const hasUrl = pend.length > 0 && pend.every(f => !!f.url);
+    let act;
+    if(busy){
+      act = `<button class="btn-primary sm" disabled>${ic('loader','spin')}下载中…</button>`;
+    } else {
+      /* 不可下载的两种理由分别给出文字说明，按钮仍可点击以便解释（按钮用 aria-disabled，
+         不用 disabled 属性——disabled 按钮不派发 click，用户点不出任何解释）。 */
+      const why = !hasUrl ? '该集合有文件缺少 source_url，服务端无法构造下载请求'
+              : !m.downloadsAllowed ? '服务未以 --allow-download 启动，请重启服务并添加该参数'
+              : '';
+      act = `<button class="btn-primary sm btn-mini" data-set-id="${esc(set.id)}"
+               aria-disabled="${why ? 'true' : 'false'}"
+               title="${why ? esc(why) : '仅下载「' + esc(set.id) + '」这一个集合'}">
+               ${ic('download')}下载「${esc(set.id)}」· ${fmtBytes(set.bytes)}</button>` +
+            (why ? `<p class="banner-note">${esc(why)}</p>` : '');
+    }
+    html += `<div class="banner-main">
+      <span class="banner-ic">${ic(corrupt ? 'alert' : 'cloud-off')}</span>
+      <div class="banner-info">
+        <div class="banner-title">
+          <b>${corrupt ? '模型文件损坏 / 缺失' : '模型文件缺失'}</b>
+          <span>${esc(set.id)} · ${pend.length} 个文件待获取 · 共 ${fmtBytes(set.bytes)} · 来源 ${esc(hosts)} · ${esc(m.source)}</span>
+        </div>
+        <div class="banner-files">${pend.map(f => `
+          <div class="bf-row">
+            <span class="bf-state ${f.state === 'corrupt' ? 'bad' : ''}">${f.state === 'corrupt' ? '损坏' : '缺失'}</span>
+            <span class="bf-name" title="${esc(f.name)}${f.sha ? '\nsha256 ' + esc(f.sha) : ''}">${esc(f.name)}</span>
+            <span class="bf-role">${ROLE_ZH[f.role] || f.role}</span>
+            <span class="bf-size">${fmtBytes(f.size)}</span>
+          </div>`).join('')}
+        </div>
+        ${corrupt ? `<p class="banner-note">损坏文件的哈希校验未通过，建议重新下载；下载完成并通过校验后将以原子方式替换原文件。</p>` : ''}
+      </div>
+      <div class="banner-act">${act}</div>
+    </div>`;
+  });
+  /* 下载进度：两种模式都来自同一个 job 生命周期（§4.2 kind="model_download"）。
+     真实模式逐秒轮询 GET /api/jobs/{id} 并显示其 state；演示模式给出实测百分比。 */
+  if(state.dlJob){
+    const st = state.dlJob.state || 'queued';
+    const el = state.dlJob.elapsed_ms != null ? ` · ${(state.dlJob.elapsed_ms / 1000).toFixed(1)}s` : '';
+    html += `<div class="banner-dl">
+      <div class="dl-line"><span>${ic('package')} 下载任务 <b>${esc(state.dlJob.id)}</b> · 集合「${esc(state.dlJob.set_id)}」· 状态 <b>${esc(modelJobZh(st))}</b>${el}（逐文件下载，完成后自动校验 SHA-256）</span><b>…</b></div>
+      <div class="bar ind"><i></i></div>
+      <div class="dl-line"><span>取消下载 = POST /api/jobs/{id}/cancel，与取消识别同一套 job 语义</span>
+      <button class="btn-ghost sm" id="dlCancelBtn">${ic('x')}取消下载</button></div></div>`;
+  } else if(demo.dlActive){
+    html += `<div class="banner-dl">
+      <div class="dl-line"><span>${ic('package')} 正在下载 ${esc(demo.dlFile)} · 逐文件下载，完成后自动校验 SHA-256</span><b>${demo.dlPct.toFixed(0)}%</b></div>
+      <div class="bar"><i id="dlBar"></i></div></div>`;
+  }
+  box.innerHTML = html;
+  const bar = $('dlBar');
+  if(bar) bar.style.width = demo.dlPct + '%';      /* CSSOM，无需内联 style 属性 */
+}
+function modelJobZh(st){
+  return { queued:'排队中', running:'下载中', succeeded:'已完成', failed:'失败', cancelled:'已取消' }[st] || st;
+}
+ $('banner').addEventListener('click', e => {
+  const retry = e.target.closest('#retryModels');
+  if(retry) return refreshModels();
+  const cancel = e.target.closest('#dlCancelBtn');
+  if(cancel) return cancelDownload();
+  const dl = e.target.closest('[data-set-id]');
+  if(!dl) return;
+  /* aria-disabled 的按钮仍然可点：这一次点击只用来解释"为什么不能下" */
+  if(dl.getAttribute('aria-disabled') === 'true')
+    return toast(dl.title || '当前不可下载该模型集', 'err', 'cloud-off');
+  startDownload(dl.dataset.setId);
+});
+function flashBanner(){
+  const b = $('banner');
+  b.scrollIntoView({ block:'nearest', behavior:'smooth' });
+  b.classList.remove('flash'); void b.offsetWidth; b.classList.add('flash');
+}
+
+/* ================= 模型下载（POST /api/models/download + job 生命周期，§4.2/§6） =================
+  请求契约（docs/05 §4.2 + §7.2）：POST /api/models/download
+    Content-Type: application/json，请求体 {"set_id": "<被点击集合的 id>"}
+  §7.2 明确"请求体不得携带 URL"（防 SSRF），因此请求体里**只有** set_id。
+  返回 {job_id, queue, state} —— 下载就是 kind="model_download" 的普通 job：
+    · 进度/状态：GET  /api/jobs/{id}
+    · 取消：      POST /api/jobs/{id}/cancel
+  页面里**不存在**第二套下载取消端点：下载任务只能经由上面这套统一 job 语义取消。
+  （历史实现曾自行发明一个 models 下的"下载取消"端点——把 /cancel 直接挂在模型下载路径上，
+  与 docs/05 §4.2 的端点表不符，已彻底删除；本文件内不存在该路径的任何字面量。） */
+function startDownload(setId){
+  if(demo.dlActive || state.dlJob) return;
+  /* 缺失/空 set_id 一律**本地拒绝**，绝不发一个没有 set_id 的请求（那等于让服务端去猜集合） */
+  const id = (setId == null) ? '' : String(setId).trim();
+  if(!id){
+    const msg = '未指定模型集 set_id，已本地拒绝该下载请求（不发送缺 set_id 的请求）';
+    state.diag = [msg].concat(state.diag).slice(0, 12);
+    renderDiag(); flashBanner();
+    return toast(msg, 'err', 'cloud-off');
+  }
+  if(DEMO) return demoDownload(id);
+  const set = state.models && state.models.sets ? state.models.sets.find(s => s.id === id) : null;
+  if(!set){
+    const msg = `模型集 ${id} 不在 /api/models 的 sets 中，已本地拒绝该下载请求`;
+    state.diag = [msg].concat(state.diag).slice(0, 12);
+    renderDiag();
+    return toast(msg, 'err', 'cloud-off');
+  }
+  state.dlSetId = id;
+  state.dlJob = { id:null, set_id:id, state:'queued', elapsed_ms:0 };
+  renderBanner();
+  apiSendJson('POST', '/api/models/download', { set_id:id })
+    .then(d => {
+      const jobId = d && d.job_id;
+      if(!jobId){
+        throw { code:'internal', message:'响应未返回 job_id（下载任务必须可轮询、可取消）' };
+      }
+      state.dlJob.id = jobId;
+      if(d.state) state.dlJob.state = d.state;
+      toast(`模型集「${id}」下载任务已启动 · job ${jobId}`, 'ok', 'package');
+      renderBanner();
+      pollDownloadJob();
+    })
+    .catch(e => {
+      state.dlJob = null; state.dlSetId = null;
+      renderBanner();
+      toastErr(e);
+    });
+}
+let dlPollTimer = null;
+function pollDownloadJob(){
+  clearTimeout(dlPollTimer);
+  const j = state.dlJob;
+  if(!j || !j.id) return;
+  const tick = async () => {
+    if(!state.dlJob || state.dlJob.id !== j.id) return;
+    try{
+      const d = await apiJson('GET', '/api/jobs/' + j.id);
+      Object.assign(j, d);
+      renderBanner();
+      if(j.state === 'queued' || j.state === 'running'){
+        dlPollTimer = setTimeout(tick, document.hidden ? 2000 : 800);
+        return;
+      }
+    }catch(e){
+      if(e && (e.status === 410 || e.status === 404)){
+        toast(e.status === 410 ? '下载任务记录已被淘汰（410）' : '下载任务不存在（404）', 'err');
+      }
+      /* 瞬时错误：退避重试，仍以 job 为唯一事实来源 */
+      dlPollTimer = setTimeout(tick, 1600);
+      return;
+    }
+    /* 终态：下载任务本身结束，再取一次 /api/models 看各文件是否已 present */
+    const st = j.state;
+    state.dlJob = null; state.dlSetId = null;
+    await refreshModels();
+    renderBanner(); renderButton();
+    if(st === 'succeeded') toast(`模型集「${j.set_id}」下载完成，引擎将在下次识别时惰性创建`, 'ok', 'package');
+    else if(st === 'failed') toast(`模型集「${j.set_id}」下载失败：${j.error || '未知错误'}`, 'err');
+    else if(st === 'cancelled') toast(`模型集「${j.set_id}」下载已取消（临时文件已清理，已校验完成的文件保留）`, 'err', 'info');
+  };
+  tick();
+}
+function cancelDownload(){
+  const j = state.dlJob;
+  if(!j) return;
+  if(DEMO){
+    demo.dlActive = false; state.dlJob = null; state.dlSetId = null;
+    renderBanner();
+    return toast('已取消下载', 'err', 'info');
+  }
+  if(!j.id){ return toast('下载任务尚未取得 job_id，无法取消', 'err'); }
+  return apiJson('POST', '/api/jobs/' + j.id + '/cancel')
+    .then(() => toast('已请求取消下载' + (j.state === 'running' ? '（取消在文件边界生效）' : ''), 'ok'))
+    .catch(e => toastErr(e));        /* 409 not_cancellable / job_finished 如实提示，不假装成功 */
+}
+
+/* ================= 渲染：文件信息 / 按钮状态 ================= */
+function renderMeta(){
+  if(!state.image) return;
+  const i = state.image;
+  $('metaText').innerHTML = `<b>${esc(i.file.name || 'clipboard.png')}</b> · ${i.w}×${i.h} · ${fmtBytes(i.file.size)}`;
+  $('annotatedBtn').hidden = !state.result;
+}
+function renderButton(){
+  const btn = $('ocrBtn'), lbl = $('ocrLbl'), ico = $('ocrIco');
+  const use = n => { ico.innerHTML = `<use href="#i-${n}"/>`; };
+  ico.classList.remove('spin');
+  if(state.uploading){ btn.disabled = true; lbl.textContent = '上传中…'; use('loader'); ico.classList.add('spin'); return; }
+  if(jobActive()){ btn.disabled = true; lbl.textContent = '识别中…'; use('loader'); ico.classList.add('spin'); return; }
+  if(!state.image){ btn.disabled = true; lbl.textContent = '等待图像输入'; use('scan'); return; }
+  /* 提交普通 OCR（文本队列）只看**文本集合**是否齐备：公式模型缺失不影响此处（P1-2） */
+  const q = modelsReadyFor('text');
+  if(!q.ready){
+    btn.disabled = false;                                   /* 仍可点：点击时解释缺什么 */
+    lbl.textContent = q.fatal ? '模型状态未知 · 点击查看' : `模型缺失 · 点击查看（${q.missing.join('、')}）`;
+    use('cloud-off');
+    return;
+  }
+  btn.disabled = false;
+  if(state.result){ lbl.textContent = '重新识别'; use('refresh'); }
+  else { lbl.textContent = '开始识别'; use('scan'); }
+}
+/* 公式开关：只有公式集合齐备时才可勾选；不可用时给出**文字**理由（不只靠颜色/透明度）。
+   禁用状态随 /api/models 刷新实时变化 —— 下载完成后重新启用，不需要重载页面。 */
+function renderFormulaToggle(){
+  const row = $('fxRow'), box = $('fxToggle'), cap = $('fxCap');
+  const st = modelsReadyFor('formula');
+  const on = st.ready;
+  box.disabled = !on;                       /* 公式模型未就绪 → 禁止开启公式路由（§10.8） */
+  if(!on) state.formula = false;
+  box.checked = state.formula === true;
+  row.hidden = false;
+  row.classList.toggle('disabled', !on);
+  row.title = on ? '公式路由：区域检测 → 公式识别（独立队列，最多 2 个在排队）'
+                 : `公式模型集未就绪：缺少 ${st.missing.join('、') || '公式模型'}；普通文本 OCR 不受影响`;
+  cap.textContent = on
+    ? '公式模型集就绪。开启后公式区域走独立队列（docs/05 §8.3），整块区域从文本通道中抹白。'
+    : `不可开启：缺少 ${st.missing.join('、') || '公式模型（/api/models 尚未返回）'}。` +
+      '公式路由默认关闭（docs/05 §10.8），**普通文本 OCR 不受影响**，可在上方横幅按集合下载公式模型。';
+}
+ $('fxToggle').addEventListener('change', e => {
+  const st = modelsReadyFor('formula');
+  if(e.target.checked && !st.ready){                        /* 兜底：状态变化期间被勾选 */
+    e.target.checked = false;
+    toast(`公式模型集未就绪（缺少 ${st.missing.join('、') || '公式模型'}），无法开启公式路由`, 'err', 'cloud-off');
+    return;
+  }
+  state.formula = !!e.target.checked;
+  toast(state.formula ? '已开启公式识别路由（公式区域走独立队列）' : '已关闭公式识别路由（仅普通文本 OCR）', 'ok', 'check');
+});
+ $('ocrBtn').addEventListener('click', () => {
+  if(state.uploading || jobActive() || !state.image) return;
+  /* 门禁只看文本队列；公式队列是否就绪与普通 OCR 无关 */
+  const q = modelsReadyFor('text');
+  if(!q.ready){
+    toast(q.fatal ? '尚未取得 /api/models 模型状态，无法确认文本模型是否齐备'
+                  : `普通 OCR 模型集不齐备：缺少 ${q.missing.join('、')}，请先在横幅中按集合下载`,
+          'err', 'cloud-off');
+    flashBanner(); return;
+  }
+  if(DEMO && demo.phase === 'waitmodels' && !demo.textReady){
+    toast('演示模式：文本模型尚未就绪', 'err', 'cloud-off');
+    flashBanner(); return;
+  }
+  submitImage();
+});
+
+/* ================= 提交识别（XHR 上传 + 进度 + 取消上传，§9.1） ================= */
+function setUpProgress(p){
+  $('upPct').textContent = Math.round(p * 100) + '%';
+  $('upBar').style.width = (p * 100).toFixed(1) + '%';   /* CSSOM */
+}
+ $('abortUpBtn').addEventListener('click', () => {
+  demo.upAbort = true;                                    /* 演示模式：置取消标志 */
+  if(state.xhr) state.xhr.abort();                        /* 真实模式：xhr.abort() */
+});
+function showUp(v){ $('uploadProg').hidden = !v; }
+
+function submitImage(){
+  if(DEMO) return demoUpload();
+  state.uploading = true; showUp(true); setUpProgress(0); renderButton();
+  drop.classList.add('no-click');
+  /* 正文仍是 application/octet-stream 原始图像字节（docs/05 §2.2）；
+     公式路由与队列不在请求体里，因此这里不发送任何 JSON body。 */
+  xhrSend('POST', '/api/ocr', state.image.file, {
+    octet: true,
+    onProgress: setUpProgress,
+    getXhr: x => { state.xhr = x; }
+  }).then(data => {
+    state.xhr = null; state.uploading = false; showUp(false);
+    drop.classList.remove('no-click');
+    state.job = {
+      id: data.job_id, kind: data.kind || 'text',
+      /* 队列以服务端返回为准（公式任务进公式队列）；缺失时按当前开关推断，仅用于展示 */
+      queue: data.queue || (state.formula ? 'formula' : 'text'),
+      state: data.state || 'queued', position: data.position, queued_ms:0, elapsed_ms:0
+    };
+    clearResult(false);
+    toast('任务已提交（202）', 'ok');
+    renderJob(); renderButton(); scanOn();
+    startPolling();
+  }).catch(e => {
+    state.xhr = null; state.uploading = false; showUp(false);
+    drop.classList.remove('no-click'); renderButton();
+    toastErr(e);
+  });
+}
+
+/* ================= 任务轮询（GET /api/jobs/{id}，§4.2/§9.1） ================= */
+let pollTimer = null;
+function startPolling(){
+  clearTimeout(pollTimer);
+  const tick = async () => {
+    const j = state.job;
+    if(!j) return;
+    try{
+      const d = await apiJson('GET', '/api/jobs/' + j.id);
+      Object.assign(j, d);
+      renderJob();
+      if(j.state === 'queued' || j.state === 'running'){
+        pollTimer = setTimeout(tick, document.hidden ? 1600 : 480);
+      } else if(j.state === 'succeeded'){
+        await fetchResult();
+      } else {
+        onJobEnd();
+      }
+    }catch(e){
+      if(e.status === 410 || e.status === 404){
+        toast(e.status === 410 ? '结果已被淘汰，请重新识别' : '任务不存在', 'err');
+        state.job = null; renderJob(); renderButton();
+      } else {
+        pollTimer = setTimeout(tick, 1600);   /* 瞬时错误：退避重试 */
+      }
+    }
+  };
+  tick();
+}
+async function fetchResult(){
+  const j = state.job;
+  try{
+    const r = await apiJson('GET', '/api/jobs/' + j.id + '/result');
+    state.result = normalizeResult(r);
+    scanOff(); finishJob();
+  }catch(e){
+    if(e.code === 'job_not_finished'){ pollTimer = setTimeout(startPolling, 480); }
+    else toastErr(e);
+  }
+}
+function onJobEnd(){
+  const j = state.job;
+  scanOff();
+  if(j && j.state === 'failed') toast('识别失败：' + (j.error || '未知错误'), 'err');
+  else if(j && j.state === 'cancelled') toast('任务已取消', 'err', 'info');
+  state.job = null; renderJob(); renderButton();
+}
+function finishJob(){
+  renderJob(); renderRegions(); renderDiag(); renderMeta(); renderButton();
+  ['copyAllBtn','expJson','expMd','expHtml'].forEach(id => $(id).disabled = false);
+  $('annotatedBtn').hidden = false;
+  layoutCanvas();
+  const t = state.result.timings;
+  const total = t.total_ms != null ? t.total_ms : (t.total != null ? t.total : null);
+  toast('识别完成' + (total != null ? ` · ${(total/1000).toFixed(2)} s` : ''), 'ok');
+}
+
+/* ================= 任务状态行 / 取消识别（§4.3 两种取消严格分开） ================= */
+function renderJob(){
+  const jl = $('jobLine'), jt = $('jlText'), cb = $('cancelJobBtn');
+  const j = state.job;
+  if(!j){ jl.hidden = true; return; }
+  jl.hidden = false;
+  let html = '';
+  if(j.state === 'queued')
+    html = ic('clock') + `<span>排队中 · <b>${zhQueue(j.queue)}队列</b> · 位置 ${j.position != null ? j.position : '—'}` +
+           (j.queued_ms != null ? ` · 已等待 ${(j.queued_ms/1000).toFixed(1)}s` : '') + '</span>';
+  else if(j.state === 'running')
+    html = ic('loader','spin') + `<span>识别中 · 已进行 <b>${((j.elapsed_ms || 0)/1000).toFixed(1)}s</b></span>`;
+  else if(j.state === 'succeeded')
+    html = ic('check') + `<span>识别完成 · <b>${esc(j.id)}</b></span>`;
+  else if(j.state === 'failed')
+    html = ic('alert') + `<span>失败 · <b>${esc(j.error || '未知错误')}</b></span>`;
+  else
+    html = ic('x') + `<span>已取消</span>`;
+  jt.innerHTML = html;
+  const cancellable = j.state === 'queued' || j.state === 'running';
+  cb.hidden = !cancellable;
+  cb.disabled = (j.state === 'running');        /* running → 不可取消，如实呈现，不假装成功 */
+  cb.title = j.state === 'running' ? '推理进行中，当前版本不支持中断（not_cancellable）' : '从队列中移除该任务';
+}
+ $('cancelJobBtn').addEventListener('click', async () => {
+  const j = state.job;
+  if(!j) return;
+  if(DEMO){
+    if(j.state === 'queued'){ j.state = 'cancelled'; onJobEnd(); toast('任务已取消', 'err', 'info'); }
+    else toast('推理进行中，当前版本不支持中断', 'err');
+    return;
+  }
+  try{
+    await apiJson('POST', '/api/jobs/' + j.id + '/cancel');
+    toast('已请求取消', 'ok');
+  }catch(e){
+    toastErr(e);                                 /* 409 not_cancellable / job_finished 如实提示 */
+    if(e.code === 'not_cancellable') $('cancelJobBtn').disabled = true;
+  }
+});
+function scanOn(){ stage.classList.add('scanning'); }
+function scanOff(){ stage.classList.remove('scanning'); }
+
+/* ================= 渲染：区域列表（阅读顺序 / 点击↔高亮，§9.2） ================= */
+function renderRegions(){
+  const wrap = $('regionList');
+  if(!state.result){
+    wrap.innerHTML = `<div class="empty-inline">${ic('scan')}<p>识别完成后，区域将按阅读顺序在此列出；<br>点击列表项可在图像上定位高亮，点击图中区域可反向定位。</p></div>`;
+    return;
+  }
+  wrap.innerHTML = state.result.regions.map((r, i) => {
+    const conf = r.conf != null ? (r.conf > 1 ? r.conf : r.conf * 100).toFixed(1) + '%' : '—';
+    const poly = r.polygon ? r.polygon.map(p => Math.round(p[0]) + ',' + Math.round(p[1])).join(' ') : '';
+    const bb = r.polygon
+      ? (() => { const xs = r.polygon.map(p=>p[0]), ys = r.polygon.map(p=>p[1]);
+          return `${Math.round(Math.min(...xs))},${Math.round(Math.min(...ys))} → ${Math.round(Math.max(...xs))},${Math.round(Math.max(...ys))}`; })()
+      : '—';
+    return `<button class="region-item" data-i="${i}" aria-pressed="false" ${poly ? `title="polygon: ${esc(poly)}"` : ''}>
+      <span class="ri-idx">${String(i + 1).padStart(2, '0')}</span>
+      <span class="ri-body">
+        <span class="ri-line">
+          <i class="tag ${r.kind === 'formula' ? 'tag-fx' : 'tag-txt'}">${r.kind === 'formula' ? '公式' : '文本'}</i>
+          <span class="ri-text">${esc(r.text) || '（空）'}</span>
+        </span>
+        <span class="ri-sub">conf ${conf} · ${bb}</span>
+      </span>
+    </button>`;
+  }).join('');
+}
+ $('regionList').addEventListener('click', e => {
+  const b = e.target.closest('.region-item');
+  if(b) selectRegion(+b.dataset.i);
+});
+
+/* 复制全文（127.0.0.1 是安全上下文，clipboard API 可用；保留降级路径） */
+ $('copyAllBtn').addEventListener('click', async () => {
+  if(!state.result) return;
+  const t = state.result.plain || '';
+  try{
+    await navigator.clipboard.writeText(t);
+    toast('全文已复制到剪贴板', 'ok', 'copy');
+  }catch{
+    const ta = document.createElement('textarea');
+    ta.value = t; document.body.appendChild(ta); ta.select();
+    try{ document.execCommand('copy'); toast('全文已复制到剪贴板', 'ok', 'copy'); }
+    catch{ toast('复制失败，请手动选择文本', 'err'); }
+    ta.remove();
+  }
+});
+
+/* ================= 下载标注图 / 导出（blob 附件，§4.2） ================= */
+ $('annotatedBtn').addEventListener('click', async () => {
+  const j = state.job;
+  if(!state.result || !j) return;
+  if(DEMO){ demoAnnotated(); return; }
+  try{
+    const b = await apiBlob('/api/jobs/' + j.id + '/annotated.png');
+    saveBlob(b, 'ocr-' + j.id + '-annotated.png');
+    toast('标注图已保存', 'ok', 'download');
+  }catch(e){ toastErr(e); }
+});
+const EXPORTS = { expJson:'json', expMd:'md', expHtml:'html' };
+Object.keys(EXPORTS).forEach(id => {
+  $(id).addEventListener('click', () => exportAs(EXPORTS[id]));
+});
+async function exportAs(fmt){
+  const j = state.job;
+  if(!state.result || !j) return;
+  if(DEMO){ demoExport(fmt); return; }
+  try{
+    const b = await apiBlob(`/api/jobs/${j.id}/export?format=${fmt}`);
+    saveBlob(b, `ocr-${j.id}.${fmt}`);
+    toast(fmt.toUpperCase() + ' 导出已保存', 'ok', 'download');
+  }catch(e){ toastErr(e); }
+}
+
+/* ================= 渲染：诊断面板（复用 timings / 指纹，不重新测量，§7.5/§10.6） ================= */
+/* 诊断面板顶部永远先渲染契约错误：字段缺失/改名在这里留痕，
+   与 toast 一起构成"可见 + 可查"的两条路径（P2-2）。
+   注意即使 state.result 为 null（解析失败）也必须显示这些错误，否则用户只剩一个 toast。 */
+function diagContractHtml(){
+  if(!state.diag.length) return '';
+  return `<div class="diag-sec">契约错误 · 响应字段</div>
+    <p class="diag-line">${state.diag.map(x => esc(x)).join('<br>')}</p>
+    <p class="diag-note">前端按 src/api.rs 的冻结契约解析响应，不做别名兼容：字段被改名或缺失时
+    一律在此点名路径并拒绝渲染，避免把后端改名悄悄吞掉。</p>`;
+}
+function renderDiag(){
+  const d = $('diagBody');
+  const head = diagContractHtml();
+  if(!state.result){
+    d.innerHTML = head + '<p class="diag-line">识别完成后，此处展示逐阶段耗时（时间账本）与运行时指纹。</p>';
+    return;
+  }
+  const t = state.result.timings;
+  const rows = Object.entries(t).filter(([k, v]) => typeof v === 'number' && k !== 'total_ms' && k !== 'total');
+  const total = t.total_ms != null ? t.total_ms : (t.total != null ? t.total
+    : rows.reduce((a, [, v]) => a + v, 0));
+  const s = state.status || emptyStatus();
+  const fp = s.fingerprint;
+  d.innerHTML = head +
+    `<div class="diag-sec">逐阶段耗时 · 时间账本（MS）</div>
+     <table class="diag-table">${rows.map(([k, v]) =>
+        `<tr><td>${esc(k)}</td><td>${v.toFixed(1)}</td></tr>`).join('')}
+       <tr class="total"><td>total</td><td>${total.toFixed(1)}</td></tr>
+     </table>
+     <div class="diag-sec">PROVIDER 实测</div>
+     <p class="diag-line">requested ${esc(s.requested || '未知')} · selected_ep ${esc(s.selected_ep || '未知')}` +
+     (s.fallback === true ? ' · 已回退 CPU' : s.fallback === false ? ' · 未回退' : ' · 回退状态未知') +
+     ` — 本页任务的实测耗时见上表。</p>` +
+     (fp ? `<div class="diag-sec">ORT 指纹</div>
+       <p class="diag-line">${esc(fp.file || '')}${fp.size_bytes ? ' · ' + fmtBytes(fp.size_bytes) : ''}` +
+       (fp.sha256 ? ' · sha256 ' + esc(String(fp.sha256).slice(0, 16)) + '…' : '') + '</p>' : '') +
+     `<p class="diag-note">口径说明：以上数据来自引擎内建 timings / stages 与 ORT 指纹，前端不重新测量；provider 名称不构成性能结论，请以实测耗时为准。</p>`;
+}
+
+/* ================= 真实模式：status / models 轮询 ================= */
+function statusOnce(){
+  return apiJson('GET', '/api/status').then(s => {
+    state.netFail = false;
+    state.status = normalizeStatus(s);
+    renderEngine(); renderPill();
+  }).catch(e => {
+    state.netFail = true; state.status = emptyStatus('failed');
+    renderEngine(); renderPill();
+  });
+}
+function statusLoop(){
+  statusOnce().then(() => {
+    setTimeout(statusLoop, state.status.state === 'ready' ? 8000 : 2000);
+  }).catch(() => setTimeout(statusLoop, 5000));
+}
+function refreshModels(){
+  if(DEMO){ renderBanner(); renderButton(); renderFormulaToggle(); renderEngine(); return Promise.resolve(); }
+  return apiJson('GET', '/api/models').then(m => {
+    state.models = normalizeModels(m);
+    /* 模型集状态一变，三处结论都要跟着重算：横幅（按集合下载）、提交门禁（文本队列）、
+       公式开关（公式队列）——公式缺失不得阻塞文本队列，反之亦然。 */
+    renderBanner(); renderButton(); renderFormulaToggle(); renderEngine();
+  }).catch(e => {
+    state.models = { error:e };
+    renderBanner(); renderButton(); renderFormulaToggle(); renderEngine();
+  });
+}
+
+/* ================================================================
+   离线预览模式（占位符未被 serve 替换时启用，页面顶部有常驻标识）
+   ================================================================ */
+function demoStatusData(){
+  const ready = demo.phase === 'ready';
+  const ph = demoPhaseFromModels();
+  return {
+    engine:{ state: ph === 'waitmodels' ? 'waiting_models'
+             : ph === 'building' ? 'loading'
+             : ph === 'ready' ? 'ready' : 'loading' },
+    /* §7.5 三字段必须齐全。离线预览刻意给一个真实场景：请求 directml 但会话回退到 CPU，
+       以便直接看到回退高亮、警示文案与"已回退 CPU"标签（缺失字段则渲染为「未知」）。 */
+    provider:{ requested:'directml', selected_ep:'CPUExecutionProvider', fallback_to_cpu:true },
+    ort:{ version:'1.20.1', fingerprint:null },
+    memory:{ peak_working_set_bytes: ready ? 537395200 : 81234567 },
+    queues:{ text:{ used: (state.job && state.job.state === 'queued') ? 1 : 0, capacity:4 },
+             formula:{ used:0, capacity:2 } }
+  };
+}
+function demoSetStatus(){
+  state.status = normalizeStatus(demoStatusData());
+  renderEngine(); renderPill();
+}
+function demoInitialModels(){
+  /* 离线预览必须能看出"文本就绪 / 公式缺失"这个区分，因此刻意给两个集合：
+       · PP-OCRv5（演示）        → **齐备**（detector + recognizer + dictionary 全 present）
+       · PP-FormulaNet（演示）   → **不齐备**（566 MB 公式模型 missing，且带 source_url）
+     与 docs/05 一致：公式模型默认不下载（§10.8），普通 OCR 不依赖它（M4 公式独立）。 */
+  return normalizeModels({
+    model_dir:'<redacted>', source:'default_table', downloads_allowed:true,
+    sets:[
+      { id:'PP-OCRv5（演示）', complete:true, download_bytes_total:0,
+        files:[
+          { name:'PP-OCRv5_server_det.onnx', role:'detector',   state:'present', size_bytes:4940000, sha256:'8f3ac21d90e…', source_url:'https://paddleocr.bj.bcebos.com/PP-OCRv5/server/det.onnx' },
+          { name:'PP-OCRv5_server_rec.onnx', role:'recognizer', state:'present', size_bytes:8010000, sha256:'c71b0f4a22e…', source_url:'https://paddleocr.bj.bcebos.com/PP-OCRv5/server/rec.onnx' },
+          { name:'ppocrv5_dict.txt',         role:'dictionary', state:'present', size_bytes:126469,  sha256:'a2d9c8e710b…', source_url:'https://paddleocr.bj.bcebos.com/PP-OCRv5/server/dict.txt' }
+        ] },
+      { id:'PP-FormulaNet（演示）', complete:false, download_bytes_total:566231040,
+        files:[
+          { name:'pp_formulanet_plus_m.onnx', role:'formula_recognizer', state:'missing', size_bytes:566231040, sha256:'d4e8f0b31c2…', source_url:'https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/pp_formulanet_plus_m.onnx' }
+        ] }
+    ]
+  });
+}
+/* 演示模式的引擎相位由**文本集合是否齐备**决定（与真实模式同一判据），
+   因此公式集合缺失不会把引擎状态压成 waiting_models。 */
+function demoPhaseFromModels(){
+  if(demo.phase === 'boot') return 'boot';
+  if(demo.phase === 'building') return 'building';
+  const t = modelsReadyFor('text');
+  if(t.fatal || !t.ready) return 'waitmodels';
+  return demo.phase === 'ready' ? 'ready' : 'waitmodels';
+}
+async function enterDemo(){
+  $('demoStrip').hidden = false;
+  demo.phase = 'boot'; demoSetStatus();
+  await sleep(1100);
+  demo.phase = 'waitmodels';
+  state.models = demoInitialModels();
+  demo.textReady = modelsReadyFor('text').ready;
+  demoSetStatus(); renderBanner(); renderButton(); renderFormulaToggle();
+}
+/* 离线预览的下载：与真实模式**共用同一套 job 生命周期**——
+   先建 job（拿到 job_id），进度来自 job 的 state/elapsed，取消走同一 cancelDownload()。
+   下载只作用于被点击的那个集合（setId），绝不落到 sets[0]。 */
+async function demoDownload(setId){
+  const set = state.models.sets.find(s => s.id === setId);
+  if(!set) return toast(`模型集 ${setId} 不存在`, 'err', 'cloud-off');
+  demo.dlActive = true; demo.dlSetId = setId;
+  const jobId = 'demo-dl-' + Math.random().toString(36).slice(2, 8);
+  state.dlSetId = setId;
+  state.dlJob = { id: jobId, set_id: setId, state:'queued', elapsed_ms:0 };
+  renderBanner();
+  await sleep(300);
+  state.dlJob.state = 'running';
+  const t0 = performance.now();
+  for(const f of set.files){
+    if(!state.dlJob) return;                      /* 已被取消 */
+    if(f.state === 'present') continue;
+    demo.dlFile = f.name; let p = 0;
+    while(p < 100){
+      if(!state.dlJob) return;                    /* 文件边界取消（§6.6） */
+      p = Math.min(100, p + 2 + Math.random() * 7);
+      demo.dlPct = p;
+      state.dlJob.elapsed_ms = performance.now() - t0;
+      renderBanner();
+      await sleep(65);
+    }
+    f.state = 'present';
+  }
+  demo.dlActive = false; demo.dlSetId = null;
+  set.complete = set.files.every(f => f.state === 'present');
+  set.bytes = set.files.filter(f => f.state !== 'present').reduce((a, f) => a + (f.size || 0), 0);
+  const finishedId = state.dlJob.id;
+  state.dlJob = null; state.dlSetId = null;
+  demo.textReady = modelsReadyFor('text').ready;
+  renderBanner(); renderButton(); renderFormulaToggle();
+  toast(`模型集「${setId}」下载完成（job ${finishedId}），引擎将在下次识别时惰性创建`, 'ok', 'package');
+  if(modelsReadyFor('text').ready){
+    demo.phase = 'building'; demoSetStatus();
+    await sleep(demo.buildMs);
+    demo.phase = 'ready'; demoSetStatus(); renderButton();
+    toast(`引擎创建完成 · 耗时 ${(demo.buildMs/1000).toFixed(1)} s`, 'ok');
+  }
+}
+async function demoUpload(){
+  state.uploading = true; showUp(true); setUpProgress(0);
+  renderButton(); drop.classList.add('no-click');
+  demo.upAbort = false;
+  let p = 0;
+  while(p < 100){
+    if(demo.upAbort) break;
+    p = Math.min(100, p + 4 + Math.random() * 11);
+    setUpProgress(p / 100);
+    await sleep(70 + Math.random() * 70);
+  }
+  state.uploading = false; showUp(false);
+  drop.classList.remove('no-click'); renderButton();
+  if(demo.upAbort){ toast('已取消上传', 'err', 'info'); return; }
+  await sleep(240);   /* 模拟 202 往返 */
+  clearResult(false);
+  state.job = { id:'demo-' + Math.random().toString(36).slice(2, 8), kind:'text',
+                queue:'text', state:'queued', position:1, queued_ms:0, elapsed_ms:0 };
+  toast('任务已提交（202）', 'ok');
+  renderJob(); renderButton(); scanOn();
+  await sleep(850);
+  if(!state.job || state.job.state !== 'queued') return;   /* 排队阶段被取消 */
+  state.job.state = 'running'; renderJob();
+  const t0 = performance.now();
+  while(performance.now() - t0 < 2500){
+    if(!state.job || state.job.state !== 'running') return;
+    state.job.elapsed_ms = performance.now() - t0;
+    renderJob();
+    await sleep(180);
+  }
+  state.job.state = 'succeeded';
+  state.result = demoResult(state.image.w, state.image.h);
+  finishJob();
+}
+/* 演示区域：按上传图实际尺寸的相对布局生成，保证叠框在任何图上都成立 */
+function demoResult(w, h){
+  const rows = [
+    ['发票代码：144032257110', .982],
+    ['开票日期：2024-06-18', .976],
+    ['购方名称：本地评估科技有限公司', .964],
+    ['合计金额（大写）壹仟贰佰捌拾元整', .971],
+    ['E = mc^{2}', .913, 'formula'],
+    ['备注：本行由离线预览数据填充', .887]
+  ];
+  const regions = rows.map((r, i) => {
+    const x0 = Math.round(w * .10);
+    const x1 = Math.round(w * (.58 + .05 * (i % 3)));
+    const y0 = Math.round(h * (.14 + .115 * i));
+    const y1 = y0 + Math.max(14, Math.round(h * .055));
+    return { text:r[0], conf:r[1], kind:r[2] || 'text', order:i + 1,
+             polygon:[[x0,y0],[x1,y0],[x1,y1],[x0,y1]] };
+  });
+  return {
+    regions,
+    plain: rows.map(r => r[0]).join('\n'),
+    timings:{ preprocess_ms:14.2, det_ms:412.8, cls_ms:8.4, rec_ms:236.5, postprocess_ms:3.1, total_ms:675.0 }
+  };
+}
+/* 演示模式：标注图 = 原图 + 当前叠框，本地合成 PNG */
+function demoAnnotated(){
+  const i = state.image;
+  if(!i || !state.result) return;
+  const c = document.createElement('canvas');
+  c.width = i.w; c.height = i.h;
+  const g = c.getContext('2d');
+  g.drawImage(imgEl, 0, 0);
+  state.result.regions.forEach(r => {
+    if(!r.polygon) return;
+    g.beginPath();
+    g.moveTo(r.polygon[0][0], r.polygon[0][1]);
+    for(let k = 1; k < r.polygon.length; k++) g.lineTo(r.polygon[k][0], r.polygon[k][1]);
+    g.closePath();
+    g.setLineDash(r.kind === 'formula' ? [8,6] : []);
+    g.lineWidth = Math.max(2, i.w / 500);
+    g.strokeStyle = '#111';
+    g.stroke();
+  });
+  c.toBlob(b => { saveBlob(b, 'ocr-' + state.job.id + '-annotated.png'); toast('标注图已保存', 'ok', 'download'); });
+}
+/* 演示模式导出：JSON / Markdown / 静态 HTML（无脚本，呼应 ReportMode::Static 口径） */
+function demoExport(fmt){
+  const r = state.result, id = state.job.id;
+  let blob, name;
+  if(fmt === 'json'){
+    blob = new Blob([JSON.stringify(r.raw && Object.keys(r.raw).length ? r.raw : {
+      job_id:id, plain_text:r.plain, regions:r.regions, timings:r.timings
+    }, null, 2)], { type:'application/json' });
+  } else if(fmt === 'md'){
+    const md = ['# OCR 识别结果', '', '- 任务：`' + id + '`', '- 区域数：' + r.regions.length, '',
+      '| # | 类型 | 置信度 | 文本 |', '|---|---|---|---|',
+      ...r.regions.map((g, i) => `| ${i+1} | ${g.kind === 'formula' ? '公式' : '文本'} | ` +
+        `${g.conf != null ? (g.conf > 1 ? g.conf : g.conf*100).toFixed(1) + '%' : '—'} | ${g.text.replace(/\|/g,'\\|')} |`)].join('\n');
+    blob = new Blob([md], { type:'text/markdown' });
+  } else {
+    const html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>OCR ' + esc(id) + '</title>' +
+      '<style>body{font-family:"Noto Sans SC","Microsoft YaHei",sans-serif;max-width:760px;margin:40px auto;' +
+      'padding:0 20px;color:#111;background:#fafafa}h1{font-size:20px}table{border-collapse:collapse;width:100%;' +
+      'font-size:14px}td,th{border-bottom:1px solid #ddd;padding:8px 6px;text-align:left}th{font-size:12px;' +
+      'color:#666;letter-spacing:.1em}small{color:#888}</style></head><body><h1>OCR 识别结果</h1><p><small>' +
+      esc(id) + ' · ' + r.regions.length + ' 个区域 · 由 RapidOCR 本地评估台导出</small></p><table><tr><th>#</th><th>类型</th><th>置信度</th><th>文本</th></tr>' +
+      r.regions.map((g, i) => '<tr><td>' + (i+1) + '</td><td>' + (g.kind === 'formula' ? '公式' : '文本') + '</td><td>' +
+        (g.conf != null ? (g.conf > 1 ? g.conf : g.conf*100).toFixed(1) + '%' : '—') + '</td><td>' + esc(g.text) + '</td></tr>').join('') +
+      '</table></body></html>';
+    blob = new Blob([html], { type:'text/html' });
+  }
+  saveBlob(blob, 'ocr-' + id + '.' + fmt);
+  toast(fmt.toUpperCase() + ' 导出已保存', 'ok', 'download');
+}
+
+/* ================= 启动 ================= */
+/* 队列就绪 / 公式开关都依赖 /api/models，因此在取到模型集之前先按"未知"渲染一遍，
+   取到之后由 refreshModels() 重算（离线预览则由 enterDemo() 负责）。 */
+renderPill(); renderEngine(); renderRegions(); renderDiag(); renderButton(); renderFormulaToggle();
+if(DEMO){
+  enterDemo();
+}else{
+  statusLoop();        /* 引擎状态：loading 期 2s，ready 后 8s */
+  refreshModels();     /* 模型集状态；下载任务的进度由 GET /api/jobs/{id} 轮询 */
+}
+})();
+</script>
+</body>
+</html>

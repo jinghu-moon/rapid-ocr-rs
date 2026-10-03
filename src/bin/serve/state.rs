@@ -87,6 +87,11 @@ pub enum EngineState {
     /// 创建失败（含 provider 不可用）。
     Failed { reason: String },
     /// 运行期切换 provider（M3）。
+    ///
+    /// 本变体及 [`EngineStateMachine::begin_rebuild`] 是 §7.6 冻结的状态机的一部分，
+    /// 有完整的转换测试，但**生产者**（M3 的 `POST /api/engine/reload` 与运行期切换）
+    /// 尚未落地，因此目前没有构造点。
+    #[allow(dead_code)]
     Rebuilding,
 }
 
@@ -252,6 +257,10 @@ impl EngineStateMachine {
     }
 
     /// 进入 `Loading`：`BlockedModelsMissing`（模型齐备后重载）| `Ready` | `Failed`。
+    ///
+    /// 启动期**不需要**它：模型齐备时 [`EngineStateMachine::start`] 已经进入 `Loading`。
+    /// 调用点属于 M3 的 `POST /api/engine/reload`。
+    #[allow(dead_code)]
     pub fn begin_loading(&mut self) -> Result<(), TransitionError> {
         self.require(
             &[
@@ -297,6 +306,10 @@ impl EngineStateMachine {
     }
 
     /// 重载时模型**仍**不齐备：刷新缺失清单，状态保持 `BlockedModelsMissing`。
+    ///
+    /// 与 [`Self::begin_loading`] 一样，调用点属于 M3 的 `POST /api/engine/reload`
+    /// （M1 在启动期一次性判定，之后不再重算）。
+    #[allow(dead_code)]
     pub fn models_still_missing(&mut self, missing: Vec<String>) -> Result<(), TransitionError> {
         self.require(
             &[StateKind::BlockedModelsMissing],
@@ -307,6 +320,9 @@ impl EngineStateMachine {
     }
 
     /// M3：运行期切换 provider，`Ready → Rebuilding`（此时暂停新任务并排空队列）。
+    ///
+    /// 见 [`EngineState::Rebuilding`] 的说明：状态机与测试已冻结，M3 才会接上调用点。
+    #[allow(dead_code)]
     pub fn begin_rebuild(&mut self) -> Result<(), TransitionError> {
         self.require(&[StateKind::Ready], StateKind::Rebuilding)?;
         self.state = EngineState::Rebuilding;

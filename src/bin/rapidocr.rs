@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-/// `rapidocr serve` 的服务端核心（M0c：纯逻辑 + feature 骨架）。
+/// `rapidocr serve` 的服务端（M1：HTTP 层 + 静态页 + 双队列 + 有界结果存储）。
 ///
 /// 只在启用 `serve` feature 时参与编译；`serve` **不在** `default` 里，
 /// 因此默认构建的依赖图与代码路径都不受影响（§2.1 的硬性约束）。
@@ -104,6 +104,21 @@ enum Command {
         output: Option<PathBuf>,
     },
     Check,
+    /// 本地 Web 评估界面（docs/05）。需要 `--features serve` 构建。
+    #[cfg(feature = "serve")]
+    Serve(serve::ServeArgs),
+    /// 未启用 `serve` feature 时仍然**可解析**，但给出可定位错误（§3）。
+    #[cfg(not(feature = "serve"))]
+    Serve(UnavailableServeArgs),
+}
+
+/// `serve` 在未启用 feature 的构建里：接收任意参数，只为了给出"重建提示"，
+/// 而不是让用户看到 clap 的 `unexpected argument` 这种与真正原因无关的错误。
+#[cfg(not(feature = "serve"))]
+#[derive(Debug, clap::Args)]
+struct UnavailableServeArgs {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    rest: Vec<String>,
 }
 
 fn main() {
@@ -169,6 +184,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             iou_threshold,
             output,
         } => evaluate_cmd(manifest, config, iou_threshold, output)?,
+        #[cfg(feature = "serve")]
+        Command::Serve(args) => serve::serve_main(args)?,
+        #[cfg(not(feature = "serve"))]
+        Command::Serve(_) => {
+            return Err(
+                "`rapidocr serve` is not compiled into this binary: rebuild with \
+                 `cargo build --features serve` (docs/05 §2.1: the HTTP layer is an optional \
+                 feature and is deliberately not part of the default build)"
+                    .into(),
+            );
+        }
     }
     Ok(())
 }

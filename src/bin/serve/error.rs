@@ -205,12 +205,26 @@ impl DownloadErrorMapping for DownloadError {
 }
 
 /// serve 层的统一错误（§11.1）。
+///
+/// # 三个"协议已冻结、生产者还没到"的变体
+///
+/// [`Self::ExportTooLarge`]（§9.5 的 `--max-export-mb`）、
+/// [`Self::InsufficientDiskSpace`]（§6.5 的磁盘预检）与 [`Self::UnsupportedInput`]
+/// （§11.1 的 422；当前所有 `unsupported_input` 都经由 `Ocr(..)` 分类产生，
+/// 因此**保留了库侧的错误文本**，见接缝第 5 条）目前没有构造点：它们的状态码与 `code`
+/// 由 §11.1 冻结，生产者分别在 M2/M3 与解析层落地。
+///
+/// 删除它们会让 §11.1 的契约失去覆盖（`every_variant_has_the_documented_status_and_code`
+/// 逐项断言了这张表），因此这里用**逐变体**的 `allow` 标明"协议项、生产者未到"——
+/// 这与 M0c 那条覆盖整个子树的 `#![allow(dead_code)]` 不是一回事：那条会同时隐藏真正的
+/// 未接线代码，这条只作用于三个已冻结的协议变体。
 #[derive(Debug)]
 pub enum ServeError {
     BadRequest,
     PayloadTooLarge,
     ResultTooLarge,
-    /// §9.5：导出文档（含内嵌图片）超过 `--max-export-mb`。
+    /// §9.5：导出文档（含内嵌图片）超过 `--max-export-mb`。**生产者：M3。**
+    #[allow(dead_code)]
     ExportTooLarge,
     BadHost,
     BadOrigin,
@@ -225,7 +239,12 @@ pub enum ServeError {
     ModelsMissing,
     ModelsCorrupt,
     DownloadsDisabled,
+    /// §6.5：下载前的磁盘空间预检。**生产者：M2。**
+    #[allow(dead_code)]
     InsufficientDiskSpace,
+    /// §11.1 的 422。当前由 `Ocr(RapidOcrError::InvalidImage | InvalidInput | Decode)`
+    /// 分类产生（保留库侧原文），因此该变体本身没有构造点。
+    #[allow(dead_code)]
     UnsupportedInput,
     EngineUnavailable {
         reason: String,

@@ -1592,3 +1592,407 @@ target\release\rapidocr.exe evaluate --manifest <OCR-test-image>\golden-manifest
 | 「测试不得依赖公网」 | ✅ 完成 | 交付物 4：fixture 只在 `127.0.0.1:0`；联网测试 0 条（`a_refused_connection_is_a_network_error` 用的是本机已释放端口） |
 | **M0 验收**：以上每项都有单元测试；`cargo test` 全绿；文档与实现一致 | ✅ 本阶段范围内成立 | 389 / 495 passed，0 failed；两个硬门槛逐位相同；本文件 + `docs/05` §13 已同步 |
 | §6.6 下载取消、M1/M2 的 HTTP 与 worker | ⛔ 不在 M0b | 见"未覆盖风险"第 5、6、10 条 |
+
+---
+
+## M1：最小闭环（HTTP 层 + `serve` 子命令 + 内联页面 + 12 图经 HTTP 与 CLI 逐张一致）
+
+**阶段**：M1 —— `docs/05` §11「M1」的全部条目 + §3/§4/§7/§8/§9/§10 里与本里程碑相关的冻结契约。
+**开工基线**：`dbab12e`（M0a `1144ddb` + M0b `dbab12e` 已提交：模型清单/单一来源、加固下载器、
+serve 纯逻辑 105 测试、**无 HTTP**）。
+**日期**：2026-10-03（同一天，接在 M0c 记录之后）
+**提交**：`（未提交：按要求不 commit）`
+
+### 环境
+
+| 项目 | 值 |
+| --- | --- |
+| target | Windows x64 + MSVC ABI：`x86_64-pc-windows-msvc` |
+| 工具链 | rustc 1.98.1 / cargo 1.98.1 |
+| crate | `rapid-ocr-rs` 0.7.0（独立 git 仓库，本阶段未提交） |
+| 真实资产 | `OCR-Model/small/`（PP-OCRv6 det/rec small + dict）、`OCR-test-image/`（12 图 + `golden-manifest.json`）、`OCR-Model/test-config-small.yaml` |
+| HTTP 依赖 | `tiny_http = { version = "0.12", optional = true }`（`serve = ["dep:tiny_http"]`，**不进 default**） |
+
+---
+
+### 交付物 1：HTTP 层与 `serve` 子命令
+
+**新增/改写的文件**（全部在二进制侧，库零改动）：
+
+```text
+src/bin/serve/model_plan.rs   459 行   6 tests  模型集单一来源解析 + 逐文件状态 + 引擎路径绑定（§5.3/§5.4/§7.6）
+src/bin/serve/engine.rs        95 行   1 test   OcrBackend + 引擎工厂（生产路径 = RapidOcrEngine）
+src/bin/serve/results.rs      203 行   3 tests  有界结果存储 + 有界序列化（§4.5/§4.6）
+src/bin/serve/download.rs      65 行   0 test   独立下载 worker（M2 的处理体；M1 如实判失败）
+src/bin/serve/server.rs       951 行   4 tests  运行期核心：共享状态/双队列/worker/TTL 清理/端点语义
+src/bin/serve/http.rs         652 行   5 tests  tiny_http 接线：路由/准入/响应头/端点分发
+src/bin/serve/run.rs          433 行   6 tests  启动编排（绑定→校验→模型→页面）、注入契约、启动日志
+src/bin/serve/tests.rs       1299 行  24 tests  真实绑定端口的端到端测试（原始 TCP 客户端）
+src/bin/web/index.html       2024 行   （数据）  Temp/demo3-v2.html 的副本 + 1 处最小改动
+                             ────────────────
+                             4157 行  51 tests（含 2 个依赖边界测试）
+```
+
+**改动既有文件（最小必要面）**：
+
+| 文件 | 改动 | 理由 |
+| --- | --- | --- |
+| `Cargo.toml` | `tiny_http` optional + `serve = ["dep:tiny_http"]` | §2.1：HTTP 只在 `serve` feature 里，且不在 `default` |
+| `src/bin/rapidocr.rs` | `Command::Serve`（启用 feature 时用真实 `ServeArgs`，未启用时给出"重建提示"的可定位错误） | §3 |
+| `src/bin/serve/mod.rs` | 挂上 7 个新模块；**删除 M0c 的 `#![allow(dead_code)]`**；`scope_tests` 替换为 `dependency_boundary`（2 个测试） | 交付物 4 |
+| `src/bin/serve/{admit,error,jobs,limits,queue,state}.rs` | 逐项接上真实调用点；删除/接线的具体项见"交付物 4" | 交付物 4 |
+
+**线程模型（§8.1，与文档逐条对应）**：
+
+```text
+serve-accept（1 个，具名线程；主线程 join 它，退出用 Server::unblock()）
+  ├── recv_timeout(200 ms) + 关闭标志
+  ├── 静态/校验类请求就地处理（路由/准入/状态/模型/任务查询）
+  ├── POST /api/ocr：准入 → 有界读取 → 建任务 → 双队列（满 → 503，不阻塞）
+  └── POST /api/models/download：校验 → 有界 channel（容量 4）→ 满则 503 并回收任务
+serve-ocr（**恰好 1 个**：引擎 &mut self，§8.2）
+serve-download（1 个：M2 的处理体；M1 收到命令后 Queued→Running→Failed 并写明"未实现"）
+serve-sweeper（1 个：JobStore::tick + 结果/原图与任务存储同步清理，500 ms 一轮）
+```
+
+推理**绝不**在 accept 线程上：`POST /api/ocr` 只做准入、读体与入队；两把锁
+（`jobs` 与 `engine`）从不同时持有，`/api/status` 只读状态机，不会因一次推理而阻塞。
+
+**端点（M1 子集，逐条对照 §4.2）**：
+
+| 端点 | 行为 | 关键证据 |
+| --- | --- | --- |
+| `GET /` | 内联页面（启动时注入 nonce/token）+ nonce CSP | `the_page_carries_the_nonce_csp_and_the_frozen_security_headers` |
+| `GET /api/status` | 服务/引擎/provider 三字段/ORT 指纹/队列/保留/TTL/上限，模型目录脱敏 | `status_reports_the_frozen_three_provider_fields_and_redacts_paths` |
+| `GET /api/models` | 每个集合的逐文件状态（扁平 `state` 字符串）、`missing`/`corrupt`/`blocked` | `models_reports_every_file_state_and_matches_the_ocr_409` |
+| `POST /api/ocr` | **202** `{job_id, kind, queue, position, state}`；`?max_side=` / `?queue=` | `the_job_goes_from_202_to_succeeded_and_its_result_round_trips` |
+| `GET /api/jobs/{id}` | `JobView` 全字段（position 由调度器实时计算） | 同上 + `cancelling_a_queued_job_succeeds_and_a_running_job_is_409` |
+| `GET /api/jobs/{id}/result` | 成功 → 已序列化结果；失败 → **重放原始状态码/错误体**；未完成 → 409 | `a_failed_job_replays_its_original_status_and_code_on_result` |
+| `POST /api/jobs/{id}/cancel` | 排队 → 200 `cancelled`；运行中/终态 → 409 `not_cancellable` | `cancelling_a_queued_job_succeeds_and_a_running_job_is_409` |
+| `POST /api/models/download` | 未开 `--allow-download` → 403 `downloads_disabled`；开启 → 建真实任务并由 M2 接缝如实判失败 | `the_download_endpoint_degrades_visibly` |
+
+**结果序列化（§4.6）**：`to_output_json` + 有界写入器（累计字节超限即中止，**不**先建大
+`String`），超限 → 413 `result_too_large`；`/result` 只把已保存的字节原样写出。
+响应里额外给出 `plain_text`（= 库的 `text`，`plain_text(TextOrder::Reading)`），
+因为内联页面的"复制全文"（§9.2）读的就是这个名字。
+
+### 交付物 2：安全与响应头（按冻结契约，无一处放宽）
+
+| 要求 | 实现 | 证据 |
+| --- | --- | --- |
+| 监听地址硬编码 | `security::bind_address(port)`（签名里没有地址参数）+ `assert_loopback` 启动断言；日志打印实际地址与允许集合 | M0c 测试 + `run.rs` 的端口一致性检查 |
+| `Host` → 421 | `LocalOrigin::check_host` | `the_host_header_is_validated_for_dns_rebinding`（含 `[::1]`、端口不符、无 Host） |
+| `Origin` → 403（仅状态改变方法） | `check_origin` | `state_changing_requests_require_a_matching_origin`（缺失 / `null` / 不匹配）+ `read_requests_do_not_require_an_origin` |
+| token（所有 `/api/*`） | `X-RapidOCR-Token` + 常量时间比较；`GET /` 是令牌下发者，**不**要求令牌 | `the_token_is_required_on_every_api_route`、`the_page_carries_...` |
+| 不发送 `Access-Control-Allow-Origin` | 没有任何 CORS 头 | 页面测试逐项断言 |
+| 三个安全头 | `SECURITY_HEADERS` 在**每个**响应上（含 401/403/404/405/409/413/421/503） | 同上 + 各状态码测试 |
+| nonce CSP（无 `unsafe-inline`） | `GET /` 的 `Content-Security-Policy`，nonce 与页面里的 3 个 `nonce=` 属性**逐字节相同** | `the_main_page_csp_is_nonce_based_and_never_allows_inline`、`the_real_page_injects_cleanly_and_matches_the_csp_nonce` |
+| 路径脱敏（§7.4/§10.9） | `/api/status`、`/api/models` 的 `model_dir` 一律 `<redacted>`；ORT 指纹只给文件名+体积+SHA-256（剥掉 `LoadedModule.path`） | `status_reports_..._and_redacts_paths`（断言绝对路径一次都不出现） |
+
+**准入顺序（§4.4）**：路由 → token → Host/Origin → **队列容量（未读 body）** → `Content-Length`
+→ 有界读取（字节上限 + 截止时间）→ 建任务。`an_over_long_content_length_is_rejected_before_the_body_is_read`
+用一个"声明 4 MiB、一个字节都不发"的请求证明 413 发生在读取之前（否则该请求会一直等到超时）。
+
+### 交付物 3：内联页面（原型零改写，1 处最小改动）
+
+- `Temp/demo3-v2.html` → `src/bin/web/index.html`（SHA-256 一致，`Temp/` 原型**未被触碰**：
+  `git status --porcelain -- Temp/demo3-v2.html` 为空）；
+- 占位符契约严格照做：`__CSP_NONCE__` ×4、`__SRV_TOKEN__` ×3（页面自己的契约注释说明了
+  这两个数字的算法）；注入后三项断言，任一失败即**拒绝启动**：
+  1. `assert_no_placeholders_left`（M0c 的严格残留检查）；
+  2. 每个 `nonce="…"` 属性与 CSP 头的 nonce 逐字节相同（HTML 注释里的同形文字不算属性——
+     页面顶部注释逐字写了 `nonce="…"`，这是它自己在描述这条规则）；
+  3. token 真的出现在页面里（否则页面会静默退化成"离线预览模式"，永远不访问服务）。
+
+**对页面做的唯一改动**（2 行 + 5 行注释，逻辑一行未动）：
+
+```diff
+ const ENG_MAP = {
+   ...
+   waiting_models:['cloud-off','等待模型就绪','warn'],
++  /* 服务端（src/bin/serve/state.rs 的 EngineState）在模型不齐备时报的是
++     blocked_models_missing（docs/05 §7.6 的枚举名）；离线预览模式报 waiting_models。
++     两者是同一件事，展示必须一致，否则真实模式下会退化成"状态未知"。 */
++  blocked_models_missing:['cloud-off','等待模型就绪','warn'],
+   unknown:       ['info','状态未知','dim']
+ };
+-  const head = (tq.ready && s.state === 'waiting_models')
++  const waiting = s.state === 'waiting_models' || s.state === 'blocked_models_missing';
++  const head = (tq.ready && waiting)
+```
+
+原因：服务端的 `EngineState`（§7.6 冻结的枚举名）是 `blocked_models_missing`，而页面只认识
+演示模式用的 `waiting_models`；不改的话真实模式下会显示"状态未知"。**服务端没有改名去迁就
+页面**（§7.6 的枚举名是文档冻结的），改的是页面这一处映射。
+
+**页面对"尚未实现的端点"的降级（如实记录）**：
+
+| 页面调用 | M1 的实现 | 页面表现 |
+| --- | --- | --- |
+| `POST /api/models/download` | 403 `downloads_disabled`（未开 `--allow-download`）；开启时创建真实任务后失败并写明"未实现、无网络 I/O" | toast 显示 `downloads_disabled` 文案或失败原因；横幅提示"服务未以 --allow-download 启动" |
+| `GET /api/jobs/{id}/annotated.png` | 404 `not_found`（M3） | `apiBlob` 拒绝 → toast"请求失败（HTTP 404）"，页面不崩 |
+| `GET /api/jobs/{id}/export?format=` | 404 `not_found`（M3） | 同上 |
+| 公式路由开关 | M1 服务端固定文本路由（§10.8）；页面本来就不发送这个开关 | 公式队列显示"不可用（不影响普通 OCR）"，文本队列正常 |
+| `plain_text` | 已提供（见交付物 1） | 复制全文走服务端的阅读顺序文本 |
+
+### 交付物 4：删除 M0 脚手架，接上 M0c 的每一处接缝
+
+- **`#![allow(dead_code)]` 已删除**。逐项处置：
+  - 接上真实调用点（不再是"只被测试用"）：`HttpMethod::parse`、`AdmissionError::Route` 的三个字段、
+    `AdmissionError::rejected`、`BodyBudget::{max_body,received}`（超限时打印账本口径）、
+    `JobStoreLimits::new`（`from_limits` 改为调用它，校验只有一份实现）、
+    `SchedulerConfig::new`（`from_limits` 同上）、`JobKind::name` / `JobState::name`
+    （202/任务视图里的 `kind`/`state` 不再写字符串字面量）、
+    `DualQueueScheduler::{round_len,served_in_round,is_empty}`（进 `/api/status` 的队列诊断）、
+    `JobStore::is_empty`（清理线程的早退）、`ServeConfigError::{field,reason}`（`Display` 改为调用它们）、
+    `LocalOrigin::port`（允许集合与实际绑定端口的一致性检查）、`ServeLimits::download_budget`
+    （下载端点的 `--max-download-mb` 预检，§6.2）、`JobStore::set_position`（由调度器计算 position）；
+  - 删除（M1 不再需要）：`ModelPlan::{model_dir,sets}`、`ModelSnapshot::source`、
+    `ServeShared::{model_dir,queue_wait_bound}`、`serve::run::resolved_model_dir`、
+    M0c 的 `scope_tests`（由更强的 `dependency_boundary` 取代）；
+  - **保留但逐项 `#[allow(dead_code)]`（带理由）**：`ServeError::{ExportTooLarge, InsufficientDiskSpace, UnsupportedInput}`
+    （§11.1 冻结的协议变体，生产者分别在 M2/M3）、`EngineState::Rebuilding` +
+    `EngineStateMachine::{begin_loading,begin_rebuild,models_still_missing}`（M3 的
+    `POST /api/engine/reload`）。这些项都有 M0c 的转换测试，删掉会让 §7.6/§11.1 的冻结契约
+    失去覆盖；`allow` 是**逐项**的，与原来覆盖整个子树的 `#![allow(dead_code)]` 不是一回事。
+- **`ModelReadiness` 由 `ModelSetStatus` 填充**（M0c 接缝 1）：`ModelPlan::resolve` 用库的
+  `ModelSource`（单一来源规则）+ `ModelRequest::text_only`（与 `--config` 一致的管线选择），
+  启动快照的 `blocked` 清单直接来自共享的 `validate_model_files`。
+- **§7.6 的 OCR 409 体形状（M0c 接缝 4）已决定并统一**：
+  `code` = `models_missing`，若有损坏文件则 `models_corrupt`（§5.2/§11.1 要求可区分）；
+  清单进 `detail`，字段名与值**复用** `/api/models` 的同一份计算：
+  `detail.{missing,corrupt,blocked,source,model_dir}` 与 `/api/models` 的同名字段**逐字节相同**
+  （`blocked` = 缺失 ∪ 损坏，也等于 `EngineState::BlockedModelsMissing.missing`）。
+- **路径脱敏（M0c 接缝 5）**：`/api/status` 不再直接序列化库的 ORT 指纹（它带绝对路径），
+  改为只给文件名 + 体积 + SHA-256 + provider DLL 名单。
+- **读取超时的实体（M0c 接缝 6）**：用 `Instant` 截止时间在**每次尝试读取前**判定；已知边界见"未覆盖风险"。
+
+### 交付物 5：验证
+
+#### 5.1 静态检查与 feature 矩阵（最终树，日志在 `target/m1-verify/`）
+
+| # | 命令 | 结果 | 退出码 |
+| --- | --- | --- | --- |
+| 1 | `cargo fmt --all -- --check` | 无输出 | 0 |
+| 2 | `cargo clippy --all-targets -- -D warnings` | 无 warning | 0 |
+| 3 | `cargo clippy --features serve --all-targets -- -D warnings` | 无 warning（**含 M0c 的 105 个测试与新代码**） | 0 |
+| 4 | `cargo test --all-targets` | 369 + 2 + 4 + 14 = **389 passed, 0 failed** | 0 |
+| 5 | `cargo test --features serve --all-targets` | 389 + **156** = **545 passed, 0 failed** | 0 |
+| 6 | `cargo build --release --bins` | `Finished release profile [optimized] in 7.98s`；`rapidocr.exe` 34,446,336 B | 0 |
+| 7 | `cargo build --release --bins --features serve` | `Finished release profile [optimized] in 8.31s`（同一二进制即可跑 serve） | 0 |
+
+**默认依赖图逐字节未变**（§2.1 的硬约束）：
+
+| 证据 | 值 |
+| --- | --- |
+| `cargo tree -e normal -p rapid-ocr-rs`（M1 开工前） | 606 行，SHA-256 `EB00BBA0C242E09DE4E7631662634596F3D5325778D32B32213E70981A8EB7B1` |
+| 同上（M1 完成后） | 606 行，SHA-256 **完全相同** |
+| 默认树里的 `tiny_http` 出现次数 | **0** |
+| `cargo tree -e normal --no-default-features` | 605 行，`tiny_http` **0** 次 |
+| `cargo tree … --features serve` | 611 行，`tiny_http v0.12.0`（+ `ascii`/`chunked_transfer`/`httpdate`） |
+| 源码级边界 | `dependency_boundary` 两个测试：库（`src/` 除 `src/bin`）不得引用 HTTP 库；`serve/` 子树里只有 `http.rs` 可以；`Cargo.toml` 必须 `optional = true`、不在 `default`、且只由 `serve` 用 `dep:` 引入 |
+
+`Cargo.lock` 有改动（记录所有 feature 的依赖并集），这是 lock 文件的职责；**默认 feature 的依赖图**才是
+§2.1 约束的对象，它是逐字节相同的。
+
+#### 5.2 真实绑定端口的端到端测试（`src/bin/serve/tests.rs`：24 个测试，原始 TCP 客户端）
+
+| 验收项 | 测试 | 结果 |
+| --- | --- | --- |
+| `/`、`/api/status`、`/api/models`、`202 → queued → running → succeeded → /result` | `the_job_goes_from_202_to_succeeded_and_its_result_round_trips`、`the_page_carries_...`、`status_reports_...`、`models_reports_...` | ✅ |
+| 401（缺 token / 错 token） | `the_token_is_required_on_every_api_route` | ✅ |
+| 403（缺 / `null` / 不匹配 `Origin`，仅 POST） | `state_changing_requests_require_a_matching_origin`、`read_requests_do_not_require_an_origin` | ✅ |
+| 421（错 Host / 无 Host / `[::1]`） | `the_host_header_is_validated_for_dns_rebinding` | ✅ |
+| 503（队列满，且**未读 body**） | `a_full_queue_is_503_without_reading_the_body` | ✅ |
+| 404 / 410（淘汰后可区分；TTL 后回到 404） | `evicted_jobs_are_410_and_after_the_ttl_they_become_404` | ✅ |
+| 409（取消运行中的任务，状态不变） | `cancelling_a_queued_job_succeeds_and_a_running_job_is_409` | ✅ |
+| 413（`Content-Length` 预检，声明后不发） | `an_over_long_content_length_is_rejected_before_the_body_is_read` | ✅ |
+| 413 `result_too_large`（有界序列化中止） | `a_result_over_the_limit_is_a_413_result_too_large` | ✅ |
+| 404/405（M3/M4 端点不存在；`Allow` 头） | `unknown_paths_are_404_and_wrong_methods_are_405` | ✅ |
+| 媒体类型（非 octet-stream）与 `?max_side=` 校验 | `the_ocr_media_type_is_validated`、`the_max_side_query_parameter_is_validated` | ✅ |
+| 安全头齐备 / 无 CORS / nonce CSP 无 `unsafe-inline` | `the_page_carries_the_nonce_csp_and_the_frozen_security_headers` | ✅ |
+| 占位符残留 → **拒绝启动** | `run::tests::a_residual_placeholder_refuses_to_start`（病理输入：token 值里含另一个占位符字面量）、`a_foreign_nonce_refuses_to_start`、`a_page_without_a_nonce_or_a_token_refuses_to_start` | ✅ |
+| 引擎 `Failed` → `/api/status` 带 reason，OCR 503 `engine_unavailable` | `an_engine_that_fails_to_load_is_failed_with_a_reason_and_503` | ✅ |
+| 空模型目录：服务 Ready + `BlockedModelsMissing` + 409 字段与 `/api/models` 一致 | `models_reports_every_file_state_and_matches_the_ocr_409` | ✅ |
+
+#### 5.3 端到端：12 张真实图片经 HTTP 与 CLI 逐张对照（`target/m1-e2e/`）
+
+```powershell
+# 服务（release 二进制，真实模型目录 + 真实配置）
+target\release\rapidocr.exe serve --port 8791 `
+  --model-dir D:\100_Projects\110_Daily\SnapClip\OCR-Model\small `
+  --config D:\100_Projects\110_Daily\SnapClip\OCR-Model\test-config-small.yaml
+# 每张图：POST /api/ocr（application/octet-stream，带 X-RapidOCR-Token 与 Origin）→
+#         轮询 GET /api/jobs/{id} → GET /api/jobs/{id}/result
+# 对照：target\release\rapidocr.exe run --img-path <同一张图> --config <同一配置> --json
+```
+
+| # | 图片 | HTTP `regions` | CLI `regions` | 区域数相同 | `text` 逐字节相同 | 逐区域文本序列相同 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 01基础多位置文本.png | 42 | 42 | ✅ | ✅ | ✅ |
+| 2 | 02多语言与RTL混排.png | 21 | 21 | ✅ | ✅ | ✅ |
+| 3 | 03旋转与倾斜.png | 13 | 13 | ✅ | ✅ | ✅ |
+| 4 | 04表格与键值对.png | 61 | 61 | ✅ | ✅ | ✅ |
+| 5 | 05代码与等宽字体.png | 38 | 38 | ✅ | ✅ | ✅ |
+| 6 | 06低对比度与深色背景.png | 21 | 21 | ✅ | ✅ | ✅ |
+| 7 | 07小字号与密集排版.png | 37 | 37 | ✅ | ✅ | ✅ |
+| 8 | 08数字公式与符号.png | 51 | 51 | ✅ | ✅ | ✅ |
+| 9 | 09竖排文本.png | 14 | 14 | ✅ | ✅ | ✅ |
+| 10 | 10长段落与分栏.png | 37 | 37 | ✅ | ✅ | ✅ |
+| 11 | 11文字样式与特效.png | 22 | 22 | ✅ | ✅ | ✅ |
+| 12 | 12综合压力测试.png | 61 | 61 | ✅ | ✅ | ✅ |
+| — | **合计** | **418** | **418** | **12/12** | **12/12** | **12/12** |
+
+`ALL_12_MATCH=True`（脚本判据：逐张 regions 数、`text`、逐区域文本序列三者全等）。
+每张图的完整响应与 CLI 输出分别保存在 `target/m1-e2e/serve-<name>.json` 与 `cli-<name>.json`。
+
+#### 5.4 空模型目录
+
+```text
+service.state=ready            engine.state=blocked_models_missing
+model_dir=<redacted>           source=default_table
+models.missing=[PP-OCRv6_det_small.onnx, PP-OCRv6_rec_small.onnx, ppocrv6_dict.txt]
+POST /api/ocr → http=409 code=models_missing
+  detail.missing=[PP-OCRv6_det_small.onnx, PP-OCRv6_rec_small.onnx, ppocrv6_dict.txt]
+  detail.corrupt=[]  detail.source=default_table  detail.model_dir=<redacted>
+FIELDS_MATCH_API_MODELS=True   （missing/blocked/source/model_dir 与 /api/models 逐字节相同）
+```
+
+#### 5.5 双向公平性（真实 HTTP 边界）
+
+M1 的**生产**路由固定为文本队列（§10.8：公式路由默认关闭，页面也不发送这个开关），
+因此"公式洪水"不能靠真实引擎在 HTTP 上产生。做法（**测试专用慢速路径，如实说明**）：
+
+1. 用 `ServeContext::engine_factory` 注入一个**脚本化后端**（`Scripted`：可设 `delay` /
+   区域数 / 失败 / 是否记录调用），它替代真实引擎，但**队列、准入、调度、任务生命周期全是真实代码**；
+2. 公式队列通过 `OcrRouting { formula: true }`（M4 才会接上真实来源）+ `POST /api/ocr?queue=formula`
+   进入——生产路径下这个取值会被 400 `bad_request` 拒绝（`the_formula_queue_is_refused_when_formula_routing_is_off`）；
+3. 每个方向的上界取自 **`/api/status` 的公开字段** `queues.<class>.wait_bound`
+   （= `capacity × 对方配额`，§8.3 的可证明上界），再乘单任务耗时并留余量；
+4. 测试先**证明目标队列真的被灌满**（`used >= capacity`），再提交另一队列的任务并计时，
+   最后断言计时窗口内洪水队列确实被服务过（否则"没被饿死"没有意义）。
+
+| 方向 | 参数 | 上界 | 结果 |
+| --- | --- | --- | --- |
+| 公式洪水（容量 2）下普通任务 | `delay=25 ms`，text 容量 4 / formula 容量 2，连续配额 4/1 | `wait_bound(text)=4` → `(4+3)×25 ms + 750 ms = 925 ms` | ✅ 未被饿死 |
+| 普通洪水（容量 4）下公式任务 | 同上 | `wait_bound(formula)=8` → `(8+3)×25 ms + 750 ms = 1025 ms` | ✅ 未被饿死 |
+
+#### 5.6 12 图硬门槛（`target/m1-gate/`，**没有**覆盖 `tests/baseline/`）
+
+```powershell
+target\release\bench_warm_e2e.exe --config <OCR-Model>\test-config-small.yaml `
+  --images-dir <OCR-test-image> --warmup-rounds 1 --rounds 3 --max-side-len 2000 `
+  --intra-threads 16 --output target\m1-gate\bench-cpu-2000.json
+target\release\rapidocr.exe evaluate --manifest <OCR-test-image>\golden-manifest.json `
+  --config <OCR-Model>\test-config-small.yaml --output target\m1-gate\evaluation-cpu.json
+```
+
+| 门槛 | 文档要求 | 本次实测（release） | 比较方式 | 结论 |
+| --- | --- | --- | --- | --- |
+| 12 图区域数均值 | `34.833333333333336` | **`34.833333333333336`**（36 样本） | 原始 JSON 的**数字字面量**字符串精确比较 | 逐位相同 |
+| 12 图 mean CER | `0.44765135645866394` | **`0.44765135645866394`**（12 例） | 同上 | 逐位相同 |
+
+`git status --porcelain -- tests/baseline` 为空；`Temp/demo3-v2.html` 也未被改动。
+
+---
+
+### 关键行为对比（AGENTS.md §9）
+
+| 项目 | 修改前（M0 基线） | 修改后 | 预期结果 |
+| --- | --- | --- | --- |
+| `serve` feature | 空 feature（`serve = []`），无 HTTP | `serve = ["dep:tiny_http"]`（optional，不进 default）；默认依赖图逐字节不变 | §2.1 |
+| `rapidocr serve` | 子命令**不存在**（无法解析） | 子命令可解析；未启用 feature 时给出"重建提示"的可定位错误 | §3 |
+| HTTP 端到端 | 完全没有（M0c 记录明说"一条都没跑"） | 24 个真实端口测试 + 12 张真实图片经 HTTP 与 CLI 逐张一致 | §12 |
+| OCR 409 体形状 | 保留为 M0c 接缝（只有 `code`，无清单） | `code`（`models_missing`/`models_corrupt`）+ `detail` 与 `/api/models` 同源同值 | §7.6 |
+| `ModelReadiness` | 本地接缝类型，没有生产者 | 由 `ModelSource`/`ModelSetStatus`（库的唯一实现）填充 | §5.2/§7.6 |
+| 引擎的模型路径 | 由 `--config` 的 `model_path` 决定（与 `/api/models` 不是一个来源） | 一律由 `--model-dir` 的模型集钉住（`pin_engine_paths`），三个 `allow_download=false` | §5.3/§0.2 |
+| 结果序列化 | 无 | 有界写入器（超限即中止）→ 413 `result_too_large` | §4.6 |
+| 下载 | 无端点 | `POST /api/models/download`：未开开关 → 403；开启 → 真实任务 + 独立的 M2 worker（M1 如实失败，**无网络 I/O**） | §4.2/§8.1 |
+| 性能表现 | — | 推理链路一行未动；12 图两个硬门槛逐位相同；新增的只有 serve 侧的线程与 HTTP | 无退化 |
+
+---
+
+### 未覆盖风险与**做不到的事**（如实记录）
+
+1. **未提交、未在干净 clone 上验证**：按要求不 commit；证据来自当前工作树。
+2. **`chunked` 请求体的 413 在 HTTP 层没有专门测试**：HTTP 层测的是 §4.4 第 5 步的
+   `Content-Length` 预检（"声明 4 MiB 一个字节都不发 → 413"），流式上限（第 6 步）由 M0c 的
+   `BodyBudget`/`read_body` 单元测试覆盖（用脚本化 `BodySource`）。二者合起来覆盖该要求，
+   但**没有一条测试**同时经过"真实 chunked 传输 + 上限中止"。
+3. **读取超时不能中断已经发起的一次 `read`**：`tiny_http` 不暴露 socket 读超时，因此
+   "客户端发完请求头就不再发数据"会让 accept 线程阻塞在那一次 `read` 上（`Instant` 截止时间
+   只能在**每次尝试读取之前**生效）。这是 M0c 接缝 6 的实体化结论，不是回归。
+   要彻底解决只能给 `tiny_http` 上游提读超时或换服务器实现。
+4. **accept 是单线程、就地读 body**：一个慢速上传会占住 accept 线程（其它静态请求等待）。
+   这是 §8.1 的既定线程模型（"静态/校验类请求就地处理"），M1 未加并发 accept。
+5. **`--allow-download` 打开时，下载任务必然失败**（原因文本写明"未实现、无网络 I/O"）。
+   选择这个形状而不是"静默 403"是为了让页面**可见地降级**并让 `JobKind::ModelDownload`
+   与 `/api/jobs/{id}` 的生命周期在 M1 就是真的；M2 只需替换 worker 的处理体。
+6. **公式队列在 M1 生产路径上不可达**（§10.8），因此公平性验收用的是测试专用慢速后端 +
+   `?queue=`（见 5.5）；真实引擎 + 公式路由的公平性要等 M4。
+7. **内联页面的区域列表按响应的 `regions` 顺序渲染**，而 `to_output_json` 保留的是**检测顺序**；
+   §9.2 希望列表是"阅读顺序"。M1 没有改库的输出形状（§1.1 指定复用 `to_output_json`），
+   `复制全文` 用的 `plain_text` 是阅读顺序的。这是 M3/M4 需要决定的一个协议问题。
+8. **`/api/models` 每次都重新读盘并重新哈希**（10–30 MB 文件，约 10–100 ms/次）：为了让 M2
+   下载完成后页面立刻看到 `present`；令牌保护下本机页面轮询低频，因此没有加缓存。
+9. **`--open` 只能打开系统默认浏览器**（`cmd /C start`），无法验证"确实打开了"。
+10. **未验证真实浏览器里的手工闭环**（粘贴、拖放、进度条、键盘/焦点、View Transitions）：
+    §12 的"手工"一行需要人工操作浏览器，本次只做了 HTTP 层与页面注入的自动验证。
+
+---
+
+### 与 `docs/05` §11「M1」验收清单的对照
+
+| §11 M1 条目 | 本阶段 | 证据 |
+| --- | --- | --- |
+| `serve` 子命令 + feature 隔离 + 未启用 feature 的可定位错误 | ✅ 完成 | `cli.rs` 测试 + `rapidocr.rs` 的两个 `Command::Serve` 分支 |
+| provider 启动期解析；`GET /`、`/api/status`、`POST /api/ocr`、`/api/jobs/{id}`、`/result` | ✅ 完成 | 5.2 的 HTTP 测试；`ServeShared::status_json` 三字段 |
+| 单图上传（XHR + 进度 + 取消上传）、异步任务与轮询 | ✅ 服务端完成 | `202 → queued → running → succeeded`；页面侧的 XHR 是原型既有代码（未改） |
+| 预览与 polygon 叠框、区域列表、复制全文、JSON 导出 | ✅ 数据面完成 | `regions[].polygon.points`（恰好 4 点、原图坐标）、`plain_text`；页面的渲染逻辑未改 |
+| 模型缺失提示（消费 `ModelSetStatus`；**不含下载动作**） | ✅ 完成 | `/api/models` + 409 `detail`；下载按 M2 处理并可见降级 |
+| 测试：状态机、tombstone（容量+TTL）、双队列 503、公平调度、准入顺序、Host/Origin/token、安全头与 nonce CSP | ✅ 完成 | 105（M0c 保留）+ 51（M1 新增）= 156 个 serve 测试，0 failed |
+| **M1 验收**：12 图经 HTTP 的 `regions` 与文本与 `rapidocr run --json` 逐张一致 | ✅ 完成 | 5.3：12/12 一致（418 = 418） |
+| **M1 验收**：空 `--model-dir` 下 `/api/models` 与 `/api/ocr` 的缺失字段一致 | ✅ 完成 | 5.4：`FIELDS_MATCH_API_MODELS=True` |
+| **M1 验收**：公式洪水下普通 OCR 不被饿死、普通洪水下公式也不被饿死 | ✅ 完成（测试专用慢速后端） | 5.5 两个方向 |
+| **M1 验收**：空模型目录下服务仍为 `Ready` + `EngineState::BlockedModelsMissing` | ✅ 完成 | 5.4 |
+| **M1 验收**：CLI 中不存在任何可改变监听地址的选项，也不存在 `--ocr-workers` | ✅ 完成 | M0c 的 `cli` 枚举测试（21 个选项，无 `--host`/`--ocr-workers`） |
+| M2/M3/M4 的条目（下载进度、`annotated.png`、`export`、`engine/reload`、公式模型） | ⛔ 不在 M1 | 见下表接缝 |
+
+---
+
+### 接缝（留给 M2 / M3 / M4）
+
+**M2（模型下载）**
+
+1. `download::worker` 的处理体：把 `NOT_IMPLEMENTED_REASON` 那一行换成真实的逐文件
+   `download_model_set`（库侧已经就绪）+ 进度上报（`JobRecord` 目前没有进度字段，需要扩展）；
+2. `ServeLimits::download_budget` 已用于"已知体积之和 > `--max-download-mb` → 413"的预检，
+   M2 的逐文件递减直接用同一个 `DownloadBudget`；
+3. `--allow-download-host` 目前只是被解析（M0b 的库函数只认编译期白名单）：M2 需要把它作为
+   显式参数接进 `DownloadRequest.allowed_hosts` 并打印高风险警告；
+4. 下载完成后**不自动**重建引擎（§7.6）：M2/M3 需要在 `POST /api/ocr` 或
+   `POST /api/engine/reload` 时惰性创建——`EngineStateMachine::begin_loading` 正为此保留；
+5. 下载任务的 `queue` 字段目前借用 `QueueClass::Text`（`JobStore` 要求一个类别）且 `position`
+   恒为 `null`；M2 若要在 UI 上区分，应引入真正的中性类别而不是继续借用。
+
+**M3（诊断与导出）**
+
+1. `GET /api/jobs/{id}/annotated.png`：需要保留原图编码字节（M1 读完 body 就丢弃，
+   字节账本仍按 `--max-body-mb` 记），并用 `output::visualize::draw_output` 生成 PNG；
+2. `?format=json|md|html` 导出：`ReportMode::Static` + 独立的导出 CSP +
+   `Content-Disposition: attachment` + `data:` 内嵌图片 + `--max-export-mb` → 413 `export_too_large`
+   （`ServeError::ExportTooLarge` 已按 §11.1 冻结，等生产者）；
+3. `POST /api/engine/reload`：`begin_loading` / `models_still_missing` / `begin_rebuild` 三个
+   已测试的转换是它的全部状态迁移；
+4. 诊断面板需要的逐阶段耗时已经在 `/result` 的 `timings`/`stages` 里（未重新测量）。
+
+**M4（公式与评估）**
+
+1. `OcrRouting { formula: true }` 的真实来源（CLI 选项或端点）：M1 的 `?queue=formula`
+   只在测试路径下被接受，生产路径明确 400；
+2. 公式模型集：`ModelPlan::resolve` 目前固定 `ModelRequest::text_only`，M4 需要
+   `text_and_formula` 并处理"两个集合声明同一 role"的歧义（`ModelPlan::file_for` 已经会
+   报 `AmbiguousRole` 而不是静默取第一个）；
+3. 页面的公式开关目前只影响展示（原型不发送该开关）：M4 需要给 `POST /api/ocr` 一个
+   明确的选中方式（查询参数或 JSON 字段），这会是一个**协议新增**，需要先改 `docs/05`；
+4. 评估（CER/精确匹配）复用库的 `evaluation`，不另写指标。

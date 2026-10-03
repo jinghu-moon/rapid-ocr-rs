@@ -302,7 +302,16 @@ pub fn read_body(
             ChunkOutcome::TimedOut => return Err(ServeError::RequestTimeout),
             ChunkOutcome::Failed(_) => return Err(ServeError::BadRequest),
             ChunkOutcome::Data(chunk) => {
-                budget.accept(chunk.len() as u64)?;
+                if let Err(error) = budget.accept(chunk.len() as u64) {
+                    // 记录账本口径（§4.4 第 6 步）：运维要能看出是"哪一侧"超限，
+                    // 而不是只看到一句 413。
+                    eprintln!(
+                        "serve: request body rejected after {} of at most {} byte(s)",
+                        budget.received(),
+                        budget.max_body()
+                    );
+                    return Err(error);
+                }
                 body.extend_from_slice(&chunk);
             }
         }

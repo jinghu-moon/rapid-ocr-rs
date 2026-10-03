@@ -104,13 +104,17 @@ impl JobStoreLimits {
     }
 
     /// 从**已经校验过**的 [`ServeLimits`] 构造。
+    ///
+    /// 仍然走 [`Self::new`]：四个上限的校验只有一份实现（`ServeLimits` 的校验已经保证了
+    /// 取值 > 0，因此这里的 `expect` 是"同一套规则不会被绕过"的编译期可见断言）。
     pub fn from_limits(limits: &ServeLimits) -> Self {
-        Self {
-            max_retained: limits.max_retained,
-            max_retained_bytes: limits.max_retained_bytes,
-            max_tombstones: limits.max_tombstones,
-            ttl_ms: limits.job_ttl_ms,
-        }
+        Self::new(
+            limits.max_retained,
+            limits.max_retained_bytes,
+            limits.max_tombstones,
+            limits.job_ttl_ms,
+        )
+        .expect("ServeLimits validates the same four bounds")
     }
 }
 
