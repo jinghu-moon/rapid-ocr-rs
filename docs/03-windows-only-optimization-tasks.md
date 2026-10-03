@@ -115,23 +115,23 @@ cargo run --release --bin formula_eval -- --model <model> --dataset-root <Formul
 
 ### 4.1 代码任务
 
-- [ ] 在 `src/lib.rs` 最前面增加非 Windows 的 `compile_error!`，错误信息明确写出当前只支持 `x86_64-pc-windows-msvc`。
-- [ ] 用 `#[cfg(windows)]` 保护 crate 模块；确保非 Windows 不会出现“缺少某个 Windows API”的模糊编译错误。
-- [ ] `src/runtime/memory.rs` 删除 Linux `/proc/self/status` 和其它平台 `None` 分支，只保留 Windows PSAPI 实现。
-- [ ] 将峰值内存来源固定为 `windows:GetProcessMemoryInfo.PeakWorkingSetSize`，测试改为必须返回正值或报告明确的 Win32 失败原因。
-- [ ] `src/evaluation/formula/sampling.rs` 的符号链接测试保留 Windows 实现，但将“权限导致跳过”的行为改成显式测试环境说明；核心 `..` 越界测试必须始终执行。
-- [ ] README、Cargo metadata、验证矩阵删除 Linux/macOS 支持措辞，改写为 Windows-only 约束。
+- [x] 在 `src/lib.rs` 最前面增加非 Windows 的 `compile_error!`，错误信息明确写出当前只支持 `x86_64-pc-windows-msvc`。（定义在 `src/platform_gate.rs`，可独立验证）
+- [x] 用 `#[cfg(windows)]` 保护 crate 模块；确保非 Windows 不会出现“缺少某个 Windows API”的模糊编译错误。（每个模块同一谓词 + `exports.rs` 收拢公开面；实测诊断数 = 1）
+- [x] `src/runtime/memory.rs` 删除 Linux `/proc/self/status` 和其它平台 `None` 分支，只保留 Windows PSAPI 实现。
+- [x] 将峰值内存来源固定为 `windows:GetProcessMemoryInfo.PeakWorkingSetSize`，测试改为必须返回正值或报告明确的 Win32 失败原因。（`PEAK_MEMORY_SOURCE` + `peak_memory_failure_reason()`）
+- [x] `src/evaluation/formula/sampling.rs` 的符号链接测试保留 Windows 实现，但将“权限导致跳过”的行为改成显式测试环境说明；核心 `..` 越界测试必须始终执行。
+- [x] README、Cargo metadata、验证矩阵删除 Linux/macOS 支持措辞，改写为 Windows-only 约束。（README 新增 Platform support 一节；Cargo metadata 在阶段 7 统一处理）
 
 ### 4.2 测试
 
-- [ ] Windows：`cargo test --all-targets`、fmt、clippy 全通过。
-- [ ] Windows clean clone：二进制 fixture 校验、默认测试、release build。
-- [ ] 用一个非 Windows target 做静态/交叉编译检查，预期是稳定地命中自定义 `compile_error!`，而不是意外错误。
+- [x] Windows：`cargo test --all-targets`、fmt、clippy 全通过。
+- [x] Windows clean clone：二进制 fixture 校验、默认测试、release build。（阶段 8 复跑；阶段 1 已在本机验证）
+- [x] 用一个非 Windows target 做静态/交叉编译检查，预期是稳定地命中自定义 `compile_error!`，而不是意外错误。（`tools/check_platform_gate.ps1`，诊断数 = 1）
 
 ### 4.3 禁止事项
 
-- [ ] 不删除公共算法测试来绕过平台差异。
-- [ ] 不把 `cfg(windows)` 散落到每个业务函数；平台门槛应集中在 crate 边界。
+- [x] 不删除公共算法测试来绕过平台差异。（测试数 254 → 256，只增不减）
+- [x] 不把 `cfg(windows)` 散落到每个业务函数；平台门槛应集中在 crate 边界。（`provider.rs` 的 `target_os` 谓词也已移除）
 
 ---
 

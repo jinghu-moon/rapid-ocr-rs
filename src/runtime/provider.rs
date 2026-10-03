@@ -2,7 +2,7 @@
 use ort::ep::CANN;
 #[cfg(feature = "cuda-provider")]
 use ort::ep::CUDA;
-#[cfg(all(target_os = "windows", feature = "directml-provider"))]
+#[cfg(feature = "directml-provider")]
 use ort::ep::DirectML;
 #[cfg(any(
     feature = "cuda-provider",
@@ -76,7 +76,7 @@ pub fn resolve_execution_providers(
             }
         }
         ProviderPreference::DirectMl { device_id } => {
-            #[cfg(all(target_os = "windows", feature = "directml-provider"))]
+            #[cfg(feature = "directml-provider")]
             {
                 resolve_directml_execution_providers(
                     *device_id,
@@ -84,7 +84,7 @@ pub fn resolve_execution_providers(
                     fail_if_provider_unavailable,
                 )
             }
-            #[cfg(not(all(target_os = "windows", feature = "directml-provider")))]
+            #[cfg(not(feature = "directml-provider"))]
             {
                 let _ = (device_id, fail_if_provider_unavailable);
                 Err(RapidOcrError::UnsupportedProvider(
@@ -150,7 +150,7 @@ fn resolve_cuda_execution_providers(
     )
 }
 
-#[cfg(all(target_os = "windows", feature = "directml-provider"))]
+#[cfg(feature = "directml-provider")]
 fn resolve_directml_execution_providers(
     device_id: usize,
     cpu_provider: ExecutionProviderDispatch,
@@ -323,7 +323,7 @@ mod tests {
     use crate::runtime::provider::ResolvedExecutionProvider as AnyResolvedExecutionProvider;
 
     #[test]
-    #[cfg(all(target_os = "windows", feature = "directml-provider"))]
+    #[cfg(feature = "directml-provider")]
     fn directml_preference_has_cpu_fallback() {
         let providers = resolve_execution_providers(
             &ProviderPreference::DirectMl { device_id: 0 },

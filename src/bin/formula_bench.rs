@@ -7,8 +7,8 @@
 //! - 每个指标记录 **多轮采样** 的 min / max / mean / P50 / P95 / 标准差，而不是只报平均值；
 //! - batch=1/2/4/8 分别统计，并给出每张图的分摊耗时；
 //! - 记录请求 / 实际 provider 与是否发生 CPU 回退；
-//! - 记录进程 **峰值工作集**（Windows PSAPI `PeakWorkingSetSize`，Linux `/proc/self/status`
-//!   `VmHWM`）；
+//! - 记录进程 **峰值工作集**（Windows PSAPI `GetProcessMemoryInfo.PeakWorkingSetSize`，
+//!   全项目唯一口径）；
 //! - 公式模型与普通 OCR 的性能**分开报告**，不混成一个吞吐指标；需要对比时通过
 //!   `--ocr-baseline` 指向普通 OCR 的 benchmark JSON，只做并列展示，不做加权合并。
 
@@ -389,9 +389,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     if memory_end.is_none() {
-        notes.push(
-            "当前平台未实现峰值工作集采集（仅支持 Windows PSAPI 与 Linux /proc）。".to_string(),
-        );
+        notes.push(format!(
+            "峰值工作集采集失败：{}",
+            rapid_ocr_rs::peak_memory_failure_reason()
+                .unwrap_or_else(|| "GetProcessMemoryInfo 未返回数据".to_string())
+        ));
     }
 
     let report = Report {

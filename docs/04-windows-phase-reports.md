@@ -109,6 +109,77 @@
 
 ---
 
+## 阶段 1：建立 Windows-only 编译边界
+
+**阶段**：1
+**日期**：2026-10-03
+**提交**：`（本阶段提交）`
+**变更摘要**：
+
+- 新增 `src/platform_gate.rs`：平台门槛的**唯一定义处**，无任何依赖，
+  因此在非 Windows target 上只会产生这一条 `compile_error!`。
+- `src/lib.rs` 改为：`#[path]` 引入门槛 + 每个模块都带
+  `#[cfg(all(windows, target_arch = "x86_64"))]`；公开 API 收拢到新的
+  `src/exports.rs`，于是平台谓词只需在 `lib.rs` 写一次，而不是在十几个 `pub use`
+  上重复。
+- `src/runtime/memory.rs` 删除 Linux `/proc/self/status` 与其它平台的 `None` 分支，
+  只保留 Windows PSAPI；新增 `PEAK_MEMORY_SOURCE`、`peak_memory_failure_reason()`
+  （失败时带 `GetLastError`），测试改为“必须拿到正值，否则报告可定位的 Win32 原因”。
+- `src/runtime/provider.rs` 去掉 `target_os = "windows"` 谓词（crate 已经只编译
+  Windows）；`src/bin/formula_bench.rs` 去掉 Linux `/proc` 口径描述，改为报告真实的
+  Win32 失败原因。
+- `src/evaluation/formula/sampling.rs` 的符号链接用例：把“权限导致跳过”改成显式的
+  `ENVIRONMENT:` 说明，并注明同一条不变式由**无条件执行**的 `..` 越界用例覆盖。
+- README 新增 “Platform support” 一节（Windows x64 only + 非目标 + 门槛可验证），
+  删除 CANN 与 Linux 内存口径措辞。
+
+**执行命令**：
+
+```powershell
+cargo test --all-targets
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --features directml-provider
+cargo test --features cuda-provider
+pwsh -NoProfile -File tools/check_platform_gate.ps1
+```
+
+**关键结果**：
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --all-targets` | lib 256 + bin 18 passed / 0 failed |
+| `--features directml-provider` | lib 259 passed / 0 failed |
+| `--features cuda-provider` | lib 257 passed / 0 failed |
+| fmt / clippy `-D warnings` | 通过 |
+| `check_platform_gate.ps1`（`x86_64-linux-android`） | 命中自定义 `compile_error!`，**诊断数 = 1**（没有额外错误泄漏） |
+| `check_platform_gate.ps1`（本机 target） | 门槛干净通过 |
+
+**基线对比**（12 图，max_side_len 2000，intra_threads 16）：
+
+| 指标 | 阶段 0 基线 | 阶段 1 后 | 判定 |
+| --- | ---: | ---: | --- |
+| mean CER（硬门槛） | 0.4477 | 0.4477 | 未退化 |
+| 区域数均值（硬门槛） | 34.8 | 34.8 | 未退化 |
+| OCR p50 (ms) | 1001.1 | 1009.8 | +0.9%，噪声范围 |
+| OCR p90 (ms) | 1153.6 | 1187.4 | +2.9%，噪声范围 |
+| init (ms) | 143.6 | 140.7 | 未退化 |
+| 峰值工作集 (MB) | 1284.0 | 1284.0 | 未退化 |
+
+**未覆盖风险**：
+
+- 交叉编译检查用的是已安装的非 Windows target `x86_64-linux-android`（本机
+  rustup 未安装 `x86_64-unknown-linux-gnu`）。Windows ARM64 与 GNU ABI 没有对应
+  target 可验证，只能靠同一个谓词推出结论；谓词已在 `platform_gate.rs` 集中，
+  将来装好 target 可以直接复跑同一个脚本。
+- 本次未安装任何新 target，因此“非 Windows 失败”的证据来自门槛文件本身，
+  而不是整 crate 的交叉编译（依赖里的 ort/turbojpeg 需要目标平台原生工具链）。
+
+**是否触发公式 smoke / val-501 / 全量评测**：均未触发。本阶段只改平台边界与
+内存采集，不触及模型调用、预处理、tokenizer、postprocess、batch/EOS 或指标实现。
+
+---
+
 ## 阶段完成记录模板（后续阶段沿用）
 
 ```text

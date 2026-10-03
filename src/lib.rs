@@ -1,76 +1,58 @@
+//! `rapid-ocr-rs`：用 Rust 调用 PP-OCR / PP-FormulaNet 系列 ONNX 模型。
+//!
+//! # 平台支持
+//!
+//! **仅支持 `x86_64-pc-windows-msvc`。**
+//!
+//! 这是刻意的收窄，而不是尚未移植：项目的实际运行环境只有 Windows，
+//! 保留 Linux/macOS 分支会让平台差异散落到业务代码里，并让验证矩阵无法收敛。
+//! 明确非目标：`aarch64-pc-windows-msvc`、`x86_64-pc-windows-gnu`、Wine、WSL、
+//! Linux、macOS。若将来需要，另立平台计划，而不是在这里逐步加回 `cfg`。
+//!
+//! 平台边界集中在 crate 根部，规则只有三条：
+//!
+//! 1. 门槛写在 `src/platform_gate.rs`（唯一定义处，无任何依赖），可以用
+//!    `tools/check_platform_gate.ps1` 单独对一个非 Windows target 验证“命中的是
+//!    我们自己的错误信息”；
+//! 2. 所有模块与重导出都带同一个 `#[cfg]` 谓词，因此非支持平台**只会**看到那一条
+//!    `compile_error!`，不会退化成一堆“缺少某个 Windows API”的模糊诊断；
+//! 3. 业务代码内部不再散布 `cfg(windows)`；平台差异只允许出现在
+//!    `runtime/memory.rs` 这类平台实现模块里。
+
+#[path = "platform_gate.rs"]
+mod platform_gate;
+
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod api;
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod config;
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod error;
+#[cfg(all(windows, target_arch = "x86_64"))]
 pub mod evaluation;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod exports;
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod formula;
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod input;
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod model_registry;
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod model_store;
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod ocr;
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod output;
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod runtime;
-#[cfg(test)]
+#[cfg(all(windows, target_arch = "x86_64", test))]
 mod test_support;
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod vision;
 
-pub use api::{
-    ClassifierPlan, ClassifierPolicy, CoordinateSpace, DetectionOutcome, DetectionPolicy,
-    EngineInfo, EnhancementPolicy, FormulaOutcome, FormulaPolicy, ImageInfo, ImageInput, ImageSize,
-    InputTimings, ModelArtifact, ModelManifest, ModelSource, OcrEngine, OcrOutput, OcrRegion,
-    OcrRequest, OcrTimings, OcrWord, OutputPolicy, OwnedPixelBuffer, PixelFormat, Polygon,
-    PreprocessPolicy, ProviderInfo, ProviderPreference as GenericProviderPreference,
-    ProviderResolutionInfo, RecognitionOutcome, RecognitionPolicy, RectU32, RegionKind,
-    RegionSource, ResolvedProvider, StagePlan, StageReport, StageReports, StageState, StageTiming,
-    TextOrder, TextOrientation, TilePolicy, WordKind, WordOutputMode,
-};
-pub use config::{
-    ColorOrder, LangCls, LangDet, LangRec, ModelType, OcrVersion, ProviderPreference, RecImage,
-    RuntimeBackend, RuntimeConfig, VisionBackend,
-};
-pub use error::{RapidOcrError, Result};
-pub use formula::contract::{
-    FORMULA_INPUT_CHANNELS, FORMULA_INPUT_RANK, FORMULA_INPUT_SPATIAL, FORMULA_OUTPUT_RANK,
-    FormulaContract, validate_formula_contract,
-};
-pub use formula::detect::{
-    DEFAULT_FORMULA_DETECT_CONFIDENCE, DEFAULT_FORMULA_DETECT_IOU,
-    DEFAULT_FORMULA_DETECT_MAX_DETECTIONS, FORMULA_DETECT_INPUT_SIZE, FormulaBox,
-    FormulaDetectOptions, FormulaDetector,
-};
-pub use formula::ftfy::{NOT_APPLICABLE_STEPS, UNIMPLEMENTED_STEPS, fix_text};
-pub use formula::model_info::FormulaModelInfo;
-pub use formula::output::{
-    order_formula_results, to_formula_html, to_formula_json, to_formula_markdown,
-};
-pub use formula::preprocess::{
-    FORMULA_INPUT_SIZE, FORMULA_MEAN, FORMULA_STD, FormulaPreprocessor, FormulaTensor,
-};
-pub use formula::recognizer::{
-    DEFAULT_MAX_FORMULA_BATCH_SIZE, DEFAULT_MAX_FORMULA_SEQUENCE_LENGTH, FORMULA_MODEL_LOOP_BOUND,
-    FormulaRecognition, FormulaRecognizer,
-};
-pub use formula::session::FormulaSession;
-pub use formula::tokenizer::{FormulaDecode, FormulaTokenizer};
-pub use formula::tokenizer_metadata::{
-    BOS_ID, BOS_TOKEN, EOS_ID, EOS_TOKEN, FormulaTokenizerMetadata, PAD_ID, PAD_TOKEN, UNK_ID,
-    UNK_TOKEN,
-};
-pub use model_store::{
-    default_model_store_dir, ensure_downloaded, sha256_file, verify_existing_file,
-};
-pub use ocr::config::{ModelConfig, RecognizeOptions, RecognizerConfig};
-pub use ocr::pipeline::{
-    config::{EngineConfig, GlobalConfig},
-    rapid_ocr::{PipelineProviderResolutions, RapidOcr, RapidOcrEngine},
-};
-pub use ocr::types::{LineResult, RecognizeOutput, WordBox, WordInfo, WordType};
-pub use output::html::{relative_image_name, render_output_report, render_report};
-pub use output::json::{OcrJsonItem, to_output_items, to_output_json};
-pub use output::markdown::to_output_markdown;
-pub use output::visualize::draw_output;
-pub use runtime::contracts::{ModelIoProbe, TensorSpec};
-pub use runtime::memory::{peak_memory_source, peak_working_set_bytes};
-pub use runtime::provider::{ProviderResolution, ResolvedExecutionProvider};
-pub use runtime::session::OrtSession;
-
-pub type Quad = [[f32; 2]; 4];
+/// 公开 API 的唯一入口（见 `src/exports.rs`）。
+///
+/// 平台谓词只在这一处出现，避免在十几个 `pub use` 上重复。
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub use exports::*;

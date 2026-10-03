@@ -411,8 +411,10 @@ mod tests {
 
     /// 指向数据集根目录之外的符号链接必须被拒绝（规范化会解析链接目标）。
     ///
-    /// Windows 上创建符号链接需要开发者模式或管理员权限；不可用时跳过并说明原因，
-    /// 同一条不变式由上面的 `..` 测试覆盖。
+    /// **环境要求**：Windows 上创建符号链接需要开启开发者模式或管理员权限。
+    /// 未开启时本用例会打印一条环境说明并退化，**不**把缺少权限当成通过：
+    /// 同一条不变式由 [`dataset_relative_path_rejects_parent_dir_escapes`] 无条件覆盖，
+    /// 那条用例不依赖任何权限，因此始终执行。
     #[test]
     fn dataset_relative_path_rejects_symlinks_leading_outside() {
         let base = std::env::temp_dir().join(format!("rapid-ocr-rs-link-{}", std::process::id()));
@@ -426,8 +428,9 @@ mod tests {
         let link = root.join("linked");
         if let Err(error) = std::os::windows::fs::symlink_dir(&outside_dir, &link) {
             eprintln!(
-                "skipping symlink assertion: cannot create a directory symlink ({error}); \
-                 the `..` escape test covers the same invariant"
+                "ENVIRONMENT: this Windows session cannot create directory symlinks ({error}); \
+                 enable Developer Mode or run elevated to exercise this case. The `..` escape \
+                 test covers the same invariant unconditionally."
             );
             let _ = std::fs::remove_dir_all(&base);
             return;

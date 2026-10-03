@@ -6,6 +6,22 @@ CTC decoding, polygon output, model resolution, and ONNX Runtime sessions. It
 does not depend on Tauri, SQLite, a clipboard implementation, or a specific
 application.
 
+## Platform support
+
+**Windows x64 only (`x86_64-pc-windows-msvc`).** Non-Windows targets fail at
+compile time with a single explicit `compile_error!` from `src/platform_gate.rs`
+instead of a scatter of "missing Windows API" diagnostics; the gate itself is
+verifiable with `pwsh -NoProfile -File tools/check_platform_gate.ps1`.
+
+Explicit non-goals: Windows ARM64, the GNU ABI, Wine, WSL, Linux, macOS. This is a
+deliberate narrowing, not an unfinished port — the project only runs on Windows,
+and keeping Linux/macOS branches would spread platform differences through the
+business code and make the verification matrix unverifiable. A future port gets
+its own platform plan rather than incremental `cfg` additions here.
+
+Platform differences are expected to live only in platform implementation modules
+(currently `src/runtime/memory.rs`); business code must not branch on the OS.
+
 ## License
 
 The `rapid-ocr-rs` source code is licensed under the Apache License, Version
@@ -18,8 +34,9 @@ before redistributing a complete application or model bundle.
 
 - PP-OCRv6 detector + recognizer; direction classifier disabled unless a
   compatible classifier artifact is explicitly configured.
-- CPU is the default provider. DirectML, CUDA, and CANN are opt-in Cargo
-  features and must be benchmarked on the target machine.
+- CPU is the default provider. DirectML and CUDA are opt-in Cargo features and
+  must be benchmarked on the target machine; CANN is not a Windows target and has
+  been removed.
 - The stable application-neutral API is `OcrEngine::recognize(OcrRequest)`.
   `OwnedPixelBuffer` accepts BGRA/RGBA/RGB/Gray pixels, padding stride,
   bottom-up buffers, and an optional ROI.
@@ -481,8 +498,8 @@ cargo run --release --bin formula_bench -- --model $Model `
 rounds, per-image and per-batch end-to-end latency, whether batch size changed
 the token sequence, the resolved provider and whether a CPU fallback occurred,
 and the process peak working set
-(`windows:GetProcessMemoryInfo.PeakWorkingSetSize` or
-`linux:/proc/self/status:VmHWM`). Formula throughput is always reported
+(`windows:GetProcessMemoryInfo.PeakWorkingSetSize` — the only memory口径 in the
+crate; a failed sample is reported with its Win32 error instead of being omitted). Formula throughput is always reported
 separately from ordinary OCR; `--ocr-baseline <bench.json>` only adds the
 ordinary OCR benchmark side by side and never merges the two into one number.
 
@@ -523,7 +540,7 @@ cargo test --all-targets
 cargo test --all-targets
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo check --features directml-provider,cuda-provider,cann-provider
+cargo check --features directml-provider,cuda-provider
 ```
 
 `--all-features` additionally enables `opencv-backend`; that build requires an
@@ -580,7 +597,7 @@ without a GPU:
 ```text
 cargo check --features directml-provider
 cargo check --features cuda-provider
-cargo check --features directml-provider,cuda-provider,cann-provider
+cargo check --features directml-provider,cuda-provider
 cargo test --features directml-provider
 cargo test --features cuda-provider
 ```
