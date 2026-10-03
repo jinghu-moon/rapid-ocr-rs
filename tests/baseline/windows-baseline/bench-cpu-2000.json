@@ -1,0 +1,62 @@
+{
+  "memory": {
+    "peak_working_set_bytes": 1346371584,
+    "source": "windows:GetProcessMemoryInfo.PeakWorkingSetSize"
+  },
+  "meta": {
+    "benchmark": {
+      "auto_tune_threads": {
+        "cls": false,
+        "det": false,
+        "rec": false
+      },
+      "build_profile": "release",
+      "inter_threads": {
+        "cls": 1,
+        "det": 1,
+        "rec": 1
+      },
+      "intra_threads": {
+        "cls": 16,
+        "det": 16,
+        "rec": 16
+      },
+      "max_side_len": 2000,
+      "timing_scope": {
+        "ocr_total_ms": "ocr_pipeline_only",
+        "wall_ms": "file_read_plus_ocr"
+      }
+    },
+    "image_count": 12,
+    "images_dir": "D:\\100_Projects\\110_Daily\\SnapClip\\OCR-test-image",
+    "init_ms": 143.5503,
+    "rounds": 3,
+    "warmup_rounds": 1
+  },
+  "stats": {
+    "ocr_total_ms": {
+      "avg": 990.8543395996094,
+      "count": 36,
+      "max": 1188.66162109375,
+      "min": 752.8859252929688,
+      "p50": 1001.101318359375,
+      "p90": 1153.647705078125
+    },
+    "regions": {
+      "avg": 34.833333333333336,
+      "count": 36,
+      "max": 61.0,
+      "min": 13.0,
+      "p50": 37.0,
+      "p90": 61.0
+    },
+    "wall_ms": {
+      "avg": 991.888988888889,
+      "count": 36,
+      "max": 1189.694,
+      "min": 753.93,
+      "p50": 1002.1278,
+      "p90": 1154.7045
+    }
+  }
+}

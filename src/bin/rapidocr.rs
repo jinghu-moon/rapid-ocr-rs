@@ -274,7 +274,20 @@ fn evaluate_cmd(
         });
     }
     let summary = EvaluationSummary::from_cases(reports);
-    let text = serde_json::to_string_pretty(&summary)?;
+    // 评估报告本身只描述质量指标；进程级峰值工作集由 CLI 附加（口径与库内一致），
+    // 不把平台内存信息塞进纯算法的报告类型。
+    let mut report = serde_json::to_value(&summary)?;
+    if let Some(object) = report.as_object_mut() {
+        object.insert(
+            "peak_working_set_bytes".to_string(),
+            serde_json::json!(rapid_ocr_rs::peak_working_set_bytes()),
+        );
+        object.insert(
+            "memory_source".to_string(),
+            serde_json::json!(rapid_ocr_rs::peak_memory_source()),
+        );
+    }
+    let text = serde_json::to_string_pretty(&report)?;
     if let Some(path) = output {
         std::fs::write(path, &text)?;
     }

@@ -1,0 +1,87 @@
+{
+  "environment": {
+    "collected_at_utc": "2026-10-03T03:32:49.4899954Z",
+    "target": "x86_64-pc-windows-msvc",
+    "frozen_targets": [
+      "x86_64-pc-windows-msvc"
+    ],
+    "non_goals": [
+      "aarch64-pc-windows-msvc",
+      "x86_64-pc-windows-gnu",
+      "Wine",
+      "WSL",
+      "Linux",
+      "macOS"
+    ],
+    "os": {
+      "caption": "Microsoft Windows 11 IoT 企业版 LTSC",
+      "version": "10.0.26100",
+      "build": "26100",
+      "arch": "64 位"
+    },
+    "cpu": {
+      "name": "13th Gen Intel(R) Core(TM) i5-13600KF",
+      "physical_cores": 14,
+      "logical_cores": 20,
+      "max_mhz": 3500
+    },
+    "gpus": [
+      {
+        "name": "GameViewer Virtual Display Adapter",
+        "driver": "15.6.5.199",
+        "driver_date": "2026-02-28T08:00:00+08:00"
+      },
+      {
+        "name": "NVIDIA GeForce RTX 4070 Ti SUPER",
+        "driver": "32.0.15.9186",
+        "driver_date": "2026-01-20T08:00:00+08:00"
+      }
+    ],
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+    "ort_crate": "=2.0.0-rc.13"
+  },
+  "build_stats": {
+    "collected_at_utc": "2026-10-03T03:33:07.6860815Z",
+    "profile": "release",
+    "crate_rebuild_ms": 17400,
+    "crate_rebuild_scope": "cargo clean -p rapid-ocr-rs --release; cargo build --release --bins",
+    "binary_bytes": {
+      "rapidocr": 34611712,
+      "bench_warm_e2e": 34365440,
+      "formula_eval": 29712384,
+      "formula_bench": 29022208
+    },
+    "target_dir_bytes": 18539595174.0
+  },
+  "bench": [
+    {
+      "max_side_len": 2000,
+      "init_ms": 143.5503,
+      "ocr_total_p50_ms": 1001.101318359375,
+      "ocr_total_p90_ms": 1153.647705078125,
+      "ocr_total_avg_ms": 990.8543395996094,
+      "wall_p50_ms": 1002.1278,
+      "regions_avg": 34.833333333333336,
+      "peak_working_set_bytes": 1346371584
+    },
+    {
+      "max_side_len": 1280,
+      "init_ms": 148.98520000000002,
+      "ocr_total_p50_ms": 664.3169555664062,
+      "ocr_total_p90_ms": 753.505859375,
+      "ocr_total_avg_ms": 644.1852366129557,
+      "wall_p50_ms": 665.0204,
+      "regions_avg": 33.416666666666664,
+      "peak_working_set_bytes": 944357376
+    }
+  ],
+  "evaluation": {
+    "mean_cer": 0.44765135645866394,
+    "exact_match_rate": 0.0,
+    "cases": 12,
+    "peak_working_set_bytes": 1219309568,
+    "memory_source": "windows:GetProcessMemoryInfo.PeakWorkingSetSize",
+    "manifest": "D:\\100_Projects\\110_Daily\\SnapClip\\OCR-test-image\\golden-manifest.json"
+  }
+}

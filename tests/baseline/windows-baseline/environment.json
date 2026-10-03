@@ -1,0 +1,42 @@
+{
+  "collected_at_utc": "2026-10-03T03:32:49.4899954Z",
+  "target": "x86_64-pc-windows-msvc",
+  "frozen_targets": [
+    "x86_64-pc-windows-msvc"
+  ],
+  "non_goals": [
+    "aarch64-pc-windows-msvc",
+    "x86_64-pc-windows-gnu",
+    "Wine",
+    "WSL",
+    "Linux",
+    "macOS"
+  ],
+  "os": {
+    "caption": "Microsoft Windows 11 IoT 企业版 LTSC",
+    "version": "10.0.26100",
+    "build": "26100",
+    "arch": "64 位"
+  },
+  "cpu": {
+    "name": "13th Gen Intel(R) Core(TM) i5-13600KF",
+    "physical_cores": 14,
+    "logical_cores": 20,
+    "max_mhz": 3500
+  },
+  "gpus": [
+    {
+      "name": "GameViewer Virtual Display Adapter",
+      "driver": "15.6.5.199",
+      "driver_date": "2026-02-28T08:00:00+08:00"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4070 Ti SUPER",
+      "driver": "32.0.15.9186",
+      "driver_date": "2026-01-20T08:00:00+08:00"
+    }
+  ],
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+  "ort_crate": "=2.0.0-rc.13"
+}

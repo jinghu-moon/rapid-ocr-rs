@@ -1,0 +1,13 @@
+{
+  "collected_at_utc": "2026-10-03T03:33:07.6860815Z",
+  "profile": "release",
+  "crate_rebuild_ms": 17400,
+  "crate_rebuild_scope": "cargo clean -p rapid-ocr-rs --release; cargo build --release --bins",
+  "binary_bytes": {
+    "rapidocr": 34611712,
+    "bench_warm_e2e": 34365440,
+    "formula_eval": 29712384,
+    "formula_bench": 29022208
+  },
+  "target_dir_bytes": 18539595174.0
+}

@@ -1,0 +1,76 @@
+{
+  "memory": {
+    "peak_working_set_bytes": 1345949696,
+    "source": "windows:GetProcessMemoryInfo.PeakWorkingSetSize"
+  },
+  "meta": {
+    "benchmark": {
+      "auto_tune_threads": {
+        "cls": false,
+        "det": false,
+        "rec": false
+      },
+      "build_profile": "release",
+      "inter_threads": {
+        "cls": 1,
+        "det": 1,
+        "rec": 1
+      },
+      "intra_threads": {
+        "cls": 16,
+        "det": 16,
+        "rec": 16
+      },
+      "max_side_len": 2000,
+      "timing_scope": {
+        "ocr_total_ms": "ocr_pipeline_only",
+        "wall_ms": "file_read_plus_ocr"
+      }
+    },
+    "image_count": 12,
+    "images_dir": "D:\\100_Projects\\110_Daily\\SnapClip\\OCR-test-image",
+    "init_ms": 125.4682,
+    "provider_resolution": {
+      "classifier": null,
+      "detector": {
+        "fallback_to_cpu": false,
+        "requested": "Cpu",
+        "resolved": "Cpu"
+      },
+      "model_id": "PP-OCRv6-small-ch",
+      "recognizer": {
+        "fallback_to_cpu": false,
+        "requested": "Cpu",
+        "resolved": "Cpu"
+      }
+    },
+    "rounds": 3,
+    "warmup_rounds": 1
+  },
+  "stats": {
+    "ocr_total_ms": {
+      "avg": 1002.8919355604384,
+      "count": 36,
+      "max": 1207.855712890625,
+      "min": 771.9614868164062,
+      "p50": 1013.49755859375,
+      "p90": 1124.98681640625
+    },
+    "regions": {
+      "avg": 34.833333333333336,
+      "count": 36,
+      "max": 61.0,
+      "min": 13.0,
+      "p50": 37.0,
+      "p90": 61.0
+    },
+    "wall_ms": {
+      "avg": 1003.9843111111111,
+      "count": 36,
+      "max": 1209.2232000000001,
+      "min": 773.1315,
+      "p50": 1014.7235999999999,
+      "p90": 1126.2383
+    }
+  }
+}

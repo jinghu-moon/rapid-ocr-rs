@@ -47,3 +47,6 @@ __pycache__/
 # 已由 /target/ 覆盖：报告、抽样 manifest、失败样本与 bench JSON 都不入库。
 # 需要长期保留的结论请写入 docs/，而不是提交原始 JSON。
 
+
+# 提交信息临时文件（避免误提交）
+.git-commit-msg.tmp

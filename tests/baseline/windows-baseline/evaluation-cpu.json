@@ -1,0 +1,107 @@
+{
+  "cases": [
+    {
+      "cer": 0.4852362275123596,
+      "detection_precision": null,
+      "detection_recall": null,
+      "exact_text": false,
+      "image": "01基础多位置文本.png",
+      "mean_polygon_iou": null
+    },
+    {
+      "cer": 0.6089494228363037,
+      "detection_precision": null,
+      "detection_recall": null,
+      "exact_text": false,
+      "image": "02多语言与RTL混排.png",
+      "mean_polygon_iou": null
+    },
+    {
+      "cer": 0.47011953592300415,
+      "detection_precision": null,
+      "detection_recall": null,
+      "exact_text": false,
+      "image": "03旋转与倾斜.png",
+      "mean_polygon_iou": null
+    },
+    {
+      "cer": 0.32970452308654785,
+      "detection_precision": null,
+      "detection_recall": null,
+      "exact_text": false,
+      "image": "04表格与键值对.png",
+      "mean_polygon_iou": null
+    },
+    {
+      "cer": 0.6574487090110779,
+      "detection_precision": null,
+      "detection_recall": null,
+      "exact_text": false,
+      "image": "05代码与等宽字体.png",
+      "mean_polygon_iou": null
+    },
+    {
+      "cer": 0.3793969750404358,
+      "detection_precision": null,
+      "detection_recall": null,
+      "exact_text": false,
+      "image": "06低对比度与深色背景.png",
+      "mean_polygon_iou": null
+    },
+    {
+      "cer": 0.5365194082260132,
+      "detection_precision": null,
+      "detection_recall": null,
+      "exact_text": false,
+      "image": "07小字号与密集排版.png",
+      "mean_polygon_iou": null
+    },
+    {
+      "cer": 0.39064475893974304,
+      "detection_precision": null,
+      "detection_recall": null,
+      "exact_text": false,
+      "image": "08数字公式与符号.png",
+      "mean_polygon_iou": null
+    },
+    {
+      "cer": 0.08387096971273422,
+      "detection_precision": null,
+      "detection_recall": null,
+      "exact_text": false,
+      "image": "09竖排文本.png",
+      "mean_polygon_iou": null
+    },
+    {
+      "cer": 0.5755939483642578,
+      "detection_precision": null,
+      "detection_recall": null,
+      "exact_text": false,
+      "image": "10长段落与分栏.png",
+      "mean_polygon_iou": null
+    },
+    {
+      "cer": 0.44142258167266846,
+      "detection_precision": null,
+      "detection_recall": null,
+      "exact_text": false,
+      "image": "11文字样式与特效.png",
+      "mean_polygon_iou": null
+    },
+    {
+      "cer": 0.4129089415073395,
+      "detection_precision": null,
+      "detection_recall": null,
+      "exact_text": false,
+      "image": "12综合压力测试.png",
+      "mean_polygon_iou": null
+    }
+  ],
+  "exact_match_rate": 0.0,
+  "mean_cer": 0.44765135645866394,
+  "mean_detection_precision": null,
+  "mean_detection_recall": null,
+  "mean_polygon_iou": null,
+  "memory_source": "windows:GetProcessMemoryInfo.PeakWorkingSetSize",
+  "peak_working_set_bytes": 1219309568
+}

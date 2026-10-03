@@ -84,12 +84,12 @@
 
 ### 3.1 任务
 
-- [ ] 记录机器信息：Windows 版本、CPU 型号/物理核心、GPU、驱动、Rust/Cargo、ORT 运行库版本。
-- [ ] 以 `--profile release` 建立普通 OCR 12 图基线：启动时间、单图 wall time、OCR pipeline P50/P95、区域数、CER、峰值工作集。
-- [ ] 建立公式 smoke 基线：im2latex-100；只在模型链路改动时再运行 val-501 对比。
-- [ ] 分别记录 CPU、DirectML、CUDA 是否能加载并运行；不可用 provider 必须记录真实错误，不得把 CPU fallback 当加速成功。
-- [ ] 记录当前二进制体积、依赖树中原生库、编译耗时和 `target` 产物大小。
-- [ ] 冻结正式 target 为 `x86_64-pc-windows-msvc`，将 ARM64/GNU/Wine/WSL 列为明确非目标。
+- [x] 记录机器信息：Windows 版本、CPU 型号/物理核心、GPU、驱动、Rust/Cargo、ORT 运行库版本。（§0 环境，含 System32 内置 ORT 1.17 的事实）
+- [x] 以 `--profile release` 建立普通 OCR 12 图基线：启动时间、单图 wall time、OCR pipeline P50/P95、区域数、CER、峰值工作集。（2000/1280 两侧，见 §0）
+- [x] 建立公式 smoke 基线：im2latex-100（exact 24.00% / CER 0.0863 / 链路失败 0，manifest `271424c18c000f95`）；只在模型链路改动时再运行 val-501 对比。
+- [x] 分别记录 CPU、DirectML、CUDA 是否能加载并运行；不可用 provider 必须记录真实错误，不得把 CPU fallback 当加速成功。（**发现 CUDA 报告 resolved 但实测与 CPU 逐位相同 → 阶段 2 必修**，见 §0）
+- [x] 记录当前二进制体积、依赖树中原生库、编译耗时和 `target` 产物大小。（§0 构建与体积）
+- [x] 冻结正式 target 为 `x86_64-pc-windows-msvc`，将 ARM64/GNU/Wine/WSL 列为明确非目标。（写入 `environment.json`）
 
 ### 3.2 基线命令
 
@@ -105,9 +105,9 @@ cargo run --release --bin formula_eval -- --model <model> --dataset-root <Formul
 
 ### 3.3 验收
 
-- [ ] 基线 JSON 和环境说明保存到 `docs/` 或 `target/` 外的受控报告中。
-- [ ] 明确哪些指标是硬门槛，哪些只是观察值；不得在优化后临时修改门槛。
-- [ ] 全量公式集不属于本阶段必跑项。
+- [x] 基线 JSON 和环境说明保存到 `docs/` 或 `target/` 外的受控报告中。（`tests/baseline/windows-baseline/` + `docs/04-windows-phase-reports.md`）
+- [x] 明确哪些指标是硬门槛，哪些只是观察值；不得在优化后临时修改门槛。（§0 硬门槛与观察值）
+- [x] 全量公式集不属于本阶段必跑项。
 
 ---
 

@@ -1,0 +1,99 @@
+{
+  "collected_at_utc": "2026-10-03T03:42:00.9563937Z",
+  "conditions": {
+    "max_side_len": 2000,
+    "intra_threads": 16,
+    "rounds": 3,
+    "warmup_rounds": 1,
+    "images_dir": "D:\\100_Projects\\110_Daily\\SnapClip\\OCR-test-image"
+  },
+  "providers": [
+    {
+      "provider": "cpu",
+      "fallback_run": {
+        "exit_code": 0,
+        "provider_resolution": {
+          "classifier": null,
+          "detector": {
+            "fallback_to_cpu": false,
+            "requested": "Cpu",
+            "resolved": "Cpu"
+          },
+          "model_id": "PP-OCRv6-small-ch",
+          "recognizer": {
+            "fallback_to_cpu": false,
+            "requested": "Cpu",
+            "resolved": "Cpu"
+          }
+        },
+        "init_ms": 125.4682,
+        "ocr_total_p50_ms": 1013.49755859375,
+        "ocr_total_p90_ms": 1124.98681640625,
+        "regions_avg": 34.833333333333336,
+        "peak_working_set_bytes": 1345949696
+      },
+      "strict_run": {
+        "exit_code": 0,
+        "stderr": null
+      }
+    },
+    {
+      "provider": "direct_ml",
+      "fallback_run": {
+        "exit_code": 0,
+        "provider_resolution": {
+          "classifier": null,
+          "detector": {
+            "fallback_to_cpu": false,
+            "requested": "DirectMl { device_id: 0 }",
+            "resolved": "DirectMl"
+          },
+          "model_id": "PP-OCRv6-small-ch",
+          "recognizer": {
+            "fallback_to_cpu": false,
+            "requested": "DirectMl { device_id: 0 }",
+            "resolved": "DirectMl"
+          }
+        },
+        "init_ms": 386.1202,
+        "ocr_total_p50_ms": 508.652587890625,
+        "ocr_total_p90_ms": 650.5000610351562,
+        "regions_avg": 34.833333333333336,
+        "peak_working_set_bytes": 784146432
+      },
+      "strict_run": {
+        "exit_code": 0,
+        "stderr": null
+      }
+    },
+    {
+      "provider": "cuda",
+      "fallback_run": {
+        "exit_code": 0,
+        "provider_resolution": {
+          "classifier": null,
+          "detector": {
+            "fallback_to_cpu": false,
+            "requested": "Cuda { device_id: 0 }",
+            "resolved": "Cuda"
+          },
+          "model_id": "PP-OCRv6-small-ch",
+          "recognizer": {
+            "fallback_to_cpu": false,
+            "requested": "Cuda { device_id: 0 }",
+            "resolved": "Cuda"
+          }
+        },
+        "init_ms": 140.46239999999997,
+        "ocr_total_p50_ms": 1013.4677124023438,
+        "ocr_total_p90_ms": 1092.16357421875,
+        "regions_avg": 34.833333333333336,
+        "peak_working_set_bytes": 1347776512
+      },
+      "strict_run": {
+        "exit_code": 0,
+        "stderr": null
+      }
+    }
+  ]
+}

@@ -96,7 +96,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "ocr_total_ms": "ocr_pipeline_only",
         },
     });
+    let engine_start = Instant::now();
     let mut engine = RapidOcrEngine::new(cfg)?;
+    let init_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
     let request = |bytes: Vec<u8>| OcrRequest {
         input: ImageInput::Encoded(Arc::from(bytes)),
         roi: None,
@@ -128,6 +130,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut wall = Vec::new();
     let mut total = Vec::new();
     let mut regions = Vec::new();
+    // 记录实际解析到的 provider 与是否发生 CPU fallback：GPU 基准不得把
+    // fallback 当加速成功（阶段 0/2/5 的证据要求）。
+    let mut provider_resolution = None;
     for _ in 0..cli.rounds {
         for p in &images {
             let start = Instant::now();
@@ -135,6 +140,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             wall.push(start.elapsed().as_secs_f64() * 1000.0);
             total.push(out.timings.total_ms as f64);
             regions.push(out.regions.len() as f64);
+            if provider_resolution.is_none() {
+                let describe = |info: &rapid_ocr_rs::ProviderResolutionInfo| {
+                    serde_json::json!({
+                        "requested": format!("{:?}", info.requested),
+                        "resolved": format!("{:?}", info.resolved),
+                        "fallback_to_cpu": info.fallback_to_cpu,
+                    })
+                };
+                provider_resolution = Some(serde_json::json!({
+                    "model_id": out.engine.model_id,
+                    "detector": describe(&out.engine.provider.detector),
+                    "classifier": out.engine.provider.classifier.as_ref().map(&describe),
+                    "recognizer": describe(&out.engine.provider.recognizer),
+                }));
+            }
         }
     }
     let report = json!({
@@ -143,13 +163,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "image_count": images.len(),
             "rounds": cli.rounds,
             "warmup_rounds": cli.warmup_rounds,
+            // 启动时间：`RapidOcrEngine::new` 的墙钟耗时（含模型加载与会话创建）。
+            "init_ms": init_ms,
             "benchmark": benchmark_meta,
+            "provider_resolution": provider_resolution,
         },
         "stats": {
             "wall_ms": stats(&wall),
             "ocr_total_ms": stats(&total),
             "regions": stats(&regions),
-        }
+        },
+        // 峰值工作集口径与库内一致：`windows:GetProcessMemoryInfo.PeakWorkingSetSize`。
+        "memory": {
+            "peak_working_set_bytes": rapid_ocr_rs::peak_working_set_bytes(),
+            "source": rapid_ocr_rs::peak_memory_source(),
+        },
     });
     let text = serde_json::to_string_pretty(&report)?;
     if let Some(p) = cli.output {
