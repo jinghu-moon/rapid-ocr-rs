@@ -19,6 +19,13 @@ pub struct OrtSession {
     session: Session,
     model_path: String,
     provider_resolution: ProviderResolution,
+    /// 打开会话时下发给 ONNX Runtime 的 `(intra, inter)` 线程数；`None` 表示**没有配置**
+    /// 该线程数（没有调用对应的 `with_*_threads`），ONNX Runtime 保留自己的默认值，
+    /// 它不表示 0 线程。
+    ///
+    /// 这里的值是 [`RuntimeConfig::effective_session_threads`] 的输出，也就是“这份配置要求
+    /// ORT 用什么”，不是 ORT 内部最终解析出的线程数（那不可观测）。
+    session_threads: (Option<usize>, Option<usize>),
     pub output_names: Vec<String>,
 }
 
@@ -32,7 +39,8 @@ impl OrtSession {
     /// Domain sessions must call [`Self::probe_io`] and validate their typed
     /// contract through [`crate::runtime::contracts`].
     pub fn open_unchecked(model_path: &Path, runtime_cfg: &RuntimeConfig) -> Result<Self> {
-        let (session, provider_resolution) = open_session(model_path, runtime_cfg)?;
+        let (session, provider_resolution, session_threads) =
+            open_session(model_path, runtime_cfg)?;
         let output_names = session
             .outputs()
             .iter()
@@ -42,8 +50,17 @@ impl OrtSession {
             session,
             model_path: model_path.display().to_string(),
             provider_resolution,
+            session_threads,
             output_names,
         })
+    }
+
+    /// 打开会话时下发给 ONNX Runtime 的 `(intra, inter)` 线程数。
+    ///
+    /// 直接构造 `RuntimeConfig` 的调用方（`FormulaSession` / `formula_bench` /
+    /// `formula_eval`）可以用它证明自己拿到的是与引擎路径同一套线程解析结果。
+    pub fn session_threads(&self) -> (Option<usize>, Option<usize>) {
+        self.session_threads
     }
 
     pub fn metadata_custom(&self, key: &str) -> Result<Option<String>> {
@@ -204,32 +221,37 @@ impl OrtSession {
     }
 }
 
+/// [`open_session`] 的返回值：ORT 会话、provider 解析结果，以及实际下发给 ONNX Runtime 的
+/// `(intra, inter)` 线程数（`None` = 该线程数未配置）。
+type OpenedSession = (Session, ProviderResolution, (Option<usize>, Option<usize>));
+
 /// 打开一个 ORT 会话。
 ///
-/// 线程设置**不做任何解析**：`RuntimeConfig` 里写了什么就传什么，`None` 表示不调用
-/// `with_intra_threads` / `with_inter_threads`，由 ONNX Runtime 使用自己的默认值。
+/// 线程设置**不在这里推导**：调用
+/// [`RuntimeConfig::effective_session_threads`]，那是本 crate 里唯一的线程策略实现
+/// （显式值优先；否则按 `auto_tune_threads` 从共享预算推导；两者都没有时 `None`）。
+/// 因此“直接构造 `RuntimeConfig` 的公式路径”和“先经过 `RuntimeProfile::plan` 的引擎路径”
+/// 得到的是同一套语义。`None` 表示不调用 `with_intra_threads` / `with_inter_threads`，
+/// 由 ONNX Runtime 使用自己的默认值。
 ///
-/// 这里刻意**没有**第二份线程推导逻辑。历史实现有一个
-/// `derive_runtime_threads`，它认为 `auto_tune_threads = false` 表示“不要自动配置”，
-/// 而 `runtime::profile` 当时在同样的输入下无条件算出 `budget` 并当成显式值下发 ——
-/// 同一份 `RuntimeConfig` 通过 `RapidOcrEngine` 与通过 `FormulaSession` /
-/// `formula_bench` / `formula_eval` 会得到不同线程行为。统一之后只有
-/// [`crate::runtime::profile::RuntimeProfile::plan`] 会推导线程数；直接构造
-/// `RuntimeConfig` 的调用方（公式工具）得到的就是它自己写下的值。
-fn open_session(
-    model_path: &Path,
-    runtime_cfg: &RuntimeConfig,
-) -> Result<(Session, ProviderResolution)> {
+/// 这里刻意**没有**第二份线程推导逻辑。历史实现有一个 `derive_runtime_threads`，它认为
+/// `auto_tune_threads = false` 表示“不要自动配置”，而 `runtime::profile` 当时在同样的输入下
+/// 无条件算出 `budget` 并当成显式值下发 —— 同一份 `RuntimeConfig` 通过 `RapidOcrEngine`
+/// 与通过 `FormulaSession` / `formula_bench` / `formula_eval` 会得到不同线程行为；
+/// 反向的偏差（引擎推导而公式路径只做透传、静默拿到 ORT 默认值）同样存在过。
+/// 现在两个方向都只经过 [`RuntimeConfig::effective_session_threads`]。
+fn open_session(model_path: &Path, runtime_cfg: &RuntimeConfig) -> Result<OpenedSession> {
     // 只有 ONNX Runtime 一种后端：以前这里的单变体 `RuntimeBackend` 检查属于伪抽象，
     // 已随枚举一起删除。provider 差异完全由 `resolve_execution_providers` 表达。
     let mut builder = Session::builder().map_err(ort_error)?;
     builder = builder
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(ort_error)?;
-    if let Some(intra) = runtime_cfg.intra_threads.filter(|value| *value > 0) {
+    let (intra, inter) = runtime_cfg.effective_session_threads();
+    if let Some(intra) = intra {
         builder = builder.with_intra_threads(intra).map_err(ort_error)?;
     }
-    if let Some(inter) = runtime_cfg.inter_threads.filter(|value| *value > 0) {
+    if let Some(inter) = inter {
         builder = builder.with_inter_threads(inter).map_err(ort_error)?;
     }
 
@@ -242,7 +264,7 @@ fn open_session(
         .with_execution_providers(provider_chain.providers)
         .map_err(ort_error)?;
     let session = builder.commit_from_file(model_path).map_err(ort_error)?;
-    Ok((session, provider_chain.resolution))
+    Ok((session, provider_chain.resolution, (intra, inter)))
 }
 
 fn tensor_spec_from_outlet(outlet: &ort::value::Outlet) -> Result<TensorSpec> {

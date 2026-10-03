@@ -10,7 +10,7 @@
 //! | DirectML | `directml-provider` | Windows GPU 加速 |
 //! | CUDA | `cuda-provider` | NVIDIA GPU 加速 |
 //!
-//! CANN 不是 Windows 目标，已从 feature、枚举、序列化和测试中删除；
+//! CANN 不是 Windows x64 目标，已从 feature、枚举、序列化和测试中删除；
 //! 历史文档里的 CANN 记录只作为历史，不再代表当前支持面。
 //!
 //! # 错误语义（三类必须可区分）

@@ -8,16 +8,21 @@ application.
 
 ## Platform support
 
-**Windows x64 only (`x86_64-pc-windows-msvc`).** Non-Windows targets fail at
-compile time with a single explicit `compile_error!` from `src/platform_gate.rs`
-instead of a scatter of "missing Windows API" diagnostics; the gate itself is
-verifiable with `pwsh -NoProfile -File tools/check_platform_gate.ps1`.
+**The only supported platform is Windows x64 with the MSVC ABI
+(`x86_64-pc-windows-msvc`).** Other targets fail at compile time with a single explicit
+`compile_error!` from `src/platform_gate.rs` instead of a scatter of "missing Windows
+API" diagnostics; the gate itself is verifiable with
+`pwsh -NoProfile -File tools/check_platform_gate.ps1`.
 
-Explicit non-goals: Windows ARM64, the GNU ABI, Wine, WSL, Linux, macOS. This is a
-deliberate narrowing, not an unfinished port — the project only runs on Windows,
-and keeping Linux/macOS branches would spread platform differences through the
-business code and make the verification matrix unverifiable. A future port gets
-its own platform plan rather than incremental `cfg` additions here.
+Explicit non-goals: **Windows x86 (i686)**, **Windows ARM64**, **the Windows GNU ABI**,
+and also Wine, WSL, Linux and macOS. This is a deliberate narrowing, not an unfinished
+port. 32-bit Windows x86 is a real limitation rather than a `cfg` change: the
+precompiled ONNX Runtime, the DirectML/CUDA execution-provider DLLs and the ~566 MB
+formula recognition model are all x64 artifacts, and the crate itself is only built and
+verified on the MSVC ABI (import library names, `#[link(name = "psapi")]`, the ort
+prebuilt runtime). Windows ARM64 has the same problem in a different shape — the whole
+native stack would have to be re-collected and re-measured. A future port gets its own
+platform plan rather than incremental `cfg` additions here.
 
 Platform differences are expected to live only in platform implementation modules
 (currently `src/runtime/memory.rs`); business code must not branch on the OS.
@@ -599,18 +604,23 @@ cargo test --features directml-provider
 cargo test --features cuda-provider
 ```
 
-## Windows-only acceptance
+## Windows x64 acceptance
 
-The stage-by-stage evidence for the Windows-only narrowing lives in
+The stage-by-stage evidence for the Windows x64 (MSVC) narrowing lives in
 `docs/04-windows-phase-reports.md`; the plan is
-`docs/03-windows-only-optimization-tasks.md`. Summary of the final state:
+`docs/03-windows-only-optimization-tasks.md` (file name kept from the first round).
+Summary of the final state:
 
 - 12-image OCR gates are bit-identical to the pre-refactor baseline
   (mean CER `0.44765135645866394`, region average `34.8333`), release binaries are
   3.7% smaller, and the im2latex-100 formula smoke reproduces exactly.
-- ONNX Runtime inference is 86.0% of page time (detector 561.0 ms + recognizer
-  280.4 ms of a 978 ms page); every named Rust pre/post stage totals 0.58%, so the
-  remaining latency is not in this crate's Rust hot paths.
+- ONNX Runtime inference is about 85.6% of page time and the named Rust side about
+  13.7%, **with a stated residual of -6.75 ms/page (0.69%)**: the timing ledger's
+  windows overlap across `inner.run()`, so it is a diagnostic instrument, not a strict
+  partition and not the acceptance basis for any performance claim. The stage-6
+  conclusion (the bottleneck is ONNX Runtime, not Rust hot paths) rests on the
+  inference share being an order of magnitude larger than every Rust component, which
+  a residual of that size cannot overturn. See `docs/04-windows-phase-reports.md`.
 - No speedup is claimed anywhere: the thread matrix, the `-C target-cpu=x86-64-v3`
   A/B (-2.84% median over 5 interleaved pairs, one pair +19.35%) and the formula
   batch curve all land inside this machine's run-to-run noise, which reaches 29-39%

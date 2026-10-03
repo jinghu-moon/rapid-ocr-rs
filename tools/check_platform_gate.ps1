@@ -1,4 +1,4 @@
-# 阶段 1：验证 Windows-only 平台门槛。
+# 阶段 1：验证 Windows x64 + MSVC ABI 平台门槛。
 #
 # 期望行为：在非支持 target 上编译 `src/platform_gate.rs` 时，**只**得到我们自己的
 # `compile_error!`，而不是“缺少某个 Windows API”或依赖项的模糊错误。

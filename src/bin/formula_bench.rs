@@ -127,9 +127,15 @@ struct ModelReport {
 
 #[derive(Debug, Serialize)]
 struct ThreadReport {
+    /// `--threads` / YAML **请求**的值（`None` = 没有显式请求）。
     intra_threads: Option<usize>,
     inter_threads: Option<usize>,
     auto_tune_threads: bool,
+    /// 真正下发给 ONNX Runtime 的线程数，来自
+    /// `RuntimeConfig::effective_session_threads()`——与引擎路径同一个函数。
+    /// `null` = 该线程数**未配置**（ORT 用自己的默认值），不是 0 线程。
+    effective_intra_threads: Option<usize>,
+    effective_inter_threads: Option<usize>,
     logical_cpus: Option<usize>,
     physical_cpus: usize,
 }
@@ -278,6 +284,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let session_start = Instant::now();
     let mut session = FormulaSession::new(&cli.model, &runtime)?;
     let session_create_ms = ms(session_start);
+    // 会话**实际**拿到的线程数（`RuntimeConfig::effective_session_threads()` 的输出），
+    // 而不是 CLI/YAML 里写了什么：默认配置会推导出 intra = 预算、inter = 1。
+    let session_threads = session.session_threads();
     let memory_after_session = peak_working_set_bytes();
     let resolution = session.provider_resolution();
 
@@ -424,6 +433,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             intra_threads: runtime.intra_threads,
             inter_threads: runtime.inter_threads,
             auto_tune_threads: runtime.auto_tune_threads,
+            effective_intra_threads: session_threads.0,
+            effective_inter_threads: session_threads.1,
             logical_cpus: std::thread::available_parallelism().ok().map(|v| v.get()),
             physical_cpus: num_cpus::get_physical(),
         },

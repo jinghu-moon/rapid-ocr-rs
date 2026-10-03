@@ -19,7 +19,7 @@ pub fn peak_working_set_bytes() -> Option<u64> {
 
 /// 峰值内存数据的来源标识，写入报告以便审查。
 ///
-/// Windows-only 之后该字符串是常量，但仍然通过函数暴露：报告字段需要它，
+/// 平台收窄之后该字符串是常量，但仍然通过函数暴露：报告字段需要它，
 /// 而且测试要断言报告里写的就是这个口径。
 pub const PEAK_MEMORY_SOURCE: &str = "windows:GetProcessMemoryInfo.PeakWorkingSetSize";
 

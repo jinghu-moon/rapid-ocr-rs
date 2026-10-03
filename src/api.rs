@@ -1086,7 +1086,7 @@ where
 
 /// 交给 ONNX Runtime 的加速提供者（**EP 链的头部**，不是逐节点执行证据）。
 ///
-/// Windows-only 之后只剩 CPU / DirectML / CUDA；CANN 已整体删除。
+/// Windows x64 收窄之后只剩 CPU / DirectML / CUDA；CANN 已整体删除。
 ///
 /// **重要**：`selected_ep` 表示“EP 链已按请求建立且 `is_available()` 自报可用”，
 /// **不代表**模型真的在该 EP 上逐节点执行（ORT 不通过该 API 暴露逐节点分配）。
@@ -1389,10 +1389,12 @@ mod tests {
     /// 工作），账本就会静默漂移。
     ///
     /// **页面级不变量不在这里断言**：实测（12 张真实页面，`tests/baseline` 的账本）
-    /// `total_ms` 与“页面级分项之和”之间存在系统性差额（默认配置下残差
-    /// −43 到 −73 ms/页，均值 −54.8 ms），因此账本把差额显式报告为
-    /// `unattributed_ms` + `conservation.conserved = false`，而不是在这里假装它恒为 0。
-    /// 详见 `src/runtime/timing.rs` 的模块文档与
+    /// `total_ms` 与“页面级分项之和”之间存在系统性差额（默认配置下 debug 残差
+    /// −43 到 −73 ms/页，均值 −54.8 ms；release 下约 −6.75 ms/页），因此账本把差额显式
+    /// 报告为 `unattributed_ms` + `conservation.conserved = false`，而不是在这里假装它恒为 0。
+    /// 这个差额的含义是**计时窗口重叠**（外层 `preprocess_ms` 与阶段计时跨越 `inner.run()`），
+    /// 并且账本明确写着它是**诊断**工具、不是验收证据；详见 `src/runtime/timing.rs` 的模块文档、
+    /// `LedgerConservation::interpretation` 与
     /// `real_world_outer_window_does_not_conserve_the_reported_total` 测试。
     #[test]
     fn ocr_timings_stage_breakdown_sums_to_each_stage_total() {

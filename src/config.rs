@@ -136,8 +136,8 @@ impl LangRec {
 
 /// 执行提供者偏好。
 ///
-/// Windows-only 之后只剩三个：CPU（默认）、CUDA、DirectML。
-/// CANN 不是 Windows 目标，已整体删除（feature、枚举变体、序列化与测试）。
+/// Windows x64 收窄之后只剩三个：CPU（默认）、CUDA、DirectML。
+/// CANN 不是 Windows x64 目标，已整体删除（feature、枚举变体、序列化与测试）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderPreference {
@@ -157,15 +157,25 @@ pub enum ProviderPreference {
 /// `RuntimeBackend::OnnxCpu` 是伪抽象（只有一个取值，却要检查、序列化并出现在 YAML 里），
 /// 已删除。provider 选择由 [`RuntimeConfig::provider_preference`] 表达。
 ///
-/// 这份配置在引擎里**只有一份**（`EngineConfig::runtime`），不再是 det/cls/rec 各一份：
+/// 这份配置在引擎里**只有一份**（`EngineConfig.runtime`），不再是 det/cls/rec 各一份：
 /// 三份总是相同的配置没有任何单一解释处，也无法回答“这个进程到底用了多少线程”。
-/// 解析规则见 `runtime::profile`。
+///
+/// **线程字段的语义只有一个**：[`RuntimeConfig::effective_session_threads`] 是唯一的
+/// 解析实现，`OrtSession` 与 `RuntimeProfile::plan` 都调用它，因此把这份配置直接交给
+/// `FormulaSession`（`formula_bench` / `formula_eval`）与交给 `RapidOcrEngine` 得到的是
+/// 同一套线程行为。Rayon 份额与批大小的完整解析见 `runtime::profile`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
+    /// ORT 每个会话的 intra 线程数；`None`/`0` = 未显式设置（见
+    /// [`RuntimeConfig::effective_session_threads`]）。
     pub intra_threads: Option<usize>,
+    /// ORT 每个会话的 inter 线程数；`None`/`0` = 未显式设置。
     pub inter_threads: Option<usize>,
+    /// 是否允许从未显式设置的字段推导线程数（`false` 表示“不要自动配置”）。
     pub auto_tune_threads: bool,
+    /// Rayon 全局线程池的线程数；`None`/`0` = 不配置。显式设置时它是**显式请求**，
+    /// 无法生效（进程里已有不同大小的池）会返回错误而不是被静默替换。
     pub rayon_threads: Option<usize>,
     pub enable_cpu_mem_arena: bool,
     pub fail_if_provider_unavailable: bool,
@@ -186,6 +196,59 @@ impl Default for RuntimeConfig {
             provider_preference: ProviderPreference::default(),
             formula_batch: 16,
         }
+    }
+}
+
+impl RuntimeConfig {
+    /// 这份配置**实际**要求 ORT 会话使用的 `(intra_threads, inter_threads)`。
+    ///
+    /// 这是线程策略的**唯一实现**：引擎路径（[`crate::runtime::profile::RuntimeProfile::plan`]）
+    /// 与直接构造会话的路径（`FormulaSession` / `formula_bench` / `formula_eval` /
+    /// [`crate::runtime::session::OrtSession::open_unchecked`]）都调用这一个函数，
+    /// 因此同一个公开字段在所有入口处只有一种含义。
+    ///
+    /// 语义：
+    ///
+    /// - 显式值永远优先：`intra_threads` / `inter_threads` 里 `Some(n)` 且 `n > 0` 时原样生效
+    ///   （与 `auto_tune_threads` 无关）；`Some(0)` 与 `None` 一样表示“未设置”；
+    /// - 未显式设置的字段在该字段没有被显式给出**且** `auto_tune_threads = true` 时，
+    ///   从共享预算推导：`intra = runtime::profile::auto_tuned_thread_budget()`
+    ///   （`min(逻辑核数, 物理核数)`，至少 1），`inter = 1`（ORT 的 inter 并行对本 workload
+    ///   无益）。预算只有那一份定义，这里不重复实现任何算术；
+    /// - `auto_tune_threads = false` 且未显式设置的字段返回 `None`：`None` 的语义是
+    ///   **不配置**，`OrtSession` 不会调用 `with_intra_threads` / `with_inter_threads`，
+    ///   ONNX Runtime 保留自己的默认值。
+    ///
+    /// 返回 `(None, None)` 因此只表示“两个线程数都不配置”，不表示 0 线程。
+    ///
+    /// | `intra_threads` | `inter_threads` | `auto_tune_threads` | 结果 |
+    /// | --- | --- | --- | --- |
+    /// | `Some(a > 0)` | `Some(b > 0)` | 任意 | `(Some(a), Some(b))` |
+    /// | `Some(a > 0)` | 未设置 | `true` | `(Some(a), Some(1))` |
+    /// | `Some(a > 0)` | 未设置 | `false` | `(Some(a), None)` |
+    /// | 未设置 | `Some(b > 0)` | `true` | `(Some(budget), Some(b))` |
+    /// | 未设置 | `Some(b > 0)` | `false` | `(None, Some(b))` |
+    /// | 未设置 | 未设置 | `true` | `(Some(budget), Some(1))` |
+    /// | 未设置 | 未设置 | `false` | `(None, None)` |
+    pub fn effective_session_threads(&self) -> (Option<usize>, Option<usize>) {
+        let explicit_intra = self.intra_threads.filter(|value| *value > 0);
+        let explicit_inter = self.inter_threads.filter(|value| *value > 0);
+        if !self.auto_tune_threads {
+            return (explicit_intra, explicit_inter);
+        }
+        let budget = crate::runtime::profile::auto_tuned_thread_budget();
+        (explicit_intra.or(Some(budget)), explicit_inter.or(Some(1)))
+    }
+
+    /// 是否显式请求过线程数：`intra_threads` / `inter_threads` / `rayon_threads` 里
+    /// **任意**一个给了 `Some(n)` 且 `n > 0`。
+    ///
+    /// `Some(0)` 与 `None` 一样表示“未设置”。这个判断是 [`crate::runtime::profile::ThreadSource`]
+    /// 的依据：显式请求过的配置不能被静默替换成另一个数字（例如已经存在的 Rayon 全局池），
+    /// 而没有显式请求的配置可以（并会报告实际生效值）。
+    pub fn has_explicit_thread_request(&self) -> bool {
+        let set = |value: Option<usize>| value.filter(|value| *value > 0).is_some();
+        set(self.intra_threads) || set(self.inter_threads) || set(self.rayon_threads)
     }
 }
 

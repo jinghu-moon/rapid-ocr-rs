@@ -57,6 +57,15 @@ impl FormulaSession {
         self.inner.provider_resolution()
     }
 
+    /// 打开这个会话时下发给 ONNX Runtime 的 `(intra, inter)` 线程数。
+    ///
+    /// 值来自 [`RuntimeConfig::effective_session_threads`]——与引擎路径
+    /// （[`crate::runtime::profile::RuntimeProfile::plan`]）用的是同一个函数。
+    /// `None` 表示该线程数**未被配置**（ORT 用自己的默认值），不是 0 线程。
+    pub fn session_threads(&self) -> (Option<usize>, Option<usize>) {
+        self.inner.session_threads()
+    }
+
     pub fn character_metadata(&self) -> Result<Option<String>> {
         self.inner.metadata_custom("character")
     }
@@ -203,5 +212,60 @@ mod tests {
             session.provider_resolution().selected_ep,
             crate::runtime::provider::ResolvedExecutionProvider::Cpu
         );
+    }
+
+    /// **P1 根因回归（独立公式路径）**：`FormulaSession::new` 直接把 `RuntimeConfig` 交给
+    /// `OrtSession`，因此它必须与引擎路径（`RuntimeProfile::plan`）得到**同一套**线程数。
+    ///
+    /// 旧行为：`OrtSession` 只按字段透传，默认配置（`auto_tune_threads = true`、没有显式
+    /// 线程数）下公式路径**不配置** ORT 线程（拿到 ORT 默认值），而引擎路径把 intra 设为
+    /// 预算（14）、inter 设为 1 —— 同一个公开字段在两个入口含义不同。
+    ///
+    /// 本测试用提交在仓库内的 fixture（`tests/fixtures/formula-onnx/formula_ok.onnx`），
+    /// **不需要**外部 566 MB 公式模型，因此不会被 skip。
+    #[test]
+    fn standalone_session_uses_the_shared_thread_policy() {
+        let runtime = RuntimeConfig::default();
+        let expected = runtime.effective_session_threads();
+        assert_eq!(
+            expected,
+            (
+                Some(crate::runtime::profile::auto_tuned_thread_budget()),
+                Some(1)
+            ),
+            "a default `RuntimeConfig` derives intra = budget and inter = 1"
+        );
+
+        let session = FormulaSession::new(&fixture("formula_ok.onnx"), &runtime)
+            .expect("formula fixture should load");
+        assert_eq!(
+            session.session_threads(),
+            expected,
+            "the standalone formula path must ask ORT for the derived thread counts"
+        );
+
+        // 引擎路径必须给出同一对数字：两条路径共用 `effective_session_threads()`。
+        let plan = crate::runtime::profile::RuntimeProfile::plan(&runtime, false);
+        assert_eq!(
+            (plan.threads.ort_intra, plan.threads.ort_inter),
+            expected,
+            "engine plan and standalone session must agree by construction"
+        );
+    }
+
+    /// 显式值在独立公式路径上同样优先，且 `auto_tune_threads = false` 时未设置的字段
+    /// 保持“不配置”。
+    #[test]
+    fn standalone_session_honours_explicit_threads() {
+        let runtime = RuntimeConfig {
+            intra_threads: Some(3),
+            inter_threads: None,
+            auto_tune_threads: false,
+            ..RuntimeConfig::default()
+        };
+        assert_eq!(runtime.effective_session_threads(), (Some(3), None));
+        let session = FormulaSession::new(&fixture("formula_ok.onnx"), &runtime)
+            .expect("formula fixture should load");
+        assert_eq!(session.session_threads(), (Some(3), None));
     }
 }

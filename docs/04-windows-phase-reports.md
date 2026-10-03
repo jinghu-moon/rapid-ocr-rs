@@ -1,4 +1,4 @@
-# rapid-ocr-rs Windows-only 阶段执行记录
+# rapid-ocr-rs Windows x64（MSVC ABI）阶段执行记录
 
 > 本文件按 `docs/03-windows-only-optimization-tasks.md` §13 的模板，逐阶段追加
 > 执行记录。原始数据保存在 `tests/baseline/windows-baseline/`（随仓库提交）。
@@ -26,8 +26,8 @@
 
 | 项目 | 值 |
 | --- | --- |
-| target | `x86_64-pc-windows-msvc`（本阶段冻结；谓词必须含 `target_env = "msvc"`） |
-| 明确非目标 | `aarch64-pc-windows-msvc`、`x86_64-pc-windows-gnu`、Wine、WSL、Linux、macOS |
+| target | Windows x64 + MSVC ABI：`x86_64-pc-windows-msvc`（本阶段冻结；谓词必须含 `target_env = "msvc"`） |
+| 明确非目标 | Windows x86（32 位 i686）、Windows ARM64（`aarch64-pc-windows-msvc`）、Windows GNU ABI（`x86_64-pc-windows-gnu`）、Wine、WSL、Linux、macOS |
 | OS | Microsoft Windows 11 IoT 企业版 LTSC 10.0.26100（Build 26100，x64） |
 | CPU | 13th Gen Intel Core i5-13600KF，14 物理核 / 20 逻辑核，3.5 GHz |
 | GPU | NVIDIA GeForce RTX 4070 Ti SUPER，驱动 32.0.15.9186（591.86） |
@@ -127,7 +127,7 @@
 
 ---
 
-## 阶段 1：建立 Windows-only 编译边界
+## 阶段 1：建立 Windows x64 + MSVC ABI 编译边界
 
 **阶段**：1
 **日期**：2026-10-03
@@ -518,7 +518,7 @@ tokenizer、postprocess、batch/EOS 或指标实现；普通 OCR 的预处理数
 - **crate metadata**（`Cargo.toml`）：`repository` 改为实际仓库
   `https://github.com/jinghu-moon/rapid-ocr-rs`；补 `rust-version = "1.88"`（当时写的 1.85 是错的，见终审修复）、
   `categories`（computer-vision / multimedia::images / api-bindings）、
-  keywords 与 description 改为反映 Windows-only + PP-OCRv6/PP-FormulaNet；
+  keywords 与 description 改为反映 Windows x64 + MSVC ABI + PP-OCRv6/PP-FormulaNet；
   新增 `exclude = ["tests/baseline/**"]`。
 - **新增 `CHANGELOG.md`（开发期变更记录）**：明确这是破坏性平台收窄、不承诺
   Linux/macOS，并逐项列出删除的公开 API 与原因。
@@ -626,11 +626,17 @@ crop 1.66 ms（0.17%），输入 resize 6.85 ms（0.70%）。
 > **口径勘误（终审修复，P2-1）**：上面这段用的是
 > `page_total.preprocess_ms + page_total.postprocess_ms` 作为“Rust 成本”，它**漏项且口径不对**：
 > 三个模型各自的 preprocess/postprocess、输入 decode/resize/crop 都没有进账，
-> 而外层 `preprocess_ms` 与阶段计时根本不在同一层。终审把它换成守恒账本
+> 而外层 `preprocess_ms` 与阶段计时根本不在同一层。终审把它换成时间账本
 > （`src/runtime/timing.rs`，报告字段 `timing_ledger`），重算后的结果见文末「终审修复」：
-> **ORT 推理 85.63%、被命名的 Rust 侧 13.69%（其中输入窗口 8.60%、识别后处理 4.19%）、
-> 未归属 0.69%**。也就是说原文的 “0.58%” 低估了约 23 倍，而 “86.03%” 本身量级正确
-> （换口径后为 85.63%）。阶段结论（瓶颈在 ORT、Rust 热路径没有可测量空间）不变。
+> **ORT 推理 ≈85.6%、被命名的 Rust 侧 ≈13.7%（其中输入窗口 8.60%、识别后处理 4.19%），
+> 并带有 −6.75 ms／页（0.69%）的残差**。也就是说原文的 “0.58%” 低估了约 23 倍，
+> 而 “86.03%” 本身量级正确（换口径后为 85.63%）。
+>
+> **残差必须一起读**：这个账本**不是**严格划分。外层 `preprocess_ms` 窗口与阶段计时跨越
+> `inner.run()` 的边界、互相重叠，因此 `conserved = false` —— 这是**测量仪器的局限**
+> （诊断工具的精度边界），不是 `total_ms` 算错了，也**不能**作为任何性能声明的验收依据；
+> 各项占比只在 ±0.69% 内成立。阶段门槛的结论（瓶颈在 ORT、Rust 热路径没有可测量空间）
+> 依据的是**推理占比比每一个 Rust 分量都大一个数量级**，0.69% 的残差无法推翻这个量级判断。
 
 `-C target-cpu=x86-64-v3`（同 commit、独立 scratch target 目录、5 组交错 A/B）：
 默认 p50 中位 999.05 ms vs v3 970.68 ms → 中位差 **−2.84%**（4/5 组支持 v3，其中一组 +19.35%）。
@@ -786,9 +792,9 @@ tokenizer、postprocess、EOS 语义与指标实现未改动，故未重跑 val-
 | 编号 | 问题 | 根因 | 修复 |
 | --- | --- | --- | --- |
 | P1-1 | 平台门槛把 Windows GNU 也放进来 | 谓词只有 `all(windows, target_arch = "x86_64")`，`x86_64-pc-windows-gnu` 同样满足 | `src/platform_gate.rs` 与 `src/lib.rs` 的**每一个** `#[cfg]` 加上 `target_env = "msvc"`；`tools/check_platform_gate.ps1` 增加 GNU 用例（std 缺失时打印 “target not installed -> this case is NOT verified” 并 exit 3）；`lib.rs` 增加编译期 `const` 断言 + 运行期 target 测试 |
-| P1-2 | `auto_tune_threads = false` 被 profile 静默忽略 | `ThreadPlan` 的三个字段是无条件算出的 `usize`；`runtime/session.rs::derive_runtime_threads` 却把同一字段解释成“不配置”，两份实现互相矛盾 | `ThreadPlan.ort_intra/ort_inter/rayon` 改为 `Option<usize>`（`None` = 不配置）；`plan()` 遵守 `auto_tune_threads`；删除 `derive_runtime_threads`，`OrtSession` 只做透传；新增 profile 级、Rayon 级与**引擎级**回归测试 |
+| P1-2 | `auto_tune_threads = false` 被 profile 静默忽略 | `ThreadPlan` 的三个字段是无条件算出的 `usize`；`runtime/session.rs::derive_runtime_threads` 却把同一字段解释成“不配置”，两份实现互相矛盾 | `ThreadPlan.ort_intra/ort_inter/rayon` 改为 `Option<usize>`（`None` = 不配置）；`plan()` 遵守 `auto_tune_threads`；删除 `derive_runtime_threads`；新增 profile 级、Rayon 级与**引擎级**回归测试。**复审第二轮补齐了反向的偏差**：`OrtSession` 不再只做透传，而是调用共享的 `RuntimeConfig::effective_session_threads()`，见文末「复审第二轮」 |
 | P1-3 | 阶段 0 与阶段 8 的 ORT 版本不可比 | 阶段 0 报告既没有版本也没有路径/体积/哈希，而且把 Windows 自带 DLL 的**文件版本** 1.17.x 当成了运行时版本；实际 ORT 是**静态链接**的 `onnxruntime.lib`（API 1.28.0） | 新增 `src/runtime/ort_runtime.rs`（+ `build.rs` 捕获链接信息）；bench 报告字段 `meta.ort_runtime`；用带指纹的报告重采基线；本节统一在 ORT 1.28.0 下比较 |
-| P2-1 | `timing_split` 不是完整账本 | 只把 `page_total.preprocess/postprocess` 当 Rust 成本，漏掉三阶段前后处理与输入项 | 新增 `src/runtime/timing.rs`：守恒账本（每项只算一次 + 显式 `unattributed`），报告字段 `timing_ledger`；`timing_split` 改为从账本派生；86.03%/0.58% 两个数字按新口径重算 |
+| P2-1 | `timing_split` 不是完整账本 | 只把 `page_total.preprocess/postprocess` 当 Rust 成本，漏掉三阶段前后处理与输入项 | 新增 `src/runtime/timing.rs`：时间账本（每项只算一次 + 显式 `unattributed` + `overlap_ms`/`interpretation`），报告字段 `timing_ledger`；`timing_split` 改为从账本派生；86.03%/0.58% 两个数字按新口径重算。**复审第二轮**明确它是**诊断**工具、不是严格划分，见文末「复审第二轮」 |
 | P2-2 | `resolved` 夸大了已证事实 | 该字段只说明“EP 链已交给 ORT 且 `is_available()` 为真”，逐节点分配不可观测 | `ProviderResolution::resolved` → `selected_ep`，`ProviderResolutionInfo::resolved` → `selected_ep`；类型文档写明“selected 只指交给 ORT 的 EP 链”；所有调用方/报告字段名/检查器同步 |
 | P2-3 | 检查器太宽松 | 只要求两个字段，缺失当默认值，不校验可比性，也不校验 `-Reference` 真的是全 CPU | `tools/check_provider_claims.ps1` 重写：必需字段（三阶段 `selected_ep`/`fallback_to_cpu`、p50/p90、image_count、rounds、max_side、ORT 指纹）逐项校验；不可比一律 exit 2；`-Reference` 非全 CPU exit 2；新增 `tools/test_provider_claims.ps1` 覆盖 14 个用例 |
 | P2-4 | 文档里的 `rust-version` 过期 | 文档写 1.85，`Cargo.toml` 是 1.88 | 阶段 7 的两处改为 `1.88` 并写明依据（`as_chunks` 需要 1.88，`clippy::incompatible_msrv` 是可执行证据） |
@@ -833,9 +839,13 @@ SHA-256 `a9d3e0e13cadb011209013eee40ccbd6255d8a45090c7a12b635b7dde487934b`，
 （`selected_ep` + `meta.ort_runtime` + `timing_ledger`），另存
 `bench-cpu-ortfp.json`（与 `bench-cpu.json` 逐字节相同，同一次运行）。
 
-### P2-1：重算后的守恒账本（12 图，max_side_len 2000，CPU）
+### P2-1：重算后的时间账本（12 图，max_side_len 2000，CPU）
 
 来源：`tests/baseline/windows-baseline/bench-cpu.json` 的 `timing_ledger`。
+
+> 表里的百分比都是相对 `total_ms` 的**诊断占比**，**不是**严格划分：被命名分量之和
+> （979.03 ms）与 `total_ms`（985.79 ms）相差 6.75 ms（0.69%），原因见下面的守恒检查。
+> 引用任何一项占比之前必须一起看该残差。
 
 | 项目 | 均值 (ms) | 占 `total_ms` |
 | --- | ---: | ---: |
@@ -850,29 +860,57 @@ SHA-256 `a9d3e0e13cadb011209013eee40ccbd6255d8a45090c7a12b635b7dde487934b`，
 | 模型侧 postprocess（det + rec；含 CTC 解码与 word boxes） | 45.82 | 4.65% |
 | 页面级 postprocess | 0.02 | 0.002% |
 | **被命名分量合计（`attributed_ms`）** | 979.03 | 99.31% |
-| **未归属（`unattributed_ms`）** | 6.75 | **0.69%** |
+| **未归属（`unattributed_ms`，= 重叠量级）** | 6.75 | **0.69%** |
 | 其中 Rust 侧合计（输入 + 模型前后处理 + 页面后处理） | 134.93 | **13.69%** |
 
-**守恒检查**：`conservation = { attributed_ms: 979.03, total_ms: 985.79,
-residual_ms: −6.75, tolerance_ms: 0.00099, conserved: false }`。
-也就是说：账本**没有**把差额藏起来——它显式报出 6.75 ms／0.69% 的残差，
-并给出 `conserved = false`。36 个样本各自的残差落在 −9.74 … −5.28 ms（p50 −6.63 ms），
-所以它不是个别样本的抖动。根因是外层 `preprocess_ms` 与阶段计时跨越了
-`recognize_text` → `inner.run()` 的边界，两者并非严格互斥（`src/runtime/timing.rs`
-的模块文档与 `real_world_outer_window_does_not_conserve_the_reported_total` 测试
-记录了这一点；debug 构建下同一残差会放大到约 −55 ms/页）。
+**守恒检查是诊断判据，不是验收依据**：`conservation = { attributed_ms: 979.03,
+total_ms: 985.79, residual_ms: −6.75, overlap_ms: 6.75, tolerance_ms: 0.00099,
+conserved: false, interpretation: "…" }`。账本**没有**把差额藏起来——它显式报出
+6.75 ms／0.69% 的残差、给出 `conserved = false`，并用 `overlap_ms` 与
+`interpretation` 说明该怎么读。`interpretation` 随报告进入 JSON，原文（第二次采集，
+`residual_ms = −7.44`、0.74%）如下：
+
+```json
+"conservation": {
+  "attributed_ms": 995.3904527790016,
+  "total_ms": 1002.8319837782118,
+  "residual_ms": -7.441530999210158,
+  "tolerance_ms": 0.0010028319837782117,
+  "conserved": false,
+  "overlap_ms": 7.441530999210158,
+  "interpretation": "NOT a strict partition, but NOT a wrong total either: residual_ms = -7.441531 is negative, i.e. the named timing windows overlap. The outer OcrTimings::preprocess_ms window and the per-stage timings cross the inner run() boundary (input decode/resize/crop are measured inside run(), and the outer preprocess window covers them too), so the same wall-clock interval is counted in two terms of total_ms and 7.441531 ms (0.74% of total_ms) is duplicated. total_ms itself is a single wall-clock measurement and is unaffected. This ledger is a DIAGNOSTIC instrument, not acceptance evidence: every share is valid only to within 7.441531 ms (0.74% of total_ms), and the stage-6 conclusion (ONNX Runtime inference is an order of magnitude larger than every Rust component) is not affected by a residual of this size."
+}
+```
+
+**负残差的含义是计时窗口重叠，不是“总量算错了”**：外层 `preprocess_ms` 窗口与
+`inner.run()` 的 e2e 窗口都包含输入的 decode/resize/crop，同一段墙钟时间在 `total_ms` 的两项里
+各算了一次；`total_ms` 本身是一次独立墙钟测量，不受分量口径影响。因此：
+
+- 账本是**诊断（diagnostic）仪器**：它回答“瓶颈在哪一侧”，各项占比只在
+  ±`overlap_ms`（0.69%）内成立；
+- **它不能作为任何性能声明的验收依据**，也不是严格划分（strict partition）；
+- 阶段门槛的结论不依赖它：ORT 推理占比（≈85.6%）比**每一个** Rust 分量都大一个数量级，
+  0.69% 的残差无法推翻这个量级判断。
+
+36 个样本各自的残差落在 −9.74 … −5.28 ms（p50 −6.63 ms），所以它不是个别样本的抖动。
+根因（外层窗口与阶段计时跨越 `recognize_text` → `inner.run()` 的边界）记录在
+`src/runtime/timing.rs` 的模块文档与
+`real_world_outer_window_does_not_conserve_the_reported_total` 测试里（debug 构建下同一残差
+放大约一个数量级，约 −55 … −100 ms/页）。`timing_ledger.conservation.interpretation`
+把这段话原样带进 JSON，因此报告是自解释的。
 
 **与原文对比**：
 
 | 口径 | 原文（阶段 6） | 终审重算 | 说明 |
 | --- | ---: | ---: | --- |
-| “ORT 推理占比” | 86.03% | **85.63%** | 量级一致（差异来自重采与分母口径） |
+| “ORT 推理占比” | 86.03% | **85.63%**（±0.69%） | 量级一致（差异来自重采与分母口径） |
 | “被命名的 Rust 前后处理” | 0.58% | **13.69%**（Rust 侧合计） | 原文漏掉了输入窗口与三阶段前后处理；**低估约 23 倍** |
-| 未归属 | 未报告 | **0.69%** | 显式报出 |
+| 未归属 / 重叠 | 未报告 | **0.69%** | 显式报出：是窗口重叠，不是漏项，也不是总量错误 |
 
 阶段门槛的结论**不变**：瓶颈仍在 ORT（≈85.6%），Rust 侧总量约 13.7%，
 因此“Rust 热路径没有可测量的优化空间”这一判断成立；
-但原文的具体百分比是不可用的，本节的数字才是守恒账本给出的值。
+但原文的具体百分比是不可用的，本节的数字才是时间账本给出的值——**并且只在 0.69% 的
+残差量级内成立**。
 
 ### P2-2 / P2-3：`selected_ep` 与加固后的检查器
 
@@ -947,10 +985,12 @@ target\release\rapidocr.exe evaluate --manifest <OCR-test-image>\golden-manifest
 
 ### 终审仍然存在的限制
 
-- **`total_ms` 与分量之和不完全守恒**（本机 release 下残差 −6.75 ms／页，约占 0.69%）：
-  外层 `preprocess_ms` 与阶段计时跨越 `inner.run()`，本 crate 没有在不改动计时语义的
-  前提下消除它。账本显式报告该残差，因此引用占比前必须先看
-  `timing_ledger.conservation.conserved`。**未做**任何“让数字好看”的调整。
+- **时间账本是诊断工具，不是性能验收依据**（本机 release 下残差 −6.75 ms／页，0.69%）：
+  外层 `preprocess_ms` 窗口与阶段计时跨越 `inner.run()`、互相重叠，本 crate 没有在不改动
+  计时语义的前提下消除它。账本把该残差作为一等公民报出
+  （`conservation.overlap_ms` + `conservation.interpretation`），因此
+  `conserved = false` **不能**被读成“`total_ms` 算错了”。**任何性能声明都不得以该账本
+  作为验收依据**；它的占比只在 ±0.69% 内成立。**未做**任何“让数字好看”的调整。
 - **ORT 指纹依赖编译期记录的缓存路径**：若 ort 缓存被清理或换机，
   `runtime_module` 会退回 exe 自身并在 `link_reason` 里说明；此时
   `runtime_source = "executable"`，报告的跨机器可比性下降（但仍能标识二进制）。
@@ -960,13 +1000,88 @@ target\release\rapidocr.exe evaluate --manifest <OCR-test-image>\golden-manifest
 - **CUDA 仍然未验证**：本机缺 cuDNN，`selected_ep = Cuda` 但实测与 CPU 无差异；
   这是 provider 的真实结论，不是工具缺陷。
 - **计时噪声**（同二进制 p50 波动可达 39%）意味着所有延迟数字只能按量级解读。
-- **公式工具现在把线程留给 ORT 自己决定**：`formula_bench` / `formula_eval` 直接构造
-  `RuntimeConfig`（`--threads` 未给时 `intra_threads = None`、`auto_tune_threads = true`），
-  而删除 `derive_runtime_threads` 之后 `OrtSession` 只做透传，因此这两个工具**不再**
-  显式设置 ORT 线程数（实测报告的 `provider.intra_threads = null`、`inter_threads = null`，
-  而修复前是 `budget` = 14）。引擎路径仍然按 plan 显式设置。
-  两者都落在 ORT 自动调优的默认线程数附近，但这是**行为变化**，公式链路的延迟数字
-  在严格对比前必须重测；本节的公式指标（CER/精确匹配）不受线程数影响。
+- **公式工具的线程行为已统一**（复审第二轮修复，原先记在这里的限制不再成立）：
+  `formula_bench` / `formula_eval` 直接构造 `RuntimeConfig` 时，线程数由共享的
+  `RuntimeConfig::effective_session_threads()` 推导，与引擎路径同一个函数；报告里
+  `provider.effective_intra_threads` / `effective_inter_threads` 给出真正下发给 ORT 的值
+  （`null` = 未配置）。详见文末「复审第二轮」。
+
+---
+
+## 复审第二轮
+
+**范围**：终审之后的第二轮评审提出 1 个 P1 + 2 个 P2 与一项措辞统一。本节记录修复、
+证据与仍然存在的限制。**没有**放宽任何硬门槛：12 图 mean CER 仍是
+`0.44765135645866394`，区域数均值仍是 `34.833333333333336`（逐位相同）。
+
+### 修复清单
+
+| 编号 | 问题 | 根因 | 修复 |
+| --- | --- | --- | --- |
+| P1 | `auto_tune_threads` 在不同公开入口含义不同 | 终审删掉 `derive_runtime_threads` 之后 `OrtSession` **只做字段透传**：引擎路径经 `RuntimeProfile::plan` 推导（intra = 预算、inter = 1），而 `FormulaSession` / `formula_bench` / `formula_eval` 直接把 `RuntimeConfig` 交给 `OrtSession`，默认配置下**不配置** ORT 线程（拿到 ORT 默认值） | 新增 `RuntimeConfig::effective_session_threads()`（**唯一**线程策略实现：显式值优先 → 否则按 `auto_tune_threads` 从 `auto_tuned_thread_budget()` 推导 → 否则 `(None, None)`）；`RuntimeProfile::plan` 与 `OrtSession::open_session` 都调用它；`OrtSession::session_threads()` / `FormulaSession::session_threads()` / `FormulaRecognizer::session_threads()` 暴露实际下发的值；`formula_bench` / `formula_eval` 报告新增 `effective_intra_threads` / `effective_inter_threads` |
+| P2-1 | `ThreadSource::Explicit` 只看 `intra_threads` | `plan()` 只从 `explicit_intra` 推导 source；`rayon_threads: Some(n)` 的配置被标成 `Auto`，于是已有全局池会被静默采纳而不是报告“显式请求无法生效” | `RuntimeConfig::has_explicit_thread_request()`（三个字段任意一个 `Some(>0)`）成为 source 的依据；冲突决策抽成纯函数 `reconcile_existing_rayon_pool(source, requested, actual)`，`apply_rayon_global_pool()` 调用它 |
+| P2-2 | 计时账本被当成验收证据 | 负残差（release −6.75 ms／页）被写成“重复计数”而 `unattributed_ms` 的正数被写成“漏项”，两者都被读成“总量有问题” | `src/runtime/timing.rs` 模块文档改为“诊断判据、不是验收证据”；`LedgerConservation` 新增 `overlap_ms`（= `max(0, -residual)`，占比成立的上界）与 `interpretation`（人可读的读法，进入 JSON）；本文件阶段 6 与 P2-1 两节的措辞按“残差一起读”重写 |
+| 措辞 | “Windows-only” 不能表达支持范围 | 支持范围是 **Windows x64 + MSVC ABI**，非目标是 Windows x86 (i686)、Windows ARM64、Windows GNU ABI（以及 Wine/WSL/Linux/macOS），而不是笼统的“Windows-only” | `README.md`、`src/lib.rs`、`src/platform_gate.rs`、`CHANGELOG.md`、`docs/03`、本文件统一措辞；非目标显式列出 i686/ARM64/GNU ABI 与理由（ORT、DirectML/CUDA provider DLL、566 MB 公式模型让 32 位 x86 成为真实限制，而不是一个 `cfg` 改动）。**未改任何代码行为** |
+
+### 关键行为对比（P1）
+
+| 入口 | 修改前（默认 `RuntimeConfig`） | 修改后 |
+| --- | --- | --- |
+| `RapidOcrEngine`（经 `RuntimeProfile::plan`） | `ort_intra = Some(budget)`（本机 14）、`ort_inter = Some(1)` | 不变：`Some(14)` / `Some(1)` |
+| `FormulaSession` / `FormulaRecognizer` | `(None, None)` → ORT 自己决定 | **`Some(14)` / `Some(1)`**（与引擎一致） |
+| `formula_bench`（无 `--threads`） | 同上 | 同上，且报告新增 `effective_intra_threads = 14` |
+| `formula_eval`（无 `--threads`） | 同上 | 同上，且 `provider.effective_intra_threads = 14` |
+| 显式 `intra_threads: Some(6)` | 引擎与公式路径都得到 `(Some(6), ...)` | 不变（显式值永远优先） |
+| `auto_tune_threads = false` 且无显式值 | `(None, None)`（两条路径恰好一致） | 不变：`(None, None)` |
+| `intra_threads: None, rayon_threads: Some(4)` 且已有不同大小的全局池 | `ThreadSource::Auto` → 静默采纳已有池 | **`ThreadSource::Explicit` → `RapidOcrError::Config`**，错误同时给出实际与请求的线程数 |
+
+### 证据
+
+- `cargo test --lib runtime::profile`：15 passed（新增
+  `default_config_derives_the_same_session_threads_in_both_paths`、
+  `auto_tune_disabled_derives_no_session_threads`、
+  `explicit_threads_win_in_both_auto_tune_modes`、
+  `rayon_only_explicit_request_conflicts_with_an_existing_pool`）。
+  最后一条的顺序无关性已实测：`-- --test-threads=1` 全绿，且用
+  `--exact runtime::profile::tests::rayon_only_explicit_request_conflicts_with_an_existing_pool`
+  单独运行（它自己最先建立全局池）同样通过——冲突**决策**由纯函数验证，
+  不依赖“池是否已经存在”。
+- `cargo test --lib formula::session`：12 passed（新增
+  `standalone_session_uses_the_shared_thread_policy`、
+  `standalone_session_honours_explicit_threads`）。两条都用**仓库内**fixture
+  `tests/fixtures/formula-onnx/formula_ok.onnx`，不需要外部 566 MB 模型，因此不会被 skip。
+- `cargo test --lib runtime::timing`：8 passed（新增
+  `positive_residual_is_explained_as_a_different_direction`，
+  并强化 `real_world_outer_window_does_not_conserve_the_reported_total`：
+  断言 `overlap_ms` 与残差量级一致、解释文案包含 “NOT a strict partition”“overlap”
+  “DIAGNOSTIC instrument, not acceptance evidence”“valid only to within”）。
+- 12 图硬门槛（`bench_warm_e2e` + `rapidocr evaluate`）与终审一致，
+  mean CER `0.44765135645866394`、区域数均值 `34.833333333333336` 逐位相同
+  （输出写到 `target/gate-verify/`，未覆盖 `tests/baseline/` 里已提交的基线）。
+- `formula_bench`（**不带** `--threads`，用仓库内 fixture）实测报告：
+  `threads = { intra_threads: null, inter_threads: null, auto_tune_threads: true,
+  effective_intra_threads: 14, effective_inter_threads: 1, logical_cpus: 20,
+  physical_cpus: 14 }` —— 公式路径与引擎路径拿到同一对线程数
+  （`budget = min(20, 14) = 14`）。
+- `cargo test --lib formula_integration_tests -- --test-threads=1`（真实模型）：
+  11 passed / 0 failed（79.1 s）。**注意**：本 crate 的该模块现在有 11 条测试，
+  阶段 4/8 记录里写的 “10 passed” 是当时的状态，本轮未改动该模块。
+- `pwsh -File tools/check_platform_gate.ps1`：`PASS`（两个非支持 target 各自只命中
+  一条自定义 `compile_error!`，本机 target 干净通过），新措辞已在其中验证。
+- `cargo test --all-targets`：lib 304 + bin 18 passed；`cargo test --features
+  directml-provider`：304 passed；`cargo check --features directml-provider,cuda-provider`
+  与 `cargo build --release --bins` 通过；`cargo fmt --all -- --check` 与
+  `cargo clippy --all-targets -- -D warnings` 干净。
+
+### 仍然存在的限制
+
+- **公式链路的延迟数字不能与终审报告直接比较**：默认配置下公式会话的线程数从
+  “ORT 默认值”变成了 `intra = 预算(14)`、`inter = 1`，这是**行为变化**；
+  本节的公式质量指标（CER / 精确匹配）不受线程数影响，但延迟必须在同一份二进制上重测。
+- **账本仍然是诊断工具**（见上）：本轮的改动只是让它**说清楚**这一点，
+  没有、也不打算消除计时窗口重叠。
+- **Windows x86 (i686) 只是被显式列为非目标**，没有任何 32 位构建证据；
+  理由（ORT / provider DLL / 公式模型）与 `src/platform_gate.rs` 保持一致。
 
 ---
 

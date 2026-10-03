@@ -183,6 +183,15 @@ impl FormulaRecognizer {
         self.session.provider_resolution()
     }
 
+    /// 该识别器会话下发给 ONNX Runtime 的 `(intra, inter)` 线程数。
+    ///
+    /// 值来自 [`RuntimeConfig::effective_session_threads`]，与引擎路径
+    /// （[`crate::runtime::profile::RuntimeProfile::plan`]）是同一个函数；
+    /// `None` 表示该线程数**未配置**（ORT 用自己的默认值），不是 0 线程。
+    pub fn session_threads(&self) -> (Option<usize>, Option<usize>) {
+        self.session.session_threads()
+    }
+
     pub fn recognize(&mut self, image: &DynamicImage) -> Result<FormulaRecognition> {
         self.ensure_image_limit(image)?;
         let start = Instant::now();

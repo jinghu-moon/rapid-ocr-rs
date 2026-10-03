@@ -1,8 +1,8 @@
-# rapid-ocr-rs Windows-only 重构与性能优化任务清单
+# rapid-ocr-rs Windows x64（MSVC ABI）重构与性能优化任务清单
 
 > 文档状态：待实施计划
 >
-> 目标：在项目开发期将 `rapid-ocr-rs` 的正式支持范围收窄为 Windows，并借此删除无效的平台分支、收紧模块边界、减少原生依赖，同时用 Windows 实测数据优化 OCR 与公式识别性能。
+> 目标：在项目开发期将 `rapid-ocr-rs` 的正式支持范围收窄为 Windows x64 + MSVC ABI，并借此删除无效的平台分支、收紧模块边界、减少原生依赖，同时用 Windows 实测数据优化 OCR 与公式识别性能。
 >
 > 适用范围：`crates/rapid-ocr-rs`。本计划允许破坏性 API 修改，不为 Linux/macOS 保留兼容层。
 
@@ -12,10 +12,13 @@
 
 ### 0.1 支持范围
 
-- 第一阶段目标平台：`x86_64-pc-windows-msvc`。
-- Windows ARM64、GNU ABI、Wine、WSL 不纳入本轮正式验收；若以后需要，另立平台计划。
+- 第一阶段目标平台：Windows x64 + MSVC ABI（`x86_64-pc-windows-msvc`）。
+- **明确非目标**：Windows x86（32 位，i686）、Windows ARM64、Windows GNU ABI，以及 Wine、
+  WSL、Linux、macOS 都不纳入本轮正式验收；若以后需要，另立平台计划。
+  32 位 x86 不是“改一个 `cfg`”就能支持的目标：预编译的 ONNX Runtime、DirectML/CUDA 的
+  provider DLL 与约 566 MB 的公式识别模型都是 x64 产物，32 位地址空间对后者本身就是真实限制。
 - Windows CPU 是基础路径；DirectML 和 CUDA 是可选加速 provider。
-- CANN 不属于 Windows 目标平台，应从公开配置、代码和验证矩阵删除。
+- CANN 不属于 Windows x64 目标平台，应从公开配置、代码和验证矩阵删除。
 - OpenCV、turbojpeg 是否保留必须由 Windows 基准决定，不能凭主观判断删除或保留。
 
 ### 0.2 不可变工程规则
@@ -42,9 +45,9 @@
 
 ### 1.1 已确认的设计问题
 
-| 区域 | 当前状态 | Windows-only 下的处理 |
+| 区域 | 当前状态 | Windows x64 收窄下的处理 |
 | --- | --- | --- |
-| 平台边界 | 没有 crate 级 Windows 编译约束；代码包含 Linux/macOS 语义 | 增加明确的非 Windows 编译错误，文档/CI 只保留 Windows |
+| 平台边界 | 没有 crate 级 Windows 编译约束；代码包含 Linux/macOS 语义 | 增加明确的非支持目标编译错误，文档/CI 只保留 Windows x64 + MSVC ABI |
 | 峰值内存 | `runtime/memory.rs` 同时实现 Windows、Linux、其它平台 | 只保留 `GetProcessMemoryInfo`，删除 `/proc` 和 unsupported 分支 |
 | provider | CPU、CUDA、DirectML、CANN 四套公开语义 | 删除 CANN；保留 CPU/CUDA/DirectML |
 | 视觉后端 | Pure Rust 与可选 OpenCV 两套实现，调用链有多处 dispatch | 先做 Windows 基准；纯 Rust 达标后删除 OpenCV feature 和 dispatch |
@@ -57,7 +60,7 @@
 ### 1.2 不应直接做的“伪优化”
 
 - 不把 `target-cpu=native` 写入可发布 crate 的默认 profile；它会破坏跨机器分发，应只在应用或本机 benchmark profile 使用。
-- 不因为 Windows-only 就把所有纯 Rust代码改成 Win32 API；OCR 数值算法仍应保持可测试、可复用和与模型契约解耦。
+- 不因为收窄到 Windows x64 就把所有纯 Rust 代码改成 Win32 API；OCR 数值算法仍应保持可测试、可复用和与模型契约解耦。
 - 不把 DirectML 强行设为默认 provider；当前已有数据表明 GPU 速度依赖图片集、动态 batch 和驱动，必须由基准决定。
 - 不用并发包围模型调用来“堆性能”；ORT、Rayon、DirectML 同时开线程可能造成过度订阅，先测量再改。
 - 不为了删除 Linux/macOS 而删除跨平台数据结构、序列化格式或算法测试；删除的是平台实现，不是业务能力。
@@ -69,7 +72,7 @@
 | 阶段 | 名称 | 核心产出 | 依赖 | 完成门槛 |
 | --- | --- | --- | --- | --- |
 | 0 | 基线与平台决策冻结 | Windows x64 基线报告、目标矩阵、风险清单 | 无 | 基线可复跑，工作区干净 |
-| 1 | Windows-only 编译边界 | 非 Windows 明确拒绝，删除跨平台内存实现 | 0 | Windows 全测通过，非 Windows 失败信息明确 |
+| 1 | Windows x64 编译边界 | 非支持目标明确拒绝，删除跨平台内存实现 | 0 | Windows x64 全测通过，非支持目标失败信息明确 |
 | 2 | Provider 与运行时裁剪 | 删除 CANN，固定/简化 ONNX Runtime 入口 | 1 | CPU/DirectML/CUDA 行为和错误语义有测试 |
 | 3 | 原生视觉依赖决策 | OpenCV/turbojpeg 保留或删除的实测结论 | 0、1 | 有同机质量/性能/构建成本对比，禁止凭感觉决策 |
 | 4 | 视觉与输入路径重构 | 单一视觉后端、统一 decode/crop/resize 缓冲路径 | 3 | 12 图准确率不退化，内存拷贝和耗时有数据 |
@@ -89,7 +92,7 @@
 - [x] 建立公式 smoke 基线：im2latex-100（exact 24.00% / CER 0.0863 / 链路失败 0，manifest `271424c18c000f95`）；只在模型链路改动时再运行 val-501 对比。
 - [x] 分别记录 CPU、DirectML、CUDA 是否能加载并运行；不可用 provider 必须记录真实错误，不得把 CPU fallback 当加速成功。（**发现 CUDA 报告 resolved 但实测与 CPU 逐位相同 → 阶段 2 必修**，见 §0）
 - [x] 记录当前二进制体积、依赖树中原生库、编译耗时和 `target` 产物大小。（§0 构建与体积）
-- [x] 冻结正式 target 为 `x86_64-pc-windows-msvc`，将 ARM64/GNU/Wine/WSL 列为明确非目标。（写入 `environment.json`）
+- [x] 冻结正式 target 为 `x86_64-pc-windows-msvc`，将 Windows x86（32 位 i686）/ Windows ARM64 / Windows GNU ABI / Wine / WSL 列为明确非目标。（写入 `environment.json`；理由见 §0.1）
 
 ### 3.2 基线命令
 
@@ -111,16 +114,16 @@ cargo run --release --bin formula_eval -- --model <model> --dataset-root <Formul
 
 ---
 
-## 4. 阶段 1：建立 Windows-only 编译边界
+## 4. 阶段 1：建立 Windows x64 + MSVC ABI 编译边界
 
 ### 4.1 代码任务
 
-- [x] 在 `src/lib.rs` 最前面增加非 Windows 的 `compile_error!`，错误信息明确写出当前只支持 `x86_64-pc-windows-msvc`。（定义在 `src/platform_gate.rs`，可独立验证）
+- [x] 在 `src/lib.rs` 最前面增加非支持目标的 `compile_error!`，错误信息明确写出当前只支持 `x86_64-pc-windows-msvc`。（定义在 `src/platform_gate.rs`，可独立验证）
 - [x] 用 `#[cfg(windows)]` 保护 crate 模块；确保非 Windows 不会出现“缺少某个 Windows API”的模糊编译错误。（每个模块同一谓词 + `exports.rs` 收拢公开面；实测诊断数 = 1）
 - [x] `src/runtime/memory.rs` 删除 Linux `/proc/self/status` 和其它平台 `None` 分支，只保留 Windows PSAPI 实现。
 - [x] 将峰值内存来源固定为 `windows:GetProcessMemoryInfo.PeakWorkingSetSize`，测试改为必须返回正值或报告明确的 Win32 失败原因。（`PEAK_MEMORY_SOURCE` + `peak_memory_failure_reason()`）
 - [x] `src/evaluation/formula/sampling.rs` 的符号链接测试保留 Windows 实现，但将“权限导致跳过”的行为改成显式测试环境说明；核心 `..` 越界测试必须始终执行。
-- [x] README、Cargo metadata、验证矩阵删除 Linux/macOS 支持措辞，改写为 Windows-only 约束。（README 新增 Platform support 一节；Cargo metadata 在阶段 7 统一处理）
+- [x] README、Cargo metadata、验证矩阵删除 Linux/macOS 支持措辞，改写为 Windows x64 + MSVC ABI 约束。（README 新增 Platform support 一节；Cargo metadata 在阶段 7 统一处理）
 
 ### 4.2 测试
 
@@ -205,7 +208,7 @@ cargo run --release --bin formula_eval -- --model <model> --dataset-root <Formul
 ### 7.3 输入路径
 
 - [x] Windows 文件路径统一使用 `PathBuf` 和 canonical/metadata 检查；不手工拼接反斜杠。（阶段 1/6 的路径规范化测试覆盖）
-- [x] 保留 URL 的 reqwest 超时和响应体限制；Windows-only 不意味着取消网络安全边界。
+- [x] 保留 URL 的 reqwest 超时和响应体限制；收窄到 Windows x64 不意味着取消网络安全边界。
 - [x] 评估将 `ImageInput::Image` 与 `ImageInput::Pixels` 归并为明确的 owned/borrowed 两个输入类型，避免同一图像多种 public 表达重复维护。（**评估后不合并**：两者语义不同——`Image` 是已解码的 `RecImage`（含颜色序），`Pixels` 是外来像素缓冲（含 stride/bottom-up）。合并会引入一个仍需在内部区分的枚举，且两者都有真实调用方与限制测试；记录而不改。）
 
 ### 7.4 验收
@@ -220,7 +223,7 @@ cargo run --release --bin formula_eval -- --model <model> --dataset-root <Formul
 
 ### 8.1 根因目标
 
-当前 det/cls/rec 各持有 `RuntimeConfig`，同时 ORT session 自己开线程、Rayon 共享线程池、recognition/classification 还可能并行处理。Windows-only 的价值在于可以针对固定 Windows 硬件建立稳定策略，但不能直接把线程数改成“CPU 核数”。
+当前 det/cls/rec 各持有 `RuntimeConfig`，同时 ORT session 自己开线程、Rayon 共享线程池、recognition/classification 还可能并行处理。固定为 Windows x64 的价值在于可以针对固定 Windows 硬件建立稳定策略，但不能直接把线程数改成“CPU 核数”。
 
 ### 8.2 任务
 
@@ -313,7 +316,7 @@ rg -n "linux|macOS|macos|CANN|cann-provider|unsupported platform|OpenCV|turbojpe
 
 ### 11.3 最终指标
 
-- [x] 提交一份 Windows-only final report：基线/改后 CER、区域数、polygon IoU、P50/P95、峰值工作集、启动时间、二进制体积。（`docs/04-windows-phase-reports.md` 阶段 8；IoU 因 manifest 未标注 boxes 仍为 null）
+- [x] 提交一份 Windows x64 final report：基线/改后 CER、区域数、polygon IoU、P50/P95、峰值工作集、启动时间、二进制体积。（`docs/04-windows-phase-reports.md` 阶段 8；IoU 因 manifest 未标注 boxes 仍为 null）
 - [x] full formula datasets 只在阶段 5/6 修改了模型调用、预处理、tokenizer、postprocess、batch/EOS 或指标实现时重跑；否则复用已锁定 baseline，并记录理由。（阶段 5 改了 batch，因此执行第 3 档：im2latex-100 与真实模型集成测试；未重跑全量，理由已记录）
 - [x] 所有未实现或环境相关限制写入 README 的 Known limitations，不得用“支持”掩盖未验证 provider。
 
@@ -335,7 +338,7 @@ rg -n "linux|macOS|macos|CANN|cann-provider|unsupported platform|OpenCV|turbojpe
 
 ### 12.2 必须暂停并重新评估的情况
 
-- Windows-only 改动导致普通 OCR CER、区域数或 polygon IoU 超出阶段 0 门槛。
+- Windows x64 收窄改动导致普通 OCR CER、区域数或 polygon IoU 超出阶段 0 门槛。
 - OpenCV/turbojpeg 删除后出现真实质量差异，或端到端 P95 退化超过 10%。
 - 线程改动使 P95、峰值工作集或稳定性变差，即使平均吞吐上升。
 - DirectML/CUDA 只能通过 CPU fallback“通过”时，必须标记 provider 不可用，不得继续优化该结果。

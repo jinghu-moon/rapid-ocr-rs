@@ -179,9 +179,15 @@ struct ProviderInfo {
     /// 加速结论必须来自实测指标。
     selected_ep: String,
     fallback_used: bool,
+    /// `--threads` **请求**的值（`None` = 没有显式请求）。
     intra_threads: Option<usize>,
     inter_threads: Option<usize>,
     auto_tune_threads: bool,
+    /// 真正下发给 ONNX Runtime 的线程数，来自
+    /// `RuntimeConfig::effective_session_threads()`——与引擎路径同一个函数。
+    /// `null` = 该线程数**未配置**（ORT 用自己的默认值），不是 0 线程。
+    effective_intra_threads: Option<usize>,
+    effective_inter_threads: Option<usize>,
     physical_cpus: usize,
 }
 
@@ -662,6 +668,8 @@ fn merge_shard_reports(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             intra_threads: first.provider.intra_threads,
             inter_threads: first.provider.inter_threads,
             auto_tune_threads: first.provider.auto_tune_threads,
+            effective_intra_threads: first.provider.effective_intra_threads,
+            effective_inter_threads: first.provider.effective_inter_threads,
             physical_cpus: first.provider.physical_cpus,
         },
         dataset: first.dataset.clone(),
@@ -857,6 +865,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         FormulaRecognizer::from_model_with_hash(&model, &runtime, cli.expected_sha256.as_deref())?;
     let load_ms = loaded_start.elapsed().as_secs_f64() * 1000.0;
     let resolution = recognizer.provider_resolution();
+    // 会话**实际**拿到的线程数（`RuntimeConfig::effective_session_threads()` 的输出），
+    // 而不是 CLI 里写了什么：默认配置会推导出 intra = 预算、inter = 1。
+    let session_threads = recognizer.session_threads();
 
     // 分片只裁剪“要评测哪些下标”，manifest 始终覆盖完整集合，
     // 因此所有分片的 manifest_sha256 相同，合并结果与串行运行等价。
@@ -1029,6 +1040,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             intra_threads: runtime.intra_threads,
             inter_threads: runtime.inter_threads,
             auto_tune_threads: runtime.auto_tune_threads,
+            effective_intra_threads: session_threads.0,
+            effective_inter_threads: session_threads.1,
             physical_cpus: num_cpus::get_physical(),
         },
         dataset: manifest.dataset.clone(),
@@ -1284,6 +1297,8 @@ mod tests {
                 intra_threads: None,
                 inter_threads: None,
                 auto_tune_threads: true,
+                effective_intra_threads: Some(8),
+                effective_inter_threads: Some(1),
                 physical_cpus: 8,
             },
             dataset: "im2latex".to_string(),

@@ -2,12 +2,19 @@
 //!
 //! # 平台支持
 //!
-//! **仅支持 `x86_64-pc-windows-msvc`。**
+//! **唯一支持的平台是 Windows x64 + MSVC ABI（`x86_64-pc-windows-msvc`）。**
 //!
-//! 这是刻意的收窄，而不是尚未移植：项目的实际运行环境只有 Windows，
+//! 这是刻意的收窄，而不是尚未移植：项目的实际运行环境只有 Windows x64，
 //! 保留 Linux/macOS 分支会让平台差异散落到业务代码里，并让验证矩阵无法收敛。
-//! 明确非目标：`aarch64-pc-windows-msvc`、`x86_64-pc-windows-gnu`、Wine、WSL、
-//! Linux、macOS。若将来需要，另立平台计划，而不是在这里逐步加回 `cfg`。
+//!
+//! 明确非目标：**Windows x86（i686，32 位）**、**Windows ARM64**、
+//! **Windows GNU ABI（`x86_64-pc-windows-gnu` / `i686-pc-windows-gnu`）**，
+//! 以及 Wine、WSL、Linux、macOS。
+//!
+//! Windows x86 不是“改一个 `cfg` 就能支持”的：预编译的 ONNX Runtime、
+//! DirectML/CUDA 的 provider DLL 与约 566 MB 的公式识别模型都是 x64 产物，
+//! 32 位地址空间对后者本身就是真实限制；Windows ARM64 则要重新收集并重测整套原生依赖。
+//! 若将来需要，另立平台计划，而不是在这里逐步加回 `cfg`。
 //!
 //! 平台边界集中在 crate 根部，规则只有四条：
 //!
@@ -17,9 +24,11 @@
 //! 2. 所有模块与重导出都带**同一个** `#[cfg]` 谓词，因此非支持平台**只会**看到那一条
 //!    `compile_error!`，不会退化成一堆“缺少某个 Windows API”的模糊诊断；
 //! 3. 谓词是 `all(windows, target_arch = "x86_64", target_env = "msvc")`，**必须带
-//!    `target_env = "msvc"`**：`x86_64-pc-windows-gnu` 同样满足
-//!    `windows + x86_64`，但本 crate 的导入库、`#[link(name = "psapi")]` 与 ort
-//!    预编译运行库都是 MSVC 产物，GNU ABI 属于明确非目标（见 `platform_gate.rs`）；
+//!    `target_env = "msvc"`**：`x86_64-pc-windows-gnu` 同样满足 `windows + x86_64`
+//!    但不是支持目标，而 32 位 x86（`i686-pc-windows-msvc` / `i686-pc-windows-gnu`）
+//!    不满足 `target_arch = "x86_64"`；本 crate 的导入库、
+//!    `#[link(name = "psapi")]` 与 ort 预编译运行库都是 MSVC x64 产物
+//!    （见 `platform_gate.rs`）；
 //! 4. 业务代码内部不再散布 `cfg(windows)`；平台差异只允许出现在
 //!    `runtime/memory.rs` 这类平台实现模块里。
 //!
@@ -96,8 +105,16 @@ mod platform_tests {
     /// 这里断言的是运行期可见的三元组，两者互相独立。
     #[test]
     fn the_test_suite_runs_on_the_gated_target() {
-        assert_eq!(std::env::consts::OS, "windows", "the crate is Windows-only");
-        assert_eq!(std::env::consts::ARCH, "x86_64", "the crate is x86_64-only");
+        assert_eq!(
+            std::env::consts::OS,
+            "windows",
+            "the only supported platform is Windows x64 + MSVC ABI"
+        );
+        assert_eq!(
+            std::env::consts::ARCH,
+            "x86_64",
+            "the only supported platform is Windows x64 + MSVC ABI"
+        );
         assert_eq!(
             std::env::consts::FAMILY,
             "windows",

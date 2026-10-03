@@ -194,10 +194,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // 分阶段统计：每个指标都带 count / min / max / avg / p50 / p90，口径与
         // `stats.wall_ms` / `stats.ocr_total_ms` 完全一致（同一个 `stats()` helper）。
         "stages": stage_report,
-        // 守恒时间账本：每一项只算一次，未归属余量显式列出，并给出守恒判定。
+        // 时间账本：每一项只算一次，余量显式列出，并给出守恒判定 + **解释**
+        // （`conservation.interpretation`）。它是**诊断**仪器：分量来自跨越
+        // `inner.run()` 的重叠窗口，因此占比只在 `conservation.overlap_ms` 内成立，
+        // 不能作为性能验收依据。
         "timing_ledger": ledger_report,
-        // ORT 推理 vs Rust 前后处理的时间占比（阶段 6 门槛证据）；
+        // ORT 推理 vs Rust 前后处理的时间占比（阶段 6 门槛证据的来源之一）；
         // 数值与 `timing_ledger` 一致，保留这个键是为了让旧的对比方式仍然可用。
+        // 与 `timing_ledger` 一样带着残差量级，读取时必须一起看。
         "timing_split": timing_split,
         // 峰值工作集口径与库内一致：`windows:GetProcessMemoryInfo.PeakWorkingSetSize`。
         "memory": {
@@ -339,8 +343,14 @@ impl StageSamples {
 /// 守恒时间账本报告。
 ///
 /// 每个样本各算一份账（[`TimingLedger::from_timings`]，每一项只算一次），再按字段求
-/// 均值。**守恒检查建立在均值账本上**（而不是把已经平均过的数字重新拼一遍）：
-/// 均值账本与每个样本账本满足同一套恒等式，因此它的余量也必须是 0。
+/// 均值。守恒检查建立在均值账本上，而**均值账本与每个样本账本一样并不严格守恒**：
+/// 外层 `preprocess_ms` 窗口与阶段计时跨越 `inner.run()`，分量不是互斥窗口。
+///
+/// 因此这里必须把“不守恒该怎么读”一起写进 JSON：
+/// `conservation.interpretation` 明确写出“负残差 = 窗口重叠、账本是诊断工具、占比只在
+/// 残差量级内成立、`total_ms` 本身不受影响”，`conservation.overlap_ms` 给出该量级。
+/// 报告的使用者**不得**把账本当作性能验收依据，也不得把 `conserved = false` 读成
+/// “总量算错了”。
 fn ledger_report(ledgers: &[TimingLedger]) -> serde_json::Value {
     if ledgers.is_empty() {
         return json!({
@@ -369,8 +379,9 @@ fn ledger_report(ledgers: &[TimingLedger]) -> serde_json::Value {
             "unattributed_ms": mean.unattributed_ms,
         },
         "shares": shares,
-        // 守恒判据：attributed_ms 与 total_ms 的差必须落在容差内。
-        // 不守恒说明账本漏项或双计，报告不得被当成有效证据。
+        // 守恒判据 + **怎么读它**：`conservation.interpretation` 说明负残差是计时窗口重叠
+        // （诊断仪器的局限），不是 `total_ms` 算错了；`overlap_ms` 是占比成立的上界。
+        // 这个账本是诊断工具，不能作为性能验收依据。
         "conservation": conservation,
         // 每个样本各自的余量：用来看“均值守恒”是不是掩盖了单样本的大偏差。
         "per_sample_unattributed_ms": stats(
@@ -387,8 +398,13 @@ fn ledger_report(ledgers: &[TimingLedger]) -> serde_json::Value {
 
 /// ONNX Runtime 推理 vs Rust 前后处理的时间占比。
 ///
-/// 分子来自守恒账本的均值，分母是 `stats.ocr_total_ms.avg`（同一个口径，来自
-/// `OcrTimings::total_ms`），因此 `inference + rust + unattributed == total`。
+/// 分子来自时间账本的均值，分母是 `stats.ocr_total_ms.avg`（同一个口径，来自
+/// `OcrTimings::total_ms`），因此 `inference + rust + unattributed == total` 按构造成立。
+///
+/// 按构造成立**不等于**这些占比是精确划分：账本的各个分量来自互相重叠的计时窗口
+/// （见 `timing_ledger.conservation`），所以每一项占比只在
+/// `conservation.overlap_ms` 的量级内成立（release 实测 ±0.69%）。这个量级足以支撑
+/// “瓶颈在 ORT（比每个 Rust 分量大一个数量级）”，但不足以支撑更细的性能结论。
 fn inference_share(ledgers: &[TimingLedger], total_avg: f64) -> serde_json::Value {
     if ledgers.is_empty() {
         return json!({"error": "no timing samples were collected"});
@@ -412,7 +428,7 @@ fn inference_share(ledgers: &[TimingLedger], total_avg: f64) -> serde_json::Valu
         "rust_share": share(rust),
         // 兼容旧的字段名：以前把“页面级 preprocess + postprocess”称作 rust_preprocess /
         // rust_postprocess。这两个数字现在**不再是**那两项（那两项本身漏项且重复），
-        // 而是守恒账本里的输入侧与后处理侧，读旧字段名的人必须知道这一点。
+        // 而是时间账本里的输入侧与后处理侧，读旧字段名的人必须知道这一点。
         "rust_input_ms": mean.input_ms(),
         "rust_input_share": share(mean.input_ms()),
         "rust_model_preprocess_ms": mean.model_preprocess_ms(),
