@@ -331,6 +331,133 @@ mod tests {
         let _ = std::fs::remove_file(&outside);
     }
 
+    /// 词法前缀匹配会放过 `<root>/../outside/image.png`：前缀是根目录，剩下的
+    /// `../outside/image.png` 既不是绝对路径也不为空，于是“相对路径”里带上了
+    /// 越界成分。这条测试固定该回归必须被拒绝。
+    #[test]
+    fn dataset_relative_path_rejects_parent_dir_escapes() {
+        let base = std::env::temp_dir().join(format!("rapid-ocr-rs-escape-{}", std::process::id()));
+        let root = base.join("dataset");
+        let outside_dir = base.join("outside");
+        std::fs::create_dir_all(root.join("images")).expect("root");
+        std::fs::create_dir_all(&outside_dir).expect("outside");
+        let inside = root.join("images").join("a.png");
+        std::fs::write(&inside, b"x").expect("write inside");
+        let outside = outside_dir.join("b.png");
+        std::fs::write(&outside, b"y").expect("write outside");
+
+        // 路径自身带 `.` 成分时也要规范化成同一个键。
+        assert_eq!(
+            dataset_relative_path(&root, &root.join("images").join(".").join("a.png"))
+                .expect("normalized path"),
+            "images/a.png"
+        );
+
+        // 词法上以 `<root>/` 开头，实际指向根目录之外。
+        let escape = root.join("..").join("outside").join("b.png");
+        // 先固定“旧实现为什么会放过它”：纯词法前缀比较是成功的。
+        assert_eq!(
+            escape.strip_prefix(&root).expect("lexical prefix matches"),
+            Path::new("..").join("outside").join("b.png"),
+            "the lexical prefix check succeeds, which is exactly why it is not enough"
+        );
+        let error =
+            dataset_relative_path(&root, &escape).expect_err("`..` escape must be rejected");
+        assert!(
+            error.to_string().contains("outside the dataset root"),
+            "error: {error}"
+        );
+
+        // 混合写法（先进入子目录再 `..` 出去）同样必须被拒绝。
+        let mixed = root
+            .join("images")
+            .join("..")
+            .join("..")
+            .join("outside")
+            .join("b.png");
+        assert!(
+            dataset_relative_path(&root, &mixed).is_err(),
+            "mixed `..` escape must be rejected"
+        );
+
+        // `FormulaSample::new` 对 `..` / `.` 成分本身也要拒绝（词法双保险）。
+        assert!(
+            FormulaSample::new(
+                "../outside/b.png".to_string(),
+                escape,
+                "x".to_string(),
+                FormulaDataset::Im2Latex,
+                FormulaSplit::Test,
+                None,
+            )
+            .is_err(),
+            "relative paths containing `..` must be rejected"
+        );
+        assert!(
+            FormulaSample::new(
+                "./images/a.png".to_string(),
+                inside,
+                "x".to_string(),
+                FormulaDataset::Im2Latex,
+                FormulaSplit::Test,
+                None,
+            )
+            .is_err(),
+            "relative paths containing `.` must be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 指向数据集根目录之外的符号链接必须被拒绝（规范化会解析链接目标）。
+    ///
+    /// Windows 上创建符号链接需要开发者模式或管理员权限；不可用时跳过并说明原因，
+    /// 同一条不变式由上面的 `..` 测试覆盖。
+    #[test]
+    fn dataset_relative_path_rejects_symlinks_leading_outside() {
+        let base = std::env::temp_dir().join(format!("rapid-ocr-rs-link-{}", std::process::id()));
+        let root = base.join("dataset");
+        let outside_dir = base.join("outside");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&outside_dir).expect("outside");
+        let outside = outside_dir.join("b.png");
+        std::fs::write(&outside, b"y").expect("write outside");
+
+        let link = root.join("linked");
+        if let Err(error) = std::os::windows::fs::symlink_dir(&outside_dir, &link) {
+            eprintln!(
+                "skipping symlink assertion: cannot create a directory symlink ({error}); \
+                 the `..` escape test covers the same invariant"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let escaped = link.join("b.png");
+        let error = dataset_relative_path(&root, &escaped)
+            .expect_err("a symlink escaping the dataset root must be rejected");
+        assert!(
+            error.to_string().contains("outside the dataset root"),
+            "error: {error}"
+        );
+
+        // 链接位于根内且目标也在根内时，规范化后的相对路径使用**真实**位置，
+        // 因此仍然是根内的稳定键。
+        let inner_target = root.join("real");
+        std::fs::create_dir_all(&inner_target).expect("real");
+        let inner_file = inner_target.join("ok.png");
+        std::fs::write(&inner_file, b"z").expect("write inner");
+        let inner_link = root.join("inner-link");
+        if std::os::windows::fs::symlink_dir(&inner_target, &inner_link).is_ok() {
+            assert_eq!(
+                dataset_relative_path(&root, &inner_link.join("ok.png")).expect("inside link"),
+                "real/ok.png"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn hash_sampling_is_deterministic_and_independent_of_input_order() {
         let original = samples(50);

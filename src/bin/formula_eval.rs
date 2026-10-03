@@ -8,7 +8,8 @@
 //! # PaddleX 示例集 501 张 smoke
 //! cargo run --release --bin formula_eval -- --model <onnx> --dataset-root <Formula-TestSet> `
 //!   --dataset latexocr --split validate --output target/formula-val-501.json
-//! # im2latex 100 张固定 smoke（内容哈希抽样）
+//! # im2latex 100 张固定 smoke（数据集相对路径 + 真值的稳定哈希抽样；
+//! # 图像内容只进 `content_sha256`，不参与样本选择）
 //! cargo run --release --bin formula_eval -- --model <onnx> --dataset-root <Formula-TestSet> `
 //!   --dataset im2latex --split test --limit 100 --output target/formula-im2latex-100.json
 //! # im2latex 完整测试集

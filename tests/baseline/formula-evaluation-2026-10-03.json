@@ -9,7 +9,7 @@
       "subset": null,
       "batch_size": 8,
       "manifest_sha256": "271424c18c000f956c31facd68d137068254e4e93d7e6b27501e9ebce67c2b6d",
-      "sample_set_sha256": null,
+      "sample_set_sha256": "b76d1da8f77af7401d938986a2f361256f537e0b50858039efa47175a91a6f06",
       "limit": 100,
       "strategy": "hash",
       "samples": 100,
@@ -24,10 +24,10 @@
         "model_mismatch": 76,
         "none": 24
       },
-      "images_per_second": 1.7640993434904295,
-      "per_image_p50_ms": 565.96337890625,
-      "per_image_p95_ms": 755.9185791015625,
-      "peak_working_set_bytes": 2200780800,
+      "images_per_second": 1.5579305240477739,
+      "per_image_p50_ms": 633.0050048828125,
+      "per_image_p95_ms": 890.8358154296875,
+      "peak_working_set_bytes": 2200834048,
       "provider": {
         "requested": "Cpu",
         "resolved": "Cpu",

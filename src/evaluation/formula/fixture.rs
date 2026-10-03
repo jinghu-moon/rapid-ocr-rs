@@ -14,7 +14,7 @@
 use std::{
     collections::BTreeSet,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -83,8 +83,10 @@ pub struct FormulaSample {
 }
 
 impl FormulaSample {
-    /// 构造样本。`relative_path` 由调用方通过 [`dataset_relative_path`] 计算，
-    /// 空值或非相对路径会被拒绝。
+    /// 构造样本。`relative_path` 由调用方通过 [`dataset_relative_path`] 计算。
+    ///
+    /// 这里做的是**词法**校验（双保险）：空值、绝对路径、以及任何 `.`/`..`
+    /// 或根/盘符成分都会被拒绝，因此字段本身不可能含路径穿越成分。
     pub fn new(
         relative_path: String,
         image_path: PathBuf,
@@ -103,6 +105,23 @@ impl FormulaSample {
                 "formula sample relative path `{relative_path}` must be relative to the dataset \
                  root, not an absolute path"
             )));
+        }
+        for component in Path::new(&relative_path).components() {
+            match component {
+                Component::Normal(_) => {}
+                Component::CurDir => {
+                    return Err(err_format(format!(
+                        "formula sample relative path `{relative_path}` must not contain `.` \
+                         components"
+                    )));
+                }
+                _ => {
+                    return Err(err_format(format!(
+                        "formula sample relative path `{relative_path}` must not contain `..` or \
+                         root components"
+                    )));
+                }
+            }
         }
         Ok(Self {
             relative_path,
@@ -127,43 +146,59 @@ impl FormulaSample {
 
 /// 计算数据集内的相对路径（`/` 分隔）。
 ///
-/// 抽样与 manifest 都依赖它，因此绝对路径必须在这里被彻底剥离：数据集被复制到
-/// 别的根目录后，同一张图必须仍然得到同一个键。
+/// 抽样与 manifest 都依赖它，因此结果必须**只含数据集内的普通路径成分**：
 ///
-/// **图像必须位于数据集根目录之下**。数据集清单里如果写了根目录之外的绝对路径，
-/// 就没有任何跨机器稳定的相对命名可用（绝对路径本身不稳定，内容哈希又会把
-/// 抽样绑到图像字节上），因此这里返回可定位错误，而不是把绝对路径原样当成
-/// “相对路径”泄漏出去。
+/// - 数据集清单里的绝对路径、`..` 穿越、以及指向根目录之外的符号链接都会让
+///   “相对路径”带上机器相关或越界的成分，跨机器复现随之失效，因此一律拒绝；
+/// - 因此这里**始终先 `canonicalize()`** 再比较，而不是先做词法前缀判断：
+///   词法判断会接受 `<root>/../outside/image.png`（前缀匹配成功，剩下
+///   `../outside/image.png`），也会接受穿过符号链接逃出根目录的路径。
+///   规范化同时解决 Windows 上的大小写、短名（8.3）与 `.`/`..` 问题。
+///
+/// 规范化后的相对路径只由普通成分组成，用 `/` 连接返回。
 pub fn dataset_relative_path(root: &Path, path: &Path) -> Result<String> {
-    let stripped = match path.strip_prefix(root) {
-        Ok(relative) => Some(relative.to_path_buf()),
-        Err(_) => {
-            // Windows 上大小写、短名（8.3）或 `..` 会让前缀比较失败，
-            // 因此再用规范化的绝对路径比较一次。
-            match (root.canonicalize(), path.canonicalize()) {
-                (Ok(canonical_root), Ok(canonical_path)) => canonical_path
-                    .strip_prefix(&canonical_root)
-                    .ok()
-                    .map(Path::to_path_buf),
-                _ => None,
+    let canonical_root = root.canonicalize().map_err(|error| {
+        err_format(format!(
+            "dataset root {} is not accessible: {error}",
+            root.display()
+        ))
+    })?;
+    let canonical_path = path.canonicalize().map_err(|error| {
+        err_format(format!(
+            "formula image {} is not accessible: {error}",
+            path.display()
+        ))
+    })?;
+    let relative = canonical_path.strip_prefix(&canonical_root).map_err(|_| {
+        err_format(format!(
+            "formula image {} is outside the dataset root {}; a formula dataset must be \
+                 self-contained (no absolute paths, `..` escapes, or symlinks leading outside) \
+                 so that sample selection is reproducible across machines",
+            canonical_path.display(),
+            canonical_root.display()
+        ))
+    })?;
+
+    let mut parts: Vec<String> = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(name) => parts.push(name.to_string_lossy().replace('\\', "/")),
+            // 规范化后的路径不应再出现这些成分；出现即说明假设被打破，直接拒绝。
+            _ => {
+                return Err(err_format(format!(
+                    "formula image {} resolved to a non-normal path component",
+                    canonical_path.display()
+                )));
             }
         }
-    };
-    let Some(relative) = stripped else {
-        return Err(err_format(format!(
-            "formula image {} is outside the dataset root {}; a formula dataset must be \
-             self-contained so that sample selection is reproducible across machines",
-            path.display(),
-            root.display()
-        )));
-    };
-    if relative.as_os_str().is_empty() {
+    }
+    if parts.is_empty() {
         return Err(err_format(format!(
             "formula image {} resolves to the dataset root itself",
-            path.display()
+            canonical_path.display()
         )));
     }
-    Ok(relative.to_string_lossy().replace('\\', "/"))
+    Ok(parts.join("/"))
 }
 
 #[derive(Debug, Clone)]

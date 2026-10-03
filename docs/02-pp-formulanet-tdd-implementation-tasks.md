@@ -2109,7 +2109,49 @@ tokenizer 与后处理 / 模型与解码 / 发布验收），并明确
 **验证**：全仓库检索 `content-hash` / `内容哈希`，除本节这种引用审核原文的
 说明外无残留。
 
-### 29.14 提交
+### 29.14 第六轮审核修复（P1 路径穿越/符号链接、P2 注释术语）
+
+#### 29.14.1 P1 `..` 与符号链接仍可绕过自包含校验
+
+**根因**：第五轮的实现是“先 `strip_prefix(root)`，失败才规范化”，因此词法前缀
+匹配成功时**根本不会规范化**。`<root>/../outside/image.png` 的词法前缀就是根目录，
+剩下 `../outside/image.png`——既非绝对路径也非空，于是通过全部校验；
+穿过符号链接逃出根目录的路径同理。`FormulaSample::new` 只拒绝绝对路径，
+不拒绝 `..`，所以两道防线同时失效。
+
+**处理**：
+
+- `dataset_relative_path` 改为**始终先 `canonicalize()` 再比较**（不是先做词法
+  判断）。规范化同时解析 `..`/`.` 与符号链接，因此越界路径在 `strip_prefix`
+  处就会失败；返回值只由 `Component::Normal` 组成并用 `/` 连接，
+  “相对路径里不可能含机器相关成分”由构造保证；
+- `FormulaSample::new` 增加词法校验（双保险）：拒绝绝对路径、空值，
+  以及任何 `.`/`..`/根或盘符成分。
+
+**验证**：新增两条测试，且都包含“旧实现为什么会放过它”的显式断言：
+
+- `dataset_relative_path_rejects_parent_dir_escapes`：先断言
+  `escape.strip_prefix(&root)` **词法匹配成功**（正是旧实现的漏洞所在），
+  再断言 `dataset_relative_path` 报 `outside the dataset root`；
+  另覆盖 `<root>/images/../../outside/b.png` 混合写法、`../`/`./` 作为
+  `FormulaSample::new` 入参、以及带 `.` 成分的合法路径会被规范化成同一个键；
+- `dataset_relative_path_rejects_symlinks_leading_outside`：创建指向根目录之外的
+  目录符号链接，断言其下图像被拒绝；根内链接则规范化到**真实**位置
+  （`inner-link/ok.png` → `real/ok.png`）。本机符号链接创建成功，
+  因此该断言确实执行（未跳过）。
+
+真实数据回归：7 个数据集重新生成 manifest **全部通过**，且
+`manifest_sha256` / `sample_set_sha256` / `content_sha256` 与第五轮逐字一致，
+说明真实数据集既没有 `..` 也没有越界符号链接，本次只收紧了越界行为。
+
+#### 29.14.2 P2 `formula_eval` 模块注释残留旧术语
+
+`src/bin/formula_eval.rs` 头部注释仍写“内容哈希抽样”。
+**处理**：改为“数据集相对路径 + 真值的稳定哈希抽样；图像内容只进
+`content_sha256`，不参与样本选择”。
+**验证**：对 `src/**` 检索 `内容哈希` / `content-hash` 无残留。
+
+### 29.15 提交
 | 内容 | 提交 | 说明 |
 | --- | --- | --- |
 | 第二轮审核修复 | `9db5dda` | `fix(formula): close the review gaps in the PP-FormulaNet integration` |
@@ -2123,3 +2165,4 @@ tokenizer 与后处理 / 模型与解码 / 发布验收），并明确
 | 第三轮审核修复 | 见 §29.11 | 删除无效参数、内存输入像素限制、benchmark 口径、分片身份校验与对比聚合、manifest 内容摘要、检测器有限性校验、测试资产定位去重 |
 | 第四轮审核修复 | 见 §29.12 | 分片校验 `content_sha256`、公式阶段计数改为 `formula_count()`、抽样键改为数据集相对路径、reference 比较内容摘要 |
 | 第五轮审核修复 | 见 §29.13 | 数据集自包含约束（拒绝根目录之外的图像）、统一“相对路径 + 真值哈希”术语 |
+| 第六轮审核修复 | 见 §29.14 | 始终规范化路径以封堵 `..` 与符号链接越界、清理模块注释旧术语 |
