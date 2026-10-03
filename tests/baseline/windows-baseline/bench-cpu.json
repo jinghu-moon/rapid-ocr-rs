@@ -266,13 +266,13 @@
       "formula_share": 0.0,
       "inference_share": 0.8562698395355066,
       "input_crop_share": 0.0011533061758835473,
-      "input_decode_share": 5.466587314492706e-7,
+      "input_decode_share": 5.466587314492706e-07,
       "input_other_share": 0.08101140637476469,
       "input_resize_share": 0.0038724316638835336,
       "input_share": 0.08603769087326323,
       "model_postprocess_share": 0.04648418573009259,
       "model_preprocess_share": 0.0043358038513645536,
-      "page_postprocess_share": 0.000021302782917157476,
+      "page_postprocess_share": 2.1302782917157476e-05,
       "recognizer_infer_share": 0.27747745430267073,
       "recognizer_postprocess_share": 0.04192789526504282,
       "rust_share": 0.13687898323763753,
@@ -307,9 +307,10 @@
     "rust_model_preprocess_share": 0.0043358038513645536,
     "rust_ms": 134.9334810596839,
     "rust_page_postprocess_ms": 0.021000000053188868,
-    "rust_page_postprocess_share": 0.000021302782917157476,
+    "rust_page_postprocess_share": 2.1302782917157476e-05,
     "rust_share": 0.13687898323763753,
     "unattributed_ms": 6.7537993832957,
     "unattributed_share": 0.006851177226855904
-  }
+  },
+  "timing_split_schema_note": "历史证据：本文件生成于 timing_split 守恒恒等式变更之前，不含 identity / identity_residual_ms / input_overflow_ms / input_overflow_share / attributed_ms / attributed_share 等键；其中已记录的数值仍然有效，但该分解的守恒性不由本文件证明，当前 schema 见 docs/04-windows-phase-reports.md 的阶段 6 记录。"
 }
