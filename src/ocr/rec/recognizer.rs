@@ -4,7 +4,7 @@ use ndarray::ArrayView4;
 use rayon::prelude::*;
 
 use crate::{
-    config::{LangRec, RecImage},
+    config::{LangRec, RecImage, RuntimeConfig},
     error::{RapidOcrError, Result},
     model_registry::{ModelRegistry, ResolvedRecModel},
     model_store::{default_model_store_dir, ensure_downloaded, verify_existing_file},
@@ -29,7 +29,8 @@ pub struct Recognizer {
 }
 
 impl Recognizer {
-    pub fn new(config: RecognizerConfig) -> Result<Self> {
+    /// `runtime` 来自引擎唯一的运行时档案（`RuntimeProfile::session_runtime`）。
+    pub fn new(config: RecognizerConfig, runtime: &RuntimeConfig) -> Result<Self> {
         if config.rec_img_shape[0] != 3 {
             return Err(RapidOcrError::Config(format!(
                 "rec_img_shape must start with channel=3, got {:?}",
@@ -55,7 +56,7 @@ impl Recognizer {
         )?;
 
         let model_path = resolve_model_path(&config, &resolved, &model_store_dir)?;
-        let mut session = OcrSession::new(&model_path, &config.runtime, OcrSessionKind::Rec)?;
+        let mut session = OcrSession::new(&model_path, runtime, OcrSessionKind::Rec)?;
 
         let character = session.take_character_list();
         let character_path = if character.is_none() {

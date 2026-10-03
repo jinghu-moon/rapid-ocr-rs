@@ -24,7 +24,6 @@ pub struct ClassifierConfig {
     pub model_type: ModelType,
     pub model_path: Option<PathBuf>,
     pub allow_download: bool,
-    pub runtime: RuntimeConfig,
     pub cls_image_shape: [usize; 3],
     pub cls_batch_num: usize,
     pub cls_thresh: f32,
@@ -40,7 +39,6 @@ impl Default for ClassifierConfig {
             model_type: ModelType::Mobile,
             model_path: None,
             allow_download: true,
-            runtime: RuntimeConfig::default(),
             cls_image_shape: [3, 48, 192],
             cls_batch_num: 6,
             cls_thresh: 0.9,
@@ -67,7 +65,8 @@ pub struct Classifier {
 }
 
 impl Classifier {
-    pub fn new(config: ClassifierConfig) -> Result<Self> {
+    /// `runtime` 来自引擎唯一的运行时档案（`RuntimeProfile::session_runtime`）。
+    pub fn new(config: ClassifierConfig, runtime: &RuntimeConfig) -> Result<Self> {
         if config.cls_batch_num == 0 {
             return Err(RapidOcrError::Config(
                 "cls_batch_num must be greater than zero".to_string(),
@@ -96,7 +95,7 @@ impl Classifier {
             ));
         };
 
-        let session = OcrSession::new(&model_path, &config.runtime, OcrSessionKind::Cls)?;
+        let session = OcrSession::new(&model_path, runtime, OcrSessionKind::Cls)?;
         Ok(Self {
             config,
             session,

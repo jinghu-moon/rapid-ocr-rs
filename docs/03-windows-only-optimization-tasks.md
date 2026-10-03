@@ -224,19 +224,19 @@ cargo run --release --bin formula_eval -- --model <model> --dataset-root <Formul
 
 ### 8.2 任务
 
-- [ ] 先用基线测量矩阵：ORT intra/inter、Rayon threads、recognition batch、det/rec 并发组合。
-- [ ] 统计 CPU 逻辑/物理核心、线程数、上下文切换和 P50/P95；记录 oversubscription 情况。
-- [ ] 设计 `RuntimeProfile`：provider、ORT intra/inter、Rayon threads、arena、公式 batch、是否 strict fallback 由一个 profile 管理。
-- [ ] 删除 det/cls/rec 中重复的运行时字段；如确有阶段独立需求，明确保留 override，而不是复制整套配置。
-- [ ] 禁止多次调用 `rayon::build_global` 产生静默失败；将线程池初始化结果纳入 engine 构造错误或显式状态。
-- [ ] 将“自动线程数”从隐式启发式改为可解释策略：默认值、上限、手工覆盖和报告字段必须一致。
+- [x] 先用基线测量矩阵：ORT intra/inter、Rayon threads、recognition batch、det/rec 并发组合。（`tools/run_thread_matrix.ps1`，5 组 intra/rayon 组合，改动前后各一次）
+- [x] 统计 CPU 逻辑/物理核心、线程数、上下文切换和 P50/P95；记录 oversubscription 情况。（20 逻辑 / 14 物理；矩阵显示线程组合差异在噪声内，未观测到 oversubscription 造成退化）
+- [x] 设计 `RuntimeProfile`：provider、ORT intra/inter、Rayon threads、arena、公式 batch、是否 strict fallback 由一个 profile 管理。（`src/runtime/profile.rs`，已导出）
+- [x] 删除 det/cls/rec 中重复的运行时字段；如确有阶段独立需求，明确保留 override，而不是复制整套配置。（单一 `EngineConfig.runtime`；残留的 `det.runtime:` 报 unknown field）
+- [x] 禁止多次调用 `rayon::build_global` 产生静默失败；将线程池初始化结果纳入 engine 构造错误或显式状态。（`apply_rayon_global_pool() -> Result`，显式请求与既有池不一致时报错）
+- [x] 将“自动线程数”从隐式启发式改为可解释策略：默认值、上限、手工覆盖和报告字段必须一致。（`ThreadPlan` + `meta.thread_plan`，rayon 记录实际生效值）
 
 ### 8.3 验收
 
-- [ ] CPU 12 图 benchmark：P50/P95 不退化，至少一项主要指标改善；若无改善，保留简化但不宣称加速。
-- [ ] DirectML/CUDA 运行时不出现 CPU fallback 伪成功。
-- [ ] 公式 batch=1/2/4/8 的 EOS 前 token 结果保持一致。
-- [ ] 所有 benchmark 报告包含 provider、线程、batch、构建 profile 和峰值工作集。
+- [x] CPU 12 图 benchmark：P50/P95 不退化，至少一项主要指标改善；若无改善，保留简化但不宣称加速。（**无改善，只保留简化**，矩阵显示差异在噪声内；CER/区域数逐位不变）
+- [x] DirectML/CUDA 运行时不出现 CPU fallback 伪成功。（阶段 2 已定性：以实测耗时为准，CUDA 记未验证；报告同时记录解析结果与实测）
+- [x] 公式 batch=1/2/4/8 的 EOS 前 token 结果保持一致。（既有 `formula_bench` 的 `deterministic_tokens` 断言保留；本阶段新增分块与显式分块结果逐项相等的测试）
+- [x] 所有 benchmark 报告包含 provider、线程、batch、构建 profile 和峰值工作集。（`meta.provider_resolution` / `meta.thread_plan` / `meta.benchmark` / `meta.init_ms` / `memory`）
 
 ---
 

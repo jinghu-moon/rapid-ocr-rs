@@ -1,16 +1,13 @@
+use std::sync::Arc;
 use std::time::Instant;
-use std::{
-    sync::{Arc, Once},
-    thread,
-};
 
 use crate::{
     api::OcrEngine as _,
     error::Result,
     input::image_loader::{LoadImage, OcrInput, ensure_decode_pixels},
-    ocr::cls::classifier::{Classifier, ClassifierConfig},
+    ocr::cls::classifier::Classifier,
     ocr::config::RecognizeOptions,
-    ocr::det::detector::{Detector, DetectorConfig},
+    ocr::det::detector::Detector,
     ocr::pipeline::{
         config::EngineConfig,
         image_ops::{
@@ -21,7 +18,7 @@ use crate::{
     },
     ocr::rec::recognizer::Recognizer,
     ocr::types::{LineResult, WordBox},
-    runtime::provider::ProviderResolution,
+    runtime::{profile::RuntimeProfile, provider::ProviderResolution},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +63,7 @@ struct RunBuffers {
 #[derive(Debug)]
 pub struct RapidOcr {
     config: EngineConfig,
+    profile: RuntimeProfile,
     detector: Detector,
     classifier: Option<Classifier>,
     recognizer: Recognizer,
@@ -74,21 +72,30 @@ pub struct RapidOcr {
 
 impl RapidOcr {
     pub fn new(config: EngineConfig) -> Result<Self> {
-        init_rayon_global_pool(&config);
-        let det = Detector::new(detector_cfg_from_pipeline(&config))?;
+        // 唯一一次解析运行时档案：线程 plan 与 provider/arena/公式批大小都从这里出发。
+        // Rayon 全局线程池的初始化也在这里，失败会向上传播（过去是 `let _ = ...` 静默吞掉）。
+        let profile = RuntimeProfile::resolve(&config.runtime, config.global.use_cls)?;
+        let session_runtime = profile.session_runtime();
+        let det = Detector::new(config.det.clone(), &session_runtime)?;
         let cls = if config.global.use_cls {
-            Some(Classifier::new(classifier_cfg_from_pipeline(&config))?)
+            Some(Classifier::new(config.cls.clone(), &session_runtime)?)
         } else {
             None
         };
-        let rec = Recognizer::new(config.rec.clone())?;
+        let rec = Recognizer::new(config.rec.clone(), &session_runtime)?;
         Ok(Self {
             config,
+            profile,
             detector: det,
             classifier: cls,
             recognizer: rec,
             loader: LoadImage::default(),
         })
+    }
+
+    /// 引擎唯一的运行时档案：基准报告与公式会话都从这里取设置。
+    pub fn runtime_profile(&self) -> &RuntimeProfile {
+        &self.profile
     }
 
     pub(crate) fn run(
@@ -362,43 +369,6 @@ impl RapidOcr {
     }
 }
 
-fn init_rayon_global_pool(config: &EngineConfig) {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let mut builder = rayon::ThreadPoolBuilder::new();
-        if let Some(threads) = resolve_rayon_threads(config) {
-            builder = builder.num_threads(threads.max(1));
-        }
-        let _ = builder.build_global();
-    });
-}
-
-fn resolve_rayon_threads(config: &EngineConfig) -> Option<usize> {
-    let runtimes = [
-        &config.det.runtime,
-        &config.cls.runtime,
-        &config.rec.runtime,
-    ];
-    let explicit = runtimes
-        .iter()
-        .filter_map(|rt| rt.rayon_threads.filter(|v| *v > 0))
-        .max();
-    if explicit.is_some() {
-        return explicit;
-    }
-    if runtimes.iter().any(|rt| rt.auto_tune_threads) {
-        return available_parallelism();
-    }
-    None
-}
-
-fn available_parallelism() -> Option<usize> {
-    let physical_cores = num_cpus::get_physical().max(1);
-    thread::available_parallelism()
-        .ok()
-        .map(|v| v.get().clamp(1, physical_cores))
-}
-
 type FullFilterOutput = (
     Vec<crate::Quad>,
     Vec<f32>,
@@ -485,10 +455,6 @@ fn filter_by_text_score_for_full(
     (out_boxes, out_scores, out_lines, out_word_boxes)
 }
 
-fn detector_cfg_from_pipeline(config: &EngineConfig) -> DetectorConfig {
-    config.det.clone()
-}
-
 fn rec_image_input(
     image: crate::config::RecImage,
     roi: Option<crate::api::RectU32>,
@@ -519,10 +485,6 @@ fn rec_image_input(
     let cropped =
         crate::config::RecImage::from_bgr_u8(roi.width as usize, roi.height as usize, out)?;
     Ok((OcrInput::Image(cropped), original_size, (roi.x, roi.y)))
-}
-
-fn classifier_cfg_from_pipeline(config: &EngineConfig) -> ClassifierConfig {
-    config.cls.clone()
 }
 
 fn rec_image_to_rgba(image: &crate::config::RecImage) -> Result<image::RgbaImage> {
@@ -580,6 +542,14 @@ impl RapidOcrEngine {
 
     pub fn provider_resolutions(&self) -> PipelineProviderResolutions {
         self.inner.provider_resolutions()
+    }
+
+    /// 引擎解析出的运行时档案（线程 plan + provider/arena/公式批大小）。
+    ///
+    /// 基准报告直接内嵌 `runtime_profile().threads`，因此报告里的线程数就是**生效值**，
+    /// 不是配置里写了什么。
+    pub fn runtime_profile(&self) -> &RuntimeProfile {
+        self.inner.runtime_profile()
     }
 
     fn provider_info(&self) -> crate::api::ProviderInfo {
@@ -1228,7 +1198,8 @@ impl RapidOcrEngine {
             iou_threshold: policy.iou_threshold,
             max_detections: policy.max_regions,
         };
-        let runtime = self.inner.config.rec.runtime.clone();
+        // 公式检测器与三个阶段共享同一份运行时档案，而不是再读一遍 rec 阶段配置。
+        let runtime = self.inner.runtime_profile().session_runtime();
         if self
             .formula_detector
             .as_ref()
@@ -1260,6 +1231,9 @@ impl RapidOcrEngine {
     }
 
     /// 懒加载公式识别器；模型路径变化时重建。
+    ///
+    /// 会话设置与批大小都来自引擎唯一的运行时档案：公式识别不是一条可以自己决定
+    /// 线程数与批大小的旁路。
     fn formula_recognizer(
         &mut self,
         policy: &crate::api::FormulaPolicy,
@@ -1267,17 +1241,19 @@ impl RapidOcrEngine {
         let path = policy.model_path.clone().ok_or_else(|| {
             crate::error::RapidOcrError::InvalidInput("formula policy requires `model_path`".into())
         })?;
-        let runtime = self.inner.config.rec.runtime.clone();
+        let runtime = self.inner.runtime_profile().session_runtime();
         let rebuild = self
             .formula_recognizer
             .as_ref()
             .is_none_or(|(current, _)| *current != path);
         if rebuild {
-            let recognizer = crate::formula::recognizer::FormulaRecognizer::from_model_with_hash(
-                &path,
-                &runtime,
-                policy.expected_model_sha256.as_deref(),
-            )?;
+            let mut recognizer =
+                crate::formula::recognizer::FormulaRecognizer::from_model_with_hash(
+                    &path,
+                    &runtime,
+                    policy.expected_model_sha256.as_deref(),
+                )?;
+            recognizer.set_max_batch_size(runtime.formula_batch)?;
             self.formula_recognizer = Some((path, recognizer));
         }
         self.formula_recognizer
@@ -2045,6 +2021,83 @@ rec:
         assert!(
             formula.token_ids.is_some(),
             "include_token_ids must keep the raw token sequence"
+        );
+    }
+
+    /// 引擎必须把 `runtime.formula_batch` 交给懒加载的公式识别器，并且**区域数超过
+    /// 批大小**时仍然成功（分块由识别器内部完成）。
+    ///
+    /// 这是根因回归：`FormulaPolicy::max_regions` 默认 64 而模型批大小默认 16，
+    /// 过去的实现把整页裁剪一次性送进 `recognize_batch`，超过上限就让整个请求失败。
+    /// 这里把 `formula_batch` 压到 4 并用 5 个区域，于是“区域数 > 批大小”这条路径
+    /// 在引擎层面被真实走通；同时直接观察识别器实际生效的批大小，锁住接线。
+    #[test]
+    fn engine_applies_formula_batch_and_chunks_region_batches() {
+        let Some(model_root) = crate::test_support::ocr_model_root() else {
+            return;
+        };
+        let Some(formula_model) = crate::test_support::formula_model_path() else {
+            return;
+        };
+        let Some(page) = crate::test_support::page_fixture("08数字公式与符号.png") else {
+            return;
+        };
+
+        let mut config = engine_config(&model_root);
+        config.runtime.formula_batch = 4;
+        let mut engine = RapidOcrEngine::new(config).expect("engine should load");
+        assert_eq!(
+            engine.runtime_profile().formula_batch,
+            4,
+            "the resolved profile must carry the configured formula batch"
+        );
+
+        let page_image = image::open(&page).expect("page readable");
+        let (width, height) = (page_image.width() as f32, page_image.height() as f32);
+        // 5 个互不重叠的显式区域：显式区域不做面积过滤，但会被裁剪到图像范围内。
+        let input_regions: Vec<crate::api::Polygon> = (0..5)
+            .map(|index| {
+                let x0 = width * (0.05 + index as f32 * 0.19);
+                let x1 = x0 + width * 0.15;
+                crate::api::Polygon {
+                    points: [
+                        [x0, height * 0.05],
+                        [x1, height * 0.05],
+                        [x1, height * 0.15],
+                        [x0, height * 0.15],
+                    ],
+                }
+            })
+            .collect();
+        let policy = FormulaPolicy {
+            enabled: true,
+            model_path: Some(formula_model),
+            detector_path: None,
+            input_regions: input_regions.clone(),
+            ..FormulaPolicy::default()
+        };
+        let bytes = std::fs::read(&page).expect("page readable");
+        let output = engine
+            .recognize(request(bytes, policy))
+            .expect("more regions than formula_batch must be chunked, not rejected");
+        output.validate().expect("output must validate");
+        assert_eq!(output.formula_count(), input_regions.len());
+        assert_eq!(
+            output.stages.formula.state,
+            StageState::Completed {
+                items: input_regions.len()
+            }
+        );
+
+        let applied_batch = engine
+            .formula_recognizer
+            .as_ref()
+            .expect("the formula recognizer is created on first use")
+            .1
+            .max_batch_size();
+        assert_eq!(
+            applied_batch, 4,
+            "the engine must apply the profile's formula_batch to the recognizer"
         );
     }
 

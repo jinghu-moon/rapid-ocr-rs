@@ -50,11 +50,13 @@ pub struct FormulaRecognition {
     /// 产生该结果的**调用**墙钟耗时（毫秒）。
     ///
     /// 同一次 [`FormulaRecognizer::recognize_batch`] 返回的所有结果共享同一个值，
-    /// 它是整个 batch 的端到端耗时，**不是**单样本耗时；需要单样本估计时除以
+    /// 它是整个调用（**包含内部所有分块**）的端到端耗时，**不是**单样本耗时，
+    /// 也不是单个分块的耗时；需要单样本估计时除以
     /// [`FormulaRecognition::batch_size`]。单图 [`FormulaRecognizer::recognize`]
     /// 的调用耗时等于单样本耗时。
     pub elapsed_ms: f32,
-    /// 产生该结果的调用包含的图片数量（单图为 1）。
+    /// 产生该结果的调用包含的图片数量（单图为 1；批量调用为整次调用的图片数，
+    /// 不是某个分块的大小）。
     pub batch_size: usize,
 }
 
@@ -248,16 +250,20 @@ impl FormulaRecognizer {
         self.recognize(&image)
     }
 
+    /// 批量识别公式，**按 `max_batch_size` 自动分块**，结果顺序与输入一致。
+    ///
+    /// 调用方不需要知道批大小上限：一页可能有几十个公式区域
+    /// （`FormulaPolicy::max_regions` 默认 64），而模型批大小默认只有 16。
+    /// 过去的实现把整页裁剪一次性送进来，超过上限就整页报错，于是 17–64 个公式区域
+    /// 的页面会**整体失败**；分块让“批大小上限”只影响单次推理的形状，不影响正确性。
+    ///
+    /// 语义（与单块实现一致）：
+    ///
+    /// - 返回值的 `elapsed_ms` 是**整个调用**的墙钟耗时（包含所有分块），
+    ///   `batch_size` 是**整个调用**的图片数量；两者对所有结果相同。
     pub fn recognize_batch(&mut self, images: &[DynamicImage]) -> Result<Vec<FormulaRecognition>> {
         if images.is_empty() {
             return Ok(Vec::new());
-        }
-        if images.len() > self.max_batch_size {
-            return Err(RapidOcrError::InvalidInput(format!(
-                "formula batch size {} exceeds limit {}",
-                images.len(),
-                self.max_batch_size
-            )));
         }
 
         for image in images {
@@ -265,6 +271,20 @@ impl FormulaRecognizer {
         }
 
         let start = Instant::now();
+        let mut results = Vec::with_capacity(images.len());
+        for chunk in images.chunks(self.max_batch_size) {
+            results.extend(self.recognize_chunk(chunk)?);
+        }
+        let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
+        for result in &mut results {
+            result.elapsed_ms = elapsed_ms;
+            result.batch_size = images.len();
+        }
+        Ok(results)
+    }
+
+    /// 单个分块的推理与解码；`images.len()` 必须 <= `self.max_batch_size`。
+    fn recognize_chunk(&mut self, images: &[DynamicImage]) -> Result<Vec<FormulaRecognition>> {
         let input = self.preprocessor.preprocess_batch(images)?;
         let output = self.session.run(input.view())?;
         if output.nrows() != images.len() {
@@ -282,12 +302,6 @@ impl FormulaRecognizer {
             let token_ids = row.to_vec();
             let decoded = self.tokenizer.decode_ids(&token_ids)?;
             results.push(self.recognition(decoded, 0.0, images.len()));
-        }
-        // 只有整个 batch（预处理 + 推理 + 全部 decode）结束后的墙钟时间才是这次调用的
-        // 耗时；把它统一写给所有结果，避免调用方误以为后一个样本更慢。
-        let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
-        for result in &mut results {
-            result.elapsed_ms = elapsed_ms;
         }
         Ok(results)
     }
@@ -395,19 +409,107 @@ mod tests {
         );
     }
 
+    /// 超过 `max_batch_size` 的批次必须**内部分块**，而不是整批失败。
+    ///
+    /// 根因：`FormulaPolicy::max_regions` 默认 64，而模型批大小默认 16，过去的实现
+    /// 把整页裁剪一次性送进来并在超限时返回错误，于是 17–64 个公式区域的页面会整体失败。
     #[test]
-    fn oversized_batch_is_rejected() {
+    fn batches_larger_than_max_batch_size_are_chunked() {
         let mut recognizer =
             FormulaRecognizer::from_model(&fixture("formula_recognizer_ok.onnx"), &rt())
                 .expect("recognizer should load");
         recognizer.set_max_batch_size(1).expect("set batch size");
-        let error = recognizer
-            .recognize_batch(&[gray(0), gray(255)])
-            .expect_err("oversized batch must fail");
+        let images = vec![gray(0), gray(255), gray(128)];
+        let results = recognizer
+            .recognize_batch(&images)
+            .expect("a batch larger than max_batch_size must be chunked, not rejected");
+        assert_eq!(results.len(), images.len());
+        for result in &results {
+            assert_eq!(result.latex, "\\cdot");
+            assert_eq!(result.token_ids, vec![0, 82, 1769, 2]);
+            assert_eq!(
+                result.batch_size, 3,
+                "batch_size must describe the whole call, not one chunk"
+            );
+        }
         assert!(
-            error.to_string().contains("exceeds limit"),
-            "error: {error}"
+            (results[0].elapsed_ms - results[2].elapsed_ms).abs() < f32::EPSILON,
+            "every result of one call shares the call wall time"
         );
+    }
+
+    /// 一页 20 个公式区域（> 默认批大小 16）必须返回 20 个结果，且与显式分成 16 + 4
+    /// 两次调用逐项一致。
+    ///
+    /// 顺序说明：`formula_recognizer_ok.onnx` 的每一行都是固定 token（只有 batch 维
+    /// 依赖输入），因此内容上无法区分“第 1 个”和“第 20 个”。这里能断言的是数量、
+    /// 每项内容与“分块对结果透明”这一不变量；分块顺序由 `results.extend(chunk)` 与
+    /// `axis_iter` 的行序结构性保证。
+    #[test]
+    fn twenty_crops_are_chunked_and_match_explicit_chunks() {
+        let mut recognizer =
+            FormulaRecognizer::from_model(&fixture("formula_recognizer_ok.onnx"), &rt())
+                .expect("recognizer should load");
+        assert_eq!(recognizer.max_batch_size(), DEFAULT_MAX_FORMULA_BATCH_SIZE);
+        const _: () = assert!(
+            20 > DEFAULT_MAX_FORMULA_BATCH_SIZE,
+            "this test must exercise more than one chunk"
+        );
+
+        let images: Vec<DynamicImage> = (0..20).map(|i| gray((i * 11) as u8)).collect();
+        let results = recognizer
+            .recognize_batch(&images)
+            .expect("20 crops must be recognized across chunks");
+        assert_eq!(results.len(), 20);
+        for (index, result) in results.iter().enumerate() {
+            assert_eq!(result.latex, "\\cdot", "crop {index}");
+            assert_eq!(result.token_ids, vec![0, 82, 1769, 2], "crop {index}");
+            assert_eq!(result.eos_index, Some(3), "crop {index}");
+            assert_eq!(result.batch_size, 20, "crop {index}");
+        }
+        let wall = results[0].elapsed_ms;
+        assert!(
+            results
+                .iter()
+                .all(|r| (r.elapsed_ms - wall).abs() < f32::EPSILON),
+            "the whole call's wall time is shared by all results"
+        );
+
+        let explicit: Vec<_> = recognizer
+            .recognize_batch(&images[..16])
+            .expect("first explicit chunk")
+            .into_iter()
+            .chain(
+                recognizer
+                    .recognize_batch(&images[16..])
+                    .expect("second explicit chunk"),
+            )
+            .collect();
+        assert_eq!(explicit.len(), results.len());
+        for (chunked, split) in results.iter().zip(&explicit) {
+            assert_eq!(chunked.latex, split.latex);
+            assert_eq!(chunked.token_ids, split.token_ids);
+            assert_eq!(chunked.eos_index, split.eos_index);
+            assert_eq!(chunked.model_id, split.model_id);
+        }
+    }
+
+    /// 显式把批大小设成 1 时，内部仍然必须逐块处理 N 张图，而不是只处理第一块。
+    #[test]
+    fn single_image_chunking_covers_every_input() {
+        let mut recognizer =
+            FormulaRecognizer::from_model(&fixture("formula_recognizer_ok.onnx"), &rt())
+                .expect("recognizer should load");
+        recognizer.set_max_batch_size(1).expect("set batch size");
+        let images: Vec<DynamicImage> = (0..5).map(|i| gray((i * 40) as u8)).collect();
+        let results = recognizer
+            .recognize_batch(&images)
+            .expect("chunked batch recognize");
+        assert_eq!(results.len(), 5);
+        for result in &results {
+            assert_eq!(result.batch_size, 5);
+            assert_eq!(result.latex, "\\cdot");
+        }
     }
 
     #[test]

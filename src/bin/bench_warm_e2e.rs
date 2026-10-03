@@ -61,36 +61,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(v) = cli.max_side_len {
         cfg.global.max_side_len = v;
     }
+    // `--intra-threads` 仍然是矩阵脚本的入口，但它现在设置的是**唯一一份**运行时配置：
+    // 三个阶段共享同一个 plan（见 `runtime::profile`）。
     if let Some(v) = cli.intra_threads {
-        for rt in [
-            &mut cfg.det.runtime,
-            &mut cfg.cls.runtime,
-            &mut cfg.rec.runtime,
-        ] {
-            rt.intra_threads = Some(v);
-            rt.inter_threads = Some(1);
-            rt.auto_tune_threads = false;
-        }
+        cfg.runtime.intra_threads = Some(v);
+        cfg.runtime.inter_threads = Some(1);
+        cfg.runtime.auto_tune_threads = false;
     }
     let effective_max_side = cfg.global.max_side_len as u32;
+    // 配置里“请求”的运行时设置。实际生效的线程分配在 `meta.thread_plan`，
+    // 由引擎解析后回报（例如 auto 的 Rayon 份额可能被已有全局池改写成实际值）。
+    let runtime_config = serde_json::to_value(&cfg.runtime)?;
     let benchmark_meta = json!({
         "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
         "max_side_len": effective_max_side,
-        "intra_threads": {
-            "det": cfg.det.runtime.intra_threads,
-            "cls": cfg.cls.runtime.intra_threads,
-            "rec": cfg.rec.runtime.intra_threads,
-        },
-        "inter_threads": {
-            "det": cfg.det.runtime.inter_threads,
-            "cls": cfg.cls.runtime.inter_threads,
-            "rec": cfg.rec.runtime.inter_threads,
-        },
-        "auto_tune_threads": {
-            "det": cfg.det.runtime.auto_tune_threads,
-            "cls": cfg.cls.runtime.auto_tune_threads,
-            "rec": cfg.rec.runtime.auto_tune_threads,
-        },
+        "runtime": runtime_config,
         "timing_scope": {
             "wall_ms": "file_read_plus_ocr",
             "ocr_total_ms": "ocr_pipeline_only",
@@ -99,6 +84,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let engine_start = Instant::now();
     let mut engine = RapidOcrEngine::new(cfg)?;
     let init_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
+    // 引擎解析出的线程 plan：报告里的数字是**生效值**，不是 YAML 里写了什么。
+    let thread_plan = serde_json::to_value(&engine.runtime_profile().threads)?;
     let request = |bytes: Vec<u8>| OcrRequest {
         input: ImageInput::Encoded(Arc::from(bytes)),
         roi: None,
@@ -166,6 +153,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // 启动时间：`RapidOcrEngine::new` 的墙钟耗时（含模型加载与会话创建）。
             "init_ms": init_ms,
             "benchmark": benchmark_meta,
+            // 引擎解析出的线程分配（生效值；三个阶段共享同一个 plan）。
+            "thread_plan": thread_plan,
             "provider_resolution": provider_resolution,
             // 实际加载的 ONNX Runtime 版本：本 crate 链接导入库，运行时可能加载系统
             // 自带的 `onnxruntime.dll`，这决定了哪些加速 provider 真正可用。

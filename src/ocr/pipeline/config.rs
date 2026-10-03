@@ -43,10 +43,16 @@ impl Default for GlobalConfig {
     }
 }
 
+/// 引擎配置。
+///
+/// 运行时设置（线程 / provider / arena / 公式批大小）只有一份 [`RuntimeConfig`]，
+/// 位于 `runtime`：det/cls/rec 三份总是相同的 `runtime` 段已删除，遗留的
+/// `det.runtime` 会因为 `deny_unknown_fields` 直接报错，而不是被静默忽略。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EngineConfig {
     pub global: GlobalConfig,
+    pub runtime: RuntimeConfig,
     pub det: DetectorConfig,
     pub cls: ClassifierConfig,
     pub rec: RecognizerConfig,
@@ -145,9 +151,7 @@ impl EngineConfig {
             )));
         }
 
-        validate_runtime_config("det.runtime", &self.det.runtime)?;
-        validate_runtime_config("cls.runtime", &self.cls.runtime)?;
-        validate_runtime_config("rec.runtime", &self.rec.runtime)?;
+        validate_runtime_config("runtime", &self.runtime)?;
 
         Ok(())
     }
@@ -188,6 +192,11 @@ fn validate_runtime_config(prefix: &str, runtime: &RuntimeConfig) -> Result<()> 
             "{prefix}.rayon_threads must be greater than zero when set"
         )));
     }
+    if runtime.formula_batch == 0 {
+        return Err(RapidOcrError::Config(format!(
+            "{prefix}.formula_batch must be greater than zero"
+        )));
+    }
     Ok(())
 }
 
@@ -225,5 +234,87 @@ mod tests {
         yaml.push_str("unexpected: true\n");
         let err = EngineConfig::from_yaml_str(&yaml).expect_err("must reject unknown top-level");
         assert!(err.to_string().contains("unknown field `unexpected`"));
+    }
+
+    /// 运行时设置只有一份：遗留的 per-stage `runtime:` 必须**报错并定位到字段**，
+    /// 而不是被当成未知键静默忽略（那会让用户以为线程设置生效了）。
+    #[test]
+    fn per_stage_runtime_sections_are_rejected_with_a_locating_error() {
+        for section in ["det", "cls", "rec"] {
+            let mut yaml = String::from("global: {}\n");
+            for name in ["det", "cls", "rec"] {
+                if name == section {
+                    yaml.push_str(&format!("{name}:\n  runtime:\n    intra_threads: 4\n"));
+                } else {
+                    yaml.push_str(&format!("{name}: {{}}\n"));
+                }
+            }
+            let err = EngineConfig::from_yaml_str(&yaml)
+                .expect_err("a per-stage runtime section must not deserialize");
+            let message = err.to_string();
+            assert!(
+                message.contains("unknown field") && message.contains("runtime"),
+                "the error for `{section}.runtime` must locate the removed field: {message}"
+            );
+        }
+
+        // 单一顶层 `runtime:` 段必须继续可用。
+        let config = EngineConfig::from_yaml_str(
+            "global: {}\ndet: {}\ncls: {}\nrec: {}\nruntime:\n  intra_threads: 4\n",
+        )
+        .expect("the single top-level runtime section must deserialize");
+        assert_eq!(config.runtime.intra_threads, Some(4));
+    }
+
+    /// `formula_batch` 必须像其他 runtime 字段一样被校验。
+    #[test]
+    fn runtime_formula_batch_must_be_greater_than_zero() {
+        let mut config = EngineConfig::default();
+        config.runtime.formula_batch = 0;
+        let err = config.validate().expect_err("zero formula batch must fail");
+        assert!(
+            err.to_string().contains("runtime.formula_batch")
+                && err.to_string().contains("greater than zero"),
+            "error: {err}"
+        );
+
+        config.runtime.formula_batch = 1;
+        config
+            .validate()
+            .expect("a positive formula batch is valid");
+    }
+
+    /// 线程字段的零值同样必须被拒绝。
+    #[test]
+    fn runtime_thread_fields_reject_zero() {
+        let mut zero_intra = EngineConfig::default();
+        zero_intra.runtime.intra_threads = Some(0);
+        assert!(
+            zero_intra
+                .validate()
+                .expect_err("zero intra threads must fail")
+                .to_string()
+                .contains("runtime.intra_threads")
+        );
+
+        let mut zero_inter = EngineConfig::default();
+        zero_inter.runtime.inter_threads = Some(0);
+        assert!(
+            zero_inter
+                .validate()
+                .expect_err("zero inter threads must fail")
+                .to_string()
+                .contains("runtime.inter_threads")
+        );
+
+        let mut zero_rayon = EngineConfig::default();
+        zero_rayon.runtime.rayon_threads = Some(0);
+        assert!(
+            zero_rayon
+                .validate()
+                .expect_err("zero rayon threads must fail")
+                .to_string()
+                .contains("runtime.rayon_threads")
+        );
     }
 }

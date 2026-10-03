@@ -394,6 +394,92 @@ tokenizer、postprocess、batch/EOS 或指标实现；普通 OCR 的预处理数
 
 ---
 
+## 阶段 5：统一 RuntimeProfile 与线程模型
+
+**阶段**：5
+**日期**：2026-10-03
+**提交**：`（本阶段提交）`
+**变更摘要**：
+
+- **测量先行**：`tools/run_thread_matrix.ps1` 在改动前跑了 5 组 intra/rayon 组合
+  （12 图真实页面，max_side_len 2000，写入 `tests/baseline/windows-baseline/thread-matrix.json`）：
+
+| intra / rayon | 16 / 16 | 16 / 4 | 8 / 4 | 8 / 8 | 4 / 8 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| p50 (ms) | 978.6 | 969.4 | 1114.8 | 964.5 | 920.0 |
+
+  极差 194.8 ms（21%），而本机同一二进制两次运行的历史极差可达 39% —— 即**线程配置差异落在噪声内**。
+  因此阶段 5 的目标定为“简化 + 可解释策略”，**不宣称加速**（任务文档也允许这种结论）。
+- **单一 runtime 段**：`EngineConfig.runtime: RuntimeConfig`；`DetectorConfig` /
+  `ClassifierConfig` / `RecognizerConfig` 删除各自的 `runtime` 字段，
+  构造函数改为接收 `runtime: &RuntimeConfig`。YAML 里残留的 `det.runtime:`
+  现在报 `unknown field 'runtime', expected one of …`（有测试与 CLI 双重证据）。
+- **`RuntimeConfig` 新增 `formula_batch`**（默认 16，校验 > 0）。
+- **新增 `src/runtime/profile.rs`**：`RuntimeProfile` / `ThreadPlan` / `ThreadSource`，
+  并导出到公开 API。策略（写在模块文档里并被测试覆盖）：
+  `budget = min(available_parallelism, 物理核数)`（本机 14）；
+  显式 `intra_threads` → `ThreadSource::Explicit`，否则 `Auto` 且 `ort_intra = budget`；
+  `ort_inter = 1`；`rayon = 显式值，否则 clamp(budget/4, 1, 8)`（本机 3）；
+  `sessions = 3`（启用分类器）或 `2`；`session_runtime()` 是三个阶段会话**唯一**的设置来源，
+  故意不提供“每阶段一份完整配置”的覆写。
+- **Rayon 不再静默失败**：`apply_rayon_global_pool()` 返回 `Result`；
+  已有全局池且请求值是显式的且不一致时返回 `RapidOcrError::Config` 并同时报出实际值与请求值；
+  `Auto` 情况下沿用既有池并把**实际**线程数写回 `ThreadPlan.rayon`（报告不撒谎）。
+  删除了原来的 `let _ = builder.build_global();`。
+- **公式批处理根因修复**：`FormulaPolicy::max_regions` 默认 64，而识别器批上限默认 16，
+  且 `recognize_with_formula` 一次性传入全部 crop —— 因此 17–64 个公式区域的页面会**整页失败**。
+  现在 `FormulaRecognizer::recognize_batch` 内部按 `max_batch_size` 分块并保持输入顺序，
+  引擎用 `profile.formula_batch` 设置该上限。
+- 删除 `init_rayon_global_pool` / `resolve_rayon_threads` / `available_parallelism` 等重复实现；
+  `runtime/session.rs::auto_tuned_thread_budget` 提升为唯一实现并被 profile 复用。
+- `bench_warm_e2e` 报告新增 `meta.thread_plan`（含 `rayon` 的实际生效值），
+  并把原先三个阶段的线程字段合并为一个 `meta.benchmark.runtime`。
+- 外部配置三个 `test-config*.yaml` 改为单一顶层 `runtime:` 段并加 `formula_batch: 16`。
+
+**执行命令与关键结果**：
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo clippy --all-targets -- -D warnings` | 通过（0 warning） |
+| `cargo test --all-targets` | lib 272 + bin 18 passed / 0 failed（阶段 4 为 258） |
+| `cargo test --features directml-provider` | 通过 |
+| `cargo check --features directml-provider,cuda-provider` | 通过 |
+| `cargo test --lib formula_integration_tests -- --test-threads=1`（真实模型） | 10 passed / 0 failed（68.4 s） |
+| `tools/run_thread_matrix.ps1 -PostRefactor` | 5 组组合 p50 1016–1033 ms（极差 1.6%） |
+
+**基线对比**（12 图，硬门槛）：
+
+| 指标 | 阶段 0 基线 | 阶段 5 后 | 判定 |
+| --- | ---: | ---: | --- |
+| mean CER（硬门槛） | 0.44765135645866394 | **0.44765135645866394**（逐位相同，12 张逐图相同） | 未退化 |
+| 区域数均值（硬门槛） | 34.833333333333336 | **34.833333333333336**（逐位相同） | 未退化 |
+| OCR p50 (ms) | 1001.1 | 1023.9（阶段报告）/ 1098.2（复核） | 噪声范围内 |
+| 峰值工作集 (MB) | 1284.0 | 1342.2 / 1280.1 | 噪声范围内 |
+
+`meta.thread_plan` 示例（auto 配置）：
+`{"source":"auto","budget":14,"ort_intra":14,"ort_inter":1,"rayon":3,"sessions":2}`
+
+**未覆盖风险**：
+
+- **没有加速**：本阶段的收益是结构简化与可解释策略。矩阵显示 intra/rayon 选择在本机是噪声，
+  因此不支持任何“调线程变快”的说法；代码与文档中均无加速声明。
+- `ThreadSource` 的语义边界：Rayon 不一致的错误只在显式固定 ORT intra 时触发；
+  同进程内第二个引擎若显式指定 `rayon_threads` 而 intra 为 auto，会沿用既有池而不是报错。
+  这是刻意的取舍（避免对 auto 策略过度失败），已在模块文档与本节记录。
+- `rayon = 3`（auto）相对旧行为（auto 路径 14、`--intra-threads` 路径 20）是行为变化，
+  实测在噪声内、指标逐位不变；将来若在别的机器上出现退化，应先用同一矩阵脚本复测。
+- 公式分块测试使用的契约 fixture 每行输出恒定（只有 batch 维与输入有关），
+  因此测试断言的是数量、内容与“分块结果 == 显式分块结果”，**顺序由结构保证而非内容证明**。
+  这一点写在测试注释里。
+
+**是否触发公式 smoke / val-501 / 全量评测**：**触发了公式集成测试**（`formula_integration_tests`，
+使用真实 PP-FormulaNet 模型，10 passed），因为本阶段修改了公式批处理的调用链。
+未触发 im2latex-100 smoke / val-501 / 全量集：批处理分块不改变单图结果，
+且引擎级与识别器级测试已覆盖；若发布前需要，可按 §0.3 的第 3 档执行。
+
+---
+
 ## 阶段完成记录模板（后续阶段沿用）
 
 ```text

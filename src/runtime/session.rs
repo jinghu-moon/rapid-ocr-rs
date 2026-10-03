@@ -222,7 +222,12 @@ fn derive_runtime_threads(runtime_cfg: &RuntimeConfig) -> (Option<usize>, Option
     (intra, inter)
 }
 
-fn auto_tuned_thread_budget() -> usize {
+/// 自动调优时的线程预算：`min(逻辑核数, 物理核数)`，至少 1。
+///
+/// 唯一定义处：`runtime::profile` 用它推导统一的 `ThreadPlan`，`derive_runtime_threads`
+/// 用它处理仍然走 `auto_tune_threads` 的调用方（公式基准等）。任何第二次实现都会让
+/// “这个进程用了多少线程”重新失去单一解释处。
+pub(crate) fn auto_tuned_thread_budget() -> usize {
     let physical_cores = num_cpus::get_physical().max(1);
     let available = thread::available_parallelism()
         .ok()

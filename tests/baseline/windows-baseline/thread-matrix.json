@@ -1,0 +1,69 @@
+{
+  "collected_at_utc": "2026-10-03T04:35:48.0771885Z",
+  "stage": "pre-refactor",
+  "conditions": {
+    "images_dir": "D:\\100_Projects\\110_Daily\\SnapClip\\OCR-test-image",
+    "max_side_len": 2000,
+    "rounds": 3,
+    "warmup_rounds": 1,
+    "logical_cpus": 20,
+    "physical_cpus": 14
+  },
+  "matrix": [
+    {
+      "ort_intra": 16,
+      "rayon_threads": 16,
+      "ort_inter": 1,
+      "p50_ms": 978.5786743164062,
+      "p90_ms": 1132.303466796875,
+      "mean_ms": 980.0976782904731,
+      "regions_avg": 34.833333333333336,
+      "init_ms": 127.64059999999999,
+      "peak_working_set_bytes": 1344954368
+    },
+    {
+      "ort_intra": 16,
+      "rayon_threads": 4,
+      "ort_inter": 1,
+      "p50_ms": 969.4491577148438,
+      "p90_ms": 1111.220703125,
+      "mean_ms": 964.994871351454,
+      "regions_avg": 34.833333333333336,
+      "init_ms": 133.9443,
+      "peak_working_set_bytes": 1346015232
+    },
+    {
+      "ort_intra": 8,
+      "rayon_threads": 4,
+      "ort_inter": 1,
+      "p50_ms": 1114.8406982421875,
+      "p90_ms": 1301.321044921875,
+      "mean_ms": 1124.8086361355251,
+      "regions_avg": 34.833333333333336,
+      "init_ms": 133.2433,
+      "peak_working_set_bytes": 1345126400
+    },
+    {
+      "ort_intra": 8,
+      "rayon_threads": 8,
+      "ort_inter": 1,
+      "p50_ms": 964.490234375,
+      "p90_ms": 1120.6746826171875,
+      "mean_ms": 970.666988796658,
+      "regions_avg": 34.833333333333336,
+      "init_ms": 126.8454,
+      "peak_working_set_bytes": 1345409024
+    },
+    {
+      "ort_intra": 4,
+      "rayon_threads": 8,
+      "ort_inter": 1,
+      "p50_ms": 919.9807739257812,
+      "p90_ms": 1120.029052734375,
+      "mean_ms": 944.6500956217448,
+      "regions_avg": 34.833333333333336,
+      "init_ms": 134.2153,
+      "peak_working_set_bytes": 1346609152
+    }
+  ]
+}

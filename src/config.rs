@@ -156,6 +156,10 @@ pub enum ProviderPreference {
 /// 这里**没有** `backend` 字段：本 crate 只使用 ONNX Runtime，曾经的单变体枚举
 /// `RuntimeBackend::OnnxCpu` 是伪抽象（只有一个取值，却要检查、序列化并出现在 YAML 里），
 /// 已删除。provider 选择由 [`RuntimeConfig::provider_preference`] 表达。
+///
+/// 这份配置在引擎里**只有一份**（`EngineConfig::runtime`），不再是 det/cls/rec 各一份：
+/// 三份总是相同的配置没有任何单一解释处，也无法回答“这个进程到底用了多少线程”。
+/// 解析规则见 `runtime::profile`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -166,6 +170,8 @@ pub struct RuntimeConfig {
     pub enable_cpu_mem_arena: bool,
     pub fail_if_provider_unavailable: bool,
     pub provider_preference: ProviderPreference,
+    /// 单次公式识别的批大小上限（必须 > 0）。
+    pub formula_batch: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -178,6 +184,7 @@ impl Default for RuntimeConfig {
             enable_cpu_mem_arena: true,
             fail_if_provider_unavailable: false,
             provider_preference: ProviderPreference::default(),
+            formula_batch: 16,
         }
     }
 }
@@ -328,6 +335,7 @@ mod tests {
         assert!(cfg.enable_cpu_mem_arena);
         assert!(!cfg.fail_if_provider_unavailable);
         assert_eq!(cfg.provider_preference, ProviderPreference::Cpu);
+        assert_eq!(cfg.formula_batch, 16);
     }
 
     /// YAML 里已经删除的字段必须被拒绝，并且错误要能定位到字段名。

@@ -26,7 +26,6 @@ pub struct DetectorConfig {
     pub model_type: ModelType,
     pub model_path: Option<PathBuf>,
     pub allow_download: bool,
-    pub runtime: RuntimeConfig,
     pub limit_side_len: usize,
     pub limit_type: String,
     pub std: [f32; 3],
@@ -48,7 +47,6 @@ impl Default for DetectorConfig {
             model_type: ModelType::Mobile,
             model_path: None,
             allow_download: true,
-            runtime: RuntimeConfig::default(),
             limit_side_len: 736,
             limit_type: "min".to_string(),
             std: [0.5, 0.5, 0.5],
@@ -89,7 +87,9 @@ pub struct Detector {
 }
 
 impl Detector {
-    pub fn new(config: DetectorConfig) -> Result<Self> {
+    /// `runtime` 来自引擎唯一的运行时档案（`RuntimeProfile::session_runtime`）：
+    /// 检测阶段的配置里刻意没有线程/provider 字段，避免出现第二个设置来源。
+    pub fn new(config: DetectorConfig, runtime: &RuntimeConfig) -> Result<Self> {
         let model_store_dir = config
             .model_store_dir
             .clone()
@@ -127,7 +127,7 @@ impl Detector {
             score_mode: config.score_mode,
             ..DbPostProcess::default()
         };
-        let session = OcrSession::new(&model_path, &config.runtime, OcrSessionKind::Det)?;
+        let session = OcrSession::new(&model_path, runtime, OcrSessionKind::Det)?;
         Ok(Self {
             pre,
             post,

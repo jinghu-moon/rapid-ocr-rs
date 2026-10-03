@@ -66,6 +66,7 @@ pub use crate::runtime::contracts::{ModelIoProbe, TensorSpec};
 pub use crate::runtime::memory::{
     PEAK_MEMORY_SOURCE, peak_memory_failure_reason, peak_memory_source, peak_working_set_bytes,
 };
+pub use crate::runtime::profile::{RuntimeProfile, ThreadPlan, ThreadSource};
 pub use crate::runtime::provider::{
     ProviderResolution, ResolvedExecutionProvider, ort_runtime_version,
 };
