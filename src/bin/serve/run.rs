@@ -29,7 +29,7 @@ use super::download;
 use super::evaluate;
 use super::http::{BoundServer, ServeHandle};
 use super::limits::{DEFAULT_ALLOW_DOWNLOAD, DEFAULT_ALLOW_PROVIDER_FALLBACK, DEFAULT_PROVIDER};
-use super::model_plan::{ModelPlan, ModelPlanError, ModelSnapshot};
+use super::model_plan::{ModelPlan, ModelPlanError, ModelSnapshot, PlanReverification};
 use super::security::{
     NonLoopbackBindError, PlaceholderError, RandomError, ServeToken, TOKEN_PLACEHOLDER,
     assert_no_placeholders_left, generate_nonce, inject, random_source,
@@ -66,6 +66,14 @@ pub(crate) enum ServeStartError {
     },
     /// 操作系统 CSPRNG 不可用（评审 P2-4 的 fail-closed 行为）。
     Random(RandomError),
+    /// `--reverify-models`：启动期冷验证发现这次运行会用到的模型文件缺失或损坏。
+    ///
+    /// **拒绝启动**（而不是"照常启动、第一次用时才失败"）：这是本开关的全部价值——
+    /// 把验证从首次使用移到启动期，并让错误在服务开始接受请求之前就出现。
+    ModelsUnusable {
+        /// 启动期冷验证的逐文件结论（含每份文件的实际状态与摘要）。
+        report: Box<super::model_plan::PlanReverification>,
+    },
     /// 运行期无法启动（线程创建失败）。
     Runtime(std::io::Error),
 }
@@ -102,6 +110,29 @@ impl std::fmt::Display for ServeStartError {
                  root (docs/05 §4.2, M1 review P2-3)",
                 path.display()
             ),
+            Self::ModelsUnusable { report } => {
+                write!(
+                    f,
+                    "refusing to start: --reverify-models could not verify every model file this \
+                     run will load. Offending file(s): {}",
+                    report
+                        .blocking()
+                        .iter()
+                        .map(|file| file.describe())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )?;
+                // 逐文件结论全部列出（包括"这次算出来的摘要"），便于定位到底是哪一份、
+                // 期望什么、实际是什么——而不是一句"模型不可用"。
+                for file in report.files() {
+                    write!(f, "\n  serve: {}", file.describe())?;
+                }
+                write!(
+                    f,
+                    "\n  (docs/05 §3: --reverify-models verifies the files this run actually \
+                     uses at startup and refuses to serve from an unusable model set)"
+                )
+            }
         }
     }
 }
@@ -219,6 +250,10 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
     let routing =
         super::server::routing_for(formula_detector.as_ref().map(|spec| spec.path.as_path()));
 
+    // A1：`--reverify-models` —— 启动期**冷验证**这次运行会真正加载的每一个模型文件。
+    if args.reverify_models {
+        reverify_gate(&model_plan, startup.plan.engine.global.use_cls)?;
+    }
     // M1 评审 P2-3：`--eval-root` 沙箱。缺少它时 `/api/evaluate` **整体关闭**
     // （而不是"接受任意本机路径"）：评估是唯一接受"路径"而不是"上传字节"的端点，
     // 因此必须由启动参数显式开启，并且清单与它引用的每张图都必须落在该目录内。
@@ -269,6 +304,8 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
         engine_factory: super::engine::real_engine_factory(),
         downloader: super::download::real_downloader_factory(),
         free_space: super::server::real_free_space(),
+        // 生产路径没有测试钩子。
+        post_verify: None,
     };
 
     let mut service = ServeHandle::start(bound, context)?;
@@ -293,6 +330,86 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
 /// 注入 nonce/token；失败即拒绝启动（§9）。
 pub(crate) fn render_page(token: &ServeToken, nonce: &str) -> Result<String, PageError> {
     render_page_with(PAGE_TEMPLATE, nonce, token.as_str())
+}
+
+/// A1 的**唯一**实现：启动期冷验证这次运行会真正加载的模型文件，任一缺失/损坏即拒绝启动。
+///
+/// # 它为什么不是"清缓存"
+///
+/// 进程内的校验缓存本来就没有历史（新进程 = 空缓存）。这个开关的价值是把验证从
+/// **首次使用**移到**启动期**，并在文件不可用时让服务**根本不起来**，
+/// 而不是"先跑起来、等第一次 OCR 才发现 566 MB 的模型是坏的"。
+///
+/// # 校验范围
+///
+/// [`ModelPlan::required_files`]（文本管线的 detector/recognizer/dictionary，`use_cls`
+/// 时再加 classifier；公式管线的 formula_recognizer）——**不是**默认表里的每一个文件：
+/// 把本轮不会打开的模型也哈希一遍既是纯浪费，也会让"启动失败"指向一个无关的文件。
+///
+/// # 逐文件一行日志 + fail-fast
+///
+/// 每个文件都打印一行（状态、这一轮是否真的算了摘要、算出的摘要），并在有文件不可用时返回
+/// [`ServeStartError::ModelsUnusable`]（错误里点名那些文件）。检查清单与引擎/`/api/models`
+/// 用的是**同一条规则**（`Pipeline::of` + `ModelFileSpec::state_in_digested`），
+/// 因此"报告的一份、加载的另一份"不可能发生（这里用断言把这一点钉住）。
+pub(crate) fn reverify_gate(
+    model_plan: &ModelPlan,
+    use_cls: bool,
+) -> Result<PlanReverification, ServeStartError> {
+    let started = std::time::Instant::now();
+    let report = model_plan.reverify(use_cls);
+    let elapsed_ms = started.elapsed().as_millis();
+    for file in report.files() {
+        println!(
+            "serve: --reverify-models {} | {} | digest computed by this call: {}",
+            file.describe(),
+            file.cause.as_str(),
+            file.sha256.is_some()
+        );
+    }
+    if !report.content_changed().is_empty() {
+        // 局部摘要抓住的"同体积同 mtime 的内容替换"：如实说出来，
+        // 因为这类替换在旧身份下会静默沿用旧摘要（docs/05 §4.2.1 的盲区已收窄）。
+        println!(
+            "serve: --reverify-models content changed for: {} (the stat identity matched but the \
+             first/last 64 KiB did not)",
+            report.content_changed().join(", ")
+        );
+    }
+    println!(
+        "serve: --reverify-models verified {} file(s) in {elapsed_ms} ms ({} full digest(s) \
+         computed by this call, {} missing/corrupt)",
+        report.files().len(),
+        report.digests_computed(),
+        report.blocking().len()
+    );
+    if report.text_blocking().is_empty() {
+        return Ok(report);
+    }
+    // 拒绝启动之前先自检一次"两份清单是否真的同源"：`report` 是刚刚冷验证出来的结论，
+    // 而引擎/`/api/models`/`POST /api/ocr` 的 409 用的是 `ModelPlan::snapshot()` 那一条。
+    // 两者都经 `Pipeline::of` + `ModelFileSpec::state_in_digested`，因此必须在**同一个磁盘
+    // 状态**上给出同一个清单；不一致就是"报告的一份、加载的另一份"，必须立刻暴露。
+    //
+    // 注意：`snapshot` 必须在这里**重新取**（调用方的快照是在这次冷验证之前算的），
+    // 否则一次位于两者之间的文件改动会让这个断言误报。
+    // 顺序比较是有意的：两条路径都继承模型集的声明顺序，因此顺序也必须一致。
+    let fresh = model_plan.snapshot();
+    let expected = fresh.blocking_names();
+    let observed: Vec<String> = report
+        .text_blocking()
+        .iter()
+        .map(|file| file.name.clone())
+        .collect();
+    if observed != expected {
+        eprintln!(
+            "serve: WARNING --reverify-models found {observed:?} but the engine's readiness \
+             snapshot reports {expected:?}; both come from the same rule, so this is a bug"
+        );
+    }
+    Err(ServeStartError::ModelsUnusable {
+        report: Box::new(report),
+    })
 }
 
 /// 注入的唯一实现（测试用病理输入直接验证三个断言）。
@@ -404,6 +521,17 @@ fn log_startup(
                  unaffected)",
                 formula_blocking.join(", ")
             )
+        }
+    );
+    println!(
+        "serve: startup model verification {}",
+        if args.reverify_models {
+            "cold (--reverify-models: every file this run uses was re-hashed at startup, and a \
+             missing or corrupt file refuses to start)"
+        } else {
+            "on first use (the identity-keyed cache verifies each file the first time it is asked \
+             for; pass --reverify-models to move that to startup and fail fast, or use \
+             POST /api/models/reverify to force a fresh check while running)"
         }
     );
     println!(
@@ -542,9 +670,143 @@ fn yaml_provider_is_overridden(args: &ServeArgs) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
+    use rapid_ocr_rs::{EngineConfig, sha256_file};
+
     use super::{
-        PAGE_TEMPLATE, PageError, check_nonce_attributes, render_page_with, strip_html_comments,
+        PAGE_TEMPLATE, PageError, ServeStartError, check_nonce_attributes, render_page_with,
+        reverify_gate, strip_html_comments,
     };
+    use crate::serve::model_plan::ModelPlan;
+
+    /// A1 的夹具：与 serve 测试同一形状的本地清单模型目录（det/rec/dict + 公式识别）。
+    ///
+    /// 四个文件都真的写到磁盘上，清单里的 `sha256` 是**真实**摘要——因此"健康"与"损坏"
+    /// 的区别只有一个字节的来源，而不是靠状态字段。
+    fn fixture_dir(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/m1-review-evidence")
+            .join(format!("reverify-{name}"));
+        std::fs::create_dir_all(&dir).expect("create the fixture dir");
+        let files = [
+            ("det.onnx", "detector"),
+            ("rec.onnx", "recognizer"),
+            ("dict.txt", "dictionary"),
+            ("fx.onnx", "formula_recognizer"),
+        ];
+        let mut manifest = String::from(
+            "{\"schema_version\":1,\"id\":\"reverify-set\",\"family\":\"PP-OCR\",\
+             \"version\":\"v-test\",\"files\":[",
+        );
+        for (index, (file, role)) in files.iter().enumerate() {
+            let path = dir.join(file);
+            std::fs::write(&path, format!("reverify fixture {file}")).expect("write the fixture");
+            let sha = sha256_file(&path).expect("hash the fixture");
+            if index > 0 {
+                manifest.push(',');
+            }
+            manifest.push_str(&format!(
+                "{{\"name\":\"{file}\",\"role\":\"{role}\",\"sha256\":\"{sha}\"}}"
+            ));
+        }
+        manifest.push_str("]}");
+        std::fs::write(dir.join("manifest.json"), manifest).expect("write the manifest");
+        dir
+    }
+
+    fn plan_for(dir: &Path) -> ModelPlan {
+        ModelPlan::resolve(dir, &EngineConfig::default()).expect("model plan")
+    }
+
+    /// A1：健康的模型集 → 冷验证通过，**每个文件都在这一次真的算了一次摘要**
+    /// （`force_verify_file` 不查缓存，因此这个数字不可能是"命中来的"）。
+    #[test]
+    fn the_startup_gate_verifies_every_file_the_run_uses_with_a_fresh_digest() {
+        let dir = fixture_dir("healthy");
+        let plan = plan_for(&dir);
+        let report = reverify_gate(&plan, false).expect("healthy models must pass");
+
+        assert_eq!(
+            report.digests_computed(),
+            report.files().len(),
+            "one computed digest per file the run uses"
+        );
+        assert!(
+            report.files().len() >= 4,
+            "the text pipeline's three files plus the formula recognizer: {:?}",
+            report.files().len()
+        );
+        assert!(report.blocking().is_empty());
+        for file in report.files() {
+            assert!(
+                file.sha256.is_some(),
+                "{} must carry the digest this call computed",
+                file.name
+            );
+            assert_eq!(
+                file.state.as_str(),
+                "present",
+                "{} must be present: {:?}",
+                file.name,
+                file.state
+            );
+            assert_eq!(
+                file.cause.as_str(),
+                "first_sight",
+                "a cold verification never reports a cache hit ({}): {:?}",
+                file.name,
+                file.cause
+            );
+        }
+        // 目录里那个**不在**本轮使用范围里的文件也必须不在清单里（默认表的其它模型）。
+        let names: Vec<&str> = report.files().iter().map(|f| f.name.as_str()).collect();
+        assert!(!names.contains(&"manifest.json"), "{names:?}");
+    }
+
+    /// A1：损坏的模型文件 → **拒绝启动**，错误里点名那个文件（可定位）。
+    #[test]
+    fn the_startup_gate_refuses_to_start_and_names_the_corrupt_file() {
+        let dir = fixture_dir("corrupt");
+        let plan = plan_for(&dir);
+        // 文件仍然在（体积是否相同都无所谓）：内容与清单声明的摘要不匹配。
+        std::fs::write(dir.join("rec.onnx"), b"corrupted recognizer bytes")
+            .expect("corrupt the recognizer");
+
+        let error =
+            reverify_gate(&plan, false).expect_err("a corrupt plan model must refuse to start");
+        let text = error.to_string();
+        assert!(text.contains("rec.onnx"), "{text}");
+        assert!(text.contains("corrupt"), "{text}");
+        assert!(text.contains("--reverify-models"), "{text}");
+        match error {
+            ServeStartError::ModelsUnusable { report } => {
+                let blocking: Vec<&str> = report
+                    .blocking()
+                    .iter()
+                    .map(|file| file.name.as_str())
+                    .collect();
+                assert_eq!(blocking, vec!["rec.onnx"], "only the corrupt file blocks");
+            }
+            other => panic!("expected ModelsUnusable, got {other:?}"),
+        }
+    }
+
+    /// A1：缺失的模型文件同样拒绝启动（不是只有"损坏"才拦）。
+    #[test]
+    fn the_startup_gate_refuses_a_missing_file_too() {
+        let dir = fixture_dir("missing");
+        let plan = plan_for(&dir);
+        std::fs::remove_file(dir.join("dict.txt")).expect("remove the dictionary");
+
+        let error =
+            reverify_gate(&plan, false).expect_err("a missing plan model must refuse to start");
+        let text = error.to_string();
+        assert!(text.contains("dict.txt"), "{text}");
+        assert!(text.contains("missing"), "{text}");
+    }
+
+    // A1 的端到端形态见 `serve::tests`（那里有真实的进程边界与模型夹具）。
 
     /// 真实页面：三个断言全过，且每个 `nonce=` 属性与 CSP nonce 逐字节相同。
     ///

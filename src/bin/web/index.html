@@ -147,6 +147,19 @@ html[data-theme="dark"] .icon-btn .i-sun{opacity:1;transform:none}
 .banner-act .btn-mini{margin:0}
 .btn-mini[aria-disabled="true"]{opacity:.4;cursor:not-allowed;border-style:dashed}
 .dl-line{font-size:12px;color:var(--fg2);display:flex;justify-content:space-between;gap:16px;margin-bottom:8px}
+/* ============ 重新校验（POST /api/models/reverify，A2） ============ */
+.verify-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:8px 0 2px}
+.verify-hint{font-size:11px;color:var(--fg3);margin:0;line-height:1.6}
+.verify-out{margin-top:8px;border:1px solid var(--line);padding:9px 11px;font-size:11.5px;
+  color:var(--fg2);line-height:1.75}
+.verify-out b{color:var(--fg)}
+.verify-out .vo-line{display:block}
+.verify-out .vo-files{margin-top:6px;border-top:1px solid var(--line);padding-top:6px}
+.verify-out .vo-row{display:flex;gap:10px;align-items:baseline;padding:3px 0}
+.verify-out .vo-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)}
+.verify-out .vo-state{flex:none;letter-spacing:.08em}
+.verify-out .vo-state.ok{color:var(--fg2)}
+.verify-out .vo-state.bad{color:var(--fg);border-bottom:1px dashed var(--fg)}
 .dl-line b{font-weight:500;color:var(--fg)}
 .bar{height:2px;background:var(--line);position:relative;overflow:hidden}
 .bar i{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--fg);
@@ -548,6 +561,19 @@ main{flex:1;min-height:0;display:grid;grid-template-columns:minmax(400px,46fr) 5
     <div class="right-inner">
       <div class="sec-label">引擎状态 <span>ENGINE</span></div>
       <div class="engine-panel" id="enginePanel"></div>
+      <!-- 重新校验（A2）：POST /api/models/reverify —— 清掉校验缓存 → 冷验证本次运行会用到的
+           每个模型文件 → 如果引擎此前就绪则**重建会话**。它是"确定性地重新读盘"的入口
+           （docs/05 §4.2）：模型文件在运行期被换掉时，只有它会同时刷新"报告的状态"与
+           "内存里真正在服务的会话"。放在常驻位置（而不是模型横幅里）是因为横幅在模型
+           齐备时是隐藏的，而这个动作在齐备时同样有意义。 -->
+      <div class="verify-row">
+        <button class="btn-ghost sm" id="verifyBtn" type="button"
+                title="清掉校验缓存，重新读盘核对本次运行会用到的每个模型文件，并重建引擎会话">
+          <svg class="ic" aria-hidden="true" focusable="false"><use href="#i-refresh"/></svg>重新校验
+        </button>
+        <p class="verify-hint" id="verifyHint">POST /api/models/reverify · 重新读盘核对模型并重建引擎会话</p>
+      </div>
+      <div class="verify-out" id="verifyOut" role="status" hidden></div>
 
       <div class="sec-label gap">识别区域 <span>REGIONS&nbsp;·&nbsp;阅读顺序</span>
         <button class="text-btn" id="copyAllBtn" disabled>
@@ -651,6 +677,8 @@ const state = {
   dlJob:null,           /* 下载任务：{id, set_id, state, elapsed_ms, error} —— 与 OCR 任务同属 job 生命周期 */
   formula:false,        /* 公式识别路由开关（§10.8 默认关闭） */
   diag:[],              /* 协议/契约错误记录（渲染进诊断面板；同时 toast 一次） */
+  verifying:false,      /* "重新校验"进行中（按钮禁用，避免重复提交） */
+  verifyOut:null,       /* 上一次 POST /api/models/reverify 的结论 {value} 或 {error} */
   netFail:false         /* 真实模式：本地服务不可达 */
 };
 
@@ -1380,6 +1408,100 @@ function renderEngine(){
   if(e.target.closest('#retryStatus')) statusOnce();
 });
 
+/* ================= 重新校验（POST /api/models/reverify，A2） =================
+   请求契约（docs/05 §4.2）：POST /api/models/reverify，**请求体为空**（无参数动作，
+   任何 body 都是协议级错误）。服务端的三步是：清掉校验缓存 → 冷验证本次运行会用到的
+   每个模型文件 → 如果引擎此前就绪则重建会话。返回里必须被如实展示的是：
+     computed          这一次真的重算了几个摘要（"重新校验"有没有真的发生）
+     content_changed   哪些文件是"stat 身份没变、内容变了"（旧身份下的盲区被抓住的那个）
+     outcome / engine  重建结论（ready / rolled_back / blocked_models_missing / failed）
+   并发时服务端给 503 busy（单飞），这里照常按 ERR_TEXT 解释。
+   离线预览模式（无令牌）不发请求，只说明该动作需要真实服务——页面不伪造结论。 */
+function renderVerify(){
+  const box = $('verifyOut'), hint = $('verifyHint');
+  if(!box || !hint) return;
+  const busy = state.verifying;
+  const btn = $('verifyBtn');
+  if(btn) btn.disabled = !!busy;
+  hint.textContent = busy ? '正在进行：清缓存 → 重新读盘核对 → 重建引擎会话…'
+    : 'POST /api/models/reverify · 重新读盘核对模型并重建引擎会话';
+  const o = state.verifyOut;
+  if(!o){ box.hidden = true; box.innerHTML = ''; return; }
+  box.hidden = false;
+  if(o.error){
+    const e = o.error;
+    /* 服务端的 ErrorBody 是 {code,message,detail}；XHR 层的拒绝对象是 {status,code,body}。
+       两种形状都如实显示，并且**不**把未知形状渲染成空白。 */
+    const code = e.code || (e.body && e.body.code);
+    const msg  = e.message || (e.body && e.body.message) || '';
+    const base = ERR_TEXT[code] || '请求失败' + (e.status ? `（HTTP ${e.status}）` : '');
+    box.innerHTML = `<span class="vo-line"><b>重新校验失败</b> — ${esc(base)}</span>` +
+      (msg ? `<span class="vo-line">服务端原文：${esc(msg)}</span>` : '') +
+      `<span class="vo-line">本次失败不改写已经在跑的引擎状态（以 /api/status 为准）。</span>`;
+    return;
+  }
+  const c = o.value || {};
+  const files = Array.isArray(c.files) ? c.files : [];
+  const bad = files.filter(f => f.state !== 'present');
+  const changed = Array.isArray(c.content_changed) ? c.content_changed : [];
+  const outcome = c.outcome != null ? String(c.outcome) : '—';
+  box.innerHTML =
+    `<span class="vo-line"><b>引擎 ${esc(outcome)}</b>` +
+    (c.load_ms != null ? ` · 建会话 ${esc(String(c.load_ms))} ms` : '') +
+    (c.error ? ` · ${esc(errText(c.error))}` : '') + `</span>` +
+    `<span class="vo-line">本次重算摘要 <b>${c.computed != null ? esc(String(c.computed)) : '—'}</b> 个` +
+    ` · 缺失 <b>${Array.isArray(c.missing) ? c.missing.length : '—'}</b>` +
+    ` · 损坏 <b>${Array.isArray(c.corrupt) ? c.corrupt.length : '—'}</b>` +
+    ` · 内容变化 <b>${changed.length}</b></span>` +
+    (changed.length
+      ? `<span class="vo-line">内容变化（stat 身份未变、首尾 64 KiB 不同）：${esc(changed.join('、'))}</span>`
+      : '') +
+    (files.length
+      ? `<div class="vo-files">${files.map(f => `<div class="vo-row">
+          <span class="vo-name" title="${esc(f.name)}">${esc(f.name)}</span>
+          <span class="vo-state ${f.state === 'present' ? 'ok' : 'bad'}">${esc(f.state || '—')}</span>
+          <span class="vo-hint">${esc(ROLE_ZH[f.role] || f.role || '')}${f.cause ? ' · ' + esc(f.cause) : ''}</span>
+        </div>`).join('')}</div>`
+      : '') +
+    (bad.length
+      ? `<span class="vo-line">服务端现在处于可定位的错误态：普通 OCR 会以 409 拒绝，直到这些文件恢复。</span>`
+      : `<span class="vo-line">全部文件状态正常：报告的状态与内存里的会话都已按磁盘上的当前内容刷新。</span>`);
+}
+function reverifyModels(){
+  if(state.verifying) return;
+  if(DEMO){
+    state.verifyOut = { error:{ code:'unavailable',
+      message:'离线预览模式没有服务端：重新校验需要通过 rapidocr serve 打开本页' } };
+    renderVerify();
+    toast('离线预览模式没有服务端，无法执行重新校验', 'err', 'refresh');
+    return;
+  }
+  state.verifying = true;
+  state.verifyOut = null;
+  renderVerify();
+  /* 请求体**必须为空**（docs/05 §4.2：这是无参数动作，任何 body 都是 400）。
+     因此走 `xhrSend` 而不是 `apiSendJson`——后者会把 `null` 序列化成字符串 "null"。 */
+  xhrSend('POST', '/api/models/reverify', '')
+    .then(v => {
+      state.verifying = false;
+      state.verifyOut = { value:v };
+      renderVerify();
+      refreshModels();      /* 模型集/引擎状态都按磁盘上的当前内容重算一遍 */
+      statusOnce();
+      const n = v && v.computed != null ? v.computed : '—';
+      const outcome = v && v.outcome ? v.outcome : '—';
+      toast(`重新校验完成 · 重算 ${n} 个摘要 · 引擎 ${outcome}`,
+            outcome === 'ready' ? 'ok' : 'err', 'refresh');
+    })
+    .catch(e => {
+      state.verifying = false;
+      state.verifyOut = { error:e };
+      renderVerify();
+      toastErr(e);
+    });
+}
+ $('verifyBtn').addEventListener('click', reverifyModels);
+
 /* ================= 渲染：模型横幅（§9.2） =================
   每一个"不齐备"的模型集**各自**拥有一个下载按钮，按钮携带该集合的 id
   （data-set-id），点击时把这份 id 原样送进 POST /api/models/download 的请求体。
@@ -2100,6 +2222,8 @@ async function enterDemo(){
   state.models = demoInitialModels();
   demo.textReady = modelsReadyFor('text').ready;
   demoSetStatus(); renderBanner(); renderButton(); renderFormulaToggle();
+  /* 离线预览没有服务端：重新校验按钮仍可点（点击后如实解释），但结论区保持为空。 */
+  renderVerify();
 }
 /* 离线预览的下载：与真实模式**共用同一套 job 生命周期**——
    先建 job（拿到 job_id），进度来自 job 的 state/elapsed，取消走同一 cancelDownload()。
@@ -2256,7 +2380,7 @@ function demoExport(fmt){
 /* ================= 启动 ================= */
 /* 队列就绪 / 公式开关都依赖 /api/models，因此在取到模型集之前先按"未知"渲染一遍，
    取到之后由 refreshModels() 重算（离线预览则由 enterDemo() 负责）。 */
-renderPill(); renderEngine(); renderRegions(); renderDiag(); renderButton(); renderFormulaToggle();
+renderPill(); renderEngine(); renderRegions(); renderDiag(); renderButton(); renderFormulaToggle(); renderVerify();
 if(DEMO){
   enterDemo();
 }else{

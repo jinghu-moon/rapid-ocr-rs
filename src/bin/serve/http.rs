@@ -84,6 +84,8 @@ enum Route {
     Status,
     Models,
     ModelsDownload,
+    /// `POST /api/models/reverify`（A2）：清缓存 → 冷验证 → 重建引擎。
+    ModelsReverify,
     EngineReload,
     Ocr,
     /// `POST /api/evaluate`（M4）：批量评估一份已标注清单。
@@ -108,6 +110,7 @@ impl Route {
             | Self::JobAnnotated(_)
             | Self::JobExport(_) => HttpMethod::Get,
             Self::ModelsDownload
+            | Self::ModelsReverify
             | Self::EngineReload
             | Self::Ocr
             | Self::Evaluate
@@ -349,8 +352,8 @@ fn handle(shared: &Arc<ServeShared>, mut request: Request) {
         }
         // 响应由另一个线程写（M3 的 provider 切换 / M2 的按当前文件重建）：本线程立刻回到
         // accept 循环，否则 `/api/status` 与 `/api/ocr` 会在整个建会话序列期间停摆。
-        Ok(Dispatch::EngineWork(provider)) => {
-            if let Err(failure) = spawn_engine_work(shared, provider, request) {
+        Ok(Dispatch::EngineWork(work)) => {
+            if let Err(failure) = spawn_engine_work(shared, work, request) {
                 // 请求没人接手（已有建会话序列在跑 / 线程起不来）：由本线程如实回答。
                 let (error, request) = *failure;
                 let _ = respond(request, Body::error(&error), &[]);
@@ -391,12 +394,22 @@ enum Dispatch {
     Respond(Body, Vec<(String, String)>),
     /// 交给 [`spawn_engine_work`]：它拥有请求对象（含写响应的责任）。
     ///
-    /// `None` = 无 body 的 `POST /api/engine/reload`（按磁盘上的当前文件重建会话）；
-    /// `Some(provider)` = M3 的显式 provider 设置应用。**两者走同一条线程路径**：
-    /// ONNX Runtime 建会话绝不在 accept 线程上发生（评审 P2-2）。
-    EngineWork(Option<ProviderPreference>),
+    /// `EngineWork::Reload(None)` = 无 body 的 `POST /api/engine/reload`（按磁盘上的当前文件
+    /// 重建会话）；`EngineWork::Reload(Some(provider))` = M3 的显式 provider 设置应用；
+    /// `EngineWork::ReverifyModels` = `POST /api/models/reverify`（A2）。**三者走同一条线程
+    /// 路径**：ONNX Runtime 建会话绝不在 accept 线程上发生（评审 P2-2）。
+    EngineWork(EngineWork),
     /// 交给 [`spawn_evaluation`]（M4）：评估是批量动作，同样由独立线程写响应。
     Evaluate(PathBuf),
+}
+
+/// 一次"引擎工作"的具体形态（见 [`Dispatch::EngineWork`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineWork {
+    /// `POST /api/engine/reload`：`None` = 按当前文件重建，`Some` = 应用 provider 设置。
+    Reload(Option<ProviderPreference>),
+    /// `POST /api/models/reverify`：清缓存 + 冷验证 + 重建引擎（A2）。
+    ReverifyModels,
 }
 
 /// 端点分发（准入已通过，这里才允许读 body）。
@@ -441,6 +454,16 @@ fn dispatch(
             let value = shared.submit_download(&set_id)?;
             Ok(Dispatch::Respond(json_body(202, value)?, Vec::new()))
         }
+        Route::ModelsReverify => {
+            // A2：一次动作完成"重新读盘"。请求体**必须为空**（这是无参数动作，任何 body
+            // 都是协议级错误），并且**委派**给引擎工作线程：它要清缓存、冷验证 566 MB
+            // 量级的模型并重建会话，绝不能在 accept 线程上跑（§8.2、评审 P2-2）。
+            let body = read_body(request, &admitted)?;
+            if !body.is_empty() {
+                return Err(ServeError::BadRequest);
+            }
+            Ok(Dispatch::EngineWork(EngineWork::ReverifyModels))
+        }
         Route::Evaluate => {
             check_json_content_type(descriptor.content_type)?;
             let bytes = read_body(request, &admitted)?;
@@ -459,7 +482,7 @@ fn dispatch(
             // 在 accept 线程上执行会让整个服务（包括 `/api/status` 与 `POST /api/ocr`）
             // 在它结束前停摆，而"`Loading`/`Rebuilding` 可见""新请求入队而不是被拒绝"
             // 正是要观察的行为（评审 P2-2：无 body 的那一支以前漏了这一步）。
-            Ok(Dispatch::EngineWork(provider))
+            Ok(Dispatch::EngineWork(EngineWork::Reload(provider)))
         }
         Route::Job(id) => Ok(Dispatch::Respond(
             json_body(200, shared.job_view(id)?)?,
@@ -494,20 +517,21 @@ fn dispatch(
     }
 }
 
-/// 在独立线程里执行一次"建/重建引擎"序列，并由那个线程写响应（M2 的按当前文件重建、
-/// M3 的 provider 切换、评审 P2-2 的无 body reload 都走这一条路径）。
+/// 在独立线程里执行一次"引擎工作"序列，并由那个线程写响应（M2 的按当前文件重建、
+/// M3 的 provider 切换、评审 P2-2 的无 body reload、A2 的 `POST /api/models/reverify`
+/// 都走这一条路径）。
 ///
-/// - 同一时刻只允许一个建会话序列（[`ServeShared::begin_provider_switch`]）：第二个请求
-///   立刻得到 503 `busy`，不排队；
+/// - 同一时刻只允许一个引擎序列（[`ServeShared::begin_provider_switch`]）：第二个请求
+///   立刻得到 503 `busy`，不排队。**A2 的单飞就是这一条**：`/api/models/reverify` 与
+///   `/api/engine/reload` 互相排斥，因此不存在"两个清缓存/两次重建"交错；
 /// - 线程创建失败 / 已有序列在跑 → 把请求连同错误原样还给调用方
 ///   （`Err(Box::new((error, request)))`，装箱只为不让 `Result` 的 `Err` 变体过大），
 ///   由它写出对应的错误响应，绝不留下"没有响应的连接"；
 /// - **accept 线程立刻回到循环**（`/api/status` 与 `POST /api/ocr` 在整个序列期间照常可用），
-///   而客户端仍然**只在序列结束（或失败）之后**才拿到响应——无 body 的 reload 与显式
-///   provider 切换的这一点行为完全一致。
+///   而客户端仍然**只在序列结束（或失败）之后**才拿到响应——三种形态在这一点上完全一致。
 fn spawn_engine_work(
     shared: &Arc<ServeShared>,
-    provider: Option<ProviderPreference>,
+    work: EngineWork,
     request: Request,
 ) -> Result<(), Box<(ServeError, Request)>> {
     let Some(guard) = shared.begin_provider_switch() else {
@@ -525,7 +549,11 @@ fn spawn_engine_work(
             let Ok(request) = rx.recv() else {
                 return;
             };
-            let body = match shared.reload_engine(provider) {
+            let result = match work {
+                EngineWork::Reload(provider) => shared.reload_engine(provider),
+                EngineWork::ReverifyModels => shared.reverify_models(),
+            };
+            let body = match result {
                 Ok(value) => match serde_json::to_vec(&value) {
                     Ok(bytes) => Body::json(200, bytes),
                     Err(_) => Body::error(&ServeError::Internal),
@@ -780,6 +808,7 @@ fn route_of(method: HttpMethod, path: &str) -> (RouteDecision, Option<Route>) {
         "/api/status" => Some(Route::Status),
         "/api/models" => Some(Route::Models),
         "/api/models/download" => Some(Route::ModelsDownload),
+        "/api/models/reverify" => Some(Route::ModelsReverify),
         "/api/engine/reload" => Some(Route::EngineReload),
         "/api/ocr" => Some(Route::Ocr),
         "/api/evaluate" => Some(Route::Evaluate),
@@ -888,6 +917,11 @@ mod tests {
                 HttpMethod::Post,
                 "/api/models/download",
                 Route::ModelsDownload,
+            ),
+            (
+                HttpMethod::Post,
+                "/api/models/reverify",
+                Route::ModelsReverify,
             ),
             (HttpMethod::Post, "/api/engine/reload", Route::EngineReload),
             (HttpMethod::Post, "/api/ocr", Route::Ocr),

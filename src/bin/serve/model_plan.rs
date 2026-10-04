@@ -46,7 +46,7 @@ use super::state::ModelReadiness;
 /// 判定**只按 role**，不按"集合 id"或集合在响应里的顺序：本地清单只产生一个集合、
 /// 默认表产生两个，同一条规则（见 [`Pipeline::of`]）在两种来源下都必须成立。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Pipeline {
+pub(crate) enum Pipeline {
     Text,
     Formula,
 }
@@ -62,6 +62,14 @@ impl Pipeline {
             | ModelRole::Recognizer
             | ModelRole::Dictionary
             | ModelRole::Tokenizer => Self::Text,
+        }
+    }
+
+    /// 稳定的小写名称（`/api/models/reverify` 的 `files[].pipeline` 与日志用）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Formula => "formula",
         }
     }
 }
@@ -300,6 +308,209 @@ impl ModelPlan {
             path: cli.to_path_buf(),
             expected_sha256,
         }))
+    }
+
+    /// 这次运行**真正会用到**的文件（按模型集的声明顺序，role 去重）。
+    ///
+    /// # 为什么不是"默认表里的每一个文件"
+    ///
+    /// `--reverify-models` 与 `POST /api/models/reverify` 的目标是"这一轮要用的东西在启动时
+    /// 就是可信的"，不是"把整个模型目录都哈希一遍"。默认表里还有当前配置**不会加载**的
+    /// 模型（别的 model_type / 别的语言），把它们的 566 MB 也读一遍既是纯粹的浪费，
+    /// 也会让"启动失败"指向一个本轮根本不会打开的文件。
+    ///
+    /// 因此判据与引擎**完全一致**：文本管线 = detector + recognizer + dictionary
+    /// （`global.use_cls` 打开时再加 classifier），公式管线 = formula_recognizer
+    /// （`--formula-detector` 声明过的检测模型**不属于**模型集，它由
+    /// [`FormulaDetectorSpec`] 单独携带，因此不在本清单里重复列出）。
+    /// `tokenizer` role 不参与：它不是管线与引擎的输入（`pin_engine_paths` 里没有它）。
+    pub fn required_files(&self, use_cls: bool) -> Vec<(&rapid_ocr_rs::ModelFileSpec, PathBuf)> {
+        let mut roles = vec![ModelRole::Detector];
+        if use_cls {
+            roles.push(ModelRole::Classifier);
+        }
+        roles.push(ModelRole::Recognizer);
+        roles.push(ModelRole::Dictionary);
+        roles.push(ModelRole::FormulaRecognizer);
+
+        let mut out = Vec::new();
+        for set in &self.sets {
+            for file in &set.files {
+                if !roles.contains(&file.role) {
+                    continue;
+                }
+                if out
+                    .iter()
+                    .any(|(seen, _): &(&rapid_ocr_rs::ModelFileSpec, PathBuf)| {
+                        seen.name == file.name
+                    })
+                {
+                    continue;
+                }
+                out.push((file, self.model_dir.join(&file.name)));
+            }
+        }
+        out
+    }
+
+    /// **冷验证**这次运行会用的每一个文件，忽略身份键控缓存（`--reverify-models` 与
+    /// `POST /api/models/reverify` 的唯一实现）。
+    ///
+    /// 每个文件都调用库的 [`rapid_ocr_rs::force_verify_file`]：它现在就读盘重算 SHA-256，
+    /// 并如实回答"这一次算了没有、为什么算"（`cause`）。命中路径**不存在**，
+    /// 因此调用方拿到的 `digests_computed` 就是"这次真的读了多少个文件"。
+    pub fn reverify(&self, use_cls: bool) -> PlanReverification {
+        let mut files = Vec::new();
+        let mut digests_computed = 0_usize;
+        let mut content_changed = Vec::new();
+        for (spec, path) in self.required_files(use_cls) {
+            // "文件不在"与"文件在但读不出来/内容不对"必须是**两种**结论（`/api/models`
+            // 的 `missing` 与 `corrupt` 就是靠它们区分，前端给出的建议也不同：
+            // 缺失 → 下载，损坏 → 重新下载并以原子方式替换）。因此先用一次 `is_file`
+            // 把"不在"分离出来，`force_verify_file` 的错误随后只表示"在但读不出来"。
+            let outcome = if path.is_file() {
+                Some(rapid_ocr_rs::force_verify_file(&path))
+            } else {
+                None
+            };
+            let (state, digest, cause, had_hash) = match outcome {
+                None => (
+                    ModelFileState::Missing,
+                    String::new(),
+                    rapid_ocr_rs::ReverifyCause::FirstSight,
+                    spec.has_hash(),
+                ),
+                Some(Ok(outcome)) => {
+                    digests_computed += 1;
+                    if outcome.cause == rapid_ocr_rs::ReverifyCause::ContentChanged {
+                        content_changed.push(spec.name.clone());
+                    }
+                    let state = if !spec.has_hash() {
+                        // 集合没有声明摘要：只能证明"文件在"（§5.2 的同一规则）。
+                        ModelFileState::Present
+                    } else if outcome.sha256.eq_ignore_ascii_case(&spec.sha256) {
+                        ModelFileState::Present
+                    } else {
+                        ModelFileState::Corrupt {
+                            expected: spec.sha256.clone(),
+                            actual: outcome.sha256.clone(),
+                        }
+                    };
+                    (state, outcome.sha256, outcome.cause, spec.has_hash())
+                }
+                Some(Err(error)) => (
+                    ModelFileState::Corrupt {
+                        expected: spec.sha256.clone(),
+                        actual: format!("unreadable: {error}"),
+                    },
+                    String::new(),
+                    rapid_ocr_rs::ReverifyCause::FirstSight,
+                    spec.has_hash(),
+                ),
+            };
+            files.push(VerifiedPlanFile {
+                name: spec.name.clone(),
+                role: spec.role,
+                pipeline: Pipeline::of(spec.role),
+                declared_sha256: had_hash.then(|| spec.sha256.clone()),
+                sha256: (had_hash && !digest.is_empty()).then_some(digest),
+                state,
+                cause,
+            });
+        }
+        PlanReverification {
+            files,
+            digests_computed,
+            content_changed,
+        }
+    }
+}
+
+/// 一次"冷验证这次运行会用的文件"的逐文件结论（启动期与 `POST /api/models/reverify` 共用）。
+///
+/// `pub(crate)` 是因为它出现在 [`crate::serve::run::ServeStartError::ModelsUnusable`] 里
+/// （启动期拒绝的错误载荷）；字段仍然私有，外部只能经下面的访问器读。
+#[derive(Debug, Clone)]
+pub(crate) struct PlanReverification {
+    /// 与 [`ModelPlan::required_files`] **同序**。
+    files: Vec<VerifiedPlanFile>,
+    /// 这一轮真的重算了多少个完整摘要（`force_verify_file` 从不命中缓存，因此它等于文件数；
+    /// 例外是读不出来的文件——它连摘要都没有）。
+    digests_computed: usize,
+    /// stat 身份相同、局部摘要不同（= 内容被换过）的文件名。
+    content_changed: Vec<String>,
+}
+
+impl PlanReverification {
+    pub fn files(&self) -> &[VerifiedPlanFile] {
+        &self.files
+    }
+
+    /// 这一轮算出的完整摘要个数（进响应的 `computed`，也是测试断言的对象）。
+    pub fn digests_computed(&self) -> usize {
+        self.digests_computed
+    }
+
+    /// 内容被换过的文件名（进响应的 `content_changed` 与启动日志）。
+    pub fn content_changed(&self) -> &[String] {
+        &self.content_changed
+    }
+
+    /// 阻塞就绪的文本管线文件（缺失 ∪ 损坏）——启动期 fail-fast 的判据。
+    pub fn text_blocking(&self) -> Vec<&VerifiedPlanFile> {
+        self.blocking_in(Pipeline::Text)
+    }
+
+    /// 缺失 ∪ 损坏的所有文件（不区分管线；启动期错误里点名的那份清单）。
+    pub fn blocking(&self) -> Vec<&VerifiedPlanFile> {
+        self.files
+            .iter()
+            .filter(|file| !file.state.is_present())
+            .collect()
+    }
+
+    fn blocking_in(&self, pipeline: Pipeline) -> Vec<&VerifiedPlanFile> {
+        self.files
+            .iter()
+            .filter(|file| file.pipeline == pipeline && !file.state.is_present())
+            .collect()
+    }
+}
+
+/// 一个"这次运行会用到的文件"的冷验证结论。
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedPlanFile {
+    /// 文件名（不泄露绝对路径；与 `/api/models` 的 `files[].name` 同值）。
+    pub name: String,
+    pub role: ModelRole,
+    pub pipeline: Pipeline,
+    /// 模型集声明的 SHA-256；`None` = 没有可信摘要（只能证明"文件在"）。
+    pub declared_sha256: Option<String>,
+    /// 这一轮真正算出来的摘要（读不出来时为 `None`）。
+    pub sha256: Option<String>,
+    pub state: ModelFileState,
+    /// 这一轮为什么算了摘要（`force_verify_file` 从不返回 `cache_hit`）。
+    pub cause: rapid_ocr_rs::ReverifyCause,
+}
+
+impl VerifiedPlanFile {
+    /// 启动日志/响应里的一行结论。
+    pub fn describe(&self) -> String {
+        match &self.state {
+            ModelFileState::Present => format!(
+                "{} ({}) present sha256={}",
+                self.name,
+                self.role,
+                self.sha256
+                    .as_deref()
+                    .map(|value| &value[..16.min(value.len())])
+                    .unwrap_or("<none declared>")
+            ),
+            ModelFileState::Missing => format!("{} ({}) missing", self.name, self.role),
+            ModelFileState::Corrupt { actual, .. } => {
+                format!("{} ({}) corrupt (actual: {actual})", self.name, self.role)
+            }
+        }
     }
 }
 

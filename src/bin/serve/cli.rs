@@ -160,6 +160,15 @@ pub struct ServeArgs {
     /// 逃逸与符号链接逃逸）；**不给时 `/api/evaluate` 整体拒绝**并给出可定位理由。
     #[arg(long = "eval-root", value_name = "DIR")]
     pub eval_root: Option<PathBuf>,
+
+    /// 启动时**冷验证**这次运行会用到的每一个模型文件，任缺失/损坏即拒绝启动。
+    ///
+    /// 与"清缓存"无关（进程内的校验缓存本来就是空的）：它的价值是把验证从**首次使用**
+    /// 移到**启动期**，并在文件缺失或损坏时**拒绝启动**，而不是等到第一次 OCR 才发现。
+    /// 校验范围是这次运行真的会加载的文件（文本管线 + 配置了检测模型时的公式管线），
+    /// 不是默认表里的每一个文件。
+    #[arg(long = "reverify-models")]
+    pub reverify_models: bool,
 }
 
 impl ServeArgs {
@@ -239,7 +248,7 @@ mod tests {
     };
 
     /// §3 的完整选项名清单（**唯一**的一处枚举）。
-    const DOCUMENTED_OPTION_NAMES: [&str; 24] = [
+    const DOCUMENTED_OPTION_NAMES: [&str; 25] = [
         "port",
         "model-dir",
         "config",
@@ -266,6 +275,8 @@ mod tests {
         "max-eval-cases",
         // 评审 P2-3：评估的沙箱根（不给即拒绝整个端点）。
         "eval-root",
+        // A1：启动期冷验证这次运行会用到的模型文件，缺失/损坏即拒绝启动。
+        "reverify-models",
     ];
 
     /// 测试用的最小 `Parser` 包装。
@@ -452,6 +463,7 @@ mod tests {
             "8",
             "--eval-root",
             "D:\\eval-root",
+            "--reverify-models",
         ]);
         assert_eq!(args.port, 9000);
         assert_eq!(
@@ -497,7 +509,23 @@ mod tests {
             args.eval_root.as_deref(),
             Some(std::path::Path::new("D:\\eval-root"))
         );
+        assert!(args.reverify_models);
         assert!(!args.uses_documented_defaults());
+    }
+
+    /// A1：`--reverify-models` 是**开关**（默认关闭），不是需要取值的选项。
+    #[test]
+    fn the_startup_reverification_flag_defaults_to_off_and_takes_no_value() {
+        assert!(!parse(&[]).reverify_models);
+        assert!(parse(&["--reverify-models"]).reverify_models);
+        assert!(
+            try_parse(&["--reverify-models=true"]).is_err(),
+            "a boolean flag must not accept a value"
+        );
+        assert!(
+            try_parse(&["--reverify-models", "1"]).is_err(),
+            "the value after the flag would be an unexpected positional argument"
+        );
     }
 
     #[test]

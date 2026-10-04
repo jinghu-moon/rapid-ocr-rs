@@ -62,6 +62,16 @@ cuda-provider = ["ort/cuda"]
 # `src/bin/serve/*` 里被引用（`src/bin/serve/mod.rs` 的边界断言会扫描这一点）。
 serve = ["dep:tiny_http"]
 
+# 集成测试：`tests/serve_startup.rs` 验收的是**真实的 `rapidocr serve` 进程**
+# （A1：`--reverify-models` 在启动期冷验证并用非零退出码拒绝损坏的模型集）。
+# 默认构建里 `rapidocr serve` 只是一句可定位的拒绝，那条路径不是这个用例要考察的东西，
+# 因此它只在启用 `serve` 时构建（文件内另有一道 `#![cfg(feature = "serve")]`）。
+# 注意：这是**测试目标**声明，不引入任何依赖（`cargo tree` 逐行不变）。
+[[test]]
+name = "serve_startup"
+path = "tests/serve_startup.rs"
+required-features = ["serve"]
+
 [lints.rust]
 # `ort` 链接的预编译原生库在 MSVC 下会偶发报告
 # `LNK4098: defaultlib 'LIBCMT'/'LIBCMTD' conflicts with use of other libs`。

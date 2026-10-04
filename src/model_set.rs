@@ -155,6 +155,19 @@ impl ModelFileSpec {
     /// 它也是 `/api/models` 的 `verification.cold_this_call` 的来源：页面每 8 s 轮询一次
     /// 就绪状态时，这个数字必须是 0，而不是"我们相信它命中了"。
     pub fn state_in_probed(&self, root: &Path) -> (ModelFileState, bool) {
+        self.state_in_digested(root, &mut String::new())
+    }
+
+    /// 与 [`Self::state_in_probed`] 相同，但把**这一次真正的**实际摘要写进 `digest`
+    /// （冷验证时是这次算出来的，命中时是缓存里的那一份）。
+    ///
+    /// 存在的理由：`--reverify-models` 与 `POST /api/models/reverify` 必须同时报告
+    /// "状态"与"实际摘要"，而判定规则（`expected` vs `actual`、缺哈希、文件名越界、
+    /// 读盘失败）**只能有一份实现**。让调用方就地取走那次验证已经算出的摘要，
+    /// 就不会出现"为了拿摘要再哈希一遍"或者"另写一套比较逻辑"的分叉。
+    /// 没有可信摘要可言时（文件名越界 / 读不出来 / 缓存里没有）`digest` 被清空。
+    pub fn state_in_digested(&self, root: &Path, digest: &mut String) -> (ModelFileState, bool) {
+        digest.clear();
         if self.validate_name().is_err() {
             return (
                 ModelFileState::Corrupt {
@@ -178,16 +191,18 @@ impl ModelFileSpec {
         }
 
         match crate::model_verify::verify_file(&path) {
-            Ok(outcome) if outcome.sha256.eq_ignore_ascii_case(&self.sha256) => {
-                (ModelFileState::Present, outcome.computed)
+            Ok(outcome) => {
+                let state = if outcome.sha256.eq_ignore_ascii_case(&self.sha256) {
+                    ModelFileState::Present
+                } else {
+                    ModelFileState::Corrupt {
+                        expected: self.sha256.clone(),
+                        actual: outcome.sha256.clone(),
+                    }
+                };
+                *digest = outcome.sha256;
+                (state, outcome.computed)
             }
-            Ok(outcome) => (
-                ModelFileState::Corrupt {
-                    expected: self.sha256.clone(),
-                    actual: outcome.sha256,
-                },
-                outcome.computed,
-            ),
             Err(error) => (
                 ModelFileState::Corrupt {
                     expected: self.sha256.clone(),

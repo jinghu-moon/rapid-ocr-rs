@@ -118,6 +118,13 @@ rapidocr serve [OPTIONS]
   --max-side <N>             覆盖 max_side_len
   --allow-download           允许下载模型（仍需 token，§7）
   --allow-download-host <H>  追加一个允许下载的 host（可重复；默认仅编译期白名单，§6.1）
+  --reverify-models          **启动期冷验证**这次运行会真正加载的每个模型文件（忽略校验缓存），
+                             任一缺失/损坏即**拒绝启动**并点名那些文件。范围 = 文本管线的
+                             detector/recognizer/dictionary（`use_cls` 时再加 classifier）+
+                             公式管线的 formula_recognizer（`--formula-detector` 声明的检测模型
+                             不属于模型集，因此由加载路径自己校验）——**不是**默认表里的每一个
+                             文件。它与"清缓存"无关（新进程的缓存本来就是空的）：价值在于把验证
+                             从**首次使用**移到**启动期**。见 A1 一节
   --open                     启动后打开系统默认浏览器
 
   # 资源上限
@@ -184,6 +191,7 @@ OCR（尤其公式路径）单图可达数秒至数十秒，**不得长期占用
 | `GET` | `/api/status` | 引擎/provider/ORT 指纹/队列与内存概况（路径脱敏）+ M4 的 `formula` 块（与 `/api/models` 同源同值） |
 | `GET` | `/api/models` | 模型集状态（§5.4；M4 起顶层字段是**文本管线**作用域，公式管线在 `formula` 块里） |
 | `POST` | `/api/models/download` | 启动下载任务（需 `--allow-download` **且** token）；请求体 `{"set_id": "<id>"}`，未知 id → **404 `model_set_not_found`**（绝不回落 `sets[0]`）。公式集合（566 MB）与文本集合同一条路径、同一个按钮语义 |
+| `POST` | `/api/models/reverify` | **A2 新增**：一次动作完成"重新读盘"——①清掉校验缓存，②**冷验证**这次运行会真正加载的每个文件，③**引擎此前就绪则重建会话**（否则"清缓存"只是一个按下去什么都不会变的按钮：流水线的会话缓存可能仍在服务一个磁盘上已经不是这个文件的模型）。请求体**必须为空**（有 body → 400）；单飞（第二个并发调用 **503 `busy`**，与 `POST /api/engine/reload` **同一把**资格），且整个序列在**独立线程**里执行（accept 线程绝不建会话）。响应见 §5.5 |
 | `POST` | `/api/ocr` | 提交识别 → **202** `{job_id, queue, position, state:"queued"}`。队列由 `?queue=text\|formula` 选择，**队列类别就是管线选择**（M4，见下） |
 | `POST` | `/api/evaluate` | **M4 新增**：批量评估一份已标注清单 → 200 + 库的评估报告。**必须先配置 `--eval-root <DIR>`**（M1 评审 P2-3）：未配置时整个端点拒绝（400 `bad_request`，`detail.reason` 点名 `--eval-root`）；配置后清单与清单引用的**每张图**都必须规范化到该目录内，越界（`..`、绝对路径、符号链接）是可定位的 400。请求体**恰好**一个键 `{"manifest": "<本机清单路径>"}`（与 `rapidocr evaluate --manifest` 同格式：`[{image, text, boxes}]`，`image` 相对清单目录解析）。报告字段与 CLI 的 `rapidocr evaluate` **同一份实现**（`cases[]` + `mean_cer` + `exact_match_rate` + `mean_detection_*` + `peak_working_set_bytes` + `memory_source` + `ort_runtime` + `ort_runtime_version`），另加 `iou_threshold` 与 `manifest_file`（只给文件名）。可定位的拒绝是 **400 `bad_request`** + `detail.reason`（没有 `--eval-root`/清单越界/格式不对/用例数超过 `--max-eval-cases`/某张图越界或读不出来）；模型缺失与引擎不可用分别是 409 `models_missing` / 503 `engine_unavailable`（与 `/api/ocr` 同一份错误体） |
 | `GET` | `/api/jobs/{id}` | `{id, kind, queue, state, position, queued_ms, started_ms, elapsed_ms, error}` + M2 追加的 `{failure, download, cancel_requested}`（见 §4.3） |
@@ -230,8 +238,25 @@ POST /api/ocr?queue=formula             → 公式管线，进公式队列
 3. 同时修掉的是**缓存失效**：识别器/检测器的会话缓存从"按路径"改为"按文件身份"，文件被替换或
    损坏后不会被内存里那份旧会话静默继续使用。
 
-残留盲区（如实）：身份由 `(size, mtime)` 近似，**体积不变且 mtime 不变**的内容替换不会被缓存
-识别（例如把时间戳写回原值），这一点在 `/api/models.verification.residual_blind_spot` 里同样写明。
+残留盲区（**B 轮已收窄，如实陈述**）：身份 = `(path, size, mtime)` **加上首尾各 64 KiB 的
+局部摘要**。因此"体积不变且 mtime 不变"的内容替换**只有在首尾 64 KiB 逐字节相同时**才不被
+识别（把改动放在中段、或用 `SetFileTime` 把时间戳写回原值的组合，现在会被抓住：
+`verification.partial_mismatches` 计数、`POST /api/models/reverify` 的 `content_changed`
+以及启动日志都会说明"这次为什么重新哈希了"）。
+
+**局部摘要是启发式，不是安全边界**：能写这个文件的人同样能保留首尾、只改中段，因此它
+降低的是"误把改过的文件当成没改"的概率，**不是**"防住能写文件的人"。`mtime` 不可得
+（文件系统不提供）时身份里是 `None`，同类替换同样落在盲区里。**确定性地**排除缓存影响只有
+两个入口：启动期的 `--reverify-models`（缺失/损坏即拒绝启动）与运行期的
+`POST /api/models/reverify`（清缓存 → 冷验证 → 重建引擎）。这一点同时写在
+`src/model_verify.rs` 的模块文档与 `/api/models.verification.residual_blind_spot` 里
+（响应里就能读到，不必翻文档）。
+
+**小于 128 KiB 的文件（规则明确）**：首块 = 前 `min(size, 64 KiB)` 字节，尾块 = 后
+`min(size, 64 KiB)` 字节。因此 `size ≤ 128 KiB` 时两个切片重叠、局部摘要实际覆盖**整个
+文件内容**——"首尾相同"就等于"内容相同"，盲区对这类文件不存在（默认表里的
+dictionary/tokenizer 就是这种量级）。`size == 0` 时两块都退化为同一个域分隔编码，规则仍然
+唯一确定。以上三条规则都有单元测试钉住（含"中段改动**不**被发现"这条**限制本身**）。
 
 **普通 OCR 永不因公式缺口而失败**：`/api/ocr` 的 409 只报告**文本管线**的缺失文件，
 `EngineState::BlockedModelsMissing` 的清单同样是文本作用域（§5.4、§7.6）。
@@ -403,14 +428,19 @@ pub struct ManifestFile { pub name: String, pub role: ModelRole, pub sha256: Str
     }
   },
   "verification": {
-    "identity": "path + size + mtime",
+    "identity": "path + size + mtime + SHA-256 of the first and last 64 KiB",
+    "partial_window_bytes": 65536,
     "cold_this_call": 0,
     "cold_verifications": 4,
     "cache_hits": 37,
+    "partial_reads": 41,
+    "partial_mismatches": 0,
     "entries": 4,
     "last_cold_ms": 1180.4,
     "last_cold_bytes": 593915961,
-    "residual_blind_spot": "a same-size, same-mtime content swap is not detected by the cache"
+    "guarantee": "content is verified at first use and re-verified whenever the file's identity changes (path, size, mtime, or the first/last 64 KiB); the service does not claim that the on-disk content is trusted at all times",
+    "force_check": "POST /api/models/reverify (or --reverify-models at startup) is the deterministic way to force a fresh full check",
+    "residual_blind_spot": "a same-size, same-mtime edit that also keeps the first and last 64 KiB byte-identical is still not detected; the partial digest is a heuristic that narrows the window, not a security boundary, because an attacker who can write the file can also preserve its head and tail"
   },
   "sets": [
     { "id": "PP-OCRv6", "complete": false, "download_bytes_total": 42106880,
@@ -425,9 +455,12 @@ pub struct ManifestFile { pub name: String, pub role: ModelRole, pub sha256: Str
 - `formula.detector` 增加 `sha256` 与 `state`：检测模型与识别模型**同一条**完整性规则。
   `sha256` 为 `null` 表示没有可信摘要（`--formula-detector` 指向一个模型集没有声明过的文件），
   此时 `state` 只能是 `present`（"文件在"）或 `missing`，绝不假装校验过；
-- `verification` 是**校验成本账**：`cold_this_call` 是这一份报告里真的重算了摘要的文件数
-  （页面每 8 s 轮询时必须是 0），`cold_verifications`/`cache_hits`/`entries` 是进程累计，
-  `last_cold_ms`/`last_cold_bytes` 是最近一次冷验证的实测耗时与被读字节数。
+- `verification` 是**校验成本账 + 保证强度**：`cold_this_call` 是这一份报告里真的重算了摘要的
+  文件数（页面每 8 s 轮询时必须是 0），`cold_verifications`/`cache_hits`/`partial_reads`/
+  `partial_mismatches`/`entries` 是进程累计，`last_cold_ms`/`last_cold_bytes` 是最近一次冷验证的
+  实测耗时与被读字节数，`guarantee`/`force_check`/`residual_blind_spot` 是**如实**的保证陈述
+  （内容在首次使用时验证、在身份变化时重新验证；服务不声称磁盘上的内容在任何时刻都可信；
+  需要确定性重查就用 `--reverify-models` 或 `POST /api/models/reverify`）。
   它存在的意义是让"不再重新哈希 566 MB"这句话**可被验证**，而不是一句承诺。
 
 **M4 的作用域修正（本文件上一版把四个顶层字段写成"所有集合"的并集，那是错的）**：
@@ -446,6 +479,53 @@ pub struct ManifestFile { pub name: String, pub role: ModelRole, pub sha256: Str
   再叠加 `formula.routing`。
 - `complete` 仍然要求"每个文件都 `Present` **且**声明了哈希"（§5.2：没有哈希的文件不得让集合
   报 `complete`）；`missing`/`corrupt` 只列缺失与损坏。
+
+### 5.5 `POST /api/models/reverify` 响应（A2）
+
+```json
+{
+  "outcome": "ready | rolled_back | blocked_models_missing | failed",
+  "engine": { "state": "ready", "requested": "cpu", "selected_ep": "CPUExecutionProvider",
+              "fallback_to_cpu": false },
+  "provider": { "requested": "cpu", "selected_ep": "CPUExecutionProvider", "fallback_to_cpu": false },
+  "requested": "cpu",
+  "selected_ep": "CPUExecutionProvider",
+  "fallback_to_cpu": false,
+  "missing": [], "corrupt": [], "source": "default_table", "model_dir": "<redacted>",
+  "load_ms": 412, "rollback_ms": null, "error": null,
+  "computed": 5,
+  "content_changed": ["fx.onnx"],
+  "files": [
+    { "name": "PP-OCRv6_det_small.onnx", "role": "detector", "pipeline": "text",
+      "state": "present", "declared_sha256": "…", "sha256": "…",
+      "cause": "first_sight | stat_changed | content_changed | cache_hit",
+      "digest_computed_this_call": true }
+  ],
+  "verification": { "…与 §5.4 同源…", "digests_computed": 5 }
+}
+```
+
+字段语义（**逐条都是可断言的**）：
+
+- `computed` = 这一轮真的重算了几个**完整摘要**（`POST /api/models/reverify` 从不查缓存，
+  因此它等于本次运行会用到的文件数，读不出来的文件除外）；`verification.digests_computed`
+  是同一个数字的另一种读法（放在成本账里，免得读者在两处之间猜口径）；
+- `content_changed` = **stat 身份相同、首尾 64 KiB 不同**的文件名。这是"为什么又读了一遍
+  566 MB"的唯一原因来源，也是 B 轮收窄盲区的可见证据；
+- `files[].cause` 是逐文件的原因；`files[].sha256` 是**这一轮算出来的**实际摘要
+  （不是声明值——声明值在 `declared_sha256` 里）；
+- `state` 只用 §5.2 的三个取值；`missing` 与 `corrupt` 的区分是"文件不在"与"文件在但读不出来
+  或内容不对"（前者建议下载，后者建议重新下载并以原子方式替换）；
+- `engine`/`outcome`/`load_ms`/`rollback_ms`/`error` 与 `POST /api/engine/reload`
+  **同一套语义**（`outcome` 只有四种取值；`error` 非空且 `engine` 仍 ready 就是
+  `rolled_back`），因此客户端不必学第二套状态词汇；
+- **请求体必须为空**：有 body → 400 `bad_request`（无参数动作）。
+
+> **为什么必须有第 3 步（重建引擎）**：只清缓存不重建会话，就等于一个按下去什么都不会变的
+> 按钮——`RapidOcrEngine` 的会话缓存按文件身份失效，而"同体积 + 同 mtime（+首尾相同）"的
+> 替换可能不被身份察觉，于是内存里那份旧会话会继续服务一个磁盘上已经不是这个文件的模型。
+> 端点的测试里有一条正是断言这一点：损坏的模型让端点报 `corrupt` 并且**引擎状态是可定位的
+> 错误态**（而不是"旧引擎继续 ready"），还原后同一个端点重建会话并回到 `ready`。
 
 ---
 
@@ -695,6 +775,7 @@ ode --check 报 Unexpected token '}'，
 | 左 | 拖放区 + 文件选择按钮 + `<img>` + 覆盖层 `<canvas>`；粘贴；缩放/适应；"下载标注图" |
 | 右上 | 引擎状态（`loading`/`ready`/`rebuilding`/`failed`）、`requested`/`selected_ep`/`fallback_to_cpu`、ORT 版本、峰值内存、进度 |
 | 右中 | 区域列表（阅读顺序、文本、置信度、坐标）；点击 ↔ 高亮；"复制全文" |
+| 右上（引擎面板下方） | **"重新校验"按钮 + 结论区**（A2）：一次动作触发 `POST /api/models/reverify`（清缓存 → 冷验证 → 重建引擎），结论显示 `computed`/`content_changed`/`outcome`/逐文件状态。放在常驻位置而不是模型横幅里：横幅在模型齐备时是隐藏的，而这个动作在齐备时同样有意义 |
 | 右下 | 导出 JSON/Markdown/HTML；折叠的诊断面板（逐阶段耗时、账本口径说明、provider 实测耗时） |
 | 横幅 | 模型缺失/损坏：文件、总大小、来源、是否允许下载、下载按钮与进度 |
 
@@ -759,9 +840,12 @@ img-src 'self' blob: data:; connect-src 'self'; base-uri 'none'; form-action 'no
    服务端侧"路由是否可用"由 `--formula-detector` 唯一决定（§4.2.1），而**加载**是惰性的——
    只有真的提交了 `queue=formula` 的任务，库才会去建那个 566 MB 的会话；
 9. `/api/status` 路径脱敏（§7.4）；
-10. **模型文件的校验结论按文件身份缓存**（键 = 路径 + 体积 + mtime）：冷验证真的读盘并如实记账，
-    命中只花一次 `stat`。`/api/models` 的 `verification` 块把成本报出来，页面 8 s 轮询因此不再
-    反复读 566 MB（M1 评审 P1-2 / 性能一节）。
+10. **模型文件的校验结论按文件身份缓存**（键 = 路径 + 体积 + mtime + 首尾各 64 KiB 的局部
+    摘要）：冷验证真的读盘并如实记账，命中只花一次 `stat` + 一次 128 KiB 局部读（与文件大小
+    无关）。`/api/models` 的 `verification` 块把成本报出来，页面 8 s 轮询因此不再反复读
+    566 MB（M1 评审 P1-2 / 性能一节；局部摘要是 B 轮加的，实测前后成本见 `docs/06`）。
+    **需要确定性地排除缓存影响时**只有两个入口：启动期的 `--reverify-models`（冷验证 +
+    缺失/损坏即拒绝启动）与运行期的 `POST /api/models/reverify`（清缓存 → 冷验证 → 重建引擎）。
 
 ---
 
@@ -862,6 +946,26 @@ M4 交付后的独立评审发现的问题；每条都在本文档的对应章�
 **这一轮改动的是实现，也是文档**：上面每一条都不是"实现没做"，而是"M4 的实现/表述在这几点上不完整"，
 因此 `docs/05` 相应章节按实现改正；`docs/03` 未改动。
 
+### A1/A2/B：启动期冷验证、运行期"重新校验"、身份加局部摘要（逐条证据见 `docs/06`）
+
+M1 评审修复轮之后的一轮，针对"校验缓存的保证强度"这三件事（同一份记录在 `docs/06` 的
+"A1/A2/B"一节）：
+
+- **A1 `--reverify-models`**：启动期**冷验证**这次运行会真正加载的每个文件（忽略缓存），
+  逐文件打印一行结论，任一缺失/损坏即**拒绝启动**并点名那些文件。范围是
+  `ModelPlan::required_files`，**不是**整张默认表。改动：§3、§5.5、§10 第 10 条、§12
+- **A2 `POST /api/models/reverify`**：①清校验缓存 ②冷验证 ③**引擎此前就绪则重建会话**
+  （缺第 3 步就是"按下去什么都不会变的按钮"）。响应给逐文件状态/原因、`computed`、
+  `content_changed` 与引擎结论（含 `load_ms`/`rolled_back`/`failed`，与 reload 同一套语义）。
+  单飞 + 独立线程（与 `POST /api/engine/reload` **同一把**资格，第二个并发调用 503 `busy`）。
+  页面新增常驻"重新校验"按钮与结论区。改动：§4.2、§5.5、§9.2、§10、§12
+- **B 身份加"首尾各 64 KiB 的局部摘要"**：命中现在要求 stat 身份**与**局部摘要都相同；
+  stat 相同而局部摘要不同 = 内容变了 → 作废并重新完整哈希，并如实报告
+  `content_changed`/`partial_mismatches`。`residual_blind_spot` 收窄为"同体积 + 同 mtime +
+  首尾 64 KiB 逐字节相同"，并明确写出**局部摘要是启发式，不是安全边界**。
+  小于 128 KiB 的文件首尾重叠 ⇒ 局部摘要覆盖整个内容（规则与测试见 §4.2.1）。
+  改动：§4.2.1、§5.4、§10 第 10 条、§12
+
 ---
 
 ## 12. 验证计划
@@ -899,6 +1003,9 @@ M4 交付后的独立评审发现的问题；每条都在本文档的对应章�
 | 引擎重建线程（M1 评审 P2-2） | 无 body 的 `POST /api/engine/reload` 在建会话被闸门按住的整段时间里：`/api/status` 显示 `loading` 且 `POST /api/ocr` 仍返回 202 |
 | 评估沙箱（M1 评审 P2-3） | 没有 `--eval-root` → 400 且理由点名开关；清单越界 / 图片越界（绝对路径、`..`、符号链接）→ 400 且点名违规路径；根内清单照常返回与 CLI 逐字段同值的报告 |
 | 令牌熵（M1 评审 P2-4） | 生成成功且每次不同、是十六进制；熵源字符串被报告；注入一个必然失败的填充器时错误被传播（fail-closed 分支被真的执行） |
+| 启动期冷验证（A1） | 损坏/缺失的计划模型 → `rapidocr serve --reverify-models` **非零退出**并点名那个文件（单元层 + 真实子进程的集成用例）；健康模型 → 每个文件**这一次**都算了一次摘要（`digests_computed == 文件数`）；不在本轮使用范围里的文件**不**被哈希 |
+| 运行期重新校验（A2） | 损坏模型 → 端点报 `corrupt` 且引擎是**可定位的错误态**（不是"旧引擎继续 ready"）；还原后同一端点恢复 `ready` 并**真的重建会话**（建会话次数 +1）；缓存命中之后调用它 `computed == 文件数`（每个文件的 `cause` 都不是 `cache_hit`）；并发调用一个真跑、另一个立刻 503 `busy`（确定性地用钩子构造重叠），且 `busy` 由 accept 线程产生（序列不在 accept 线程上）；有 body → 400 |
+| 局部摘要（B） | 同体积 + 同 mtime：改**头部**、改**尾部**都必须被发现并触发完整重哈希（`cause = content_changed`、`partial_mismatches` 增长）；只改**中段**必须**不**被发现（限制被测试钉住，不是只写在文档里）；`size ≤ 128 KiB` 时首尾重叠 ⇒ 任意位置改动都被发现；空文件与正好 128 KiB 良定义；命中路径不完整哈希（`computed == false`）；`/api/models` 命中成本与加局部摘要前对比（前后实测见 `docs/06`） |
 
 **证据要求**：每个里程碑在 `docs/06-local-web-demo-reports.md`（新建）记录命令、关键输出、与验收标准对照、未覆盖风险。**不得**以"界面看起来正常"作为验证通过。
 

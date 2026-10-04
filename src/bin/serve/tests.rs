@@ -34,15 +34,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rapid_ocr_rs::{
-    CoordinateSpace, DetectionOutcome, DownloadError, EngineConfig, EngineInfo, FormulaPolicy,
-    GenericProviderPreference, ImageInfo, ImageSize, LangDet, LangRec, ModelFileSpec, ModelType,
-    OcrOutput, OcrRegion, OcrRequest, OcrTimings, OcrVersion, Polygon, ProviderInfo,
-    ProviderResolutionInfo, RapidOcrError, RecognitionOutcome, RegionSource, ResolvedProvider,
-    StageReports, sha256_file,
-};
-use serde_json::{Value, json};
-
 use super::download::{DownloadJob, DownloadSink, DownloaderFactory, ModelDownloader};
 use super::engine::{BackendProvider, EngineFactory, OcrBackend};
 use super::evaluate::EvalRoot;
@@ -54,6 +45,14 @@ use super::run::render_page;
 use super::security::{LocalOrigin, ServeToken, generate_nonce};
 use super::server::{FreeSpaceFactory, OcrRouting, ServeContext, ServeShared};
 use super::state::ServeStartup;
+use rapid_ocr_rs::{
+    CoordinateSpace, DetectionOutcome, DownloadError, EngineConfig, EngineInfo, FileIdentity,
+    FormulaPolicy, GenericProviderPreference, ImageInfo, ImageSize, LangDet, LangRec,
+    ModelFileSpec, ModelType, OcrOutput, OcrRegion, OcrRequest, OcrTimings, OcrVersion, Polygon,
+    ProviderInfo, ProviderResolutionInfo, RapidOcrError, RecognitionOutcome, RegionSource,
+    ResolvedProvider, StageReports, sha256_file,
+};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------- 测试基础设施
 
@@ -247,6 +246,12 @@ struct TestOptions {
     free_space: FreeSpaceFactory,
     model_dir: PathBuf,
     engine_config: EngineConfig,
+    /// A2 的确定性钩子：**模型冷验证返回之后、响应写出之前**调用一次（原始 HTTP 层用）。
+    ///
+    /// 单飞（"第二个并发调用得到 503 `busy`"）必须被确定性地观察到，而不是靠 sleep 猜时序：
+    /// 有了它，测试可以在"第一个调用已经写完校验结论、但还没有回响应"的**精确窗口**里
+    /// 发第二个请求。
+    post_verify: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl TestOptions {
@@ -267,6 +272,7 @@ impl TestOptions {
             free_space: Arc::new(|_dir: &Path| Ok(1 << 40)),
             model_dir,
             engine_config: test_engine_config(),
+            post_verify: None,
         }
     }
 
@@ -363,6 +369,7 @@ impl TestServer {
         let model_plan =
             ModelPlan::resolve(&options.model_dir, &startup.plan.engine).expect("model plan");
         let snapshot = model_plan.snapshot();
+        let post_verify = options.post_verify;
         let context = ServeContext {
             limits: startup.limits,
             plan: startup.plan,
@@ -382,6 +389,7 @@ impl TestServer {
             engine_factory: options.engine_factory,
             downloader: options.downloader,
             free_space: options.free_space,
+            post_verify,
         };
         let handle = ServeHandle::start(bound, context).expect("the runtime must start");
         let token = handle.shared().token().as_str().to_string();
@@ -562,9 +570,15 @@ fn send(addr: SocketAddr, raw: &[u8]) -> RawResponse {
             Err(error) => panic!("reading the response failed: {error}"),
         }
     }
+    parse_response(&buffer)
+}
 
-    let head_end =
-        find(&buffer, b"\r\n\r\n").expect("the response must contain a header block") + 4;
+/// 把一份完整的原始响应字节解析成 [`RawResponse`]。
+///
+/// 抽成自由函数的理由：A2 的单飞用例必须在**同一个连接**上"先写头、再写体"，
+/// 因此它自己读字节，然后复用这里的定界逻辑（不能有两套解析）。
+fn parse_response(buffer: &[u8]) -> RawResponse {
+    let head_end = find(buffer, b"\r\n\r\n").expect("the response must contain a header block") + 4;
     let head = String::from_utf8_lossy(&buffer[..head_end - 4]).into_owned();
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or_default();
@@ -2407,7 +2421,26 @@ fn models_reuses_the_verified_digest_until_the_file_identity_changes() {
         first["verification"]["cold_this_call"], 0,
         "the startup snapshot already verified every declared file: {first}"
     );
-    assert_eq!(first["verification"]["identity"], "path + size + mtime");
+    assert_eq!(
+        first["verification"]["identity"],
+        "path + size + mtime + SHA-256 of the first and last 64 KiB",
+        "the identity must name all four components (B: the windows narrow the blind spot)"
+    );
+    assert_eq!(
+        first["verification"]["partial_window_bytes"], 65536,
+        "{first}"
+    );
+    assert!(
+        first["verification"]["partial_reads"].as_u64().unwrap_or(0) >= 5,
+        "every check reads the 128 KiB window: {first}"
+    );
+    assert!(
+        first["verification"]["residual_blind_spot"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not a security boundary"),
+        "the honest statement must say what the heuristic is not: {first}"
+    );
     assert!(first["verification"]["last_cold_ms"].is_number(), "{first}");
     assert!(
         first["verification"]["cold_verifications"]
@@ -2439,8 +2472,435 @@ fn models_reuses_the_verified_digest_until_the_file_identity_changes() {
     assert_eq!(third["formula"]["corrupt"], json!(["fx.onnx"]));
 }
 
-// ---------------------------------------------------------------- M4：评估
+// ------------------------------------------- A1：`--reverify-models`（启动期冷验证，fail-fast）
 
+/// A2 的页面侧：`重新校验` 按钮必须真的在页面里，并按页面既有的写法接线。
+///
+/// 页面是**冻结契约**的一部分（§9：三个 `nonce=` 属性逐字节相同、占位符与令牌计数固定），
+/// 因此这里同时断言"新增按钮没有破坏那三条不变量"：
+///
+/// - 没有内联 `style=` 或 `onclick=`（CSP 是 nonce，内联处理器会被拦掉；
+///   页面既有的做法是 `addEventListener` + CSS 类）；
+/// - 按钮与结论区都在，且用 `role="status"`（`aria-live`）通报结果；
+/// - 离线预览（`DEMO`）分支不发请求，如实解释"没有服务端"。
+#[test]
+fn the_page_carries_the_reverify_button_without_inline_handlers_or_styles() {
+    let server = TestServer::start(TestOptions::new(
+        empty_model_dir("page-reverify"),
+        Scripted::fast(),
+    ));
+    let page = server.get("/").text();
+
+    assert!(
+        page.contains("id=\"verifyBtn\"") && page.contains("重新校验"),
+        "the page must carry the reverify button"
+    );
+    assert!(
+        page.contains("/api/models/reverify"),
+        "the button must go through the documented endpoint"
+    );
+    assert!(
+        page.contains("$('verifyBtn').addEventListener('click', reverifyModels)"),
+        "the handler must be attached with addEventListener (no inline onclick under the nonce CSP)"
+    );
+    assert!(
+        page.contains("id=\"verifyOut\"") && page.contains("role=\"status\""),
+        "the outcome must be announced through a live region"
+    );
+    assert!(
+        !page.contains("onclick=") && !page.contains(" style=\""),
+        "no inline handlers or inline styles (docs/05 §9.5, WCAG: the page's own CSP forbids them)"
+    );
+    // 页面里那个唯一的空请求体入口（有 body 就是 400）。
+    assert!(
+        page.contains("xhrSend('POST', '/api/models/reverify', '')"),
+        "the request body must be empty, exactly as the endpoint requires"
+    );
+    // 冻结的占位符计数（§9：nonce 属性 ×3、占位符出现 ×4、令牌 ×3）。
+    assert_eq!(
+        page.matches("__CSP_NONCE__").count(),
+        0,
+        "placeholders are injected"
+    );
+    assert_eq!(
+        page.matches("__SRV_TOKEN__").count(),
+        0,
+        "placeholders are injected"
+    );
+}
+
+// A1 的门禁本身在 `serve::run::tests`（三个用例：健康 / 损坏 / 缺失），
+// **进程边界**那一条在 `tests/serve_startup.rs`。
+//
+// 为什么不在这个文件里跑子进程：本模块的测试二进制在 `target/<profile>/deps/` 下，
+// cargo 在那里不保证注入 `CARGO_BIN_EXE_rapidocr`，靠"猜上一级目录"可能拿到
+// `cargo build` 留下的、**没有** `serve` feature 的旧可执行文件——那会让断言对象
+// 与本次构建无关。集成测试里有 cargo 的保证。
+
+// ------------------------------- A2：`POST /api/models/reverify`（清缓存 + 冷验证 + 重建引擎）
+
+/// B × A2 的端到端证据：**同体积 + 同 mtime** 的内容替换在真实服务路径上被抓住。
+///
+/// 旧的 `(path, size, mtime)` 身份对这次替换会命中缓存、继续报 `present`；现在
+/// `/api/models` 会把它报成 `corrupt`，并且在 `verification` 的成本账里留下两条痕迹：
+/// `partial_mismatches` 增长、本次 `cold_this_call` 至少 1（**只有它**被重新哈希）。
+#[test]
+fn models_detects_a_same_size_same_mtime_swap_through_the_content_windows() {
+    let dir = complete_model_dir("verify-window-swap");
+    let path = dir.join("rec.onnx");
+    let server = TestServer::start(TestOptions::new(dir, Scripted::fast()));
+
+    let first = server.get("/api/models").json();
+    assert_eq!(first["complete"], true, "{first}");
+    let mismatches_before = first["verification"]["partial_mismatches"]
+        .as_u64()
+        .expect("partial_mismatches");
+
+    // 同体积 + 把 mtime 写回原值：stat 身份三项全部不变。
+    let identity_before = FileIdentity::of(&path).expect("identity before the swap");
+    let before = std::fs::metadata(&path)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    let original = std::fs::read(&path).expect("read the healthy model");
+    std::fs::write(&path, corrupt_bytes(original.len())).expect("swap the content");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open to restore the timestamp");
+    file.set_modified(before).expect("write the old mtime back");
+    drop(file);
+    let identity_after = FileIdentity::of(&path).expect("identity after the swap");
+    assert_eq!(
+        identity_after.size(),
+        identity_before.size(),
+        "the size must be unchanged"
+    );
+    assert_eq!(
+        identity_after.modified(),
+        identity_before.modified(),
+        "the mtime must be written back"
+    );
+    assert_ne!(
+        identity_after.partial(),
+        identity_before.partial(),
+        "only the first/last 64 KiB windows can distinguish this swap"
+    );
+
+    let second = server.get("/api/models").json();
+    assert!(
+        second["verification"]["cold_this_call"]
+            .as_u64()
+            .expect("cold_this_call")
+            >= 1,
+        "the swap must force a re-hash (a stale hit would make this 0 and miss it): {second}"
+    );
+    assert!(
+        second["verification"]["partial_mismatches"]
+            .as_u64()
+            .expect("partial_mismatches")
+            > mismatches_before,
+        "the reason must be visible in the cost ledger: {second}"
+    );
+    assert_eq!(second["complete"], false, "{second}");
+    assert_eq!(second["corrupt"], json!(["rec.onnx"]), "{second}");
+
+    // 端点也报同一个结论（同一条哈希证据），并且 reason 说的是"内容变了"。
+    let response = server.post("/api/models/reverify", &[], b"");
+    assert_eq!(response.status, 200, "{}", response.text());
+    let body = response.json();
+    assert_eq!(body["corrupt"], json!(["rec.onnx"]), "{body}");
+    let culprit = body["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .find(|file| file["name"] == "rec.onnx")
+        .expect("the swapped file must be listed");
+    assert_eq!(culprit["state"], "corrupt", "{body}");
+    assert_eq!(
+        culprit["cause"], "first_sight",
+        "a forced verification never consults the cache, so its cause is the cold path: {body}"
+    );
+}
+
+/// 与夹具**同体积**的替换内容。
+///
+/// 同体积是这几条用例的要点：`(path, size, mtime)` 三项全部不变，因此只有首尾 64 KiB 的
+/// 局部摘要能把这次替换抓出来（旧身份下缓存会继续返回旧摘要，这正是 B 要收窄的窗口）。
+fn corrupt_bytes(size: usize) -> Vec<u8> {
+    let seed = b"corrupted model bytes";
+    (0..size).map(|index| seed[index % seed.len()]).collect()
+}
+
+/// A2：损坏但**存在**的模型 → 端点报 `corrupt`，并把服务留在**可定位的错误态**，
+/// 而不是"旧引擎继续 ready"。
+///
+/// 这是本端点的核心价值：只清缓存不重建引擎，页面上的按钮按下去什么都不会变——
+/// 流水线的会话缓存（按文件身份失效）可能仍然服务着磁盘上已经不是这个文件的模型。
+/// 因此这里断言的是**引擎状态本身**（`failed` + 点名文件 `rec.onnx`），
+/// 而不是一句"端点返回了 200"。
+///
+/// 夹具的写法：先让引擎**真正建起来**（健康模型），再让"服务看到的那份文件"变成
+/// 同体积的坏内容，最后调端点。恢复过程（写回正确字节 → ready）在
+/// [`reverify_restores_ready_and_rebuilds_the_engine_after_a_healthy_revert`] 里，
+/// 那条用例还断言了"会话真的被重建"。
+#[test]
+fn reverify_reports_a_corrupt_model_and_leaves_the_service_blocked_not_stale_ready() {
+    let dir = complete_model_dir("reverify-corrupt");
+    // 破坏**文本管线**里的识别模型：它才是引擎要加载的那一份，因此"服务的状态"会从
+    // `ready` 变成**可定位的错误态**（公式模型损坏只影响公式队列，普通 OCR 不受影响，
+    // 那是 M4 的正确行为，不是本用例要考察的东西）。
+    //
+    // 同体积 + 把 mtime 写回原值：`(path, size, mtime)` 三项全部不变。旧身份下缓存会
+    // 继续报 `present`（这正是 B 要收窄的窗口），因此这一条同时是局部摘要在真实服务
+    // 路径上的证据。
+    let path = dir.join("rec.onnx");
+    let before = std::fs::metadata(&path)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    let original = std::fs::read(&path).expect("read the healthy model");
+    assert!(
+        original.starts_with(b"test model file"),
+        "the fixture content must be the healthy one: {:?}",
+        String::from_utf8_lossy(&original)
+    );
+    std::fs::write(&path, corrupt_bytes(original.len())).expect("corrupt the recognizer");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open to restore the timestamp");
+    file.set_modified(before).expect("write the old mtime back");
+    drop(file);
+
+    let built = Arc::new(AtomicUsize::new(0));
+    let server = TestServer::start(TestOptions {
+        engine_factory: counting_engine_factory(Arc::clone(&built)),
+        ..TestOptions::new(dir.clone(), Scripted::fast())
+    });
+    // 启动期就如实报告：齐备性判定用的是同一份哈希证据，坏文件不会被当成好文件。
+    assert_eq!(
+        server.get("/api/status").json()["engine"]["state"],
+        "blocked_models_missing",
+        "the startup readiness check must already see the corrupt recognizer"
+    );
+    assert_eq!(built.load(Ordering::SeqCst), 0, "no session was created");
+
+    let response = server.post("/api/models/reverify", &[], b"");
+    assert_eq!(response.status, 200, "{}", response.text());
+    let body = response.json();
+    assert_eq!(
+        body["computed"].as_u64(),
+        Some(4),
+        "every file this run uses was re-hashed: {body}"
+    );
+    assert_eq!(body["corrupt"], json!(["rec.onnx"]), "{body}");
+    assert_eq!(
+        body["outcome"], "blocked_models_missing",
+        "the state must be locatable, not a stale ready: {body}"
+    );
+    assert_eq!(body["engine"]["state"], "blocked_models_missing", "{body}");
+    assert_eq!(body["engine"]["missing"], json!(["rec.onnx"]), "{body}");
+    let culprit = body["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .find(|file| file["name"] == "rec.onnx")
+        .expect("the corrupt file must be listed");
+    assert_eq!(culprit["state"], "corrupt", "{body}");
+    assert_eq!(
+        culprit["cause"], "first_sight",
+        "this call's cold verification has no earlier identity to compare against: {body}"
+    );
+    assert_eq!(culprit["digest_computed_this_call"], true, "{body}");
+
+    // 可定位的错误态：后续 OCR 得到 409（而不是"成功但用了旧模型"）。
+    let ocr = server.submit_ocr(b"image");
+    assert_eq!(ocr.status, 409, "{}", ocr.text());
+    assert_eq!(ocr.code(), "models_corrupt", "{}", ocr.text());
+    assert_eq!(
+        ocr.json()["detail"]["corrupt"],
+        json!(["rec.onnx"]),
+        "the 409 must name the file"
+    );
+    // 引擎没有被"重建成功"——模型不齐备时**不创建会话**。
+    assert_eq!(
+        built.load(Ordering::SeqCst),
+        0,
+        "a blocked model set must not create a session"
+    );
+}
+
+/// A2：健康文件被还原后，同一个端点把服务恢复成 `ready`，**并且真的重建了会话**。
+///
+/// "重建引擎"这一步如果只是清缓存，这个断言会失败（建会话次数不会增加）——
+/// 而用户看到的就是"按钮按下去模型没换"。
+#[test]
+fn reverify_restores_ready_and_rebuilds_the_engine_after_a_healthy_revert() {
+    let dir = complete_model_dir("reverify-revert");
+    let kept = dir.join("kept.onnx");
+    std::fs::write(&kept, std::fs::read(dir.join("rec.onnx")).expect("read")).expect("seed");
+    let built = Arc::new(AtomicUsize::new(0));
+    let server = TestServer::start(TestOptions {
+        engine_factory: counting_engine_factory(Arc::clone(&built)),
+        ..TestOptions::new(dir.clone(), Scripted::fast())
+    });
+    assert_eq!(server.get("/api/status").json()["engine"]["state"], "ready");
+    assert_eq!(built.load(Ordering::SeqCst), 1);
+
+    // 写坏 → 端点报 corrupt、引擎状态是可定位的错误态（`failed` + 点名文件）。
+    std::fs::write(dir.join("rec.onnx"), b"corrupted same-len").expect("corrupt");
+    let broken = server.post("/api/models/reverify", &[], b"").json();
+    assert_eq!(broken["outcome"], "failed", "{broken}");
+    assert_eq!(broken["corrupt"], json!(["rec.onnx"]), "{broken}");
+
+    // 还原成正确的字节 → 同一个端点必须恢复 ready，并重建会话（状态机是
+    // `failed → Loading → Ready`，这条边是合法的）。
+    std::fs::copy(&kept, dir.join("rec.onnx")).expect("restore the model");
+    let response = server.post("/api/models/reverify", &[], b"");
+    assert_eq!(response.status, 200, "{}", response.text());
+    let body = response.json();
+    assert_eq!(body["outcome"], "ready", "{body}");
+    assert_eq!(body["engine"]["state"], "ready", "{body}");
+    assert!(body["load_ms"].as_u64().is_some(), "{body}");
+    assert_eq!(body["content_changed"], json!([]), "{body}");
+    assert_eq!(body["missing"], json!([]), "{body}");
+    assert_eq!(
+        built.load(Ordering::SeqCst),
+        2,
+        "the endpoint must rebuild the engine, not just clear a cache"
+    );
+    assert_eq!(server.get("/api/status").json()["engine"]["state"], "ready");
+
+    // 恢复正常之后普通 OCR 也要能用（不是"只把状态字段改回 ready"）。
+    let id = server.submit_ocr(b"image").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    assert_eq!(
+        server.wait_terminal(&id, Duration::from_secs(20))["state"],
+        "succeeded"
+    );
+}
+
+/// A2：**缓存命中之后**调用本端点，摘要必须被**重新计算**（这就是"重新校验"的定义）。
+///
+/// 断言的是绝对数字：这个模型集里有 4 个本次运行会用到的文件（det/rec/dict/fx），
+/// 因此 `computed == 4`，且每个文件的 `cause` 都不是 `cache_hit`（冷验证不查缓存）。
+///
+/// 注：库的校验缓存与它的累计账都是**进程级**的（同一个进程看到的同一个文件只有一种
+/// 结论），而 `cargo test` 并行跑用例，因此这里只断言"缓存命中确实发生了"
+/// （`cold_this_call == 0` 且 `cache_hits` 增长），不去断言某个精确的增量。
+#[test]
+fn reverify_recomputes_digests_that_the_cache_would_have_answered() {
+    let dir = complete_model_dir("reverify-cold");
+    let server = TestServer::start(TestOptions::new(dir, Scripted::fast()));
+
+    // 预热缓存：两次 `/api/models` 全程命中，`cold_this_call == 0`。
+    let first = server.get("/api/models").json();
+    assert_eq!(first["verification"]["cold_this_call"], 0, "{first}");
+    let hits_before = first["verification"]["cache_hits"]
+        .as_u64()
+        .expect("cache_hits");
+    let second = server.get("/api/models").json();
+    assert_eq!(second["verification"]["cold_this_call"], 0, "{second}");
+    assert!(
+        second["verification"]["cache_hits"]
+            .as_u64()
+            .expect("cache_hits")
+            > hits_before,
+        "the cache really answered the files this time: {second}"
+    );
+
+    let response = server.post("/api/models/reverify", &[], b"");
+    assert_eq!(response.status, 200, "{}", response.text());
+    let body = response.json();
+    assert_eq!(
+        body["computed"].as_u64(),
+        Some(4),
+        "a cache hit must not survive the forced re-verification: {body}"
+    );
+    assert_eq!(body["verification"]["digests_computed"], 4, "{body}");
+    let files = body["files"].as_array().expect("files");
+    assert_eq!(files.len(), 4, "{body}");
+    for file in files {
+        assert_ne!(
+            file["cause"], "cache_hit",
+            "a forced verification never reports a cache hit: {body}"
+        );
+        assert_eq!(file["digest_computed_this_call"], true, "{body}");
+    }
+    // 请求体必须为空：这是无参数动作，任何 body 都是协议级错误。
+    let with_body = server.post("/api/models/reverify", &[], b"{}");
+    assert_eq!(with_body.status, 400, "{}", with_body.text());
+}
+
+/// A2：并发调用只有一个真的跑（**单飞**），另一个立刻 503 `busy`；并且整个序列
+/// **不在 accept 线程上**。
+///
+/// 确定性地构造"两个调用重叠"：靠 [`ServeContext::post_verify`] 把第一次调用精确地停在
+/// "校验结论已经算完、引擎还没重建"的窗口里——请求体因此也还没有发完。此时从**另一个
+/// 连接**发第二次请求，它必须立刻拿到 503（不排队）；而 `busy` 的响应正是在 accept 线程上
+/// 产生的，这就是"它没有被这个序列占住"的证据（旧实现在 accept 线程上跑的话，
+/// 第二次请求连响应都拿不到，会一直等到第一次结束）。
+#[test]
+fn concurrent_reverifications_are_single_flight_and_never_run_on_the_accept_thread() {
+    let dir = complete_model_dir("reverify-busy");
+    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
+    let server = TestServer::start(TestOptions {
+        post_verify: Some(Box::new(move || {
+            let _ = tx.send(());
+        })),
+        ..TestOptions::new(dir, Scripted::fast())
+    });
+
+    // 第一次调用：完整的请求字节（**空 body**），一次写完。
+    //
+    // 连接保持打开、响应尚未写出，因为这一次序列被 [`ServeContext::post_verify`] 的钩子
+    // 按在"校验已算完、引擎还没重建"的窗口里——"序列仍在进行"因此是确定的事实，
+    // 而不是靠时序猜出来的。
+    let mut stream = TcpStream::connect(server.addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("read timeout");
+    let head = format!(
+        "POST /api/models/reverify HTTP/1.1\r\nConnection: close\r\nHost: {}\r\n\
+         X-RapidOCR-Token: {}\r\nOrigin: {}\r\nContent-Length: 0\r\n\r\n",
+        server.host, server.token, server.origin
+    );
+    stream
+        .write_all(head.as_bytes())
+        .expect("write the request");
+    stream.flush().expect("flush");
+
+    // 服务端已经冷验证完（钩子被调用），但还没写响应。
+    rx.recv_timeout(Duration::from_secs(30))
+        .expect("the first call must reach the post-verification hook");
+
+    // 第二个连接：单飞资格已被第一次调用持有 → 立刻 503 busy，而不是排队。
+    let second = Instant::now();
+    let response = server.post("/api/models/reverify", &[], b"");
+    let elapsed = second.elapsed();
+    assert_eq!(response.status, 503, "{}", response.text());
+    assert_eq!(response.code(), "busy", "{}", response.text());
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the second call must not queue behind the first: {elapsed:?}"
+    );
+
+    // 第一次调用随后照常完成：连接关闭，响应是一个 200 + 逐文件结论。
+    let mut buffer = Vec::new();
+    stream
+        .read_to_end(&mut buffer)
+        .expect("read the first response");
+    let first = parse_response(&buffer);
+    assert_eq!(first.status, 200, "{}", first.text());
+    let body = first.json();
+    assert_eq!(body["computed"].as_u64(), Some(4), "{}", first.text());
+    assert_eq!(body["outcome"], "ready", "{}", first.text());
+}
+
+// ---------------------------------------------------------------- M4：评估
 /// `POST /api/evaluate`：清单里每个用例跑一次真实识别路径，返回**库的**汇总
 /// （`EvaluationSummary` + CLI 附加的运行时字段）。
 ///

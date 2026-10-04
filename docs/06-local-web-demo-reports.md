@@ -4431,3 +4431,514 @@ GATE_MEAN_CER_LITERAL=0.0863135185950055  GATE_ZERO_PIPELINE_FAILURES=True
    §5.3 里"当前 `ModelManifest` 与 `default_models.yaml` 是两套权威"这类**设计时**的描述）。
    本轮只改正了**与实现状态矛盾**的地方（状态行、§3/§4.2/§4.2.1/§4.4/§5.4/§7.2/§10/§11/§12/§13/§14/§15），
    没有重写历史盘点章节——那会让"当时的判断"不可追溯。
+
+# A1 / A2 / B 轮：启动期冷验证、运行期"重新校验"、身份加局部摘要
+
+**基线**：HEAD `c541486`（M1 评审修复轮交付），**未提交**（按要求）。本轮**不改 `docs/03`**
+（`git status --porcelain -- docs/03-…` 为空），`Temp/demo3-v2.html` 一个字节都没动
+（SHA-256 仍是 `14871FED101D11451F9B799FD199144D6CEC7874C5682D0D630DED1F5E3D46EE`，
+与 M3/M4/评审轮记录相同）。
+
+**本轮的性质**：M1 评审修复轮交付后的一轮复审提出 A1/A2/B 三项。三件事都是**保证强度**问题，
+不是"能被利用的洞"（服务仍然只监听 loopback 且每次启动一个令牌）——因此本轮的产出是
+"把保证写成它真正成立的样子"，并且把**确定性重查**做成两个真实入口。
+
+| 编号 | 根因（一句话） | 修复位置 |
+| --- | --- | --- |
+| A1 | 验证发生在**首次使用**：服务先跑起来，坏模型要等到第一次 OCR 才发现 | `cli.rs`（新开关）/ `run.rs`（`reverify_gate`）/ `README` |
+| A2 | 缓存按身份失效，但"同体积同 mtime 的替换"可能不被察觉 → **内存里的旧会话会继续服务一个磁盘上已经不是这个文件的模型**；而当时没有任何"重新读盘"的入口 | `model_plan.rs` / `server.rs` / `http.rs` / `web/index.html` |
+| B | 身份 `(path, size, mtime)` 对"同体积 + 同 mtime"的内容替换是盲区 | `model_verify.rs` / `model_set.rs` / `docs/05` |
+
+**变更规模**：`git diff --stat` = 13 个跟踪文件 **+2235 / −112**，另加新文件
+`tests/serve_startup.rs`（112 行，进程边界的集成用例）。
+
+## 环境
+
+| 项目 | 值 |
+| --- | --- |
+| target | `x86_64-pc-windows-msvc`（Windows x64 + MSVC ABI） |
+| 工具链 | rustc 1.98.1 / cargo 1.98.1 |
+| crate | `rapid-ocr-rs` 0.7.0（独立 git 仓库，基线 `c541486`，**未提交**） |
+| 真实资产（文本） | `OCR-Model/small/`、`OCR-Model/test-config-small.yaml`、`OCR-test-image/`（12 图 + `golden-manifest.json`） |
+| 真实资产（公式） | `OCR-Model/Formula-Recognition-Models/onnx/pp_formulanet_plus_m.onnx`（593,915,961 B）、`OCR-Model/Formula-Detection-Model/pix2text-mfd-1.5.onnx`、`Formula-TestSet/` |
+| 证据目录 | `target/reverify-gate/`（本轮全部门禁与实测）、`target/m1-review-evidence/`（沿用上一轮的脚本） |
+
+**改动过的对外签名（新增/改变的部分）**：
+
+```rust
+// src/model_verify.rs —— 身份的第二半 + "忽略缓存"的唯一入口 + 可见的原因
+pub const PARTIAL_DIGEST_WINDOW_BYTES: u64 = 64 * 1024;
+pub struct PartialDigest { /* size + 首 64 KiB 的 SHA-256 + 尾 64 KiB 的 SHA-256 */ }
+impl PartialDigest { pub fn compute(&Path, size: u64) -> Result<Self>; pub fn describe(&self) -> String; }
+pub struct FileIdentity { /* path + size + mtime + PartialDigest */ }
+pub enum ReverifyCause { FirstSight, StatChanged, ContentChanged, CacheHit }
+impl ReverifyCause { pub const fn as_str(self) -> &'static str; pub const fn computed(self) -> bool; }
+pub struct VerificationOutcome { /* … */ pub cause: ReverifyCause }
+pub struct VerificationStats { /* … */ pub partial_mismatches: u64, pub partial_reads: u64 }
+pub fn force_verify_file(&Path) -> Result<VerificationOutcome>;   // 不查缓存，现在就读盘
+
+// src/model_set.rs —— 让"这次真的算出来的摘要"可以被取走，比较规则仍然只有一份
+impl ModelFileSpec { pub fn state_in_digested(&self, root: &Path, digest: &mut String) -> (ModelFileState, bool) }
+
+// src/bin/serve/model_plan.rs
+impl ModelPlan { pub fn required_files(&self, use_cls: bool) -> Vec<(&ModelFileSpec, PathBuf)>;
+                 pub fn reverify(&self, use_cls: bool) -> PlanReverification }
+pub(crate) struct PlanReverification { /* files + digests_computed + content_changed */ }
+pub(crate) struct VerifiedPlanFile { pub name, pub role, pub pipeline, pub declared_sha256,
+                                     pub sha256, pub state, pub cause }
+
+// src/bin/serve/run.rs
+pub(crate) fn reverify_gate(&ModelPlan, use_cls: bool) -> Result<PlanReverification, ServeStartError>
+pub(crate) enum ServeStartError { /* … */ ModelsUnusable { report: Box<PlanReverification> } }
+
+// src/bin/serve/server.rs
+impl ServeShared { pub fn reverify_models(&self) -> Result<Value, ServeError> }
+pub(super) struct ServeContext { /* … */ pub post_verify: Option<Box<dyn Fn() + Send + Sync>> }
+
+// src/bin/serve/http.rs
+enum Route { /* … */ ModelsReverify }
+enum EngineWork { Reload(Option<ProviderPreference>), ReverifyModels }   // 同一条线程路径
+
+// CLI：--reverify-models（选项面 24 → 25，逐项枚举测试同步）
+```
+
+## A1 `--reverify-models`：启动期冷验证 + fail-fast
+
+**根因**：进程内的校验缓存是新进程里的空缓存，因此"清缓存"不是这个开关的价值；真正的缺口是
+**验证时机**——旧实现下服务先起来、第一次用到某个模型时才验证，一个 566 MB 的坏文件在
+"服务已经 Ready"之后才暴露。运维需要的是"这次要用的东西在启动时就核对过，不对就别起来"。
+
+**实现**（`run.rs::reverify_gate`，唯一实现，`run()` 与测试共用）：
+
+1. **范围 = 这次运行真正会加载的文件**（`ModelPlan::required_files`）：文本管线的
+   detector/recognizer/dictionary（`use_cls` 时再加 classifier）+ 公式管线的
+   formula_recognizer。**不是**整张默认表——把当前配置永远不会加载的模型也哈希一遍既是
+   纯浪费（566 MB 量级），也会让"启动失败"指向一个无关的文件。`--formula-detector` 声明的
+   检测模型不属于模型集，由加载路径自己按集合声明的摘要校验（P1-1 那条规则不变）；
+2. **冷验证**：每个文件都走库的 `force_verify_file`（不查缓存），逐文件打印一行
+   `状态 | cause | 这一次算没算摘要`，最后一行汇总文件数、真正算出的摘要数、缺失/损坏数；
+3. **fail-fast**：任一文件缺失或损坏 → `ServeStartError::ModelsUnusable`（错误里点名那些文件
+   + 逐文件结论），`run()` 在**绑定端口之后、建会话之前**返回，进程以非零状态退出；
+4. **自检**：拒绝启动前把 `report` 的文本阻塞清单与 `ModelPlan::snapshot()` 的清单比一次
+   （同一个磁盘状态上必须一致）。不一致只打印 WARNING 并继续按 `report` 拒绝——如果这里
+   `debug_assert`，那么"两次观察之间文件恰好被改动"会让服务直接 panic（一个拒绝启动的
+   路径不应该有这种失败模式）。
+
+**修改前后行为**：
+
+| 场景 | 修改前 | 修改后 |
+| --- | --- | --- |
+| 计划内模型损坏 + `--reverify-models` | 与不加开关完全一样：服务起来，第一次 OCR 才失败 | 启动期逐文件核对 → **拒绝启动**，`stderr` 点名文件与状态，`stdout` 留下逐文件结论 |
+| 计划内模型健康 + `--reverify-models` | — | 每个文件在启动日志里各有一行，`digests_computed == 本轮会加载的文件数` |
+| 默认表里**不会**被加载的模型 | — | **不参与**这次验证（不读它的几百 MB） |
+| 不加开关 | 缓存仍然在首次使用时验证（行为不变） | 同上，且启动日志明确写出"为什么现在不查、怎么让它查" |
+
+**证据（单元层，`serve::run::tests`，3 条）**：
+
+```text
+serve::run::tests::the_startup_gate_verifies_every_file_the_run_uses_with_a_fresh_digest
+serve::run::tests::the_startup_gate_refuses_to_start_and_names_the_corrupt_file
+serve::run::tests::the_startup_gate_refuses_a_missing_file_too
+```
+
+第一条断言的是**绝对数字**：`digests_computed == files.len()`（`force_verify_file` 从不命中
+缓存，因此这个数字不可能是"命中来的"），每个文件 `cause == first_sight`、
+`state == present`、`sha256` 有值；并且清单里**不**含 `manifest.json` 这类不在本轮范围内的
+文件。后两条断言错误文本里点名文件名 + 状态 + 开关名，且 `ModelsUnusable` 的清单里**只有**
+那一个坏文件。
+
+**证据（进程边界，`tests/serve_startup.rs`，1 条）**：
+
+```text
+tests/serve_startup.rs::the_serve_command_refuses_to_start_when_the_plan_model_is_missing
+  （真实的 rapidocr.exe + 真实命令行 + 真实退出码；CARGO_BIN_EXE_rapidocr 由 cargo 注入，
+    因此它一定指向本次 --features serve 构建出来的那个可执行文件）
+```
+
+它单独放在 `tests/` 而不是 `src/bin/serve/tests.rs` 的原因写在两个文件的注释里：单元测试
+二进制在 `target/<profile>/deps/` 下，cargo 在那里**不保证**注入 `CARGO_BIN_EXE_rapidocr`，
+"猜上一级目录"可能拿到 `cargo build` 留下的、没有 `serve` feature 的旧可执行文件——本轮
+第一版正是这样，测试实际上在对一个与本次构建无关的二进制断言。这是一处**被实测纠正的
+设计**，如实记录。
+
+## A2 `POST /api/models/reverify`：一次动作完成"重新读盘"
+
+**根因**：`RapidOcrEngine` 的公式会话缓存按文件身份失效，而身份对"同体积 + 同 mtime"的替换
+是盲区（B 收窄了它，但没有消灭它）。因此存在这样一条路径：磁盘上的模型已经被换掉，报告里
+看不出变化，**内存里的旧会话继续服务那个已经不是这个文件的东西**。当时没有任何入口能让
+用户/运维强制"现在重新读一遍盘"。
+
+**实现**（三步，缺一不可）：
+
+1. `clear_verification_cache()` —— 否则"重新校验"会在身份未变时立刻命中，什么都不会重算；
+2. `ModelPlan::reverify(use_cls)` —— 与 `--reverify-models` **同一个实现**、同一份声明
+   哈希比较规则（`ModelFileSpec::state_in_digested`），忽略缓存全部重算；
+3. `ensure_engine_loaded(true)` —— **引擎此前就绪就重建会话**。这一条是本端点的价值：
+   只清缓存不重建引擎，就等于一个按下去什么都不会变的按钮。
+
+响应（`docs/05` §5.5 冻结）给：逐文件 `{name, role, pipeline, state, declared_sha256, sha256,
+cause, digest_computed_this_call}`、`computed`（这一轮真的重算了几个**完整摘要**）、
+`content_changed`（stat 身份相同而首尾 64 KiB 不同的文件名）、以及
+`outcome`/`engine`/`load_ms`/`rollback_ms`/`error`（与 `POST /api/engine/reload` **同一套**
+语义）+ `verification` 成本账。
+
+**单飞与线程**：整个序列在独立线程里跑，资格用的是 `begin_provider_switch`（与
+`POST /api/engine/reload` **同一把**）——第二个并发调用立刻 **503 `busy`**，而 `busy` 的响应
+由 accept 线程产生，这正是"它没有被这个序列占住"的证据。请求体**必须为空**（有 body → 400）。
+
+**页面**（`src/bin/web/index.html`）：引擎面板下方新增常驻"重新校验"按钮 + 结论区
+（`role="status"`）。放在常驻位置而不是模型横幅里，因为横幅在模型齐备时是隐藏的，而这个动作
+在齐备时同样有意义。按页面既有写法接线：`addEventListener`（无内联 `onclick`）、CSS 类
+（无内联 `style`）、结果为 `null` 时明确渲染缺失（不伪造结论）、离线预览模式如实说明"没有
+服务端"。`__CSP_NONCE__` 仍是 4 处、`__SRV_TOKEN__` 仍是 3 处（冻结的占位符计数不变）。
+
+**修改前后行为**：
+
+| 场景 | 修改前 | 修改后 |
+| --- | --- | --- |
+| 模型文件在运行期被换掉 | 没有任何入口强制重新读盘；报告与内存会话都可能是旧的 | 一次点击 → 清缓存 → 冷验证 → 重建会话；响应逐文件说明状态与原因 |
+| 损坏但存在的模型 | — | 端点报 `corrupt`，引擎进入**可定位的错误态**（不是"旧引擎继续 ready"） |
+| 健康文件被还原 | — | 同一端点恢复 `ready` 并**真的重建会话**（建会话次数 +1） |
+| 同时对引擎做两件事 | `engine/reload` 之间互相单飞 | `reverify` 与 `reload` **共用同一把资格**，第二个 503 `busy` |
+
+**证据（HTTP 层，`serve::tests`，4 条）**：
+
+```text
+serve::tests::reverify_reports_a_corrupt_model_and_leaves_the_service_blocked_not_stale_ready
+serve::tests::reverify_restores_ready_and_rebuilds_the_engine_after_a_healthy_revert
+serve::tests::reverify_recomputes_digests_that_the_cache_would_have_answered
+serve::tests::concurrent_reverifications_are_single_flight_and_never_run_on_the_accept_thread
+serve::tests::the_page_carries_the_reverify_button_without_inline_handlers_or_styles
+```
+
+- 第 1 条：`rec.onnx` 被换成**同体积**内容并把 mtime 写回原值 → 启动期就报
+  `blocked_models_missing`（不建会话），端点报 `corrupt: ["rec.onnx"]`、`computed == 4`，
+  之后的 `POST /api/ocr` 是 409 `models_corrupt` 且点名文件；
+- 第 2 条：写坏 → 端点 `failed`；还原 → 端点 `ready` 且建会话次数 1 → 2（**真的重建**），
+  随后普通 OCR 成功（不是"只把状态字段改回 ready"）；
+- 第 3 条：预热缓存（`cold_this_call == 0`）之后调端点，`computed == 4` 且每个文件的
+  `cause != cache_hit`；有 body → 400；
+- 第 4 条：用 `ServeContext::post_verify` 这个**测试注入点**把第一次调用精确停在
+  "校验已算完、引擎未重建"的窗口里（生产路径该字段恒为 `None`），此时第二个连接立刻拿到
+  503 `busy`（< 5 s），随后第一次调用照常返回 200。**这条例外需要说明**：为了确定性地
+  观察单飞，`ServeContext` 多了一个仅测试可设的钩子；它不是生产路径的一部分。
+- 第 5 条：页面里 `id="verifyBtn"`、`/api/models/reverify`、`addEventListener`、
+  `role="status"` 都在，且**不存在**任何 `onclick=` / ` style="`；请求体为空字面量
+  `xhrSend('POST', '/api/models/reverify', '')`。
+
+## B 身份加"首尾各 64 KiB 的局部摘要"
+
+**根因**：`(path, size, mtime)` 对"同体积 + 同 mtime"的内容替换是盲区。这不是理论问题：
+`SetFileTime`（或同一时间戳粒度内的原地改写）就能构造它，而**同一个盲区**同时影响
+`/api/models` 的报告、公式准入与两条加载路径（它们共用这一份证据）。
+
+**实现**：
+
+- `PartialDigest::compute(path, size)` 一次 `open` + 两次定位读：首 `min(size, 64 KiB)` 字节、
+  尾 `min(size, 64 KiB)` 字节，各算一次 SHA-256，与体积一起构成摘要（体积参与编码）；
+- 命中判据从"stat 身份相同"变成"**体积相同 且 局部摘要相同**"。`mtime` 退回它本来的角色
+  （元数据），只在**报告/日志**里出现——把它当判据会让"原样复制文件"报出错误的
+  `content_changed`（见下一条）；
+- stat 相同而局部摘要不同 → **作废并重新完整哈希**，并如实留下 `cause = ContentChanged`；
+- 新增可见计数：`verification.partial_mismatches`（"内容变了"被抓住的次数）与
+  `verification.partial_reads`（局部读次数；每次校验恰好一次）；
+- `force_verify_file`（不查缓存）成为"确定性重查"的唯一库入口，A1/A2 都用它。
+
+**修改前后行为**：
+
+| 场景 | 修改前 | 修改后 |
+| --- | --- | --- |
+| 同体积 + 同 mtime，改动落在**头部** 64 KiB | 命中缓存 → 返回旧摘要（**漏报**） | `ContentChanged` → 完整重哈希 → 报 `corrupt` |
+| 同体积 + 同 mtime，改动落在**尾部** 64 KiB | 同上 | 同上 |
+| 同体积 + 同 mtime，改动只落在**中段** | 漏报 | **仍然漏报**（这是被测试钉住的限制，不是意外） |
+| 文件 ≤ 128 KiB | 漏报 | **不漏报**：首尾切片重叠，局部摘要覆盖整个内容 |
+| `mtime` 变了但内容一个字节没变 | 身份不等 → 完整重哈希（**多花一次 300 ms**） | 命中（内容没变），并如实报 `cache_hit` |
+| 每次校验的成本 | 一次 `stat` | 一次 `stat` + 128 KiB 顺序读 |
+
+**证据（库层，`model_verify::tests`，14 条；本轮新增/改写的 8 条）**：
+
+```text
+a_same_size_same_mtime_edit_in_the_head_is_detected_and_rehashed    （B-1a）
+a_same_size_same_mtime_edit_in_the_tail_is_detected_and_rehashed    （B-1b）
+a_same_size_same_mtime_edit_confined_to_the_middle_is_not_detected  （B-2，**限制本身**被钉住）
+a_file_smaller_than_the_window_is_fully_covered_by_the_partial_digest（B-3）
+empty_and_exactly_window_sized_files_are_well_defined               （边界：0 字节与正好 128 KiB）
+the_partial_digest_binds_the_first_and_last_window_only             （窗口只绑首尾；中段不动它）
+a_cache_hit_reads_only_the_windows_and_never_rehashes               （B-4：命中不完整哈希）
+an_mtime_only_change_still_hits_and_is_not_reported_as_a_content_change（原因必须是真实原因）
+```
+
+`a_same_size_same_mtime_edit_confined_to_the_middle_is_not_detected` 刻意断言**限制**：它同时
+断言 `force_verify_file` 会给出真实摘要并纠正缓存（"确定性逃生口真的有效"）。这样"把窗口
+当成保证"的改动会让测试失败，而不是只让文档变得不准确。
+
+**证据（HTTP 层）**：`serve::tests::models_detects_a_same_size_same_mtime_swap_through_the_content_windows`
+—— 同体积 + mtime 写回原值后，`/api/models` 报 `corrupt: ["rec.onnx"]`，
+`verification.partial_mismatches` 增长，且**这次调用**至少重算了 1 个摘要
+（`cold_this_call >= 1`）。
+
+**一处被实测纠正的断言**（如实记录）：这条用例最初断言 `cold_this_call == 1`（"只有它被重新
+哈希"）与 `partial_mismatches` 差值，在 `cargo test --all-targets` 下**偶发失败**——库的缓存
+与累计账都是**进程级**的，而"预热那一次 `/api/models`"是否真的命中取决于同一进程里另一个
+测试二进制（`--lib` 与 `serve` bin）的并行校验。修正方式不是放宽结论，而是把断言改成
+不依赖累计计数器的形式：枚举顺序（`FileIdentity::of`）先证明"体积与 mtime 完全相同、只有
+窗口不同"，再断言 `cold_this_call >= 1`（**旧身份下这里必然是 0**，也就是漏报）与
+`partial_mismatches` 增长。反过来，`model_verify` 的 14 条用例保留 `serial()` 串行锁，
+让"这一次算没算"这类**单次调用**的属性仍然可以被逐条断言。
+
+## 性能：`/api/models` 轮询成本（加局部摘要前后）与两条"强制重查"路径
+
+`target/reverify-gate/run-reverify-latency.ps1`（真实 release 服务 + 真实 566 MB 公式模型；
+输出 `target/reverify-gate/latency.log`）：
+
+```text
+startup: cold_this_call=0 cold_verifications=4 partial_reads=8 wall_ms=19.3
+
+round,wall_ms,cold_this_call,cold_verifications,cache_hits,partial_reads,partial_mismatches,last_cold_ms,last_cold_bytes
+cold round 1 (head window byte changed, stat identity restored),316.27,1,5,7,12,1,314.264,593915961
+cold round 2 (head window byte changed, stat identity restored),319.28,1,6,10,16,2,317.617,593915961
+cold round 3 (head window byte changed, stat identity restored),314.43,1,7,13,20,3,312.464,593915961
+restore re-hash (content windows changed back),338.04,1,8,16,24,4,336.372,593915961
+cache hit (identity unchanged),1.53,0,8,20,28,4,336.372,593915961
+cache hit (identity unchanged),1.29,0,8,24,32,4,336.372,593915961
+cache hit (identity unchanged),1.5,0,8,28,36,4,336.372,593915961
+cache hit (identity unchanged),1.45,0,8,32,40,4,336.372,593915961
+cache hit (identity unchanged),1.15,0,8,36,44,4,336.372,593915961
+
+COLD   /api/models (566 MB re-hashed because the head window changed): mean=316.66 ms over 3 rounds; per-call cold_this_call=1
+CACHED /api/models (identity unchanged, 128 KiB windows read): mean=1.38 ms, max=1.53 ms over 5 rounds; per-call cold_this_call=0
+RESTORE (the 566 MB copy came back): 338.04 ms, cold_this_call=1 partial_mismatches=4
+SPEEDUP: 229.5x
+BASELINE (before B, same machine/protocol): cached mean=0.80 ms, max=1.34 ms; cold mean=315.12 ms
+POLL DELTA: 0.58 ms per /api/models (this is the price of the 128 KiB windows)
+```
+
+- **轮询成本（前 → 后）**：稳态均值 **0.80 ms → 1.38 ms**（max 1.34 ms → 1.53 ms），即
+  **每个 `/api/models` 多约 0.58 ms**；这 0.58 ms 就是 4 个文件 × 128 KiB 的顺序读。
+  这个变化在页面 8 s 轮询的尺度上不可观察，而且它买到的是"同体积 + 同 mtime 的替换不再
+  静默通过"。
+- **冷验证成本**：**316.66 ms**（`last_cold_bytes = 593,915,961`），与加局部摘要前的
+  315.12 ms 在噪声内相同——因为 128 KiB 相对于 566 MB 是 0.02%。
+- **"只改 mtime"不再是重哈希的理由**（这一条与 B 的设计直接相关）：第一版测量脚本用
+  `LastWriteTime = Get-Date` 制造"冷"，结果 `cold_this_call=0`——因为新判据看的是**内容窗口**
+  而不是 mtime，内容没变就该命中。要真正强制一次完整重哈希，必须让**首 64 KiB 变化**
+  （脚本改成改写第 0 个字节并把 mtime 写回原值），这正是 `cold round` 那一组做的事，
+  `partial_mismatches` 逐轮 +1 就是证据。
+  **这处"测量脚本第一版测错了东西"如实记录**：旧口径下的"冷"在新实现里根本不是冷。
+- **启动期 `--reverify-models` 成本**（`target/reverify-gate/serve-reverify-startup.log`）：
+
+```text
+serve: --reverify-models PP-OCRv6_det_small.onnx (detector) present sha256=090f04abcd9d9a74 | first_sight | digest computed by this call: true
+serve: --reverify-models PP-OCRv6_rec_small.onnx (recognizer) present sha256=6f327246b50388f3 | first_sight | digest computed by this call: true
+serve: --reverify-models ppocrv6_dict.txt (dictionary) present sha256=b5f2bfe2bdd94484 | first_sight | digest computed by this call: true
+serve: --reverify-models pp_formulanet_plus_m.onnx (formula_recognizer) present sha256=71b6d389cf7b857e | first_sight | digest computed by this call: true
+serve: --reverify-models verified 4 file(s) in 343 ms (4 full digest(s) computed by this call, 0 missing/corrupt)
+```
+
+  **启动期验证的墙钟成本 = 343 ms**（4 个文件，其中 566 MB 那个占绝大部分），每个文件一行，
+  `digest computed by this call: true` 逐行可见。
+
+- **运行期 `POST /api/models/reverify` 成本**（同一脚本，引擎已是 ready）：
+
+```text
+POST /api/models/reverify: HTTP 200 wall_ms=453.39 outcome=ready computed=4 content_changed= load_ms=448
+  reverify file PP-OCRv6_det_small.onnx role=detector pipeline=text state=present cause=first_sight computed=True
+  reverify file PP-OCRv6_rec_small.onnx role=recognizer pipeline=text state=present cause=first_sight computed=True
+  reverify file ppocrv6_dict.txt role=dictionary pipeline=text state=present cause=first_sight computed=True
+  reverify file pp_formulanet_plus_m.onnx role=formula_recognizer pipeline=formula state=present cause=first_sight computed=True
+```
+
+  **453 ms**，其中 `load_ms = 448 ms` 是重建会话（真实 ONNX 会话创建），余下是 4 个文件的
+  冷验证。也就是说这个端点的成本**由"重建引擎"主导**，而不是由多读一次盘主导——这正是
+  "必须有第 3 步"的量化理由。
+
+## 验证
+
+### 1. 静态检查、feature 矩阵与 release 构建（全部 exit 0）
+
+`target/reverify-gate/run-gates.ps1` → `target/reverify-gate/gates.log`：
+
+| # | 命令 | 结果 |
+| --- | --- | --- |
+| 1 | `cargo fmt --all -- --check` | 0 |
+| 2 | `cargo clippy --all-targets -- -D warnings` | 0 |
+| 3 | `cargo clippy --features serve --all-targets -- -D warnings` | 0 |
+| 4 | `cargo test --all-targets` | **401 passed**（lib）+ 2 + 4 + 14 + 0，**0 failed** |
+| 5 | `cargo test --features serve --all-targets` | **401 passed**（lib）+ 2 + 4 + 14 + **242 passed**（bin）+ **1 passed**（`serve_startup` 集成），**0 failed** |
+| 6 | `cargo build --release --bins` | 0 |
+| 7 | `cargo build --release --features serve --bins` | 0 |
+
+本轮新增 **17 个库单测**（384 → 401：`model_verify` 11 → 14、`cli` +1、`run` +3、
+`serve::tests` +5、集成 +1，另有若干条既有用例的断言被**加强**而不是弱化）。改动过的既有
+断言只有两类**预期行为发生正确变化**的原因：
+
+1. `/api/models.verification.identity` 的字面量（`path + size + mtime` →
+   `… + SHA-256 of the first and last 64 KiB`），并**新增** `partial_window_bytes`、
+   `partial_reads`、`residual_blind_spot` 含 "not a security boundary" 的断言；
+2. `the_serve_command_cold_verifies_at_startup_and_exits_non_zero_on_a_corrupt_model` 从
+   `src/bin/serve/tests.rs`（单元测试目标，拿不到 `CARGO_BIN_EXE_rapidocr`）**搬到**
+   `tests/serve_startup.rs`（集成测试，cargo 保证注入）——不是因为断言太严，而是因为它在
+   原来的位置上断言的是**另一个二进制**。
+
+**没有跳过、没有弱化、没有删除任何既有断言。** 另外 `cargo fmt --all` 改动了若干处本轮之前
+就不符合 rustfmt 的格式（`docs/05` 未涉及）。
+
+### 2. 依赖隔离（三份依赖树与 M4 / 评审快照**逐行 0 差异**）
+
+`Cargo.toml` 的 `[dependencies]` / `[features]` 未改；新增的只是一个**测试目标**声明
+（`[[test]] serve_startup` + `required-features = ["serve"]`，见 `src/bin/serve/mod.rs` 的边界
+测试与下表）。
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo tree -e normal -p rapid-ocr-rs` | **606 行**，与 `target/review-gate/tree-default-normalized.txt` **逐行相同**；`tiny_http` **0** 次 |
+| `cargo tree -e normal --no-default-features` | **605 行**，与快照逐行相同；`tiny_http` **0** 次 |
+| `cargo tree -e normal -p rapid-ocr-rs --features serve` | **611 行**，与快照逐行相同；`tiny_http` **1** 次 |
+
+（`serve::dependency_boundary::{the_http_dependency_is_optional_and_outside_the_default_feature,
+the_http_dependency_lives_only_in_the_http_module}` 两条边界断言同时通过：
+`tiny_http` 只出现在 `src/bin/serve/http.rs`。）
+
+### 3. `cargo package --allow-dirty` 与打包树的 `--features serve` 检查
+
+```text
+Packaged 191 files, 14.2MiB (3.3MiB compressed)
+Verifying rapid-ocr-rs v0.7.0 (…\target\package\rapid-ocr-rs-0.7.0)
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.90s     （exit 0）
+```
+
+`cargo package --list` 里 `src/model_verify.rs`、`src/bin/web/index.html`、
+`src/bin/serve/model_plan.rs`、`tests/serve_startup.rs` 都在；打包树上的
+`cargo check --features serve --all-targets`（`target/package/rapid-ocr-rs-0.7.0`）**exit 0**
+（24.23 s），日志 `target/reverify-gate/package-serve-check.log`。
+
+### 4. 12 图硬门槛（`target/reverify-gate/`，**没有**覆盖 `tests/baseline/`）
+
+`target/reverify-gate/run-hard-gates.ps1` → `hard-gates.log`：
+
+| 门槛 | 要求 | 本次实测（release） | 比较方式 | 结论 |
+| --- | --- | --- | --- | --- |
+| 12 图区域数均值 | `34.833333333333336` | **`34.833333333333336`**（36 样本） | 原始 JSON 的**数字字面量**精确比较 | True |
+| 12 图 mean CER | `0.44765135645866394` | **`0.44765135645866394`**（12 例） | 同上 | True |
+
+`tests/baseline` 未被改动（脚本内 `git status --porcelain -- tests/baseline` 为空，
+`bench-cpu-2000.json` 的 `regions.avg` 与本次字面量相同）。
+
+### 5. 12 图 HTTP 与 CLI 逐张一致（**12/12**，真实服务 + 真实模型）
+
+`target/reverify-gate/run-12-images.ps1` → `http-vs-cli.log`：
+
+```text
+models: complete=True formula.complete=True formula.routing=False
+verification: identity='path + size + mtime + SHA-256 of the first and last 64 KiB' window=65536
+verification: cold_this_call=0 cold_verifications=4 cache_hits=4 partial_reads=8 partial_mismatches=0
+…（逐张 regions 数与 recognition.text 序列全等，明细在 http-vs-cli.log）
+TOTAL serve=418 cli=418 images=12
+ALL_12_MATCH=True
+second /api/models: cold_this_call=0 cache_hits=8 partial_reads=12
+POLLING_DOES_NOT_REHASH=True
+POST /api/models/reverify: HTTP 200 wall_ms=546 outcome=ready computed=4 content_changed= load_ms=541
+```
+
+（真实资产上的 `reverify` 比测量脚本里的 453 ms 稍慢：这一次服务刚跑完 12 张图，
+引擎重建 541 ms。**数值如实记录，不取最好的一次。**）
+
+### 6. 环境变量门控的 `formula_integration_tests`（真实模型，0 skipped）
+
+```powershell
+$env:RAPID_OCR_MODEL_ROOT='D:\100_Projects\110_Daily\SnapClip\OCR-Model'
+$env:RAPID_OCR_FORMULA_TEST_ROOT='D:\100_Projects\110_Daily\SnapClip\Formula-TestSet'
+cargo test --lib formula_integration_tests -- --test-threads=1
+```
+
+**12 passed, 0 failed, 0 ignored**（89.59 s），`skipping test` 出现 **0** 次
+（→ 真的加载了 566 MB 公式识别模型与真实页面）。日志：
+`target/reverify-gate/formula-integration.log`。其中
+`a_replaced_formula_detector_is_reverified_instead_of_reused` 正是"会话缓存按文件身份失效"
+那一条，本轮改了身份的定义，因此它是必须重跑的回归。
+
+### 7. im2latex-100 smoke（**本轮改动了公式加载路径共用的校验入口，因此必须跑**）
+
+```powershell
+target\release\formula_eval.exe --model <OCR-Model>\…\pp_formulanet_plus_m.onnx `
+  --dataset-root D:\100_Projects\110_Daily\SnapClip\Formula-TestSet `
+  --dataset im2latex --split test --limit 100 `
+  --expect-manifest target\formula-eval\manifest-im2latex-100.json `
+  --output target\reverify-gate\formula-im2latex-100.json
+```
+
+`target/reverify-gate/im2latex-smoke.log`：
+
+```text
+done: total=100 scored=100 exact=0.2400 normalized=0.2500 mean_cer=0.0863 pipeline_failures=0
+      model_mismatches=76 truncated=0 load_ms=1306.8 wall_ms=69121.2
+new summary: total=100 scored=100 pipeline_failures=0 exact=24 normalized=25 truncated=0
+             exact_rate=0.24 normalized_rate=0.25 mean_cer=0.0863135185950055
+old summary: 与上面逐字段相同
+MANIFEST_MATCH=True  SAMPLE_SET_MATCH=True  CONTENT_MATCH=True
+records new=100 old=100   PER_SAMPLE_IDENTICAL=True   TOKEN_IDS_IDENTICAL=True
+GATE_EXACT_RATE_24=True  GATE_NORMALIZED_RATE_25=True
+GATE_MEAN_CER_LITERAL=0.0863135185950055  GATE_ZERO_PIPELINE_FAILURES=True
+```
+
+即 **24.00% / 25.00% / 0.0863 / 0 pipeline failures** 全部复现，且与上一里程碑的
+`target/formula-eval/im2latex-100.json` **逐样本**相同（含全部 token ids）。
+
+### 8. `docs/05` 与 `README` 的改动（A3：把保证写成它真正成立的样子）
+
+| 位置 | 改动 |
+| --- | --- |
+| `docs/05` §3 | 新增 `--reverify-models`（含范围、代价、与"清缓存"的区别） |
+| §4.2 端点表 | 新增 `POST /api/models/reverify`（三步、空 body、单飞、独立线程） |
+| §4.2.1 残留盲区 | 从"`(size, mtime)` 近似"改成"**同体积 + 同 mtime + 首尾 64 KiB 逐字节相同**"，并写明局部摘要是**启发式而不是安全边界**、两个确定性入口、以及小于 128 KiB 的明确规则 |
+| §5.4 响应 | `verification` 增加 `partial_window_bytes`/`partial_reads`/`partial_mismatches`/`guarantee`/`force_check`，`residual_blind_spot` 换成收窄后的文本 |
+| **§5.5（新）** | `POST /api/models/reverify` 的响应形状与逐字段语义（含"为什么必须有第 3 步"） |
+| §9.2 布局 | 引擎面板下方的"重新校验"按钮与结论区（含"为什么放在常驻位置"） |
+| §10 第 10 条 | 身份定义、命中成本、以及"需要确定性重查时的两个入口" |
+| §11 | 新增"A1/A2/B"清单，逐条指向被改正的章节 |
+| §12 | 新增 3 行验证计划（启动期冷验证 / 运行期重新校验 / 局部摘要） |
+| `README` "Model integrity" | 新增一节"What the digest cache does — and does not — guarantee"：把保证原句、盲区、启发式定位与两个确定性入口写清楚 |
+
+`docs/03` 未改动。
+
+## 关键行为对比（AGENTS.md §9）
+
+| 项目 | 修改前 | 修改后 | 预期结果 |
+| --- | --- | --- | --- |
+| 启动期验证时机 | 首次使用（服务已 Ready 之后） | `--reverify-models` 时在**建会话之前**，缺失/损坏 → 非零退出并点名文件 | A1 |
+| 运行期"重新读盘" | **没有入口** | `POST /api/models/reverify`：清缓存 → 冷验证 → 重建会话 | A2 |
+| 模型被换成"同体积 + 同 mtime"的另一份内容 | 缓存命中 → 报告与内存会话都停在旧结论 | 首尾 64 KiB 变化 → 重新完整哈希 → 报 `corrupt`（`content_changed`/`partial_mismatches` 可见） | B |
+| 同一替换只改**中段** | 漏报 | **仍然漏报**（被测试钉住的限制，文档同时写明） | 如实 |
+| `size ≤ 128 KiB` 的替换 | 漏报 | 不漏报（首尾重叠 ⇒ 覆盖整个内容） | B |
+| 只改 mtime（内容不变） | 完整重哈希（约 300 ms） | 命中（`cache_hit`），并如实报"不是内容变化" | 原因必须真实 |
+| `/api/models` 稳态轮询 | 0.80 ms | **1.38 ms**（+0.58 ms = 4 × 128 KiB） | 轮询成本仍可忽略 |
+| 引擎序列的单飞 | `engine/reload` 之间 | `reverify` 与 `reload` **共用同一把资格**（第二个 503 `busy`） | §4.2、§7.6 |
+| 库依赖图 | 606 / 605 / 611 行 | **逐行相同**（`tiny_http` 0/0/1） | 不得泄漏进默认构建 |
+| 12 图硬门槛 / HTTP-vs-CLI / im2latex-100 | `34.833333333333336` / `0.44765135645866394` / 12-12 / 24.00%·25.00%·0.0863 | **完全相同** | 无回归 |
+
+## 未覆盖风险与**做不到的事**（如实）
+
+1. **未提交、未在干净 clone 上验证**：按要求不 commit；证据来自当前工作树（`c541486` + 本轮改动）。
+2. **局部摘要不是安全边界**（本轮的核心限制，重复一次）：能写文件的人可以保留首尾、只改中段；
+   `mtime` 不可得时身份里没有它，同类替换同样落在盲区里。它收窄的是"误判"概率。
+3. **A2 的单飞测试用了一个仅测试可设的钩子**：`ServeContext.post_verify` 生产路径恒为 `None`。
+   没有它，唯一的替代是 sleep 猜时序（那会让"第一个序列仍在进行"变成概率事件）。这是
+   "为了可断言性引入一个测试注入点"的取舍，注入点本身在代码里被点名说明。
+4. **`Ready → (文件被破坏) → ?` 的状态机边**：`docs/05` §7.6 的转换表里没有
+   `Ready → BlockedModelsMissing`，因此"引擎已就绪之后计划内文件被破坏"的诚实结论文案是
+   `Failed` + `reason` 点名文件（`Loading → Failed`），不是 `blocked_models_missing`。
+   本轮的用例因此断言"**不是** stale ready + 点名文件 + 后续 409"，而不是一个文档里不存在的状态。
+   这是上一轮就存在的设计事实，本轮**首次把它写清楚**（测试注释与本节）。
+5. **`/api/models` 的冷/热数字是单机、单次采样**：3 次冷 + 5 次命中，页缓存是热的；
+   磁盘更冷时冷验证会更慢（M4 记录过约 1 s），命中侧（`stat` + 128 KiB）与文件大小无关，
+   因此结论不依赖那个假设，但**倍数**会随冷侧变化。基线（0.80 ms）来自上一轮同一台机器、
+   同一份脚本协议。
+6. **A1 的"健康模型"用例在单元层不断言"服务真的接受请求"**：夹具文件不是有效的 ONNX，
+   真实建会话会在更后面失败。进程边界的那条用例证的是**拒绝启动**（损坏/缺失），
+   "健康 → 真的开始服务"由本轮的 12 图 HTTP 用例（真实模型 + 真实服务）覆盖。
+7. **`cargo package` 的 serve 检查在打包树上跑**（`target/package/rapid-ocr-rs-0.7.0`），
+   不是在一个全新的干净 clone 上；依赖来自本机 cargo 缓存，无网络。
+8. **页面按钮只做了结构与接线断言**：`serve::tests` 断言按钮、端点字面量、
+   `addEventListener`、`role="status"`、无内联 handler/style；**没有**浏览器自动化
+   （本轮没有运行 Playwright 一类的驱动）。JS 语法用 `node --check` 对抽取出的
+   `<script>` 块验证通过（`target/tmp/page-script.js`）。

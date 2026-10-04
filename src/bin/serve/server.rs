@@ -37,8 +37,9 @@ use rapid_ocr_rs::{
     ALLOWED_DOWNLOAD_HOSTS, DetectionPolicy, DownloadError, FormulaPolicy, ImageInput,
     ModelFileSpec, ModelFileState, ModelRole, OcrOutput, OcrRequest, OrtRuntimeFingerprint,
     OutputPolicy, PreprocessPolicy, ProviderPreference, RapidOcrError, RecognitionPolicy,
-    StagePlan, WordOutputMode, available_disk_bytes, ort_runtime_fingerprint, ort_runtime_version,
-    peak_memory_source, peak_working_set_bytes, verification_stats,
+    StagePlan, WordOutputMode, available_disk_bytes, clear_verification_cache,
+    ort_runtime_fingerprint, ort_runtime_version, peak_memory_source, peak_working_set_bytes,
+    verification_stats,
 };
 use serde_json::{Value, json};
 
@@ -56,7 +57,8 @@ use super::jobs::{
 };
 use super::limits::ServeLimits;
 use super::model_plan::{
-    FormulaDetectorSpec, ModelPlan, ModelReport, ModelSnapshot, PendingDownload, source_label,
+    FormulaDetectorSpec, ModelPlan, ModelReport, ModelSnapshot, PendingDownload,
+    PlanReverification, VerifiedPlanFile, source_label,
 };
 use super::queue::{DualQueueScheduler, QueueClass, ScheduledJob, SchedulerConfig};
 use super::results::{Outcome, ResultStore, SerializeError, Succeeded, serialize_bounded};
@@ -205,6 +207,12 @@ pub(super) struct ServeContext {
     pub engine_factory: EngineFactory,
     pub downloader: DownloaderFactory,
     pub free_space: FreeSpaceFactory,
+    /// `/api/models/reverify` 的**测试注入点**：冷验证返回之后、重建引擎之前调用一次。
+    ///
+    /// 生产路径永远是 `None`。存在的理由只有一个：单飞（"第二个并发调用得到 503 `busy`"）
+    /// 必须被**确定性地**观察到，而不是靠 sleep 猜时序——有了它，测试可以把第一次调用
+    /// 精确地停在"校验结论已经算完、引擎还没重建"的窗口里，然后从另一个连接发第二次请求。
+    pub post_verify: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 /// 保留的**原图编码字节**（§4.5：只保留编码字节，绝不保留解码结果）。
@@ -366,6 +374,8 @@ pub(super) struct ServeShared {
     engine_factory: EngineFactory,
     downloader: DownloaderFactory,
     free_space: FreeSpaceFactory,
+    /// 见 [`ServeContext::post_verify`]（生产路径永远是 `None`）。
+    post_verify: Option<Box<dyn Fn() + Send + Sync>>,
     shutting_down: AtomicBool,
 }
 
@@ -1444,6 +1454,47 @@ impl ServeShared {
         self.apply_provider(requested, started)
     }
 
+    /// `POST /api/models/reverify`：一次动作完成"重新读盘"（A2）。
+    ///
+    /// 三步，缺一不可：
+    ///
+    /// 1. **清掉校验缓存**：否则"重新校验"会在身份未变时立刻命中，什么都不会重算；
+    /// 2. **冷验证这次运行会用的每一个文件**（[`ModelPlan::reverify`]，与
+    ///    `--reverify-models` **同一个**实现、**同一条**声明哈希规则）：逐文件给出
+    ///    状态 + 这一轮真正算出的摘要 + `cause`；
+    /// 3. **重建引擎**（如果它此前是 `Ready`）：这是本端点的价值所在——流水线的会话缓存
+    ///    按文件身份失效，但"文件被换成同体积同 mtime 的另一份内容"这类替换可能不被身份
+    ///    察觉，于是**内存里的旧会话会继续服务一个磁盘上已经不是这个文件的模型**。
+    ///    只清缓存不重建引擎，就等于一个按下去什么都不会变的按钮。
+    ///
+    /// `outcome`/`load_ms`/`rollback_ms`/`error` 与 `POST /api/engine/reload` **同一套语义**
+    /// （`loaded` 之外的三种都如实区分：`blocked_models_missing` 是"定位错误态"而不是
+    /// "还留着旧引擎的假 ready"）。
+    ///
+    /// 单飞由 [`Self::begin_provider_switch`] 保证（第二个并发调用 503 `busy`），
+    /// 且整个序列在**独立线程**里执行——accept 线程绝不建立会话（§8.2、评审 P2-2）。
+    pub fn reverify_models(&self) -> Result<Value, ServeError> {
+        let started = Instant::now();
+        // 第 1 步：清缓存（"重新校验"的前提）。
+        clear_verification_cache();
+        // 第 2 步：冷验证这次运行会用的文件（忽略缓存，全部重算）。
+        let report = self
+            .model_plan
+            .reverify(self.plan_snapshot().engine.global.use_cls);
+        // 紧接冷验证之后取一次状态：它的 `cold_this_call` 就是**这一次**的重算数
+        // （再晚一点取，后面的步骤会让它变成 0——读者会把"什么都没算"当成结论）。
+        let status = self.models();
+        // 测试注入点（生产路径为 `None`）：把第一次调用停在"校验已算完、引擎未重建"的窗口里。
+        if let Some(hook) = &self.post_verify {
+            hook();
+        }
+        // 第 3 步：重建引擎。`ensure_engine_loaded(true)` 的语义就是"按磁盘上的当前文件
+        // 重新建立会话"；文件缺失/损坏时它会进入 `blocked_models_missing`/`failed`，
+        // 绝不留下一个与磁盘不一致的 ready 引擎。
+        let outcome = self.ensure_engine_loaded(true);
+        Ok(self.engine_response_with_report(outcome, started, None, None, &report, &status))
+    }
+
     /// 取得"由我执行这次建会话序列"的资格（同时只允许一个）。
     ///
     /// 第二个并发请求拿到 `None` → 503 `busy`（**不排队**：排队只会让两个客户端都等到
@@ -1624,6 +1675,90 @@ impl ServeShared {
         rollback_ms: Option<u64>,
     ) -> Value {
         let report = self.models();
+        self.engine_response(outcome, started, error, rollback_ms, &report)
+    }
+
+    /// [`Self::engine_payload`] 的实现：`report` 由调用方给出，因此 `POST /api/models/reverify`
+    /// 可以把它**这一轮冷验证**的那一份报告（含 `cold_this_call`）带进响应，
+    /// 而不是再算一份新的、看起来"什么都没算"的报告。
+    fn engine_response(
+        &self,
+        outcome: EngineLoad,
+        started: Instant,
+        error: Option<String>,
+        rollback_ms: Option<u64>,
+        report: &ModelReport,
+    ) -> Value {
+        let base = self.engine_payload_json(outcome, started, error, rollback_ms, report);
+        let Value::Object(mut object) = base else {
+            return base;
+        };
+        object.insert(
+            "verification".to_string(),
+            verification_json(report.cold_this_call()),
+        );
+        Value::Object(object)
+    }
+
+    /// `POST /api/models/reverify` 的响应体（见 [`Self::reverify_models`]）。
+    ///
+    /// 在 [`Self::engine_response`] 的基础上加三块：
+    ///
+    /// - `files[]`：这次冷验证的**逐文件结论**（状态 + 这一轮算出的摘要 + `cause`）；
+    /// - `computed` / `content_changed`：这一轮真的重算了几个完整摘要、哪些文件是
+    ///   "stat 身份没变但首尾 64 KiB 变了"（后者是局部摘要抓住的替换，必须可见）；
+    /// - `verification.digests_computed`：把 `computed` 与"轮询时不再重哈希"的那本账
+    ///   放在同一个块里，读者不必在两处之间猜口径。
+    fn engine_response_with_report(
+        &self,
+        outcome: EngineLoad,
+        started: Instant,
+        error: Option<String>,
+        rollback_ms: Option<u64>,
+        verified: &PlanReverification,
+        report: &ModelReport,
+    ) -> Value {
+        let base = self.engine_response(outcome, started, error, rollback_ms, report);
+        let Value::Object(mut object) = base else {
+            return base;
+        };
+        object.insert(
+            "files".to_string(),
+            Value::Array(verified.files().iter().map(plan_file_json).collect()),
+        );
+        object.insert(
+            "computed".to_string(),
+            Value::from(verified.digests_computed()),
+        );
+        object.insert(
+            "content_changed".to_string(),
+            Value::Array(
+                verified
+                    .content_changed()
+                    .iter()
+                    .map(|name| Value::from(name.clone()))
+                    .collect(),
+            ),
+        );
+        // `verification.cold_this_call` 已经是这一轮的重算数；这里再补一个与
+        // `computed` 同值的字段，让"这一次算了几个摘要"在同一个块里就能读到。
+        if let Some(Value::Object(verification)) = object.get_mut("verification") {
+            verification.insert(
+                "digests_computed".to_string(),
+                Value::from(verified.digests_computed()),
+            );
+        }
+        Value::Object(object)
+    }
+
+    fn engine_payload_json(
+        &self,
+        outcome: EngineLoad,
+        started: Instant,
+        error: Option<String>,
+        rollback_ms: Option<u64>,
+        report: &ModelReport,
+    ) -> Value {
         let provider = self.provider_status();
         let outcome_label = match (&error, outcome) {
             (Some(_), EngineLoad::Ready) => "rolled_back",
@@ -1827,6 +1962,7 @@ impl ServeRuntime {
             engine_factory: context.engine_factory,
             downloader: context.downloader,
             free_space: context.free_space,
+            post_verify: context.post_verify,
             shutting_down: AtomicBool::new(false),
         });
 
@@ -2227,28 +2363,65 @@ fn render_error_body(body: &ErrorBody) -> Vec<u8> {
     serde_json::to_vec(body).expect("ErrorBody serialization cannot fail")
 }
 
-/// `/api/models` 的 `verification` 块：**哈希校验的成本账**。
+/// `POST /api/models/reverify` 的 `files[]` 元素：**这一次冷验证**的逐文件结论。
 ///
-/// `/api/models` 对每个文件都用库的**身份键控校验缓存**（键 = 路径 + 体积 + mtime）：
-/// 首次见到某个身份时真的读盘哈希（566 MB 公式模型约 1 s），命中只花一次 `stat`。
-/// 页面每 8 s 轮询一次就绪状态，因此这里把三件事都说清楚：
+/// 与 `/api/models.sets[].files[]` 的区别是"这是一次真正的读盘结论"：
+/// `sha256` 是这一轮算出来的摘要（不是声明值），`cause` 说明为什么会重算
+/// （冷验证因此永远是 `first_sight` 或 `content_changed`，绝不可能是 `cache_hit`）。
+fn plan_file_json(file: &VerifiedPlanFile) -> Value {
+    json!({
+        "name": file.name,
+        "role": file.role.as_str(),
+        "pipeline": file.pipeline.as_str(),
+        "state": file.state.as_str(),
+        "declared_sha256": file.declared_sha256,
+        "sha256": file.sha256,
+        "cause": file.cause.as_str(),
+        "digest_computed_this_call": file.sha256.is_some(),
+    })
+}
+
+/// `/api/models` 的 `verification` 块：**哈希校验的成本账与保证强度**。
+///
+/// `/api/models` 对每个文件都用库的**身份键控校验缓存**
+/// （键 = 路径 + 体积 + mtime + 首尾各 64 KiB 的局部摘要）：
+/// 首次见到某个身份（或局部摘要变了）时真的读盘完整哈希（566 MB 公式模型实测约 313 ms），
+/// 命中只花一次 `stat` + 一次 128 KiB 局部读。页面每 8 s 轮询一次就绪状态，因此这里把
+/// 四件事都说清楚：
 ///
 /// - `cold_this_call`：**这一份报告**真的重算了几个文件的摘要（稳态下必须是 0）；
-/// - `cold_verifications`/`cache_hits`：进程启动以来的累计；
-/// - `last_cold_ms`/`last_cold_bytes`：最近一次冷验证的实测耗时与被读的字节数。
+/// - `cold_verifications`/`cache_hits`/`partial_mismatches`/`partial_reads`：进程启动以来的累计；
+/// - `last_cold_ms`/`last_cold_bytes`：最近一次冷验证的实测耗时与被读的字节数；
+/// - `guarantee`/`force_check`/`residual_blind_spot`：**这个缓存到底保证什么、不保证什么**
+///   （如实陈述，不把启发式写成安全边界）。
 ///
 /// 读者不必相信一句"已缓存"：`cold_this_call == 0` 就是"这次没有读那 566 MB"的证据。
 fn verification_json(cold_this_call: usize) -> Value {
     let stats = verification_stats();
     json!({
-        "identity": "path + size + mtime",
+        // 身份 = stat 身份 + 首尾各 64 KiB 的局部摘要（B 轮收窄的那一半）。
+        "identity": "path + size + mtime + SHA-256 of the first and last 64 KiB",
+        "partial_window_bytes": rapid_ocr_rs::PARTIAL_DIGEST_WINDOW_BYTES,
         "cold_this_call": cold_this_call,
         "cold_verifications": stats.cold_verifications,
         "cache_hits": stats.cache_hits,
+        "partial_reads": stats.partial_reads,
+        "partial_mismatches": stats.partial_mismatches,
         "entries": stats.entries,
         "last_cold_ms": stats.last_cold_ms(),
         "last_cold_bytes": stats.last_cold_bytes,
-        "residual_blind_spot": "a same-size, same-mtime content swap is not detected by the cache",
+        // 保证强度的**如实**陈述：内容在首次使用时被验证、在文件身份变化时被重新验证；
+        // 服务不声称"磁盘上的内容在任何时刻都是可信的"。局部摘要是启发式，不是安全边界。
+        "guarantee": "content is verified at first use and re-verified whenever the file's \
+                      identity changes (path, size, mtime, or the first/last 64 KiB); the \
+                      service does not claim that the on-disk content is trusted at all times",
+        "force_check": "POST /api/models/reverify (or --reverify-models at startup) is the \
+                        deterministic way to force a fresh full check",
+        "residual_blind_spot": "a same-size, same-mtime edit that also keeps the first and last \
+                                64 KiB byte-identical is still not detected; the partial digest \
+                                is a heuristic that narrows the window, not a security boundary, \
+                                because an attacker who can write the file can also preserve its \
+                                head and tail",
     })
 }
 
