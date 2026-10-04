@@ -45,7 +45,7 @@
 | 能力 | 位置 | 复用方式 |
 | --- | --- | --- |
 | 检测框叠加 | `output::visualize::draw_output(img: &RecImage, output: &OcrOutput) -> RgbImage` | `annotated.png` |
-| 哈希计算 | `model_store::sha256_file` | 状态判定与下载校验。**M1 评审 P1-2 之后的实际形态**：状态判定与两条公式加载路径改走 `model_verify` 的**身份键控缓存**（`path + size + mtime`），`sha256_file` 仍是唯一的底层实现与下载校验入口 |
+| 哈希计算 | `model_store::sha256_file` | 状态判定与下载校验。**M1 评审 P1-2 之后的实际形态**：状态判定与两条公式加载路径改走 `model_verify` 的**身份键控缓存**（身份 = `path + size + mtime`，**再加首尾各 64 KiB 的 SHA-256 局部摘要**；命中要求两者都不变，见 §4.2.1 与 §5.5），`sha256_file` 仍是唯一的底层实现与下载校验入口 |
 | 默认模型目录 | `model_store::default_model_store_dir()` | 默认 `--model-dir` |
 | 模型来源表 | `assets/default_models.yaml` | 构造 `ModelSet`（§5） |
 | 结果序列化 | `to_output_json` / `to_output_items` / `plain_text(TextOrder)` | API 响应 |
@@ -1056,6 +1056,11 @@ M4 交付后的独立评审发现的问题；每条都在本文档的对应章�
 因此 `docs/05` 相应章节按实现改正；`docs/03` 未改动。
 
 ### A1/A2/B：启动期冷验证、运行期"重新校验"、身份加局部摘要（逐条证据见 `docs/06`）
+
+> **本节是历史演进记录。** 其中的接口名与参数以当时实现为准：
+> `ModelPlan::required_files` 已被 `ModelPlan::plan_files` 的"一份运行计划"取代，
+> 缓存身份也已从 `path + size + mtime` 扩为再加首尾各 64 KiB 局部摘要。
+> 当前接口以 §3、§4.2、§5.4、§5.5、§10 为准。
 
 M1 评审修复轮之后的一轮，针对"校验缓存的保证强度"这三件事（同一份记录在 `docs/06` 的
 "A1/A2/B"一节）：
