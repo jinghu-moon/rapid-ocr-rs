@@ -4942,3 +4942,411 @@ GATE_MEAN_CER_LITERAL=0.0863135185950055  GATE_ZERO_PIPELINE_FAILURES=True
    `addEventListener`、`role="status"`、无内联 handler/style；**没有**浏览器自动化
    （本轮没有运行 Playwright 一类的驱动）。JS 语法用 `node --check` 对抽取出的
    `<script>` 块验证通过（`target/tmp/page-script.js`）。
+
+---
+
+# 计划轮：一份运行计划（公式检测模型进计划 + 逐管线报告）
+
+**基线**：HEAD `a04d6bc`（A1/A2/B 轮交付），**未提交**（按要求）。本轮**不改 `docs/03`**
+（`git status --porcelain -- docs/03-…` 为空），`Temp/demo3-v2.html` 一个字节都没动
+（SHA-256 仍是 `14871FED101D11451F9B799FD199144D6CEC7874C5682D0D630DED1F5E3D46EE`，
+与 M3/M4/评审/A1-A2-B 轮记录相同）。证据目录：`target/plan-gate/`。
+
+**变更规模**：`git diff --stat` = 9 个跟踪文件 **+2973 / −692**，其中 8 个是本轮的实现/测试/
+文档（**+2566 / −692**），第 9 个是本节（`docs/06`，+407）。**库源码（`src/*.rs` 顶层）一行
+未改**：`src/model_verify.rs`、`src/model_set.rs`、`src/ocr/`、`src/formula/` 都没动，因此
+im2latex smoke 的必跑条件（"库公式代码改动"）不成立——本轮仍然把它跑了，作为额外证据
+（见验证 7）。
+
+## 根因
+
+"**这次运行会加载哪些文件**"这一个问题，旧实现里有**三份说法**：
+
+| 说法 | 位置 | 它包含什么 | 谁读它 |
+| --- | --- | --- | --- |
+| `ModelPlan::required_files(use_cls)` | `model_plan.rs`（本轮之前的 ~327 行） | 文本三个（+ `use_cls` 时的 classifier）+ **无条件**的 `formula_recognizer` | A1（`--reverify-models`）、A2（`POST /api/models/reverify`） |
+| `snapshot()` / `blocking_files(statuses, …)` | `model_plan.rs` | 库存里**各 role 的全部文件**，按管线过滤 | 引擎状态机、`/api/models`、`/api/ocr` 的 409 |
+| `formula_detector_status()` | `server.rs` | 临时用 `ModelFileSpec::new(...)` 重建的**检测模型**单独一份 | 公式准入、`formula.detail.detector` |
+
+由此同时存在两个**方向相反**的错误：
+
+1. **检测模型漏在计划外**：`required_files` 的 role 列表里没有 `formula_detector`
+   （旁边那行注释甚至写着"它不属于模型集，因此不在本清单里重复列出"）。于是
+   `--reverify-models` **从不冷验证**一个 `--formula-detector`（或集合声明的检测模型），
+   `POST /api/models/reverify` 也**从不列它、从不为它算摘要**——一个"同体积 + 同 mtime、
+   改动只落在中段"的检测模型可以一直留在陈旧摘要上，直到某次普通公式请求路径碰巧重新
+   校验。检测模型是**真的会被加载**的（`FormulaPolicy.detector_path` →
+   `rapid_ocr.rs::formula_detector`），所以这是"报告的一份、加载的另一份"的经典缺口。
+2. **公式识别模型被无条件加入计划，而 fail-fast 只看 `text_blocking()`**：于是
+   (a) 公式路由**未启用**时，A1/A2 仍然把 566 MB 的 `formula_recognizer` 读一遍（纯浪费）；
+   (b) 公式路由**已启用**时，一个损坏的 `formula_recognizer` **不会**让 `--reverify-models`
+   失败（与开关"验证这次运行会用的整份计划"的契约矛盾），运行期的"重新校验"也因此可能
+   回答"引擎就绪"而公式模型其实是坏的。
+
+**根因归类**：不是局部实现错误，而是**数据结构/模块边界错误**——"运行计划"没有作为一个
+显式结构存在，而是散落成三处各自维护的清单。因此本轮的修法是把它变成 `ModelPlan` 的
+一个字段（`planned: Vec<PlanFile>`），并让所有消费者读它，而不是在旧的三份清单上打补丁。
+
+## 仲裁后的设计（不重新讨论）
+
+**一份运行计划，所有消费者共用**：
+
+- 文本管线：`detector` + `recognizer` + `dictionary`（`global.use_cls` 为真时再加 `classifier`）；
+- 公式管线：**仅当公式路由启用时**（解析出了检测模型：`--formula-detector` 优先，其次是
+  模型集声明的 `formula_detector` role）加入 `formula_recognizer` **与** `formula_detector`；
+  CLI 指到别处时集合里那份不会被加载，因此**不进计划**；
+- 公式未启用 ⇒ 公式模型**不在计划里**，A1/A2 一个字节都不读。
+
+**两种语义（互相兼容，都写进文档与错误文案）**：
+
+- `--reverify-models` = 显式 opt-in："启动时验证**这一次运行的整份计划**，计划内任何文件不可用
+  都拒绝启动"。公式启用时损坏的公式模型（检测器**或**识别器）让启动失败，错误**按管线分组**
+  并点名文件与所属管线；
+- 运行期准入**按管线**不变：损坏的公式模型只让公式队列在读 body 之前 409
+  （`detail.scope="formula"`），普通 OCR 照常；
+- `POST /api/models/reverify` **按管线**报告：`text.outcome` 与
+  `formula.{routing,in_plan,complete,missing,corrupt,blocked,detector}` 分开给出，
+  "文本就绪、公式损坏"是显式的。
+
+**没有声明摘要时"验证"的含义（新文档化规则）**：集合之外的 `--formula-detector` 没有可信
+摘要，此时 "verified" 只意味着**存在 + 可读 + 像 ONNX**（protobuf 序言：字段 1 =
+`ir_version`，tag `0x08` + varint 1..=64；空文件被拒绝）。响应里它的 `sha256` 是 `null`，
+但 A1/A2 仍然**真的算一个摘要**并如实报告算出来的值；集合声明了摘要时哈希始终是权威。
+
+## 修改过的对外签名
+
+```rust
+// src/bin/serve/model_plan.rs
+pub(super) struct PlanFile { pub name, pub role, pub path, pub declared_sha256, pub pipeline }
+impl PlanFile { pub fn has_declared_digest(&self) -> bool;
+                pub fn state(&self) -> ModelFileState;   // 唯一状态判定：有摘要→哈希；没有→文档化规则
+                pub fn status(&self) -> PlanFileStatus }
+pub(super) struct PlanFileStatus { pub name, pub role, pub pipeline, pub state }
+
+impl ModelPlan {
+    // 第三个参数是 CLI 的 --formula-detector：计划在这里一次算完
+    pub fn resolve(dir: &Path, engine: &EngineConfig, formula_detector: Option<&Path>) -> Result<Self, ModelPlanError>;
+    pub fn plan_files(&self) -> &[PlanFile];
+    pub fn plan_files_in(&self, pipeline: Pipeline) -> Vec<&PlanFile>;
+    pub fn plan_file(&self, role: ModelRole) -> Option<&PlanFile>;
+    pub fn plan_blocking(&self, pipeline: Pipeline) -> Vec<BlockingFile>;
+    pub fn plan_complete(&self, pipeline: Pipeline) -> bool;
+    pub fn formula_in_plan(&self) -> bool;
+    pub fn formula_detector(&self) -> Option<&FormulaDetectorSpec>;
+    pub fn reverify(&self) -> PlanReverification;   // 不再收 use_cls：计划在解析期固定
+}
+// 删除（公开形状）：required_files()、formula_recognizer()、resolve_formula_detector()
+// 新增内部实现：build_plan()、detector_is_declared()、undeclared_digest_failure()、file_name()
+
+// src/bin/serve/model_plan.rs —— 报告与快照口径
+impl PlanReverification { pub fn blocking_in(&self, Pipeline) -> Vec<&VerifiedPlanFile>;
+                          pub fn files_in(&self, Pipeline) -> Vec<&VerifiedPlanFile>;
+                          pub fn blocking_summary(&self) -> String }   // 错误文案按管线分组
+impl ModelReport { /* 库存口径：formula_inventory_blocking() / formula_inventory_complete() */ }
+impl ModelSnapshot { /* 按运行计划分组 + formula_in_plan() */ }
+
+// src/bin/serve/run.rs
+impl OcrRouting { pub fn from_plan(plan: &ModelPlan) -> Self }   // 路由的唯一来源
+pub(crate) fn reverify_gate(model_plan: &ModelPlan) -> Result<PlanReverification, ServeStartError>;
+ServeStartError::ModelsUnusable { report }   // Display 改为按管线分组
+
+// src/bin/serve/server.rs
+pub(super) struct ServeContext { /* 去掉 routing / formula_detector：两者都由计划决定 */ }
+impl ServeShared {
+    pub fn routing(&self) -> OcrRouting;                          // OcrRouting::from_plan(&self.model_plan)
+    pub fn formula_policy(&self) -> Option<FormulaPolicy>;        // 计划里的识别 + 检测
+    pub fn formula_models_ready(&self) -> bool;                   // plan_blocking(Formula).is_empty()
+    pub fn formula_detector_status(&self) -> Option<PlanFileStatus>;
+    fn pipelines_json(&self, Option<&PlanReverification>, text_outcome: &str) -> Value;  // /api/models 与 A2 共用
+}
+```
+
+## 关键行为对比（AGENTS.md §9）
+
+| 项目 | 修改前 | 修改后 | 预期结果 |
+| --- | --- | --- | --- |
+| 公式检测模型（`--formula-detector` / 集合声明） | **不在计划里**：A1 不冷验证、A2 不列不算摘要；状态由 `server.rs` 单独重建一份 | 在计划里：A1 冷验证、A2 列出并**真的重算摘要**、准入与报告读同一份状态 | 根因修复 |
+| 集合**之外**的检测模型（无声明摘要） | 由 `server.rs` 的临时 spec 判定，`state_in` 无哈希 → 无条件 `present` | 文档化规则：存在 + 可读 + 像 ONNX；`sha256: null`；A2 仍报告算出来的摘要 | 如实 |
+| 公式路由**未启用** + `formula_recognizer` 损坏 | `--reverify-models` 通过（只看 `text_blocking()`），但计划里**还是**把它哈希了 | 不在计划里：不哈希（`digests_computed == 3`）、不拦启动 | 两个方向都修 |
+| 公式路由**启用** + `formula_recognizer` 损坏 | `--reverify-models` **通过**（与契约矛盾） | 启动失败，错误点名 `formula pipeline: fx.onnx (…) corrupt` | 契约 |
+| 公式路由启用 + 检测模型损坏 | 启动**通过**；A2 的 `files[]` 里没有它 | 启动失败并点名它；A2 `files[]` 有它且 `digest_computed_this_call=true` | 根因修复 |
+| 运行期公式模型损坏 | 公式队列 409（`scope=formula`），普通 OCR 正常 | **不变** | 不回归 |
+| A2 的响应 | `outcome` + 逐文件（混两条管线） | 加 `pipelines.text`/`pipelines.formula`（`text.outcome` 与公式结论分开）；顶层 `missing`/`corrupt` 改成这次冷验证的**文本**结论 | 显式 |
+| `/api/models` | 顶层=文本（库存并集）、`formula` 块=公式 | 顶层=**计划**的文本；`formula` 块=**库存**（页面下载口径不变）；**新增** `pipelines`（计划口径，含 `in_plan`） | 加而不改 |
+| 页面结论区 | 只显示引擎 `outcome` + 逐文件状态 | 多一行"公式管线：…（检测模型 …）"，并按 `pipelines` 区分"普通 OCR 409"与"仅公式队列 409" | 最小改动 |
+| `--reverify-models` 启动成本（公式未启用，同一目录） | **343 ms**（4 个文件，含 566 MB） | **17.3 ms**（3 个文件；566 MB 不在计划里） | 见实测 |
+| `--reverify-models` 启动成本（公式启用） | 不可能（检测模型从不进计划） | **379.7 ms**（5 个文件：文本 3 + 566 MB + 80 MB 检测器） | 见实测 |
+
+## 测试（新增 17 条；既有断言的期望变更逐条给理由）
+
+测试数量：**lib 401（不变）+ bin 257（242 → 257，+15）+ 集成 2（1 → 2，+1）**。
+bin 内 `#[test]` 计数：`model_plan` 10 → 17、`run` 9 → 13、`serve::tests` 74 → 78、`server` 5 → 5。
+
+### 新用例（逐条对应要求的 5 项）
+
+| 要求 | 用例 |
+| --- | --- |
+| 1（检测模型损坏 → A1 失败点名 + A2 列出并重算摘要） | `serve::run::tests::the_startup_gate_fails_on_a_corrupt_formula_detector_and_names_it`、`serve::tests::reverify_cold_verifies_the_formula_detector_and_reports_it_per_pipeline`、`tests/serve_startup.rs::the_serve_command_refuses_to_start_when_the_formula_detector_is_corrupt` |
+| 2（识别模型损坏：启用时拦截 / 未启用时不影响且不哈希） | `serve::run::tests::the_startup_gate_fails_on_a_corrupt_formula_recognizer_when_formula_is_enabled`、`serve::run::tests::a_corrupt_formula_recognizer_is_out_of_scope_when_formula_is_disabled`、`serve::model_plan::tests::a_corrupt_formula_recognizer_blocks_the_formula_pipeline_when_it_is_planned`、`serve::tests::reverify_recomputes_digests_that_the_cache_would_have_answered`（断言 `computed == 3`） |
+| 3（文本就绪 + 公式损坏显式） | `serve::tests::reverify_reports_text_ready_and_formula_corrupt_explicitly` |
+| 4（集合之外、无声明摘要 → 在计划里、被冷验证、状态如实、规则生效） | `serve::model_plan::tests::an_external_detector_without_a_declared_digest_follows_the_documented_rule`、`serve::run::tests::the_startup_gate_covers_an_external_detector_without_a_declared_digest`、`serve::tests::an_external_detector_is_reported_honestly_without_a_declared_digest` |
+| 5（A1/A2/`/api/models`/准入/加载路径同一份计划） | `serve::tests::every_entry_point_reads_the_same_run_plan`、`serve::model_plan::tests::one_plan_feeds_reverification_the_snapshot_and_the_loading_paths` |
+| 计划形状（新增） | `serve::model_plan::tests` 的 `the_formula_pipeline_is_planned_only_when_a_detector_is_resolved`、`a_set_declared_detector_is_planned_once_with_its_declared_digest`、`a_declared_digest_is_enforced_and_is_the_authority`、`reverification_covers_exactly_the_plan`、`the_classifier_joins_the_plan_when_use_cls_is_on` |
+
+关键断言（都是**绝对数字**或**逐字段**，不是"看起来对"）：
+
+- 需求 1：损坏的真实检测模型 → `files[]` 里 `{role: formula_detector, pipeline: formula,
+  state: corrupt, declared_sha256: <集合声明值>, sha256: <这一次算出来的值>,
+  digest_computed_this_call: true}`，`computed == 5`，`pipelines.text.outcome == "ready"`
+  与 `pipelines.formula.corrupt == ["mfd.onnx"]` 同时出现；公式队列 409
+  （`detail.corrupt == ["mfd.onnx"]`、`detail.scope == "formula"`）而普通 OCR 202 → 任务
+  `succeeded`；进程边界上 `mfd.onnx` + `formula pipeline` + `corrupt` 都在 stderr，stdout 里
+  有 `--reverify-models mfd.onnx … digest computed by this call: true`。
+- 需求 2：未启用公式时同一份损坏目录 `digests_computed == 3`、`files` 里没有 `fx.onnx`、
+  gate 返回 `Ok`；启用时同一份损坏让 gate 返回 `Err` 且错误里有 `formula pipeline`、
+  **没有** `text pipeline:`（避免把文本管线误报成肇事者）。
+- 需求 4：集合之外的文件 `declared_sha256: null`、`has_declared_digest: false`、
+  `sha256 == sha256_file(该文件)`（独立算一遍对照）；空文件/非 ONNX 内容 → `corrupt` →
+  运行期公式队列 409 点名它；文本 OCR 全程 202。
+- 需求 5：同一个 `ModelPlan::resolve` 算出的期望清单，经 `/api/models.pipelines.*.files`、
+  A2 的 `files[].name`（同序）、`ServeShared::formula_policy()` 的
+  `model_path`/`detector_path`/`expected_*_sha256`、公式队列 409 点名的文件名四个入口读回来
+  必须一致。
+
+### 既有断言的期望变更（都是"预期行为发生了正确变化"）
+
+1. `reverify_recomputes_digests_that_the_cache_would_have_answered`：`computed == 4` → **3**
+   （旧值把本轮不会加载的 566 MB 也算进去了），并**新增**"`fx.onnx` 不在 `files[]` 里"、
+   "`pipelines.formula.in_plan == false`"、"`files[].name == [det, rec, dict]`"三条断言。
+   同一用例里"第一次 `/api/models` 的 `cold_this_call == 0`"改成"**第二次**必须为 0"：
+   计划不再为不在计划里的公式模型读盘，因此**库存**报告第一次见到它时仍会算一次摘要
+   （页面需要它的状态来给下载按钮），这是本轮**可见的**行为变化，不是缓存退化。
+2. `reverify_reports_a_corrupt_model_and_leaves_the_service_blocked_not_stale_ready`：
+   `computed == 4` → **3**，并新增 `pipelines.text.outcome`/`pipelines.formula.in_plan` 的断言。
+3. `concurrent_reverifications_are_single_flight_and_never_run_on_the_accept_thread`：
+   `computed == 4` → **3**（同上）。
+4. `a_cli_formula_detector_is_verified_by_the_same_rule`：旧用例给一个**任何模型集都没有声明
+   过**的文件硬塞了一个"声明哈希"（`with_verified_formula_detector`），那正是"造一个看起来
+   校验过的形状"。现在该文件的 `sha256` 是 `null`，夹具改成"像 ONNX"的内容，并把
+   "内容被换掉 → 公式队列在读 body 之前 409"这条断言**保留并加强**（不靠任何伪造摘要）。
+5. `a_corrupt_formula_detector_is_reported_and_refused_before_the_body`：去掉测试注入的声明
+   哈希（`detector_model_dir` 的清单本来就声明了 `mfd.onnx`，解析器自己会带上它），并新增
+   `pipelines.formula.files == ["fx.onnx","mfd.onnx"]` 与 `in_plan` 断言。
+6. `serve::run::tests` 的夹具签名从 `fixture_dir(name)` / `plan_for(dir)` 改成
+   `fixture_dir(name, with_detector)` / `plan_for(dir, detector)`；"健康模型"用例从
+   `files.len() >= 4` 改成**恰好 5**（`digests_computed == files.len()` 仍然成立），
+   并断言公式管线在计划里（2 个文件）。
+7. `models_reuses_the_verified_digest_until_the_file_identity_changes`：**断言没变**
+   （仍然要求第一次之后 `cold_this_call == 0`、替换后 `== 1`），但新增了
+   `cache_serial()` 串行守卫：本轮新增 4 个调用 `POST /api/models/reverify`（= 清**进程级**
+   缓存）的用例，会让"精确计数"变成概率事件（A1/A2/B 轮已经记录过同类偶发失败）。
+   凡是"清缓存"或"断言这一次算了几个"的用例现在都持有同一把锁。
+
+### 被删除/搬迁的既有用例
+
+- **删除** `serve::model_plan::tests::the_formula_roles_resolve_through_the_same_rule`：
+  它断言的是本轮删掉的公开形状（`ModelPlan::formula_recognizer()` +
+  `resolve_formula_detector()`）。它的两条断言被**搬进**新用例：
+  默认表下公式识别模型必须是 `pp_formulanet_plus_m.onnx` 且带 64 字符声明摘要
+  （`the_formula_pipeline_is_planned_only_when_a_detector_is_resolved`），
+  检测模型的声明摘要跟随被选中的文件（`the_formula_detector_hash_travels_with_the_selected_file`，
+  保留并加强了"计划里只有它一个"的断言）。**没有**删除任何断言本身。
+- **无**其它删除；`docs/03`、`tests/baseline/` 未改动。
+
+## 实测
+
+### `--reverify-models` 的启动成本（公式启用 vs 未启用）
+
+`target/plan-gate/run-reverify-startup-cost.ps1` → `startup-cost.log`（真实 release 二进制、
+真实 `target/m4-model-dir` 的默认表模型、真实 80 MB 检测器副本；每档 3 轮）：
+
+```text
+ROUND[formula-enabled/1] files=5 ms=379  digests=5 blocking=0
+ROUND[formula-enabled/2] files=5 ms=379  digests=5 blocking=0
+ROUND[formula-enabled/3] files=5 ms=381  digests=5 blocking=0
+SUMMARY[formula-enabled]  rounds=3 files=5 digests=5 mean_ms=379.7  min_ms=379 max_ms=381
+ROUND[formula-disabled/1] files=3 ms=18  digests=3 blocking=0
+ROUND[formula-disabled/2] files=3 ms=17  digests=3 blocking=0
+ROUND[formula-disabled/3] files=3 ms=17  digests=3 blocking=0
+SUMMARY[formula-disabled] rounds=3 files=3 digests=3 mean_ms=17.3 min_ms=17 max_ms=18
+```
+
+- **公式启用 = 379.7 ms / 5 个文件**（文本 3 + 566 MB 公式识别 + 80.3 MB 检测器）；
+- **公式未启用 = 17.3 ms / 3 个文件**（566 MB 与检测器都不在计划里，一个字节都不读）；
+- **对照（修改前，同一台机器/同一份协议/同一个模型目录）**：A1/A2/B 轮记录的启动期验证是
+  **343 ms / 4 个文件**（当时公式未启用，却仍然包含 566 MB 的 `formula_recognizer`）——
+  即同一场景从 **343 ms → 17.3 ms**，差别就是"不再读本轮不会加载的 566 MB"；
+- `/api/models` 的**库存**报告在公式未启用时仍会在第一次见到 566 MB 那个文件时算一次摘要
+  （页面要显示它的状态并给下载按钮），这一次会计入 `verification.cold_this_call`；
+  A1/A2/启动快照都不碰它。这一条写在 `docs/05` §10 第 10 条里。
+
+### A2 与 `/api/models`（真实 566 MB + 真实 80 MB 检测器）
+
+`target/plan-gate/run-12-images.ps1` → `http-vs-cli.log`（真实 release 服务，公式路由开启，
+检测器是 `OCR-Model/Formula-Detection-Model/pix2text-mfd-1.5.onnx` 的副本）：
+
+```text
+plan.text.files=PP-OCRv6_det_small.onnx,PP-OCRv6_rec_small.onnx,ppocrv6_dict.txt
+plan.formula.files=pp_formulanet_plus_m.onnx,pix2text-mfd-1.5.onnx in_plan=True complete=True
+plan.formula.detector: configured=True file=pix2text-mfd-1.5.onnx sha256= state=present
+POST /api/models/reverify: HTTP 200 wall_ms=549.75 outcome=ready computed=5 content_changed= load_ms=545
+pipelines.text: outcome=ready complete=True files=PP-OCRv6_det_small.onnx,PP-OCRv6_rec_small.onnx,ppocrv6_dict.txt
+pipelines.formula: in_plan=True routing=True complete=True files=pp_formulanet_plus_m.onnx,pix2text-mfd-1.5.onnx blocked=
+  reverify file pp_formulanet_plus_m.onnx role=formula_recognizer pipeline=formula state=present declared=True cause=first_sight computed=True
+  reverify file pix2text-mfd-1.5.onnx role=formula_detector pipeline=formula state=present declared=False cause=first_sight computed=True
+detector edited (first byte): state=corrupt blocked=pix2text-mfd-1.5.onnx
+ordinary OCR with a corrupt real detector: status=202
+formula queue with a corrupt real detector: status=409 code=models_corrupt scope=formula corrupt=pix2text-mfd-1.5.onnx
+detector restored: state=present blocked=
+second /api/models: cold_this_call=0 cache_hits=30 partial_reads=34
+POLLING_DOES_NOT_REHASH=True
+```
+
+- **检测模型真的进了计划**：`computed == 5`（旧实现是 4，且 `files[]` 里没有它）；
+  `declared=False`（集合没有声明它）但 `computed=True`（这一次真的算了摘要）——正是本轮
+  要的"如实"。
+- **按管线**：`text.outcome=ready` 与 `formula.blocked=[]`（健康时）分别可见；把真实检测器
+  的首字节改坏之后，`/api/models` 报 `corrupt`、**普通 OCR 仍然 202**、公式队列 409
+  `models_corrupt` + `scope=formula` + 点名文件，恢复后回到 `present`。
+- A2 的墙钟 **549.8 ms** 里 `load_ms=545`（含 566 MB + 80 MB 的冷验证与一次真实建会话），
+  与 A1/A2/B 轮同一端点的 453–546 ms 同一量级（多读的 80 MB 在这个尺度上不可分辨）。
+
+## 验证
+
+### 1. 静态检查、feature 矩阵与 release 构建（全部 exit 0）
+
+`target/plan-gate/run-gates.ps1` → `gates.log`：
+
+| # | 命令 | 结果 |
+| --- | --- | --- |
+| 1 | `cargo fmt --all -- --check` | 0 |
+| 2 | `cargo clippy --all-targets -- -D warnings` | 0 |
+| 3 | `cargo clippy --features serve --all-targets -- -D warnings` | 0 |
+| 4 | `cargo test --all-targets` | **401 passed**（lib）+ 2 + 4 + 14 + 0，**0 failed** |
+| 5 | `cargo test --features serve --all-targets` | **401 passed**（lib）+ 2 + 4 + 14 + **257 passed**（bin）+ **2 passed**（`serve_startup` 集成），**0 failed** |
+| 6 | `cargo build --release --bins` | 0 |
+| 7 | `cargo build --release --features serve --bins` | 0 |
+
+### 2. 依赖隔离（三份依赖树与 A1/A2/B 快照**逐行 0 差异**）
+
+`Cargo.toml` 的 `[dependencies]` / `[features]` 一个字未改；本轮没有新增测试目标。
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo tree -e normal -p rapid-ocr-rs` | **606 行**，与 `target/reverify-gate/tree-default.txt` **逐行相同**；`tiny_http` **0** 次 |
+| `cargo tree -e normal --no-default-features` | **605 行**，逐行相同；`tiny_http` **0** 次 |
+| `cargo tree -e normal -p rapid-ocr-rs --features serve` | **611 行**，逐行相同；`tiny_http` **1** 次 |
+
+（`tiny_http` 仍然只出现在 `src/bin/serve/http.rs`：`serve::dependency_boundary` 的两条边界
+断言同时通过。）
+
+### 3. `cargo package --allow-dirty` 与打包树的 `--features serve` 检查
+
+```text
+Packaged 191 files, 14.3MiB (3.4MiB compressed)
+Verifying rapid-ocr-rs v0.7.0 (…\target\package\rapid-ocr-rs-0.7.0)
+Finished `dev` profile … in 16.93s        （exit 0；target/plan-gate/package.log）
+```
+
+`cargo package --list` 里 `src/bin/serve/model_plan.rs`、`src/bin/serve/server.rs`、
+`src/bin/serve/tests.rs`、`src/bin/web/index.html`、`tests/serve_startup.rs` 都在；打包树上
+`cargo check --features serve --all-targets` **exit 0**（25.02 s，
+`target/plan-gate/package-serve-check.log`）。
+
+### 4. 12 图硬门槛（`target/plan-gate/`，**没有**覆盖 `tests/baseline/`）
+
+`target/plan-gate/run-hard-gates.ps1` → `hard-gates.log`：
+
+| 门槛 | 要求 | 本次实测（release） | 比较方式 | 结论 |
+| --- | --- | --- | --- | --- |
+| 12 图区域数均值 | `34.833333333333336` | **`34.833333333333336`**（36 样本） | 原始 JSON 的**数字字面量**精确比较 | True |
+| 12 图 mean CER | `0.44765135645866394` | **`0.44765135645866394`**（12 例） | 同上 | True |
+
+`tests/baseline` 未被改动（脚本内 `git status --porcelain -- tests/baseline` 为空，
+`bench-cpu-2000.json` 的 `regions.avg` 与本次字面量相同）。
+
+### 5. 12 图 HTTP 与 CLI 逐张一致（**12/12**）
+
+`target/plan-gate/run-12-images.ps1` → `http-vs-cli.log`（本次**打开**了公式路由 + 真实检测器，
+这是本轮唯一新增的端到端维度）：
+
+```text
+TOTAL serve=418 cli=418 images=12
+ALL_12_MATCH=True
+```
+
+逐张 `serve=N cli=N count=True texts=True`（明细在日志里）；`/api/models` 第二次
+`cold_this_call=0`（`POLLING_DOES_NOT_REHASH=True`）。
+
+### 6. 环境变量门控的 `formula_integration_tests`（真实模型，0 skipped）
+
+```powershell
+$env:RAPID_OCR_MODEL_ROOT='D:\100_Projects\110_Daily\SnapClip\OCR-Model'
+$env:RAPID_OCR_FORMULA_TEST_ROOT='D:\100_Projects\110_Daily\SnapClip\Formula-TestSet'
+cargo test --lib formula_integration_tests -- --test-threads=1
+```
+
+**12 passed, 0 failed, 0 ignored**（83.71 s），`skipping test` 出现 **0** 次；
+`target/plan-gate/formula-integration.log`。
+
+### 7. im2latex-100 smoke（本轮**没有**改库公式代码，仍然重跑作为额外证据）
+
+```text
+done: total=100 scored=100 exact=0.2400 normalized=0.2500 mean_cer=0.0863 pipeline_failures=0
+      model_mismatches=76 truncated=0 load_ms=1271.6 wall_ms=67205.4
+```
+
+即 **24.00% / 25.00% / 0.0863 / 0 pipeline failures** 全部复现
+（`target/plan-gate/im2latex-smoke.log`）。
+
+### 8. `docs/05` 与 `README` 的改动
+
+| 位置 | 改动 |
+| --- | --- |
+| `docs/05` §3 | `--reverify-models` 的范围改成"整份运行计划"（含公式启用时的检测模型）；`--formula-detector` 说明它进计划、且集合之外时"验证"按 §4.2.1 的规则 |
+| §4.2 端点表 | `/api/models` 的作用域（计划/库存）与 `/api/models/reverify` 的"按管线报告" |
+| §4.2.1 | 公式 409 的清单改成**运行计划**口径（含 `in_plan`）；新增"一份运行计划"、"库存 vs 计划"、"没有声明摘要时的文档化规则"、"启动期与运行期的两种语义"四段 |
+| §5.4 响应 | 新增 `pipelines` 块；把四个顶层字段改成**计划**的文本管线口径；说明 `formula` 块是**库存**口径（页面下载依赖它）；`complete` 的两个口径分别写清 |
+| §5.5 响应 | 新增 `pipelines` 与逐字段语义（含 `has_declared_digest`、`declared_sha256: null` 时仍报告算出的摘要） |
+| §7.6 启动顺序第 3 步 | 新增 `--reverify-models` 的整份计划 fail-fast 与"运行期仍按管线" |
+| §9.2 布局 | 结论区显示 `pipelines` 的公式结论（"文本就绪、公式损坏"不被合并） |
+| §10 第 10 条 | 两个确定性入口**都只碰运行计划**；库存报告首次见到计划外文件仍会算一次摘要 |
+| §11 | 新增"计划轮"清单（P1 的根因、文档化规则、逐管线报告），逐条指向被改正的章节 |
+| §12 | 更新 A1/A2 两行，新增"一份运行计划"与"逐管线报告"两行 |
+| `README` "Model integrity" | 新增 "One run model plan" 与 "What \"verified\" means without a declared digest" 两节（把两种语义与规则写进英文文档） |
+
+`docs/03` 未改动（`git status` 为空）。
+
+## 未覆盖风险与**做不到的事**（如实）
+
+1. **未提交、未在干净 clone 上验证**：按要求不 commit；证据来自当前工作树
+   （`a04d6bc` + 本轮改动）。
+2. **"像 ONNX"是启发式**：`0x08` + `ir_version` varint 是 protobuf 序言，能拦住"随便一个
+   文件冒充模型"，**拦不住**能构造一个看起来像 ONNX 的坏文件的人。没有可信摘要时服务
+   **不声称**内容被校验过（`sha256: null` 写在响应里），这一条同时写进 `docs/05` §4.2.1
+   与 `README`。
+3. **`/api/models`（库存）在公式未启用时仍会为计划外的 566 MB 文件算一次摘要**：页面用它
+   显示状态、决定下载按钮，因此这是有意的；A1/A2/启动快照都不碰它（实测 17.3 ms）。
+   如果将来要让 `/api/models` 也完全不读它，就得放弃"无哈希/无读取也能报 `present`"的
+   诚实性，属于另一个决策。
+4. **`pipelines.formula.complete=false` when `in_plan=false`**：这是有意选择（"没计划"不是
+   "计划齐备"），消费者必须同时看 `in_plan`；文档与测试都写明这一点，但它是协议里的一个
+   新约定，客户端需要读它。
+5. **公式准入的"计划外"分支不可达**：路由未启用时 `queue=formula` 在读 body 之前就是 400
+   （M1 起不变），因此公式准入只会在"公式在计划里"时执行；"不在计划里"的形状只在
+   `/api/models` 的 `pipelines` 与 A2 的响应里被测试到。
+6. **A2 的墙钟由"重建会话"主导**（549.8 ms 里 545 ms），冷验证 646 MB 的读写被包在同一个
+   窗口里，因此本轮没有单独测"只做冷验证"的耗时；启动期那一组（379.7 ms / 17.3 ms）
+   是纯冷验证的数字。
+7. **页面只做了结构与接线断言**（`c.pipelines`/公式管线行/无内联 handler/style/占位符计数），
+   **没有**浏览器自动化；页面真正的 `<script nonce=…>` 块用 `node --check` 验证通过
+   （`target/plan-gate/page-script-2.js`）。
+8. **夹具跨进程残留被发现并修掉（如实记录）**：`target/m1-serve-tests/` 下的夹具目录在
+   进程之间保留，而 `unique()` 每次从 0 开始；`with_formula_routing` 最初只在"文件不存在"
+   时写夹具，于是**上一轮遗留的旧内容**（不像 ONNX）让两个公平性用例在第一轮全量测试里
+   失败（公式队列 409 而不是 202/503）。修法是"无条件重写夹具"，不是放宽断言。
+9. **进程级校验缓存的测试串行化**：本轮新增 4 个"清缓存"用例，因此给"清缓存/精确计数"
+   的用例加了 `cache_serial()` 守卫（与库内 `model_verify::tests::serial()` 同一思路）。
+   不持有它的用例不断言精确的 `cold_this_call`，因此不受影响；但这条依赖是**约定**，
+   将来新增"精确计数"用例必须一并持有它。
+

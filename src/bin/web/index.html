@@ -1445,14 +1445,32 @@ function renderVerify(){
   const bad = files.filter(f => f.state !== 'present');
   const changed = Array.isArray(c.content_changed) ? c.content_changed : [];
   const outcome = c.outcome != null ? String(c.outcome) : '—';
+  /* 逐管线结论（A2 新增的 pipelines 块）：顶层 missing/corrupt 是**文本**作用域，
+     公式模型损坏只影响公式队列——因此这里按 f.pipeline 分开说，不把两者混成一句
+     "服务不可用"。服务端没给这块时退回旧的单一结论（不伪造结论）。 */
+  const pipes = (c.pipelines && typeof c.pipelines === 'object') ? c.pipelines : null;
+  const fp = (pipes && pipes.formula) ? pipes.formula : null;
+  const blocked = (arr) => Array.isArray(arr) ? arr : [];
+  const badText = fp ? files.filter(f => f.pipeline !== 'formula' && f.state !== 'present') : bad;
+  const badFormula = fp ? files.filter(f => f.pipeline === 'formula' && f.state !== 'present') : [];
   box.innerHTML =
     `<span class="vo-line"><b>引擎 ${esc(outcome)}</b>` +
     (c.load_ms != null ? ` · 建会话 ${esc(String(c.load_ms))} ms` : '') +
     (c.error ? ` · ${esc(errText(c.error))}` : '') + `</span>` +
     `<span class="vo-line">本次重算摘要 <b>${c.computed != null ? esc(String(c.computed)) : '—'}</b> 个` +
-    ` · 缺失 <b>${Array.isArray(c.missing) ? c.missing.length : '—'}</b>` +
-    ` · 损坏 <b>${Array.isArray(c.corrupt) ? c.corrupt.length : '—'}</b>` +
+    ` · 缺失（文本） <b>${Array.isArray(c.missing) ? c.missing.length : '—'}</b>` +
+    ` · 损坏（文本） <b>${Array.isArray(c.corrupt) ? c.corrupt.length : '—'}</b>` +
     ` · 内容变化 <b>${changed.length}</b></span>` +
+    (fp
+      ? `<span class="vo-line">公式管线：<b>${
+          !fp.in_plan ? '不属于本次运行'
+          : blocked(fp.blocked).length ? '阻塞 ' + esc(blocked(fp.blocked).join('、'))
+          : '正常'}</b>${
+          fp.routing === false ? ' · 路由未启用' : ''}${
+          fp.detector && fp.detector.file
+            ? ` · 检测模型 ${esc(fp.detector.file)}（${esc(fp.detector.state || '—')}）`
+            : ''}</span>`
+      : '') +
     (changed.length
       ? `<span class="vo-line">内容变化（stat 身份未变、首尾 64 KiB 不同）：${esc(changed.join('、'))}</span>`
       : '') +
@@ -1463,9 +1481,11 @@ function renderVerify(){
           <span class="vo-hint">${esc(ROLE_ZH[f.role] || f.role || '')}${f.cause ? ' · ' + esc(f.cause) : ''}</span>
         </div>`).join('')}</div>`
       : '') +
-    (bad.length
-      ? `<span class="vo-line">服务端现在处于可定位的错误态：普通 OCR 会以 409 拒绝，直到这些文件恢复。</span>`
-      : `<span class="vo-line">全部文件状态正常：报告的状态与内存里的会话都已按磁盘上的当前内容刷新。</span>`);
+    (badText.length
+      ? `<span class="vo-line">服务端现在处于可定位的错误态：普通 OCR 会以 409 拒绝，直到这些文本管线文件恢复。</span>`
+      : badFormula.length
+        ? `<span class="vo-line">普通 OCR 不受影响；公式队列会以 409（detail.scope=formula）拒绝，直到这些公式文件恢复。</span>`
+        : `<span class="vo-line">全部文件状态正常：报告的状态与内存里的会话都已按磁盘上的当前内容刷新。</span>`);
 }
 function reverifyModels(){
   if(state.verifying) return;

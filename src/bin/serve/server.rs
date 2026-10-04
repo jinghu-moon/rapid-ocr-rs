@@ -35,11 +35,10 @@ use std::time::{Duration, Instant};
 
 use rapid_ocr_rs::{
     ALLOWED_DOWNLOAD_HOSTS, DetectionPolicy, DownloadError, FormulaPolicy, ImageInput,
-    ModelFileSpec, ModelFileState, ModelRole, OcrOutput, OcrRequest, OrtRuntimeFingerprint,
-    OutputPolicy, PreprocessPolicy, ProviderPreference, RapidOcrError, RecognitionPolicy,
-    StagePlan, WordOutputMode, available_disk_bytes, clear_verification_cache,
-    ort_runtime_fingerprint, ort_runtime_version, peak_memory_source, peak_working_set_bytes,
-    verification_stats,
+    ModelFileState, ModelRole, OcrOutput, OcrRequest, OrtRuntimeFingerprint, OutputPolicy,
+    PreprocessPolicy, ProviderPreference, RapidOcrError, RecognitionPolicy, StagePlan,
+    WordOutputMode, available_disk_bytes, clear_verification_cache, ort_runtime_fingerprint,
+    ort_runtime_version, peak_memory_source, peak_working_set_bytes, verification_stats,
 };
 use serde_json::{Value, json};
 
@@ -57,8 +56,9 @@ use super::jobs::{
 };
 use super::limits::ServeLimits;
 use super::model_plan::{
-    FormulaDetectorSpec, ModelPlan, ModelReport, ModelSnapshot, PendingDownload,
-    PlanReverification, VerifiedPlanFile, source_label,
+    BlockingFile, ModelPlan, ModelReport, ModelSnapshot, PendingDownload, Pipeline, PlanFileStatus,
+    PlanReverification, VerifiedPlanFile, blocked_names, corrupt_names, missing_names,
+    source_label,
 };
 use super::queue::{DualQueueScheduler, QueueClass, ScheduledJob, SchedulerConfig};
 use super::results::{Outcome, ResultStore, SerializeError, Succeeded, serialize_bounded};
@@ -147,12 +147,14 @@ pub(super) fn routing_for(detector: Option<&Path>) -> OcrRouting {
     }
 }
 
-/// 配置好的公式检测模型在磁盘上的状态（评审 P1-1：检测模型与识别模型同一条完整性规则）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct FormulaDetectorStatus {
-    /// 文件名（§7.4 脱敏；绝不把本机绝对路径写进响应）。
-    pub name: String,
-    pub state: ModelFileState,
+impl OcrRouting {
+    /// 由**运行计划**唯一决定（§4.2、§10.8）：解析出页面公式检测模型 ⇔ 公式管线属于这次运行。
+    ///
+    /// 这是路由的唯一来源：`run.rs` 的启动日志与 [`ServeShared`] 都调用它，因此不存在
+    /// "计划里有检测模型、路由却按另一个判据算"的分叉。
+    pub fn from_plan(plan: &ModelPlan) -> Self {
+        routing_for(plan.formula_detector().map(|spec| spec.path.as_path()))
+    }
 }
 
 /// 磁盘可用空间的来源（可注入，§6.5 的任务级预检）。
@@ -195,13 +197,6 @@ pub(super) struct ServeContext {
     /// `--allow-provider-fallback`（§7.5）。运行期切换 provider 时**必须**沿用同一个开关，
     /// 否则同一条冻结规则会有两种解释（见 [`ServeShared::switch_provider`]）。
     pub allow_provider_fallback: bool,
-    pub routing: OcrRouting,
-    /// 页面公式检测模型（M4）：`--formula-detector` 优先，其次是模型集里声明的
-    /// `formula_detector` role。`None` = 公式路由不可用（见 [`OcrRouting`]）。
-    ///
-    /// **哈希跟着路径走**（评审 P1-1）：集合声明过这个文件时它带着声明的 SHA-256，
-    /// 库在加载检测器时校验，与识别模型完全对称。
-    pub formula_detector: Option<FormulaDetectorSpec>,
     /// `--eval-root` 沙箱（M1 评审 P2-3）：`None` = `/api/evaluate` 整体关闭。
     pub eval_root: Option<EvalRoot>,
     pub engine_factory: EngineFactory,
@@ -340,9 +335,6 @@ pub(super) struct ServeShared {
     allow_download_hosts: Vec<String>,
     /// `--allow-provider-fallback`（§7.5）：运行期切换 provider 复用**同一个**开关。
     allow_provider_fallback: bool,
-    routing: OcrRouting,
-    /// 页面公式检测模型（M4）；`None` = 公式路由不可用。
-    formula_detector: Option<FormulaDetectorSpec>,
     /// `--eval-root` 沙箱（M1 评审 P2-3）；`None` = `/api/evaluate` 整体关闭。
     eval_root: Option<EvalRoot>,
     engine_state: Mutex<EngineStateMachine>,
@@ -427,50 +419,60 @@ impl ServeShared {
         self.plan_snapshot().engine.global.min_side_len as u32
     }
 
-    /// `/api/models` 与 OCR 409 的**同一份**模型状态（§7.6 的"字段一致"）。
+    /// `/api/models` 的**库存**口径（模型集逐文件状态与冷验证成本账）。
+    ///
+    /// 运行期判定（引擎、两条管线的准入、A1/A2）用**运行计划**口径
+    /// （[`ModelPlan::plan_blocking`]）；库存回答"这个目录里有什么"（页面据此给出下载按钮），
+    /// 计划回答"这次运行会加载什么"。两者的实现都在 `model_plan.rs`。
     pub fn models(&self) -> ModelReport {
         self.model_plan.report()
     }
 
+    /// 公式路由（由运行计划唯一决定，见 [`OcrRouting::from_plan`]）。
     pub fn routing(&self) -> OcrRouting {
-        self.routing.clone()
+        OcrRouting::from_plan(&self.model_plan)
     }
 
-    /// 公式队列任务的 `FormulaPolicy`（M4）：识别模型、**集合声明的 SHA-256** 与检测模型
-    /// （路径 + **它的**声明哈希）都来自模型集，检测模型只可能来自启动期解析的那一个文件。
+    /// 文本管线的阻塞文件（缺失 ∪ 损坏）——引擎状态机、`/api/ocr` 的 409 与
+    /// `/api/models` 的顶层字段都用它（**运行计划**口径）。
+    fn text_blocking(&self) -> Vec<BlockingFile> {
+        self.model_plan.plan_blocking(Pipeline::Text)
+    }
+
+    /// 公式队列任务的 `FormulaPolicy`（M4）：识别模型与检测模型（路径 + **各自的**声明
+    /// 哈希）都来自**运行计划**，因此只可能是启动期解析的那两个文件。
     ///
-    /// 返回 `None` 只有一种情况：模型集里没有公式识别模型（启动期已拒绝，理论上不可达）。
+    /// 返回 `None` 只有一种情况：公式管线不属于这次运行（路由未启用时请求已经在
+    /// `class_for` 里被 400 拒绝，因此这条路径在运行期不可达）。
     pub fn formula_policy(&self) -> Option<FormulaPolicy> {
-        let (model_path, sha256) = self.model_plan.formula_recognizer().ok()?;
+        let recognizer = self.model_plan.plan_file(ModelRole::FormulaRecognizer)?;
+        let detector = self.model_plan.plan_file(ModelRole::FormulaDetector);
         Some(FormulaPolicy {
             enabled: true,
-            model_path: Some(model_path),
-            expected_model_sha256: Some(sha256),
-            detector_path: self.formula_detector.as_ref().map(|spec| spec.path.clone()),
+            model_path: Some(recognizer.path.clone()),
+            expected_model_sha256: recognizer.declared_sha256.clone(),
+            detector_path: detector.map(|file| file.path.clone()),
             // 评审 P1-1：检测模型的哈希与识别模型走**同一条**规则。集合没有声明它时
             // 这里是 `None`（如实表示"没有可信摘要"），而不是留空后静默加载。
-            expected_detector_sha256: self
-                .formula_detector
-                .as_ref()
-                .and_then(|spec| spec.expected_sha256.clone()),
+            expected_detector_sha256: detector.and_then(|file| file.declared_sha256.clone()),
             ..FormulaPolicy::default()
         })
     }
 
-    /// 公式队列的准入判定（§4.4 第 4 步之后、读 body 之前）：公式 role 的文件是否**可用**。
+    /// 公式队列的准入判定（§4.4 第 4 步之后、读 body 之前）：公式管线计划里的文件是否**可用**。
     ///
-    /// 判定用的是与 `/api/models` **同一份**逐文件哈希状态（`file.state_in` →
-    /// 身份键控的校验缓存），因此"报告损坏"与"拒绝请求"不可能分叉：损坏但存在的公式文件
-    /// 现在在**读 body 之前**就是 409 `models_corrupt`，而不是先建任务、再由 worker 失败。
-    /// 配置好的检测模型同属公式管线，因此它的状态也在这里判定。
+    /// 判定用的是与 `/api/models` 的 `pipelines` 块、A1/A2 **同一份**逐文件状态
+    /// （[`super::model_plan::PlanFile::state`] → 身份键控的校验缓存），因此"报告损坏"与
+    /// "拒绝请求"不可能分叉：损坏但存在的公式文件（含 `--formula-detector` 指向的集合外文件）
+    /// 在读 body 之前就是 409 `models_corrupt`，而不是先建任务、再由 worker 失败。
     ///
     /// 成本如实：冷验证真的读盘（启动快照已经做过一次，566 MB 公式模型的实测耗时记在
     /// `/api/models` 的 `verification` 块里）；命中只花一次 `stat`，与文件大小无关。
     pub fn formula_models_ready(&self) -> bool {
-        self.models().formula_blocking_names().is_empty() && !self.formula_detector_blocks()
+        self.model_plan.plan_blocking(Pipeline::Formula).is_empty()
     }
 
-    /// 上面那条预检的响应体（与 `/api/models` 的 `formula` 块同源同序）。
+    /// 上面那条预检的响应体（与 `/api/models` 的 `pipelines.formula` 块同源同序）。
     pub fn formula_blocked_body(&self) -> Body {
         Body::json(409, render_error_body(&self.formula_missing_failure()))
     }
@@ -489,96 +491,64 @@ impl ServeShared {
         }
     }
 
-    /// 公式管线的阻塞清单 `(missing, corrupt)`：模型集里的公式 role **加上**启动期解析出的
-    /// 检测模型。
+    /// 公式管线的阻塞清单 `(missing, corrupt)`：**运行计划**里公式管线的文件
+    /// （formula_recognizer + 被选中的 formula_detector）。
     ///
-    /// 检测模型可能来自 `--formula-detector`（不在任何集合里），因此它必须**单独**补进来，
-    /// 否则"检测模型损坏"会得到一份空清单：`code` 是 `models_corrupt` 却列不出文件名。
-    /// 已经在集合里报过的名字不重复列出（同一个 role 两种来源只报一次）。
+    /// 检测模型可能来自 `--formula-detector`（不在任何集合里），因此它由计划单独携带；
+    /// 计划里不会出现"集合声明了但不会被加载"的文件，所以这份清单精确等于
+    /// "公式队列为什么拒绝请求"。
     fn formula_blocking_lists(&self) -> (Vec<String>, Vec<String>) {
-        let report = self.models();
-        let mut missing = report.formula_missing_names();
-        let mut corrupt = report.formula_corrupt_names();
-        if let Some(status) = self.formula_detector_status()
-            && !missing.contains(&status.name)
-            && !corrupt.contains(&status.name)
-        {
-            match status.state {
-                ModelFileState::Missing => missing.push(status.name),
-                ModelFileState::Corrupt { .. } => corrupt.push(status.name),
-                ModelFileState::Present => {}
-            }
-        }
-        (missing, corrupt)
+        let blocking = self.model_plan.plan_blocking(Pipeline::Formula);
+        (missing_names(&blocking), corrupt_names(&blocking))
     }
 
-    /// 配置好的公式检测模型在磁盘上的状态（评审 P1-1 的根因回归）。
+    /// 计划里的公式检测模型在磁盘上的状态（评审 P1-1 的根因回归）。
     ///
-    /// 与识别模型**同一条规则**：复用库的 [`ModelFileSpec::state_in`]（唯一的逐文件状态
-    /// 实现）与它背后的身份键控校验缓存，因此"`/api/models` 报告它是损坏的"与
-    /// "加载它时被拒绝"是同一个结论，不可能分叉。
+    /// 与识别模型**同一条规则**：判定走计划里的 [`super::model_plan::PlanFile::state`]
+    /// （声明了摘要就按哈希，没有就按文档化的"存在 + 可读 + 像 ONNX"），因此
+    /// "`/api/models` 报告它是损坏的"与"加载它时被拒绝"是同一个结论，不可能分叉。
     ///
-    /// `None` = 没有配置检测模型（公式路由本来就不该可用）。没有声明哈希时状态是
-    /// `Present`——库只能证明"文件在"，这一点由 `/api/models` 的 `sha256: null` 如实说明。
-    pub fn formula_detector_status(&self) -> Option<FormulaDetectorStatus> {
-        let spec = self.formula_detector.as_ref()?;
-        let name = file_name(&spec.path.to_string_lossy());
-        let root = spec.path.parent().unwrap_or_else(|| Path::new("."));
-        let expected = spec.expected_sha256.clone().unwrap_or_default();
-        let state = match ModelFileSpec::new(
-            name.clone(),
-            ModelRole::FormulaDetector,
-            None,
-            expected.clone(),
-            String::new(),
-        ) {
-            Ok(file) => file.state_in(root),
-            Err(error) => ModelFileState::Corrupt {
-                expected,
-                actual: format!("cannot describe the detector file: {error}"),
-            },
-        };
-        Some(FormulaDetectorStatus { name, state })
+    /// `None` = 没有配置检测模型（公式路由本来就不该可用）。
+    pub fn formula_detector_status(&self) -> Option<PlanFileStatus> {
+        self.model_plan
+            .plan_file(ModelRole::FormulaDetector)
+            .map(|file| file.status())
     }
 
-    /// 检测模型是否**阻塞**公式队列（缺失或损坏）。`Present`（含"存在但没有可信摘要"）
-    /// 不阻塞：没有摘要时库无法判定内容对错，把它当成损坏是伪造证据。
-    fn formula_detector_blocks(&self) -> bool {
-        matches!(
-            self.formula_detector_status().map(|status| status.state),
-            Some(ModelFileState::Missing | ModelFileState::Corrupt { .. })
-        )
-    }
-
-    /// 公式队列 409 的 `detail`（**公式**作用域；与 `/api/models` 的 `formula` 块同值）。
+    /// 公式队列 409 的 `detail`（**公式**作用域；与 `/api/models` 的 `pipelines.formula` 同值）。
     ///
-    /// `missing`/`corrupt`/`blocked` 都来自那一份**哈希判定过的**状态：请求路径上不再有
+    /// `missing`/`corrupt`/`blocked` 都来自运行计划里那一份**判定过的**状态：请求路径上不再有
     /// 第二套"只看存在性"的清单（评审 P1-2 的根因是那种廉价清单让损坏文件溜过准入）。
     pub fn formula_detail(&self) -> Value {
-        let (missing, corrupt) = self.formula_blocking_lists();
-        let mut blocked = missing.clone();
-        blocked.extend(corrupt.iter().cloned());
+        let blocking = self.model_plan.plan_blocking(Pipeline::Formula);
+        let missing = missing_names(&blocking);
+        let corrupt = corrupt_names(&blocking);
+        let blocked = blocked_names(&blocking);
         json!({
             "scope": "formula",
             "missing": missing,
             "corrupt": corrupt,
             "blocked": blocked,
+            "in_plan": self.model_plan.formula_in_plan(),
             "source": source_label(self.model_plan.source()),
             "model_dir": REDACTED_MODEL_DIR,
             "detector": self.formula_detector_detail(),
         })
     }
 
-    /// `detail.detector` / `/api/models.formula.detector` 的**同一份**取值。
+    /// `detail.detector` / `/api/models` 的 `formula.detector` 与 `pipelines.formula.detector`
+    /// 的**同一份**取值。
+    ///
+    /// `sha256` 为 `null` 表示**没有可信摘要**（`--formula-detector` 指向一个模型集没有
+    /// 声明过的文件）：那时 `state` 只可能来自文档化规则（存在 + 可读 + 像 ONNX），
+    /// 服务不声称内容被校验过。
     fn formula_detector_detail(&self) -> Value {
+        let planned = self.model_plan.plan_file(ModelRole::FormulaDetector);
         let status = self.formula_detector_status();
         json!({
-            "configured": self.formula_detector.is_some(),
+            "configured": self.model_plan.formula_in_plan(),
             "file": status.as_ref().map(|status| status.name.clone()),
-            "sha256": self
-                .formula_detector
-                .as_ref()
-                .and_then(|spec| spec.expected_sha256.clone()),
+            "sha256": planned.and_then(|file| file.declared_sha256.clone()),
             "state": status.as_ref().map(|status| status.state.as_str()),
         })
     }
@@ -725,47 +695,143 @@ impl ServeShared {
     /// 因为公式模型没下载而报 409——一个把可选能力变成硬依赖的错误结论。
     /// 因此：
     ///
-    /// - 顶层四个字段 = **文本管线**（= 引擎要加载的那些文件；`POST /api/ocr` 的 409 用它）；
-    /// - 新增 `formula` 块 = **公式管线**的同一组字段 + 路由是否可用 + 不可用的文字理由；
-    /// - `sets[]` 保持 §5.4 的扁平形状不变（页面按 `files[].role` 自己分组，两边判据一致）。
+    /// - 顶层四个字段 = **文本管线**（= 引擎要加载的那些文件；`POST /api/ocr` 的 409 用它），
+    ///   取自**运行计划**；
+    /// - `formula` 块 = **公式管线库存**（模型集里声明的公式 role）的同一组字段 + 路由是否
+    ///   可用 + 不可用的文字理由（页面用它给公式开关设门禁、并据此显示要下载的文件）；
+    /// - **新增 `pipelines` 块** = **运行计划**的逐管线结论（含 `files`/`in_plan`/`blocked`），
+    ///   与 A1/A2/准入读的是同一份清单：库存回答"这个目录里有什么"，计划回答"这次运行会
+    ///   加载什么"；
+    /// - `sets[]` 保持 §5.4 的扁平形状不变（页面按 `files[].role` 自己分组）。
     pub fn models_json(&self) -> Value {
         let report = self.models();
+        let blocking = self.text_blocking();
         json!({
             "model_dir": REDACTED_MODEL_DIR,
             "source": source_label(self.model_plan.source()),
             "downloads_allowed": self.allow_download,
-            "complete": report.is_complete(),
-            "missing": report.missing_names(),
-            "corrupt": report.corrupt_names(),
-            "blocked": report.blocking_names(),
+            "complete": blocking.is_empty(),
+            "missing": missing_names(&blocking),
+            "corrupt": corrupt_names(&blocking),
+            "blocked": blocked_names(&blocking),
             "formula": self.formula_status_json(&report),
+            "pipelines": self.pipelines_json(None, self.engine_state_name()),
             "verification": verification_json(report.cold_this_call()),
             "sets": report.statuses().iter().map(set_status_json).collect::<Vec<_>>(),
         })
     }
 
-    /// `/api/models` 的 `formula` 块（**唯一**实现；`/api/ocr` 的公式 409 复用它）。
+    /// `/api/models` 的 `formula` 块（**库存**口径；公式 409 的 `detector` 复用它）。
     ///
-    /// 页面用它给公式开关设门禁：`complete`（模型集齐备）**与** `routing`（服务端真的能把
-    /// 请求跑成公式区域）两者都成立才允许勾选，`disabled_reason` 给出文字理由。
+    /// 页面用它给公式开关设门禁：`routing`（服务端真的能把请求跑成公式区域）**与**模型集
+    /// 齐备两者都成立才允许勾选，`disabled_reason` 给出文字理由。运行期判定（准入、A1/A2、
+    /// `/api/models` 的 `pipelines` 块）用**运行计划**口径，见 [`Self::pipelines_json`]。
     pub fn formula_status_json(&self, report: &ModelReport) -> Value {
+        let blocking = report.formula_inventory_blocking();
+        let routing = self.routing();
         json!({
-            "complete": report.formula_complete(),
-            "missing": report.formula_missing_names(),
-            "corrupt": report.formula_corrupt_names(),
-            "blocked": report.formula_blocking_names(),
-            "routing": self.routing.formula,
-            "disabled_reason": self.routing.disabled_reason,
+            "complete": report.formula_inventory_complete(),
+            "missing": missing_names(&blocking),
+            "corrupt": corrupt_names(&blocking),
+            "blocked": blocked_names(&blocking),
+            "routing": routing.formula,
+            "disabled_reason": routing.disabled_reason,
             "required_roles": ["formula_recognizer"],
             "detector": self.formula_detector_detail(),
         })
     }
 
+    /// **运行计划**的逐管线结论（**唯一实现**：`/api/models.pipelines` 与
+    /// `POST /api/models/reverify.pipelines`）。
+    ///
+    /// `verified` 为 `Some` 时用这次**冷验证**的逐文件结论（A2：绝对新鲜），`None` 时用计划
+    /// 当前的状态（`/api/models`）。两条路径读的是同一份运行计划，因此不存在第二种判据。
+    ///
+    /// `text.outcome` 是文本引擎的结论：A2 给建会话结论（`ready`/`rolled_back`/
+    /// `blocked_models_missing`/`failed`），`/api/models` 给引擎状态名。公式管线额外给出
+    /// `routing`/`in_plan`/`detector`：`in_plan=false` 时 `files`/`blocked` 都为空
+    /// （公式模型不属于这次运行，因此既不会被哈希也不会阻塞任何东西），`complete` 也就
+    /// 不可能是 `true`——"没计划"与"计划齐备"是两件事，不能混为一谈。
+    fn pipelines_json(&self, verified: Option<&PlanReverification>, text_outcome: &str) -> Value {
+        let pipeline_files = |pipeline: Pipeline| -> Vec<(String, ModelFileState)> {
+            match verified {
+                Some(report) => report
+                    .files_in(pipeline)
+                    .iter()
+                    .map(|file| (file.name.clone(), file.state.clone()))
+                    .collect(),
+                None => self
+                    .model_plan
+                    .plan_files_in(pipeline)
+                    .into_iter()
+                    .map(|file| (file.name.clone(), file.state()))
+                    .collect(),
+            }
+        };
+        let verdict = |files: &[(String, ModelFileState)]| {
+            let names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+            let missing: Vec<String> = files
+                .iter()
+                .filter(|(_, state)| matches!(state, ModelFileState::Missing))
+                .map(|(name, _)| name.clone())
+                .collect();
+            let corrupt: Vec<String> = files
+                .iter()
+                .filter(|(_, state)| matches!(state, ModelFileState::Corrupt { .. }))
+                .map(|(name, _)| name.clone())
+                .collect();
+            let mut blocked = missing.clone();
+            blocked.extend(corrupt.iter().cloned());
+            (names, missing, corrupt, blocked)
+        };
+
+        let text_files = pipeline_files(Pipeline::Text);
+        let (text_names, text_missing, text_corrupt, text_blocked) = verdict(&text_files);
+        let formula_files = pipeline_files(Pipeline::Formula);
+        let (formula_names, formula_missing, formula_corrupt, formula_blocked) =
+            verdict(&formula_files);
+        let routing = self.routing();
+        let formula_in_plan = self.model_plan.formula_in_plan();
+        // "齐备"的唯一判据在计划里（`plan_complete`）；冷验证给的是同一份计划的**这一次**
+        // 读盘结论，两者都是"计划里没有阻塞文件"，因此只在措辞上区分。
+        let complete = |pipeline: Pipeline, blocked: &[String]| match verified {
+            Some(_) => blocked.is_empty(),
+            None => self.model_plan.plan_complete(pipeline),
+        };
+        let text_complete = complete(Pipeline::Text, &text_blocked);
+        let formula_complete = formula_in_plan && complete(Pipeline::Formula, &formula_blocked);
+
+        json!({
+            "text": {
+                "pipeline": Pipeline::Text.as_str(),
+                "outcome": text_outcome,
+                "in_plan": true,
+                "complete": text_complete,
+                "files": text_names,
+                "missing": text_missing,
+                "corrupt": text_corrupt,
+                "blocked": text_blocked,
+            },
+            "formula": {
+                "pipeline": Pipeline::Formula.as_str(),
+                "routing": routing.formula,
+                "disabled_reason": routing.disabled_reason,
+                "in_plan": formula_in_plan,
+                "complete": formula_complete,
+                "files": formula_names,
+                "missing": formula_missing,
+                "corrupt": formula_corrupt,
+                "blocked": formula_blocked,
+                "detector": self.formula_detector_detail(),
+            },
+        })
+    }
+
     /// `/api/ocr` 的 409 `models_missing` / `models_corrupt` 的 `detail`。
     ///
-    /// §7.6 要求"字段与 `/api/models` 一致"：这里**调用同一个** [`Self::models`] 与同一个
-    /// 脱敏常量，因此 `missing` / `corrupt` / `blocked` / `source` / `model_dir` 与
-    /// `/api/models` 是逐字节相同的值，而不是另算一遍的近似值。
+    /// §7.6 要求"字段与 `/api/models` 一致"：这里**调用同一份运行计划**与同一个脱敏常量，
+    /// 因此 `missing` / `corrupt` / `blocked` / `source` / `model_dir` 与 `/api/models` 的
+    /// 顶层字段是逐字节相同的值，而不是另算一遍的近似值。
     /// `blocked`（缺失 ∪ 损坏）同时是 `EngineState::BlockedModelsMissing.missing` 的内容。
     ///
     /// # 形状决策（M0c 接缝第 4 条的收口）
@@ -774,11 +840,11 @@ impl ServeShared {
     /// 因此：`code` 仍然是 `models_missing` / `models_corrupt`（哪个取决于是否存在损坏文件），
     /// **清单进 `detail`**，并在 `detail` 里复用 `/api/models` 的字段名与值。
     pub fn models_missing_detail(&self) -> Value {
-        let report = self.models();
+        let blocking = self.text_blocking();
         json!({
-            "missing": report.missing_names(),
-            "corrupt": report.corrupt_names(),
-            "blocked": report.blocking_names(),
+            "missing": missing_names(&blocking),
+            "corrupt": corrupt_names(&blocking),
+            "blocked": blocked_names(&blocking),
             "source": source_label(self.model_plan.source()),
             "model_dir": REDACTED_MODEL_DIR,
         })
@@ -787,8 +853,7 @@ impl ServeShared {
     /// 引擎 `BlockedModelsMissing` 时 `/api/ocr` 的 `code`：有损坏文件就是
     /// `models_corrupt`（§5.2 与 §11.1 要求两者可区分：损坏建议重新下载）。
     pub fn models_missing_error(&self) -> ServeError {
-        let report = self.models();
-        if report.corrupt_names().is_empty() {
+        if self.text_blocking().iter().all(|file| !file.corrupt) {
             ServeError::ModelsMissing
         } else {
             ServeError::ModelsCorrupt
@@ -912,7 +977,7 @@ impl ServeShared {
 
     /// `BlockedModelsMissing` 下的准入：模型现在齐备就转入 `Loading`（惰性创建），否则 409。
     fn admit_with_models_on_disk(&self) -> Result<(), ServeError> {
-        let blocking = self.models().blocking_names();
+        let blocking = blocked_names(&self.text_blocking());
         if blocking.is_empty() {
             // 下载让它齐备了：进入 `Loading`（`BlockedModelsMissing → Loading` 是 §7.6 的
             // 合法转换），真正的会话由 worker 创建——accept 线程绝不建立会话。
@@ -1362,7 +1427,7 @@ impl ServeShared {
 
     /// `engine_load` 已经持有的加载路径（见 [`Self::ensure_engine_loaded`] 的文档）。
     fn load_engine(&self, plan: &ServeConfigPlan) -> EngineLoad {
-        let blocking = self.models().blocking_names();
+        let blocking = blocked_names(&self.text_blocking());
         {
             let mut machine = lock(&self.engine_state);
             if matches!(machine.state(), EngineState::Loading) {
@@ -1471,16 +1536,18 @@ impl ServeShared {
     /// （`loaded` 之外的三种都如实区分：`blocked_models_missing` 是"定位错误态"而不是
     /// "还留着旧引擎的假 ready"）。
     ///
+    /// 响应里的 `pipelines` 块按管线给出这次冷验证的结论：文本引擎的 `outcome` **与**公式
+    /// 管线的结果（`routing`/`in_plan`/`missing`/`corrupt`/`blocked`）分别给出，因此
+    /// "文本就绪、公式损坏"是显式的，而不是一句笼统的 `ready`。
+    ///
     /// 单飞由 [`Self::begin_provider_switch`] 保证（第二个并发调用 503 `busy`），
     /// 且整个序列在**独立线程**里执行——accept 线程绝不建立会话（§8.2、评审 P2-2）。
     pub fn reverify_models(&self) -> Result<Value, ServeError> {
         let started = Instant::now();
         // 第 1 步：清缓存（"重新校验"的前提）。
         clear_verification_cache();
-        // 第 2 步：冷验证这次运行会用的文件（忽略缓存，全部重算）。
-        let report = self
-            .model_plan
-            .reverify(self.plan_snapshot().engine.global.use_cls);
+        // 第 2 步：冷验证这次运行会计划加载的文件（忽略缓存，全部重算）。
+        let report = self.model_plan.reverify();
         // 紧接冷验证之后取一次状态：它的 `cold_this_call` 就是**这一次**的重算数
         // （再晚一点取，后面的步骤会让它变成 0——读者会把"什么都没算"当成结论）。
         let status = self.models();
@@ -1689,7 +1756,7 @@ impl ServeShared {
         rollback_ms: Option<u64>,
         report: &ModelReport,
     ) -> Value {
-        let base = self.engine_payload_json(outcome, started, error, rollback_ms, report);
+        let base = self.engine_payload_json(outcome, started, error, rollback_ms);
         let Value::Object(mut object) = base else {
             return base;
         };
@@ -1702,13 +1769,19 @@ impl ServeShared {
 
     /// `POST /api/models/reverify` 的响应体（见 [`Self::reverify_models`]）。
     ///
-    /// 在 [`Self::engine_response`] 的基础上加三块：
+    /// 在 [`Self::engine_response`] 的基础上加四块：
     ///
-    /// - `files[]`：这次冷验证的**逐文件结论**（状态 + 这一轮算出的摘要 + `cause`）；
+    /// - `files[]`：这次冷验证的**逐文件结论**（状态 + 这一轮算出的摘要 + `cause` + 管线）；
     /// - `computed` / `content_changed`：这一轮真的重算了几个完整摘要、哪些文件是
     ///   "stat 身份没变但首尾 64 KiB 变了"（后者是局部摘要抓住的替换，必须可见）；
+    /// - `pipelines`：**按管线**的结论 —— 文本引擎的 `outcome` 与公式管线的
+    ///   `routing`/`in_plan`/`missing`/`corrupt`/`blocked` 分开给出，因此
+    ///   "文本就绪、公式损坏"是显式的；
     /// - `verification.digests_computed`：把 `computed` 与"轮询时不再重哈希"的那本账
     ///   放在同一个块里，读者不必在两处之间猜口径。
+    ///
+    /// 顶层的 `missing`/`corrupt` 被**这次冷验证的文本管线结论**覆盖（而不是库存口径）：
+    /// 端点回答的是"这一轮计划里的文件现在是什么状态"。
     fn engine_response_with_report(
         &self,
         outcome: EngineLoad,
@@ -1718,14 +1791,18 @@ impl ServeShared {
         verified: &PlanReverification,
         report: &ModelReport,
     ) -> Value {
-        let base = self.engine_response(outcome, started, error, rollback_ms, report);
-        let Value::Object(mut object) = base else {
+        let mut base = self.engine_response(outcome, started, error, rollback_ms, report);
+        let Value::Object(object) = &mut base else {
             return base;
         };
-        object.insert(
-            "files".to_string(),
-            Value::Array(verified.files().iter().map(plan_file_json).collect()),
-        );
+        let outcome_label = match object.get("outcome") {
+            Some(Value::String(label)) => label.clone(),
+            _ => "failed".to_string(),
+        };
+        // 顶层的 `missing`/`corrupt` 换成**这次冷验证**的文本管线结论（同序、同一份证据）。
+        object.insert("missing".to_string(), verified_names(verified, false));
+        object.insert("corrupt".to_string(), verified_names(verified, true));
+        object.insert("files".to_string(), plan_files_json(verified));
         object.insert(
             "computed".to_string(),
             Value::from(verified.digests_computed()),
@@ -1740,6 +1817,12 @@ impl ServeShared {
                     .collect(),
             ),
         );
+        // **按管线**的结论：文本引擎的 outcome 与公式管线的结果分开给出，
+        // 因此"文本就绪、公式损坏"是显式的，而不是一句笼统的 ready。
+        object.insert(
+            "pipelines".to_string(),
+            self.pipelines_json(Some(verified), &outcome_label),
+        );
         // `verification.cold_this_call` 已经是这一轮的重算数；这里再补一个与
         // `computed` 同值的字段，让"这一次算了几个摘要"在同一个块里就能读到。
         if let Some(Value::Object(verification)) = object.get_mut("verification") {
@@ -1748,7 +1831,7 @@ impl ServeShared {
                 Value::from(verified.digests_computed()),
             );
         }
-        Value::Object(object)
+        base
     }
 
     fn engine_payload_json(
@@ -1757,17 +1840,10 @@ impl ServeShared {
         started: Instant,
         error: Option<String>,
         rollback_ms: Option<u64>,
-        report: &ModelReport,
     ) -> Value {
         let provider = self.provider_status();
-        let outcome_label = match (&error, outcome) {
-            (Some(_), EngineLoad::Ready) => "rolled_back",
-            _ => match outcome {
-                EngineLoad::Ready => "ready",
-                EngineLoad::BlockedModelsMissing => "blocked_models_missing",
-                EngineLoad::Failed => "failed",
-            },
-        };
+        let outcome_label = outcome_label(&error, outcome);
+        let blocking = self.text_blocking();
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         json!({
             "outcome": outcome_label,
@@ -1776,14 +1852,27 @@ impl ServeShared {
             "requested": provider.requested,
             "selected_ep": provider.selected_ep,
             "fallback_to_cpu": provider.fallback_to_cpu,
-            "missing": report.missing_names(),
-            "corrupt": report.corrupt_names(),
+            "missing": missing_names(&blocking),
+            "corrupt": corrupt_names(&blocking),
             "source": source_label(self.model_plan.source()),
             "model_dir": REDACTED_MODEL_DIR,
             "load_ms": elapsed_ms,
             "rollback_ms": rollback_ms,
             "error": error,
         })
+    }
+}
+
+/// 建会话结论的稳定标签（`outcome` 的唯一实现：`/api/engine/reload` 与
+/// `POST /api/models/reverify` 共用）。
+fn outcome_label(error: &Option<String>, outcome: EngineLoad) -> &'static str {
+    match (error, outcome) {
+        (Some(_), EngineLoad::Ready) => "rolled_back",
+        _ => match outcome {
+            EngineLoad::Ready => "ready",
+            EngineLoad::BlockedModelsMissing => "blocked_models_missing",
+            EngineLoad::Failed => "failed",
+        },
     }
 }
 
@@ -1936,8 +2025,6 @@ impl ServeRuntime {
             allow_download: context.allow_download,
             allow_download_hosts: context.allow_download_hosts,
             allow_provider_fallback: context.allow_provider_fallback,
-            routing: context.routing,
-            formula_detector: context.formula_detector,
             eval_root: context.eval_root,
             engine_state: Mutex::new(machine),
             engine: Mutex::new(backend),
@@ -2368,6 +2455,8 @@ fn render_error_body(body: &ErrorBody) -> Vec<u8> {
 /// 与 `/api/models.sets[].files[]` 的区别是"这是一次真正的读盘结论"：
 /// `sha256` 是这一轮算出来的摘要（不是声明值），`cause` 说明为什么会重算
 /// （冷验证因此永远是 `first_sight` 或 `content_changed`，绝不可能是 `cache_hit`）。
+/// 没有声明摘要的文件（集合之外的 `--formula-detector`）照样给出算出来的摘要，
+/// 但 `declared_sha256` 是 `null`——"算过"不等于"有可信期望值"。
 fn plan_file_json(file: &VerifiedPlanFile) -> Value {
     json!({
         "name": file.name,
@@ -2375,10 +2464,32 @@ fn plan_file_json(file: &VerifiedPlanFile) -> Value {
         "pipeline": file.pipeline.as_str(),
         "state": file.state.as_str(),
         "declared_sha256": file.declared_sha256,
+        "has_declared_digest": file.declared_sha256.is_some(),
         "sha256": file.sha256,
         "cause": file.cause.as_str(),
         "digest_computed_this_call": file.sha256.is_some(),
     })
+}
+
+/// 这次冷验证的 `files[]`（与 [`plan_file_json`] 同序同集）。
+fn plan_files_json(verified: &PlanReverification) -> Value {
+    Value::Array(verified.files().iter().map(plan_file_json).collect())
+}
+
+/// 这次冷验证里**文本管线**的缺失（`corrupt = false`）或损坏（`true`）文件名。
+///
+/// 存在理由：`POST /api/models/reverify` 顶层的 `missing`/`corrupt` 是"这一轮计划的文本
+/// 结论"，而它与 `/api/models` 的顶层字段必须同名同义；把这个映射写成一处，
+/// 就不会出现"两处各筛一遍、筛法不同"的分叉。
+fn verified_names(verified: &PlanReverification, corrupt: bool) -> Value {
+    Value::Array(
+        verified
+            .blocking_in(Pipeline::Text)
+            .iter()
+            .filter(|file| matches!(file.state, ModelFileState::Corrupt { .. }) == corrupt)
+            .map(|file| Value::from(file.name.clone()))
+            .collect(),
+    )
 }
 
 /// `/api/models` 的 `verification` 块：**哈希校验的成本账与保证强度**。

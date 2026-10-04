@@ -118,13 +118,17 @@ rapidocr serve [OPTIONS]
   --max-side <N>             覆盖 max_side_len
   --allow-download           允许下载模型（仍需 token，§7）
   --allow-download-host <H>  追加一个允许下载的 host（可重复；默认仅编译期白名单，§6.1）
-  --reverify-models          **启动期冷验证**这次运行会真正加载的每个模型文件（忽略校验缓存），
-                             任一缺失/损坏即**拒绝启动**并点名那些文件。范围 = 文本管线的
-                             detector/recognizer/dictionary（`use_cls` 时再加 classifier）+
-                             公式管线的 formula_recognizer（`--formula-detector` 声明的检测模型
-                             不属于模型集，因此由加载路径自己校验）——**不是**默认表里的每一个
-                             文件。它与"清缓存"无关（新进程的缓存本来就是空的）：价值在于把验证
-                             从**首次使用**移到**启动期**。见 A1 一节
+  --reverify-models          **启动期冷验证这次运行的整份模型计划**（忽略校验缓存），
+                             计划内任一文件缺失/损坏即**拒绝启动**，错误按**管线分组**点名文件。
+                             计划 = 文本管线（detector/recognizer/dictionary，`use_cls` 时再加
+                             classifier）**加上**——**仅当公式路由启用时**（配了
+                             `--formula-detector`，或模型集声明了 `formula_detector` role）——
+                             公式管线的 formula_recognizer **与** formula_detector。
+                             公式未启用时公式模型**不在计划里**：566 MB 的识别模型既不会被读，
+                             也不会拦住普通 OCR 的启动。**不是**默认表里的每一个文件。
+                             它与"清缓存"无关（新进程的缓存本来就是空的）：价值在于把验证
+                             从**首次使用**移到**启动期**并 fail-fast。见 A1 一节与 §11 的
+                             "一份运行计划"
   --open                     启动后打开系统默认浏览器
 
   # 资源上限
@@ -143,8 +147,10 @@ rapidocr serve [OPTIONS]
 
   # M4：公式队列与评估
   --formula-detector <ONNX>  页面公式检测模型（pix2text-mfd-1.5.onnx）；给出即启用公式队列
-                             （§4.2、§10.8）。缺省时 `queue=formula` 仍是 400，
-                             理由进 `/api/models` 的 `formula.disabled_reason`
+                             （§4.2、§10.8），并让它（连同 formula_recognizer）进入**运行计划**
+                             （因此 `--reverify-models` 会冷验证它）。缺省时 `queue=formula`
+                             仍是 400，理由进 `/api/models` 的 `formula.disabled_reason`；
+                             属于模型集之外的路径时它**没有声明摘要**，此时"验证"的含义见 §4.2.1
   --max-eval-cases <N>       `POST /api/evaluate` 一张清单最多评估多少张图，默认 32
   --eval-root <DIR>          `POST /api/evaluate` 的沙箱根（**默认不配置**）。端点是唯一
                              接收**本机路径**的端点，因此读取范围必须显式开启：
@@ -189,9 +195,9 @@ OCR（尤其公式路径）单图可达数秒至数十秒，**不得长期占用
 | --- | --- | --- |
 | `GET` | `/` | 内联单页（注入 nonce + token） |
 | `GET` | `/api/status` | 引擎/provider/ORT 指纹/队列与内存概况（路径脱敏）+ M4 的 `formula` 块（与 `/api/models` 同源同值） |
-| `GET` | `/api/models` | 模型集状态（§5.4；M4 起顶层字段是**文本管线**作用域，公式管线在 `formula` 块里） |
+| `GET` | `/api/models` | 模型集状态（§5.4；顶层字段是**本次运行计划**的**文本管线**作用域，公式管线在 `formula` 块（库存）与 `pipelines.formula`（计划）里） |
 | `POST` | `/api/models/download` | 启动下载任务（需 `--allow-download` **且** token）；请求体 `{"set_id": "<id>"}`，未知 id → **404 `model_set_not_found`**（绝不回落 `sets[0]`）。公式集合（566 MB）与文本集合同一条路径、同一个按钮语义 |
-| `POST` | `/api/models/reverify` | **A2 新增**：一次动作完成"重新读盘"——①清掉校验缓存，②**冷验证**这次运行会真正加载的每个文件，③**引擎此前就绪则重建会话**（否则"清缓存"只是一个按下去什么都不会变的按钮：流水线的会话缓存可能仍在服务一个磁盘上已经不是这个文件的模型）。请求体**必须为空**（有 body → 400）；单飞（第二个并发调用 **503 `busy`**，与 `POST /api/engine/reload` **同一把**资格），且整个序列在**独立线程**里执行（accept 线程绝不建会话）。响应见 §5.5 |
+| `POST` | `/api/models/reverify` | **A2 新增**：一次动作完成"重新读盘"——①清掉校验缓存，②**冷验证这次运行的整份模型计划**（含 `--formula-detector`/集合声明的公式检测模型），③**引擎此前就绪则重建会话**（否则"清缓存"只是一个按下去什么都不会变的按钮：流水线的会话缓存可能仍在服务一个磁盘上已经不是这个文件的模型）。请求体**必须为空**（有 body → 400）；单飞（第二个并发调用 **503 `busy`**，与 `POST /api/engine/reload` **同一把**资格），且整个序列在**独立线程**里执行（accept 线程绝不建会话）。响应**按管线**给结论（`text.outcome` 与 `formula.*` 分开），见 §5.5 |
 | `POST` | `/api/ocr` | 提交识别 → **202** `{job_id, queue, position, state:"queued"}`。队列由 `?queue=text\|formula` 选择，**队列类别就是管线选择**（M4，见下） |
 | `POST` | `/api/evaluate` | **M4 新增**：批量评估一份已标注清单 → 200 + 库的评估报告。**必须先配置 `--eval-root <DIR>`**（M1 评审 P2-3）：未配置时整个端点拒绝（400 `bad_request`，`detail.reason` 点名 `--eval-root`）；配置后清单与清单引用的**每张图**都必须规范化到该目录内，越界（`..`、绝对路径、符号链接）是可定位的 400。请求体**恰好**一个键 `{"manifest": "<本机清单路径>"}`（与 `rapidocr evaluate --manifest` 同格式：`[{image, text, boxes}]`，`image` 相对清单目录解析）。报告字段与 CLI 的 `rapidocr evaluate` **同一份实现**（`cases[]` + `mean_cer` + `exact_match_rate` + `mean_detection_*` + `peak_working_set_bytes` + `memory_source` + `ort_runtime` + `ort_runtime_version`），另加 `iou_threshold` 与 `manifest_file`（只给文件名）。可定位的拒绝是 **400 `bad_request`** + `detail.reason`（没有 `--eval-root`/清单越界/格式不对/用例数超过 `--max-eval-cases`/某张图越界或读不出来）；模型缺失与引擎不可用分别是 409 `models_missing` / 503 `engine_unavailable`（与 `/api/ocr` 同一份错误体） |
 | `GET` | `/api/jobs/{id}` | `{id, kind, queue, state, position, queued_ms, started_ms, elapsed_ms, error}` + M2 追加的 `{failure, download, cancel_requested}`（见 §4.3） |
@@ -220,8 +226,42 @@ POST /api/ocr?queue=formula             → 公式管线，进公式队列
 | 情况 | 结论 |
 | --- | --- |
 | 路由可用、公式模型齐备 | 202 `{queue:"formula"}`，进公式队列，由公式管线执行 |
-| 路由可用、公式模型**缺失/损坏** | **409** `models_missing` / `models_corrupt`，`detail.scope="formula"`、`missing`/`corrupt`/`blocked` 列出公式 role 的文件，`detail.detector` 给出检测模型的 `{configured, file, sha256, state}`。判定在**读 body 之前**完成，用的是与 `/api/models` **同一份哈希状态**（库的身份键控校验缓存：键 = 路径 + 体积 + mtime，冷验证真的读盘、命中只花一次 `stat`）；`state` 取 `present`/`corrupt`/`missing`，`sha256` 为 `null` 表示没有可信摘要（只能证明"存在"） |
-| 路由**不可用**（没配 `--formula-detector`） | **400** `bad_request`（M1 起不变），理由在 `/api/models` 的 `formula.disabled_reason` 里 |
+| 路由可用、公式模型**缺失/损坏** | **409** `models_missing` / `models_corrupt`，`detail.scope="formula"`、`missing`/`corrupt`/`blocked` 列出**运行计划里公式管线**的文件（`formula_recognizer` + 被选中的 `formula_detector`，后者可以在模型目录之外），`detail.in_plan` 说明公式是否属于本次运行，`detail.detector` 给出检测模型的 `{configured, file, sha256, state}`。判定在**读 body 之前**完成，用的是与 `/api/models` 的 `pipelines.formula` 块**同一份**判定（库的身份键控校验缓存：键 = 路径 + 体积 + mtime + 首尾 64 KiB 的局部摘要，冷验证真的读盘、命中只花一次 `stat`）；`state` 取 `present`/`corrupt`/`missing`，`sha256` 为 `null` 表示没有可信摘要（此时按下面那条文档化规则判定） |
+| 路由**不可用**（没配检测模型） | **400** `bad_request`（M1 起不变），理由在 `/api/models` 的 `formula.disabled_reason` 里 |
+
+**一份运行计划（唯一的判据，A1/A2/`/api/models`/准入/加载路径共用）**：`ModelPlan::resolve`
+在启动期算出"这次运行真的会加载哪些文件"，并且**只有**这一份清单：
+
+- 文本管线：`detector` + `recognizer` + `dictionary`（`global.use_cls` 为真时再加 `classifier`）；
+- 公式管线：**仅当公式路由启用时**（解析出了检测模型：`--formula-detector` 优先，其次是模型集
+  声明的 `formula_detector` role），加入 `formula_recognizer` **与** `formula_detector`；
+  被 CLI 指到别处时，集合里那份**不会被加载**，因此它**不进计划**；
+- 公式未启用 ⇒ 公式模型不在计划里，A1/A2 一个字节都不读它们（566 MB 的识别模型不再被无条件
+  哈希：`POST /api/models/reverify` 的 `computed` 因此不含它）。
+
+**模型库存与运行计划的区别（两者都由 `model_plan.rs` 给出，且只有那里给）**：`sets[]` 与
+`formula` 块是**库存**（"这个目录里有什么"：页面据此显示 566 MB 的体积并让用户按集合下载）；
+`pipelines` 块是**计划**（"这次运行会加载什么"：准入与 fail-fast 用它）。`formula.missing`
+因此在公式路由关闭时仍然列出缺失的公式识别模型（那是"要下载什么"），而
+`pipelines.formula.in_plan=false`、`files: []`、`blocked: []`（那是"这次会不会加载它"）。
+
+**没有声明摘要时"验证"的含义（文档化规则）**：`--formula-detector` 指向的文件可能不属于任何
+模型集，因此**没有可信摘要**。"verified" 此时只意味着三件事——文件**存在**、**读得出来**、
+**看起来是一份 ONNX**（protobuf 序言：字段 1 = `ir_version`，tag `0x08` + varint 取值 1..=64；
+空文件不算）。这是**启发式**，不是完整性证明：响应里该文件的 `sha256` 是 `null`，服务不声称
+内容被校验过；A1/A2 仍然会为它**真的算一个摘要**并如实报告算出来的值。集合声明了摘要时，
+判定完全按哈希（不匹配 = `corrupt`），**声明值始终是权威**。
+
+**启动期与运行期的两种语义（互相兼容，都必须成立）**：
+
+- `--reverify-models` 是**显式 opt-in**，意思是"启动时验证**这一次运行的整份计划**，计划里
+  任何文件不可用都拒绝启动"：公式启用时一个损坏的公式模型（检测器**或**识别器）会让启动
+  失败，错误里点名文件**并说明它属于哪条管线**（`text pipeline:` / `formula pipeline:`）；
+- 运行期准入仍然**按管线**：损坏的公式模型只让公式队列在读 body 之前 409
+  （`detail.scope="formula"`），普通 OCR 照常工作（**行为不变**）；
+- `POST /api/models/reverify` **按管线**报告：文本引擎的结论（`pipelines.text.outcome`）与
+  公式的验证结果 + 路由状态（`pipelines.formula.{routing,in_plan,complete,missing,corrupt,
+  blocked,detector}`）分开给出，因此"文本就绪、公式损坏"是显式的，而不是一句笼统的 `ready`。
 
 **M1 评审 P1-1/P1-2 的修正（本节上一版的说法已经被实现否掉，如实记录）**：上一版写的是
 "存在性检查在**读 body 之前**完成（只 `stat`，不哈希 566 MB）；权威哈希判定由库在加载识别器时
@@ -427,6 +467,31 @@ pub struct ManifestFile { pub name: String, pub role: ModelRole, pub sha256: Str
       "state": "present | corrupt | missing"
     }
   },
+  "pipelines": {
+    "text": {
+      "pipeline": "text",
+      "outcome": "ready | loading | blocked_models_missing | failed | rebuilding",
+      "in_plan": true,
+      "complete": false,
+      "files": ["PP-OCRv6_det_small.onnx", "PP-OCRv6_rec_small.onnx", "ppocrv6_dict.txt"],
+      "missing": ["PP-OCRv6_det_small.onnx"],
+      "corrupt": [],
+      "blocked": ["PP-OCRv6_det_small.onnx"]
+    },
+    "formula": {
+      "pipeline": "formula",
+      "routing": true,
+      "disabled_reason": null,
+      "in_plan": true,
+      "complete": false,
+      "files": ["pp_formulanet_plus_m.onnx", "pix2text-mfd-1.5.onnx"],
+      "missing": ["pp_formulanet_plus_m.onnx"],
+      "corrupt": [],
+      "blocked": ["pp_formulanet_plus_m.onnx"],
+      "detector": { "configured": true, "file": "pix2text-mfd-1.5.onnx",
+                    "sha256": "…|null", "state": "present | corrupt | missing" }
+    }
+  },
   "verification": {
     "identity": "path + size + mtime + SHA-256 of the first and last 64 KiB",
     "partial_window_bytes": 65536,
@@ -454,7 +519,8 @@ pub struct ManifestFile { pub name: String, pub role: ModelRole, pub sha256: Str
 
 - `formula.detector` 增加 `sha256` 与 `state`：检测模型与识别模型**同一条**完整性规则。
   `sha256` 为 `null` 表示没有可信摘要（`--formula-detector` 指向一个模型集没有声明过的文件），
-  此时 `state` 只能是 `present`（"文件在"）或 `missing`，绝不假装校验过；
+  此时 `state` 由 §4.2.1 的**文档化规则**给出（`present` = 存在 + 可读 + 像 ONNX；`corrupt` =
+  不满足其中任一条；`missing` = 文件不在），绝不假装内容被校验过；
 - `verification` 是**校验成本账 + 保证强度**：`cold_this_call` 是这一份报告里真的重算了摘要的
   文件数（页面每 8 s 轮询时必须是 0），`cold_verifications`/`cache_hits`/`partial_reads`/
   `partial_mismatches`/`entries` 是进程累计，`last_cold_ms`/`last_cold_bytes` 是最近一次冷验证的
@@ -463,22 +529,30 @@ pub struct ManifestFile { pub name: String, pub role: ModelRole, pub sha256: Str
   需要确定性重查就用 `--reverify-models` 或 `POST /api/models/reverify`）。
   它存在的意义是让"不再重新哈希 566 MB"这句话**可被验证**，而不是一句承诺。
 
-**M4 的作用域修正（本文件上一版把四个顶层字段写成"所有集合"的并集，那是错的）**：
+**作用域修正（本文件上一版把四个顶层字段写成"所有集合"的并集，那是错的；本轮进一步把
+"库存"与"运行计划"分开）**：
 
-- 顶层的 `complete`/`missing`/`corrupt`/`blocked` = **文本管线**（detector/classifier/recognizer/
-  dictionary/tokenizer），也就是引擎真正要加载的那些文件；`POST /api/ocr` 的 409 `detail`
-  与 `EngineState::BlockedModelsMissing` 用它。公式模型（566 MB，默认不下载）缺失**绝不会**
-  让普通 OCR 变成 409——这正是 M4 要修掉的根因；
-- `formula` 块 = **公式管线**（`formula_recognizer`）的同一组字段，外加
+- 顶层的 `complete`/`missing`/`corrupt`/`blocked` = **运行计划里的文本管线**
+  （detector/recognizer/dictionary，`use_cls` 时再加 classifier），也就是引擎真正要加载的那些
+  文件；`POST /api/ocr` 的 409 `detail` 与 `EngineState::BlockedModelsMissing` 用它。公式模型
+  （566 MB，默认不下载）缺失**绝不会**让普通 OCR 变成 409——这正是 M4 要修掉的根因；
+- `pipelines.text` = **同一份计划**的文本管线结论（`outcome` + `in_plan` + `files` +
+  `missing`/`corrupt`/`blocked`）；`/api/models` 用它把"这次运行会加载哪些文件"直接说出来
+  （A1/A2 与准入用的是同一份清单）；
+- `pipelines.formula` = **运行计划**的公式管线结论（`routing`/`in_plan` + 同一组字段 + `detector`）。
+  `in_plan=false` 时 `files`/`blocked` 都为空、`complete=false`："没计划"与"计划齐备"是两件事；
+- `formula` 块 = **公式管线的库存**（模型集里声明的公式 role），外加
   `routing`（服务端是否启用了公式队列，§4.2）与 `disabled_reason`（不可用时的**文字**理由，
-  页面据此禁用开关并显示原因，§9.4 要求不只靠颜色）；`detector` 只给**文件名**（§7.4 路径脱敏）；
+  页面据此禁用开关并显示原因，§9.4 要求不只靠颜色）；`detector` 只给**文件名**（§7.4 路径脱敏）
+  与判定过的 `state`/`sha256`。页面按集合下载时读的是 `sets[]`，因此这里的库存口径不能改成计划口径；
 - 分组依据是 `files[].role`（`Pipeline::of`），**不是集合 id 或集合顺序**：默认表把两条管线
   放在两个集合里，本地清单把两条管线放在**一个**集合里，两种来源下结论必须一致；
 - 页面同一套判据：`QUEUE_ROLES.text = [detector, recognizer, dictionary]`、
   `QUEUE_ROLES.formula = [formula_recognizer]`（= 库的 `ModelRequest::text_roles/formula_roles`），
   再叠加 `formula.routing`。
-- `complete` 仍然要求"每个文件都 `Present` **且**声明了哈希"（§5.2：没有哈希的文件不得让集合
-  报 `complete`）；`missing`/`corrupt` 只列缺失与损坏。
+- 库存口径的 `complete` 仍然要求"每个文件都 `Present` **且**声明了哈希"（§5.2：没有哈希的文件
+  不得让集合报 `complete`）；`missing`/`corrupt` 只列缺失与损坏。计划口径的 `complete` 说的是
+  "计划里每个文件都 `Present`（没有声明摘要的按文档化规则判定）"。
 
 ### 5.5 `POST /api/models/reverify` 响应（A2）
 
@@ -497,10 +571,24 @@ pub struct ManifestFile { pub name: String, pub role: ModelRole, pub sha256: Str
   "content_changed": ["fx.onnx"],
   "files": [
     { "name": "PP-OCRv6_det_small.onnx", "role": "detector", "pipeline": "text",
-      "state": "present", "declared_sha256": "…", "sha256": "…",
+      "state": "present", "declared_sha256": "…", "has_declared_digest": true, "sha256": "…",
       "cause": "first_sight | stat_changed | content_changed | cache_hit",
-      "digest_computed_this_call": true }
+      "digest_computed_this_call": true },
+    { "name": "pix2text-mfd-1.5.onnx", "role": "formula_detector", "pipeline": "formula",
+      "state": "present", "declared_sha256": null, "has_declared_digest": false,
+      "sha256": "…（这一次真的算出来的摘要）",
+      "cause": "first_sight", "digest_computed_this_call": true }
   ],
+  "pipelines": {
+    "text": { "pipeline": "text", "outcome": "ready", "in_plan": true, "complete": true,
+              "files": ["…"], "missing": [], "corrupt": [], "blocked": [] },
+    "formula": { "pipeline": "formula", "routing": true, "disabled_reason": null, "in_plan": true,
+                 "complete": false, "files": ["pp_formulanet_plus_m.onnx", "pix2text-mfd-1.5.onnx"],
+                 "missing": [], "corrupt": ["pix2text-mfd-1.5.onnx"],
+                 "blocked": ["pix2text-mfd-1.5.onnx"],
+                 "detector": { "configured": true, "file": "pix2text-mfd-1.5.onnx",
+                               "sha256": "…|null", "state": "corrupt" } }
+  },
   "verification": { "…与 §5.4 同源…", "digests_computed": 5 }
 }
 ```
@@ -508,14 +596,26 @@ pub struct ManifestFile { pub name: String, pub role: ModelRole, pub sha256: Str
 字段语义（**逐条都是可断言的**）：
 
 - `computed` = 这一轮真的重算了几个**完整摘要**（`POST /api/models/reverify` 从不查缓存，
-  因此它等于本次运行会用到的文件数，读不出来的文件除外）；`verification.digests_computed`
-  是同一个数字的另一种读法（放在成本账里，免得读者在两处之间猜口径）；
+  因此它等于**运行计划**里的文件数，读不出来的文件除外）；`verification.digests_computed`
+  是同一个数字的另一种读法（放在成本账里，免得读者在两处之间猜口径）。
+  公式未启用时公式模型不在计划里，因此这个数字里**没有**那 566 MB；
 - `content_changed` = **stat 身份相同、首尾 64 KiB 不同**的文件名。这是"为什么又读了一遍
   566 MB"的唯一原因来源，也是 B 轮收窄盲区的可见证据；
 - `files[].cause` 是逐文件的原因；`files[].sha256` 是**这一轮算出来的**实际摘要
-  （不是声明值——声明值在 `declared_sha256` 里）；
+  （不是声明值——声明值在 `declared_sha256` 里）。没有声明摘要的文件（集合之外的
+  `--formula-detector`）的 `has_declared_digest=false`、`declared_sha256=null`，但 `sha256`
+  仍然是**这一次真的算出来的**值（"算过"不等于"有可信期望值"，见 §4.2.1 的文档化规则）；
+- `files[].pipeline` 让客户端不必按 role 自己分组；同序、同集于**运行计划**；
+- `pipelines.text` / `pipelines.formula` = **按管线**的结论：`text.outcome` 是这次建会话的
+  结论（与顶层 `outcome` 同值，含 `rolled_back`/`failed`），`formula` 给出
+  `routing`/`in_plan`/`files`/`missing`/`corrupt`/`blocked`/`detector`。因此
+  "**文本就绪、公式损坏**"是显式的：`text.complete=true` 与
+  `formula.corrupt=["…"]` 同时出现，而不是一句笼统的 `ready`；
+- 顶层 `missing`/`corrupt` = **这次冷验证的文本管线结论**（与 `/api/models` 的顶层字段同名
+  同义）；公式文件**只**出现在 `pipelines.formula` 与 `files[]` 里；
 - `state` 只用 §5.2 的三个取值；`missing` 与 `corrupt` 的区分是"文件不在"与"文件在但读不出来
-  或内容不对"（前者建议下载，后者建议重新下载并以原子方式替换）；
+  或内容不对"（前者建议下载，后者建议重新下载并以原子方式替换）；没有声明摘要的文件按
+  §4.2.1 的文档化规则区分"可用"与"不像模型"；
 - `engine`/`outcome`/`load_ms`/`rollback_ms`/`error` 与 `POST /api/engine/reload`
   **同一套语义**（`outcome` 只有四种取值；`error` 非空且 `engine` 仍 ready 就是
   `rolled_back`），因此客户端不必学第二套状态词汇；
@@ -673,7 +773,13 @@ pub enum EngineState {
 2. **校验运行配置**：provider 名称、对应 feature 是否编译进来、各资源上限取值合法 → 任一非法立即退出；
 3. 检查模型集状态（§5）：
    - **不齐备** → 服务**正常启动**，`EngineState::BlockedModelsMissing`；`/api/models`、`/api/status` 可用；`POST /api/ocr` 返回 **409 `models_missing`**（字段与 `/api/models` 一致）；
-   - **齐备** → **预加载**：`Loading` → `Ready`（provider 不可用则 `Failed`，原因写入 `/api/status`）。
+   - **齐备** → **预加载**：`Loading` → `Ready`（provider 不可用则 `Failed`，原因写入 `/api/status`）；
+   - **`--reverify-models`（显式 opt-in，A1）** → 在建会话**之前**冷验证**这次运行的整份模型
+     计划**（§4.2.1）：文本管线 + （公式路由启用时）公式管线的识别与检测模型；计划内任一文件
+     缺失/损坏 → **拒绝启动**，错误按管线分组点名文件（`text pipeline:` / `formula pipeline:`）。
+     计划口径与引擎/`/api/models` 的 `pipelines` 块/准入是**同一份清单**，因此"启动期拒绝的"
+     就是"引擎不会去加载的"；公式未启用时公式模型不在计划里（一个损坏的 566 MB 识别模型既不
+     拦住启动、也不被读一遍），而**运行期**准入仍然按管线：损坏的公式模型只让公式队列 409。
 
 运行期转换：
 
@@ -775,7 +881,7 @@ ode --check 报 Unexpected token '}'，
 | 左 | 拖放区 + 文件选择按钮 + `<img>` + 覆盖层 `<canvas>`；粘贴；缩放/适应；"下载标注图" |
 | 右上 | 引擎状态（`loading`/`ready`/`rebuilding`/`failed`）、`requested`/`selected_ep`/`fallback_to_cpu`、ORT 版本、峰值内存、进度 |
 | 右中 | 区域列表（阅读顺序、文本、置信度、坐标）；点击 ↔ 高亮；"复制全文" |
-| 右上（引擎面板下方） | **"重新校验"按钮 + 结论区**（A2）：一次动作触发 `POST /api/models/reverify`（清缓存 → 冷验证 → 重建引擎），结论显示 `computed`/`content_changed`/`outcome`/逐文件状态。放在常驻位置而不是模型横幅里：横幅在模型齐备时是隐藏的，而这个动作在齐备时同样有意义 |
+| 右上（引擎面板下方） | **"重新校验"按钮 + 结论区**（A2）：一次动作触发 `POST /api/models/reverify`（清缓存 → 冷验证 → 重建引擎），结论显示 `computed`/`content_changed`/`outcome`/逐文件状态，并按 `pipelines` 块给出**公式管线**的独立结论（阻塞的文件名、检测模型与它的状态），因此"文本就绪、公式损坏"在页面上不会被合并成一句"服务不可用"。放在常驻位置而不是模型横幅里：横幅在模型齐备时是隐藏的，而这个动作在齐备时同样有意义 |
 | 右下 | 导出 JSON/Markdown/HTML；折叠的诊断面板（逐阶段耗时、账本口径说明、provider 实测耗时） |
 | 横幅 | 模型缺失/损坏：文件、总大小、来源、是否允许下载、下载按钮与进度 |
 
@@ -846,6 +952,9 @@ img-src 'self' blob: data:; connect-src 'self'; base-uri 'none'; form-action 'no
     566 MB（M1 评审 P1-2 / 性能一节；局部摘要是 B 轮加的，实测前后成本见 `docs/06`）。
     **需要确定性地排除缓存影响时**只有两个入口：启动期的 `--reverify-models`（冷验证 +
     缺失/损坏即拒绝启动）与运行期的 `POST /api/models/reverify`（清缓存 → 冷验证 → 重建引擎）。
+    **两个入口都只碰"这次运行的模型计划"**（§4.2.1）：公式路由未启用时，那两个入口都不会读
+    566 MB 的公式识别模型——它不在计划里（启动快照因此也不再为它读盘；`/api/models` 的库存
+    报告为了显示状态仍会在首次见到它时算一次摘要，并如实记进 `cold_this_call`）。
 
 ---
 
@@ -953,7 +1062,8 @@ M1 评审修复轮之后的一轮，针对"校验缓存的保证强度"这三件
 
 - **A1 `--reverify-models`**：启动期**冷验证**这次运行会真正加载的每个文件（忽略缓存），
   逐文件打印一行结论，任一缺失/损坏即**拒绝启动**并点名那些文件。范围是
-  `ModelPlan::required_files`，**不是**整张默认表。改动：§3、§5.5、§10 第 10 条、§12
+  `ModelPlan::required_files`（**计划轮起由 `ModelPlan::plan_files` 的"一份运行计划"取代**），
+  **不是**整张默认表。改动：§3、§5.5、§10 第 10 条、§12
 - **A2 `POST /api/models/reverify`**：①清校验缓存 ②冷验证 ③**引擎此前就绪则重建会话**
   （缺第 3 步就是"按下去什么都不会变的按钮"）。响应给逐文件状态/原因、`computed`、
   `content_changed` 与引擎结论（含 `load_ms`/`rolled_back`/`failed`，与 reload 同一套语义）。
@@ -965,6 +1075,32 @@ M1 评审修复轮之后的一轮，针对"校验缓存的保证强度"这三件
   首尾 64 KiB 逐字节相同"，并明确写出**局部摘要是启发式，不是安全边界**。
   小于 128 KiB 的文件首尾重叠 ⇒ 局部摘要覆盖整个内容（规则与测试见 §4.2.1）。
   改动：§4.2.1、§5.4、§10 第 10 条、§12
+
+### 计划轮：检测模型漏在计划外 + 逐管线报告（P1，逐条证据见 `docs/06`）
+
+A1/A2/B 之后的一轮，修的是**"这次运行会加载哪些文件"有三份不同的说法**这一个根因
+（同一份记录在 `docs/06` 的"计划轮"一节）：
+
+- **P1 一份运行计划（唯一来源）**：`ModelPlan::resolve` 一次算出计划，
+  A1（`--reverify-models`）、A2（`POST /api/models/reverify`）、`/api/models` 的 `pipelines`
+  块、两条管线的准入与 `pin_engine_paths`/`FormulaPolicy` 两条加载路径全部读它。
+  改动：§3、§4.2.1、§5.4、§5.5、§7.6、§10 第 10 条、§12
+- **公式检测模型进计划（根因）**：旧实现把 `formula_detector` 排除在计划之外，于是
+  `--reverify-models` 从不冷验证一个 `--formula-detector`，`POST /api/models/reverify` 也从不
+  列它、从不为它算摘要（同体积同 mtime 的中段改动可以一直留在陈旧摘要上）。
+  集合之外的检测模型**没有声明摘要**，此时"验证"的含义被明确写成文档化规则
+  （存在 + 可读 + 像 ONNX：protobuf 序言 `0x08` + `ir_version` varint 1..=64），
+  响应里它的 `sha256` 是 `null`，而 A1/A2 仍然为它真的算一个摘要并如实报告。
+- **公式未启用 ⇒ 公式模型不在计划里**：`formula_recognizer` 旧实现被**无条件**加入计划，
+  而 fail-fast 只看 `text_blocking()`，于是"公式启用时损坏的公式识别模型不拦启动"与
+  "公式未启用时也要哈希 566 MB"两个错误同时存在。现在：公式路由启用 ⇒ 识别与检测都在计划里，
+  `--reverify-models` 对两者 fail-fast（错误按管线分组）；未启用 ⇒ 两者都不在计划里，
+  A1/A2 一个字节都不读，启动也不受它们影响。
+- **逐管线报告**：`/api/models` 与 A2 都新增 `pipelines` 块（`text` 的 `outcome` 与 `formula`
+  的 `routing`/`in_plan`/`missing`/`corrupt`/`blocked`/`detector` 分开给出），页面据此显示
+  "文本就绪、公式损坏"。既有字段名一个都没改（`complete`/`missing`/`corrupt`/`blocked`/
+  `routing`/`disabled_reason`/`detector` 原样保留，页面读的 `sets[]` 与 `formula` 块口径不变）。
+  改动：§5.4、§5.5、§9.2（页面结论区）、§12
 
 ---
 
@@ -1003,8 +1139,10 @@ M1 评审修复轮之后的一轮，针对"校验缓存的保证强度"这三件
 | 引擎重建线程（M1 评审 P2-2） | 无 body 的 `POST /api/engine/reload` 在建会话被闸门按住的整段时间里：`/api/status` 显示 `loading` 且 `POST /api/ocr` 仍返回 202 |
 | 评估沙箱（M1 评审 P2-3） | 没有 `--eval-root` → 400 且理由点名开关；清单越界 / 图片越界（绝对路径、`..`、符号链接）→ 400 且点名违规路径；根内清单照常返回与 CLI 逐字段同值的报告 |
 | 令牌熵（M1 评审 P2-4） | 生成成功且每次不同、是十六进制；熵源字符串被报告；注入一个必然失败的填充器时错误被传播（fail-closed 分支被真的执行） |
-| 启动期冷验证（A1） | 损坏/缺失的计划模型 → `rapidocr serve --reverify-models` **非零退出**并点名那个文件（单元层 + 真实子进程的集成用例）；健康模型 → 每个文件**这一次**都算了一次摘要（`digests_computed == 文件数`）；不在本轮使用范围里的文件**不**被哈希 |
-| 运行期重新校验（A2） | 损坏模型 → 端点报 `corrupt` 且引擎是**可定位的错误态**（不是"旧引擎继续 ready"）；还原后同一端点恢复 `ready` 并**真的重建会话**（建会话次数 +1）；缓存命中之后调用它 `computed == 文件数`（每个文件的 `cause` 都不是 `cache_hit`）；并发调用一个真跑、另一个立刻 503 `busy`（确定性地用钩子构造重叠），且 `busy` 由 accept 线程产生（序列不在 accept 线程上）；有 body → 400 |
+| 启动期冷验证（A1） | 损坏/缺失的**计划**模型 → `rapidocr serve --reverify-models` **非零退出**并点名那个文件**与所属管线**（单元层 + 真实子进程的集成用例，含公式检测模型那一条）；健康模型 → 每个计划文件**这一次**都算了一次摘要（`digests_computed == 计划文件数`）；不在计划里的文件**不**被哈希（公式未启用时 `digests_computed == 3`，566 MB 那个一个字节都不读） |
+| 运行期重新校验（A2） | 损坏模型 → 端点报 `corrupt` 且引擎是**可定位的错误态**（不是"旧引擎继续 ready"）；还原后同一端点恢复 `ready` 并**真的重建会话**（建会话次数 +1）；缓存命中之后调用它 `computed == 计划文件数`（每个文件的 `cause` 都不是 `cache_hit`）；**公式检测模型在 `files[]` 里且这一次真的重算了它的摘要**；并发调用一个真跑、另一个立刻 503 `busy`（确定性地用钩子构造重叠），且 `busy` 由 accept 线程产生（序列不在 accept 线程上）；有 body → 400 |
+| 一份运行计划（P1，本轮） | 同一份清单经四个入口读回来必须一致：`/api/models.pipelines.*.files`、A2 的 `files[].name`（同序）、`FormulaPolicy` 的两个路径与两个声明摘要、公式队列 409 点名的文件（身份断言用例）；公式启用时损坏的**检测模型**与**识别模型**都让 `--reverify-models` 失败并点名管线；公式未启用时同一个损坏不影响启动、且不被哈希；集合之外的 `--formula-detector` 没有声明摘要时在计划里、`sha256: null`、按"存在 + 可读 + 像 ONNX"判定（写垃圾 → `corrupt` → 公式队列 409），文本 OCR 全程 202 |
+| 逐管线报告（P1，本轮） | A2 在"文本健康 + 公式识别模型损坏"时**同时**给出 `pipelines.text.outcome=ready`/`complete=true` 与 `pipelines.formula.corrupt=["fx.onnx"]`（顶层 `missing`/`corrupt` 保持文本作用域）；`/api/models` 的 `pipelines.formula.in_plan=false`（公式未启用）时 `files`/`blocked` 为空；页面读取并显示 `pipelines`（无内联 handler/style，占位符计数不变） |
 | 局部摘要（B） | 同体积 + 同 mtime：改**头部**、改**尾部**都必须被发现并触发完整重哈希（`cause = content_changed`、`partial_mismatches` 增长）；只改**中段**必须**不**被发现（限制被测试钉住，不是只写在文档里）；`size ≤ 128 KiB` 时首尾重叠 ⇒ 任意位置改动都被发现；空文件与正好 128 KiB 良定义；命中路径不完整哈希（`computed == false`）；`/api/models` 命中成本与加局部摘要前对比（前后实测见 `docs/06`） |
 
 **证据要求**：每个里程碑在 `docs/06-local-web-demo-reports.md`（新建）记录命令、关键输出、与验收标准对照、未覆盖风险。**不得**以"界面看起来正常"作为验证通过。

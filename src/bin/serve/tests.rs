@@ -24,8 +24,9 @@
 //! `delay=25ms` 的脚本化后端 + `limit=0` 的滑动窗口。两个方向都跑：
 //! 公式洪水下的普通任务、普通洪水下的公式任务，上界取调度器的
 //! `wait_bound`（`capacity × 对方配额`）再乘上单任务耗时并留足余量。
-//! 公式队列在 M1 生产路径上不可达（§10.8），因此这里显式把 `OcrRouting { formula: true }`
-//! 打开，并用 `?queue=formula` 选择队列——这就是"测试专用慢速路径"的全部内容。
+//! 公式队列在 M1 生产路径上不可达（§10.8），因此这里用 `--formula-detector` 打开它（见
+//! `TestOptions::with_formula_routing`），并用 `?queue=formula` 选择队列——这就是"测试专用
+//! 慢速路径"的全部内容。
 
 use std::io::{Cursor, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -39,11 +40,11 @@ use super::engine::{BackendProvider, EngineFactory, OcrBackend};
 use super::evaluate::EvalRoot;
 use super::http::{BoundServer, ServeHandle};
 use super::limits::RawServeLimits;
-use super::model_plan::{FormulaDetectorSpec, ModelPlan};
+use super::model_plan::ModelPlan;
 use super::queue::QueueClass;
 use super::run::render_page;
 use super::security::{LocalOrigin, ServeToken, generate_nonce};
-use super::server::{FreeSpaceFactory, OcrRouting, ServeContext, ServeShared};
+use super::server::{FreeSpaceFactory, ServeContext, ServeShared};
 use super::state::ServeStartup;
 use rapid_ocr_rs::{
     CoordinateSpace, DetectionOutcome, DownloadError, EngineConfig, EngineInfo, FileIdentity,
@@ -235,10 +236,11 @@ struct TestOptions {
     allow_download_hosts: Vec<String>,
     /// `--allow-provider-fallback`（§7.5）：运行期切换 provider 会用同一个值。
     allow_provider_fallback: bool,
-    routing: OcrRouting,
-    /// `--formula-detector`（M4）；路由打开时它必须有值，否则 `FormulaPolicy` 会是
-    /// "只处理显式区域"的退化形状。它是**路径 + 集合声明的哈希**（评审 P1-1）。
-    formula_detector: Option<FormulaDetectorSpec>,
+    /// `--formula-detector`（M4）的 **CLI 路径**。
+    ///
+    /// 路由与"该哈希谁"都由 `ModelPlan::resolve` 从这一条路径唯一解析（单一的运行计划），
+    /// 测试因此不再自己拼一份 `FormulaDetectorSpec`——那正是"报告一份、加载另一份"的形状。
+    formula_detector: Option<PathBuf>,
     /// `--eval-root` 沙箱（评审 P2-3）：默认指向测试模型目录（评估夹具就写在那里）。
     eval_root: Option<EvalRoot>,
     engine_factory: EngineFactory,
@@ -262,9 +264,6 @@ impl TestOptions {
             allow_download: false,
             allow_download_hosts: Vec::new(),
             allow_provider_fallback: false,
-            routing: OcrRouting::text_only(
-                "test server: no --formula-detector, so the formula queue is refused (§10.8)",
-            ),
             formula_detector: None,
             eval_root,
             engine_factory: scripted.factory(),
@@ -276,39 +275,23 @@ impl TestOptions {
         }
     }
 
-    /// 打开公式路由（M4）：检测模型路径在场，公式队列因此可达。
+    /// 打开公式路由（M4）：给出 `--formula-detector` 的路径，公式队列因此可达。
     ///
     /// `detector` 只需是一个路径：脚本化后端不加载它（真实启动期的存在性校验在 `run.rs`），
     /// 但 `FormulaPolicy.detector_path` 必须真的有值——否则接上的就是"只处理显式区域"的
     /// 退化形状，公式任务会静默地一个区域都产不出来。
     ///
-    /// **文件必须真的在磁盘上**：评审 P1-2 之后，公式队列的准入按检测模型的哈希状态判定，
-    /// "配置了检测模型但文件不在"同样是 409。`run.rs` 在启动期就拒绝这种配置，因此测试
-    /// 夹具也复现这个不变量（缺文件时写一份占位内容）。
+    /// **文件必须真的在磁盘上，而且必须"像 ONNX"**：评审 P1-2 之后，公式队列的准入按检测
+    /// 模型的状态判定；集合之外的文件没有声明摘要，因此按文档化规则（存在 + 可读 + 像 ONNX）
+    /// 判定，而 `run.rs` 在启动期就拒绝"配置了检测模型但文件不在"。夹具因此写一份
+    /// protobuf 序言（`0x08 0x07`）开头的占位内容。
+    ///
+    /// **无条件重写**：夹具目录在 `target/` 下、跨进程保留，`unique()` 每次从 0 开始——
+    /// 只写"文件不在时"的话，上一次运行留下的同名文件（旧内容）会决定本次测试的结论。
     fn with_formula_routing(mut self, detector: &Path) -> Self {
-        if !detector.is_file() {
-            let name = detector
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "detector.onnx".to_string());
-            std::fs::write(detector, model_file_bytes(&name)).expect("write the detector fixture");
-        }
-        self.routing = OcrRouting::formula_enabled();
-        self.formula_detector = Some(FormulaDetectorSpec {
-            path: detector.to_path_buf(),
-            expected_sha256: None,
-        });
-        self
-    }
-
-    /// 与 [`Self::with_formula_routing`] 相同，但检测模型带**集合声明的** SHA-256
-    /// （评审 P1-1：损坏的检测模型必须在准入/加载时被抓住）。
-    fn with_verified_formula_detector(mut self, detector: &Path, sha256: &str) -> Self {
-        self.routing = OcrRouting::formula_enabled();
-        self.formula_detector = Some(FormulaDetectorSpec {
-            path: detector.to_path_buf(),
-            expected_sha256: Some(sha256.to_string()),
-        });
+        std::fs::write(detector, plausible_onnx_bytes("detector fixture"))
+            .expect("write the detector fixture");
+        self.formula_detector = Some(detector.to_path_buf());
         self
     }
 
@@ -366,8 +349,12 @@ impl TestServer {
             options.allow_provider_fallback,
         )
         .expect("the test limits must be valid");
-        let model_plan =
-            ModelPlan::resolve(&options.model_dir, &startup.plan.engine).expect("model plan");
+        let model_plan = ModelPlan::resolve(
+            &options.model_dir,
+            &startup.plan.engine,
+            options.formula_detector.as_deref(),
+        )
+        .expect("model plan");
         let snapshot = model_plan.snapshot();
         let post_verify = options.post_verify;
         let context = ServeContext {
@@ -383,8 +370,6 @@ impl TestServer {
             allow_download_hosts: options.allow_download_hosts,
             // §7.5：`ServeStartup::validate` 用的是同一个开关，运行期切换 provider 也用它。
             allow_provider_fallback: options.allow_provider_fallback,
-            routing: options.routing,
-            formula_detector: options.formula_detector,
             eval_root: options.eval_root,
             engine_factory: options.engine_factory,
             downloader: options.downloader,
@@ -652,6 +637,17 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// 而不是把状态标记成"完成"。
 fn model_file_bytes(name: &str) -> Vec<u8> {
     format!("M2 scripted model file {name}").into_bytes()
+}
+
+/// 一份"看起来像 ONNX"的内容：protobuf 序言 = 字段 1（`ir_version`）= 7。
+///
+/// 集合之外的 `--formula-detector` **没有声明摘要**，因此按文档化规则判定
+/// （存在 + 可读 + 像 ONNX）；夹具必须过这一关，否则"公式队列可用"的用例会在准入处
+/// 拿到 409 而不是 202。声明了摘要的文件看哈希，内容与本函数无关。
+fn plausible_onnx_bytes(tag: &str) -> Vec<u8> {
+    let mut bytes = vec![0x08, 0x07];
+    bytes.extend_from_slice(tag.as_bytes());
+    bytes
 }
 
 /// 一个用本地 manifest 描述的模型目录：
@@ -972,6 +968,18 @@ fn unique() -> u64 {
     use std::sync::atomic::AtomicU64;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+/// 串行化"会动**进程级**校验缓存"的用例：`POST /api/models/reverify` 会
+/// `clear_verification_cache()`，`force_verify_file` 会写入条目——两者都会影响
+/// 别的用例对 `verification.cold_this_call` 的**精确**断言（"第二次轮询必须是 0"）。
+///
+/// 这与库内 `model_verify::tests` 的 `serial()` 是同一个理由：缓存是进程级的，而
+/// `cargo test` 并行跑用例。因此凡是"清缓存"或"断言这一次算了几个"的用例都持有它；
+/// 没有它，"精确计数"就只能是概率事件（`docs/06` 记录过同类偶发失败）。
+fn cache_serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 fn limits(text: usize, formula: usize) -> RawServeLimits {
@@ -2297,10 +2305,8 @@ fn detector_model_dir(name: &str) -> DetectorFixture {
 fn a_corrupt_formula_detector_is_reported_and_refused_before_the_body() {
     let fixture = detector_model_dir("corrupt-detector");
     std::fs::write(&fixture.detector, b"corrupted detector bytes").expect("corrupt the detector");
-    let server = TestServer::start(
-        TestOptions::new(fixture.dir.clone(), Scripted::fast())
-            .with_verified_formula_detector(&fixture.detector, &fixture.detector_sha),
-    );
+    // 检测模型由**集合声明**（`formula_detector` role），因此它自动进入运行计划并启用路由。
+    let server = TestServer::start(TestOptions::new(fixture.dir.clone(), Scripted::fast()));
 
     // `/api/models`：集合里的检测模型是损坏的，且**只给文件名**（§7.4 脱敏）。
     let models = server.get("/api/models").json();
@@ -2319,6 +2325,18 @@ fn a_corrupt_formula_detector_is_reported_and_refused_before_the_body() {
     assert_eq!(
         models["formula"]["detector"]["sha256"], fixture.detector_sha,
         "the declared hash must be reported (not dropped)"
+    );
+    // 运行计划的公式块：识别模型在计划里、检测模型**在**计划里且是唯一的阻塞项。
+    assert_eq!(models["pipelines"]["formula"]["in_plan"], true, "{models}");
+    assert_eq!(
+        models["pipelines"]["formula"]["corrupt"],
+        json!(["mfd.onnx"]),
+        "{models}"
+    );
+    assert_eq!(
+        models["pipelines"]["formula"]["files"],
+        json!(["fx.onnx", "mfd.onnx"]),
+        "the run plan's formula pipeline is exactly the recognizer + the detector: {models}"
     );
     assert!(
         !models
@@ -2347,31 +2365,49 @@ fn a_corrupt_formula_detector_is_reported_and_refused_before_the_body() {
     assert_eq!(detail["scope"], "formula");
     assert_eq!(detail["corrupt"], json!(["mfd.onnx"]));
     assert_eq!(detail["detector"]["state"], "corrupt");
+    assert_eq!(detail["in_plan"], true);
 
     // 普通 OCR 完全不受影响（那是公式队列的缺口，不是引擎的）。
     let text = server.submit_ocr(b"text image");
     assert_eq!(text.status, 202, "{}", text.text());
 }
 
-/// 评审 P1-1：检测模型来自 `--formula-detector`（**不在任何集合里**）时同样要被校验，
-/// 而且它是唯一阻塞项时 `detail.corrupt` 仍要点名它——否则 `code=models_corrupt` 会
-/// 列不出任何一个文件名。
+/// 评审 P1-1 + 本轮：检测模型来自 `--formula-detector`（**不在任何集合里**）时同样进入
+/// 运行计划、同样被校验，而且它是唯一阻塞项时 `detail.corrupt` 仍要点名它。
+///
+/// **本轮的行为变化（有意的期望变更）**：集合之外的文件**没有可信摘要**，因此
+/// `/api/models` 与 409 的 `detector.sha256` 是 `null`——旧用例给它塞了一个"声明哈希"
+/// 来走哈希分支，那正是"报告一份、加载另一份"的形状。现在的判据是文档化规则：
+/// 存在 + 可读 + 像 ONNX（`0x08` + `ir_version` varint）。内容被换成不是 ONNX 的东西时
+/// 状态变成 `corrupt`，公式队列因此在**读 body 之前** 409——旧用例证的那条保证仍然成立。
 #[test]
 fn a_cli_formula_detector_is_verified_by_the_same_rule() {
     let dir = manifest_model_dir_text_only("cli-detector", &text_fixture_files(), None);
     let detector = dir.join("pix2text-mfd-1.5.onnx");
-    std::fs::write(&detector, b"a detector the manifest never declared").expect("write detector");
-    let declared = sha256_file(&detector).expect("hash the detector");
+    std::fs::write(
+        &detector,
+        plausible_onnx_bytes("a detector the manifest never declared"),
+    )
+    .expect("write detector");
     let server = TestServer::start(
-        TestOptions::new(dir.clone(), Scripted::fast())
-            .with_verified_formula_detector(&detector, &declared),
+        TestOptions::new(dir.clone(), Scripted::fast()).with_formula_routing(&detector),
     );
 
-    // 内容正确 → 公式集合齐备、检测模型 `present`、公式队列照常 202。
+    // 内容看起来是 ONNX → 检测模型 `present`、公式队列照常 202。
     let models = server.get("/api/models").json();
-    assert_eq!(models["formula"]["complete"], true, "{models}");
     assert_eq!(models["formula"]["detector"]["state"], "present");
-    assert_eq!(models["formula"]["detector"]["sha256"], declared);
+    assert_eq!(
+        models["formula"]["detector"]["sha256"],
+        Value::Null,
+        "an external detector has no declared digest, and the service must not invent one: {models}"
+    );
+    assert_eq!(models["formula"]["routing"], true);
+    // 它在**运行计划**里（这是本轮修复的根因：旧实现把它排除在 `required_files` 之外）。
+    assert_eq!(
+        models["pipelines"]["formula"]["files"],
+        json!(["fx.onnx", "pix2text-mfd-1.5.onnx"]),
+        "{models}"
+    );
     let accepted = server.post(
         "/api/ocr?queue=formula",
         &[("Content-Type", "application/octet-stream")],
@@ -2379,11 +2415,17 @@ fn a_cli_formula_detector_is_verified_by_the_same_rule() {
     );
     assert_eq!(accepted.status, 202, "{}", accepted.text());
 
-    // 同一个路径、内容被替换 → 身份变化 → 必须重新校验并拒绝（不能继续用旧结论）。
+    // 同一个路径、内容被换成"不是 ONNX" → 文档化规则（存在 + 可读 + 像 ONNX）判成 corrupt，
+    // 准入在**读 body 之前** 409（不能继续用第一次的结论）。
     std::fs::write(&detector, b"corrupted after the first verification").expect("corrupt");
     let models = server.get("/api/models").json();
     assert_eq!(
         models["formula"]["detector"]["state"], "corrupt",
+        "{models}"
+    );
+    assert_eq!(
+        models["pipelines"]["formula"]["corrupt"],
+        json!(["pix2text-mfd-1.5.onnx"]),
         "{models}"
     );
     let refused = server.request(
@@ -2405,6 +2447,14 @@ fn a_cli_formula_detector_is_verified_by_the_same_rule() {
         json!(["pix2text-mfd-1.5.onnx"]),
         "the detector is the only blocker and must be named"
     );
+    assert!(
+        refused.json()["detail"]["detector"]["sha256"].is_null(),
+        "no declared digest → null (never a fabricated one)"
+    );
+
+    // 普通 OCR 照常可用：公式缺口不得阻塞文本管线。
+    let text = server.submit_ocr(b"text image");
+    assert_eq!(text.status, 202, "{}", text.text());
 }
 
 /// 评审 P1-2 + 性能一节：`/api/models` 复用**身份键控**的校验结论，而不是每次重新哈希。
@@ -2413,6 +2463,8 @@ fn a_cli_formula_detector_is_verified_by_the_same_rule() {
 /// 因此稳态下必须是 0；一个文件被替换（体积/mtime 变化）时，只有它必须重新验证。
 #[test]
 fn models_reuses_the_verified_digest_until_the_file_identity_changes() {
+    // 进程级校验缓存：本用例会清缓存或断言精确的重算次数，必须与同类用例串行。
+    let _serial = cache_serial();
     let fixture = detector_model_dir("verify-cache");
     let server = TestServer::start(TestOptions::new(fixture.dir.clone(), Scripted::fast()));
 
@@ -2516,6 +2568,12 @@ fn the_page_carries_the_reverify_button_without_inline_handlers_or_styles() {
         page.contains("xhrSend('POST', '/api/models/reverify', '')"),
         "the request body must be empty, exactly as the endpoint requires"
     );
+    // A2 的逐管线结论必须被显示：否则"文本就绪、公式损坏"在页面上又会退化回一句笼统的
+    // 结论（服务端把它分开说了，页面不能把它合并回去）。
+    assert!(
+        page.contains("c.pipelines") && page.contains("公式管线："),
+        "the page must render A2's per-pipeline verdict"
+    );
     // 冻结的占位符计数（§9：nonce 属性 ×3、占位符出现 ×4、令牌 ×3）。
     assert_eq!(
         page.matches("__CSP_NONCE__").count(),
@@ -2546,6 +2604,8 @@ fn the_page_carries_the_reverify_button_without_inline_handlers_or_styles() {
 /// `partial_mismatches` 增长、本次 `cold_this_call` 至少 1（**只有它**被重新哈希）。
 #[test]
 fn models_detects_a_same_size_same_mtime_swap_through_the_content_windows() {
+    // 进程级校验缓存：本用例会清缓存或断言精确的重算次数，必须与同类用例串行。
+    let _serial = cache_serial();
     let dir = complete_model_dir("verify-window-swap");
     let path = dir.join("rec.onnx");
     let server = TestServer::start(TestOptions::new(dir, Scripted::fast()));
@@ -2646,6 +2706,8 @@ fn corrupt_bytes(size: usize) -> Vec<u8> {
 /// 那条用例还断言了"会话真的被重建"。
 #[test]
 fn reverify_reports_a_corrupt_model_and_leaves_the_service_blocked_not_stale_ready() {
+    // 进程级校验缓存：本用例会清缓存或断言精确的重算次数，必须与同类用例串行。
+    let _serial = cache_serial();
     let dir = complete_model_dir("reverify-corrupt");
     // 破坏**文本管线**里的识别模型：它才是引擎要加载的那一份，因此"服务的状态"会从
     // `ready` 变成**可定位的错误态**（公式模型损坏只影响公式队列，普通 OCR 不受影响，
@@ -2691,10 +2753,19 @@ fn reverify_reports_a_corrupt_model_and_leaves_the_service_blocked_not_stale_rea
     let body = response.json();
     assert_eq!(
         body["computed"].as_u64(),
-        Some(4),
-        "every file this run uses was re-hashed: {body}"
+        Some(3),
+        "every file **this run's plan** uses was re-hashed; the formula model is not planned \
+         (no --formula-detector), so the 566 MB file must not be hashed: {body}"
     );
     assert_eq!(body["corrupt"], json!(["rec.onnx"]), "{body}");
+    assert_eq!(
+        body["pipelines"]["formula"]["in_plan"], false,
+        "the formula pipeline is not part of this run: {body}"
+    );
+    assert_eq!(
+        body["pipelines"]["text"]["outcome"], "blocked_models_missing",
+        "the text engine's outcome is reported per pipeline: {body}"
+    );
     assert_eq!(
         body["outcome"], "blocked_models_missing",
         "the state must be locatable, not a stale ready: {body}"
@@ -2737,6 +2808,8 @@ fn reverify_reports_a_corrupt_model_and_leaves_the_service_blocked_not_stale_rea
 /// 而用户看到的就是"按钮按下去模型没换"。
 #[test]
 fn reverify_restores_ready_and_rebuilds_the_engine_after_a_healthy_revert() {
+    // 进程级校验缓存：本用例会清缓存或断言精确的重算次数，必须与同类用例串行。
+    let _serial = cache_serial();
     let dir = complete_model_dir("reverify-revert");
     let kept = dir.join("kept.onnx");
     std::fs::write(&kept, std::fs::read(dir.join("rec.onnx")).expect("read")).expect("seed");
@@ -2785,25 +2858,36 @@ fn reverify_restores_ready_and_rebuilds_the_engine_after_a_healthy_revert() {
 
 /// A2：**缓存命中之后**调用本端点，摘要必须被**重新计算**（这就是"重新校验"的定义）。
 ///
-/// 断言的是绝对数字：这个模型集里有 4 个本次运行会用到的文件（det/rec/dict/fx），
-/// 因此 `computed == 4`，且每个文件的 `cause` 都不是 `cache_hit`（冷验证不查缓存）。
+/// 断言的是绝对数字：这次运行的**计划**里有 3 个文件（det/rec/dict）——公式路由没有启用
+/// （没有 `--formula-detector`），因此 566 MB 的 `fx.onnx` **不在计划里**、一个字节都不读。
+/// 每个文件的 `cause` 都不是 `cache_hit`（冷验证不查缓存），且它确实出现在 `files[]` 里。
+///
+/// **本轮的行为变化（有意的期望变更）**：旧实现无条件把 `formula_recognizer` 加进这份清单，
+/// 于是这里断言的是 4——一个本轮根本不会加载的 566 MB 文件。现在数字是 3，并且额外断言
+/// "`fx.onnx` 不在清单里"，这正是修复的根因所在（见 `docs/06` 的本轮记录）。
 ///
 /// 注：库的校验缓存与它的累计账都是**进程级**的（同一个进程看到的同一个文件只有一种
 /// 结论），而 `cargo test` 并行跑用例，因此这里只断言"缓存命中确实发生了"
 /// （`cold_this_call == 0` 且 `cache_hits` 增长），不去断言某个精确的增量。
 #[test]
 fn reverify_recomputes_digests_that_the_cache_would_have_answered() {
+    // 进程级校验缓存：本用例会清缓存或断言精确的重算次数，必须与同类用例串行。
+    let _serial = cache_serial();
     let dir = complete_model_dir("reverify-cold");
     let server = TestServer::start(TestOptions::new(dir, Scripted::fast()));
 
-    // 预热缓存：两次 `/api/models` 全程命中，`cold_this_call == 0`。
+    // 预热缓存：第一次 `/api/models` 可能还要为**库存**里的公式模型算一次摘要（它不在
+    // 本次运行的计划里，因此启动快照没有读它——这正是本轮修复的可见效果）；从那以后
+    // 每一次 `/api/models` 都必须全程命中，`cold_this_call == 0`。
     let first = server.get("/api/models").json();
-    assert_eq!(first["verification"]["cold_this_call"], 0, "{first}");
     let hits_before = first["verification"]["cache_hits"]
         .as_u64()
         .expect("cache_hits");
     let second = server.get("/api/models").json();
-    assert_eq!(second["verification"]["cold_this_call"], 0, "{second}");
+    assert_eq!(
+        second["verification"]["cold_this_call"], 0,
+        "a second poll must not re-hash anything: {second}"
+    );
     assert!(
         second["verification"]["cache_hits"]
             .as_u64()
@@ -2811,18 +2895,35 @@ fn reverify_recomputes_digests_that_the_cache_would_have_answered() {
             > hits_before,
         "the cache really answered the files this time: {second}"
     );
+    // 计划口径（本轮修复的根因回归）：公式不在计划里，公式模型因此不在清单里。
+    assert_eq!(second["pipelines"]["formula"]["in_plan"], false, "{second}");
+    assert_eq!(
+        second["pipelines"]["formula"]["files"],
+        json!([]),
+        "{second}"
+    );
 
     let response = server.post("/api/models/reverify", &[], b"");
     assert_eq!(response.status, 200, "{}", response.text());
     let body = response.json();
     assert_eq!(
         body["computed"].as_u64(),
-        Some(4),
-        "a cache hit must not survive the forced re-verification: {body}"
+        Some(3),
+        "a cache hit must not survive the forced re-verification, and only this run's plan is \
+         hashed: {body}"
     );
-    assert_eq!(body["verification"]["digests_computed"], 4, "{body}");
+    assert_eq!(body["verification"]["digests_computed"], 3, "{body}");
     let files = body["files"].as_array().expect("files");
-    assert_eq!(files.len(), 4, "{body}");
+    assert_eq!(files.len(), 3, "{body}");
+    let names: Vec<&str> = files
+        .iter()
+        .map(|file| file["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, vec!["det.onnx", "rec.onnx", "dict.txt"], "{body}");
+    assert!(
+        !names.contains(&"fx.onnx"),
+        "the 566 MB formula recognizer is not part of this run's plan: {body}"
+    );
     for file in files {
         assert_ne!(
             file["cause"], "cache_hit",
@@ -2845,6 +2946,8 @@ fn reverify_recomputes_digests_that_the_cache_would_have_answered() {
 /// 第二次请求连响应都拿不到，会一直等到第一次结束）。
 #[test]
 fn concurrent_reverifications_are_single_flight_and_never_run_on_the_accept_thread() {
+    // 进程级校验缓存：本用例会清缓存或断言精确的重算次数，必须与同类用例串行。
+    let _serial = cache_serial();
     let dir = complete_model_dir("reverify-busy");
     let (tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
     let server = TestServer::start(TestOptions {
@@ -2896,8 +2999,437 @@ fn concurrent_reverifications_are_single_flight_and_never_run_on_the_accept_thre
     let first = parse_response(&buffer);
     assert_eq!(first.status, 200, "{}", first.text());
     let body = first.json();
-    assert_eq!(body["computed"].as_u64(), Some(4), "{}", first.text());
+    assert_eq!(
+        body["computed"].as_u64(),
+        Some(3),
+        "the formula model is not part of this run's plan: {}",
+        first.text()
+    );
     assert_eq!(body["outcome"], "ready", "{}", first.text());
+}
+
+// ---------------------- 本轮：一份运行计划（公式检测模型 + 逐管线报告 + 身份断言）
+
+/// 需求 1（HTTP 层）+ 需求 3：损坏的公式**检测**模型在 A2 的 `files[]` 里、
+/// **这一次真的重算了它的摘要**，并且响应把"文本就绪"与"公式损坏"分开说清楚。
+///
+/// 旧实现的根因：`required_files` 只收 detector/recognizer/dictionary + 可选的 classifier +
+/// `formula_recognizer`，**把 `formula_detector` 漏在外面**，因此
+/// `POST /api/models/reverify` 既不列它、也不为它算摘要（一个同体积同 mtime 的中段改动可以
+/// 一直留在陈旧摘要上）。现在检测模型属于运行计划，判定与冷验证都覆盖它。
+#[test]
+fn reverify_cold_verifies_the_formula_detector_and_reports_it_per_pipeline() {
+    // 进程级校验缓存：本用例会清缓存或断言精确的重算次数，必须与同类用例串行。
+    let _serial = cache_serial();
+    let fixture = detector_model_dir("plan-detector");
+    let original = std::fs::read(&fixture.detector).expect("read the detector");
+    // 存在但内容与集合声明的摘要不符（"损坏"的检测模型）。
+    std::fs::write(&fixture.detector, corrupt_bytes(original.len())).expect("corrupt the detector");
+    let actual = sha256_file(&fixture.detector).expect("hash the corrupted detector");
+    assert_ne!(actual, fixture.detector_sha);
+
+    let server = TestServer::start(TestOptions::new(fixture.dir.clone(), Scripted::fast()));
+
+    let response = server.post("/api/models/reverify", &[], b"");
+    assert_eq!(response.status, 200, "{}", response.text());
+    let body = response.json();
+
+    // **整份计划**（两个管线）都被冷验证：3 个文本文件 + 公式识别 + 公式检测。
+    assert_eq!(
+        body["computed"].as_u64(),
+        Some(5),
+        "the formula detector must be cold-verified too: {body}"
+    );
+    let files = body["files"].as_array().expect("files");
+    let names: Vec<&str> = files
+        .iter()
+        .map(|file| file["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["det.onnx", "rec.onnx", "dict.txt", "fx.onnx", "mfd.onnx"],
+        "{body}"
+    );
+    let detector = files
+        .iter()
+        .find(|file| file["name"] == "mfd.onnx")
+        .expect("the detector must be listed");
+    assert_eq!(detector["role"], "formula_detector");
+    assert_eq!(detector["pipeline"], "formula");
+    assert_eq!(detector["state"], "corrupt", "{body}");
+    assert_eq!(
+        detector["declared_sha256"], fixture.detector_sha,
+        "the set's declared digest must be reported"
+    );
+    assert_eq!(
+        detector["sha256"], actual,
+        "this call must have re-read the file and reported the digest it computed: {body}"
+    );
+    assert_eq!(detector["digest_computed_this_call"], true, "{body}");
+    assert_eq!(detector["has_declared_digest"], true, "{body}");
+
+    // **逐管线**：文本就绪（引擎重建成功），公式损坏——两件事分别说，而不是一句 ready。
+    assert_eq!(body["outcome"], "ready", "{body}");
+    assert_eq!(body["pipelines"]["text"]["outcome"], "ready", "{body}");
+    assert_eq!(body["pipelines"]["text"]["complete"], true, "{body}");
+    assert_eq!(body["pipelines"]["text"]["blocked"], json!([]), "{body}");
+    assert_eq!(
+        body["pipelines"]["text"]["files"],
+        json!(["det.onnx", "rec.onnx", "dict.txt"])
+    );
+    assert_eq!(body["pipelines"]["formula"]["in_plan"], true, "{body}");
+    assert_eq!(body["pipelines"]["formula"]["routing"], true, "{body}");
+    assert_eq!(body["pipelines"]["formula"]["complete"], false, "{body}");
+    assert_eq!(
+        body["pipelines"]["formula"]["corrupt"],
+        json!(["mfd.onnx"]),
+        "{body}"
+    );
+    assert_eq!(
+        body["pipelines"]["formula"]["files"],
+        json!(["fx.onnx", "mfd.onnx"]),
+        "{body}"
+    );
+    assert_eq!(
+        body["pipelines"]["formula"]["detector"]["sha256"], fixture.detector_sha,
+        "{body}"
+    );
+    assert_eq!(
+        body["pipelines"]["formula"]["detector"]["state"], "corrupt",
+        "{body}"
+    );
+
+    // 运行期准入保持**按管线**：公式队列在读 body 之前 409（公式作用域、点名检测模型），
+    // 普通 OCR 完全不受影响。
+    let refused = server.request(
+        "POST",
+        "/api/ocr?queue=formula",
+        &[
+            ("Host", server.host.as_str()),
+            ("X-RapidOCR-Token", server.token.as_str()),
+            ("Origin", server.origin.as_str()),
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Length", "1048576"),
+        ],
+        None,
+    );
+    assert_eq!(refused.status, 409, "{}", refused.text());
+    assert_eq!(refused.code(), "models_corrupt");
+    assert_eq!(refused.json()["detail"]["scope"], "formula");
+    assert_eq!(
+        refused.json()["detail"]["corrupt"],
+        json!(["mfd.onnx"]),
+        "the detector is the only formula blocker and must be named"
+    );
+    let text = server.submit_ocr(b"text image");
+    assert_eq!(text.status, 202, "{}", text.text());
+    let text_id = text.json()["job_id"].as_str().expect("id").to_string();
+    assert_eq!(
+        server.wait_terminal(&text_id, Duration::from_secs(20))["state"],
+        "succeeded"
+    );
+}
+
+/// 需求 3：文本健康、公式识别模型损坏 → A2 的响应必须**同时**说"文本 ready"与
+/// "公式 corrupt"，而不是一个笼统的 `ready`/`failed`。
+///
+/// 这也是仲裁后的启动期语义在运行期的对照：`--reverify-models` 会在这种目录上拒绝启动
+/// （公式属于这次运行的整份计划），而运行期准入**只**让公式队列 409。
+#[test]
+fn reverify_reports_text_ready_and_formula_corrupt_explicitly() {
+    // 进程级校验缓存：本用例会清缓存或断言精确的重算次数，必须与同类用例串行。
+    let _serial = cache_serial();
+    let fixture = detector_model_dir("plan-text-ready-formula-corrupt");
+    // 只损坏公式**识别**模型（声明哈希不匹配）；文本三个文件与检测模型都是好的。
+    std::fs::write(fixture.dir.join("fx.onnx"), b"corrupted formula recognizer")
+        .expect("corrupt the formula recognizer");
+    let built = Arc::new(AtomicUsize::new(0));
+    let server = TestServer::start(TestOptions {
+        engine_factory: counting_engine_factory(Arc::clone(&built)),
+        ..TestOptions::new(fixture.dir.clone(), Scripted::fast())
+    });
+    assert_eq!(
+        server.get("/api/status").json()["engine"]["state"],
+        "ready",
+        "the text engine must load: the formula model is not part of it"
+    );
+
+    let body = server.post("/api/models/reverify", &[], b"").json();
+    assert_eq!(
+        body["outcome"], "ready",
+        "the text engine outcome is ready (it really rebuilt): {body}"
+    );
+    assert_eq!(built.load(Ordering::SeqCst), 2, "startup + rebuild");
+    assert_eq!(body["missing"], json!([]), "{body}");
+    assert_eq!(
+        body["corrupt"],
+        json!([]),
+        "the top-level lists stay text-scoped: {body}"
+    );
+    assert_eq!(body["pipelines"]["text"]["outcome"], "ready", "{body}");
+    assert_eq!(body["pipelines"]["text"]["complete"], true, "{body}");
+    assert_eq!(body["pipelines"]["text"]["blocked"], json!([]), "{body}");
+    assert_eq!(body["pipelines"]["formula"]["in_plan"], true, "{body}");
+    assert_eq!(
+        body["pipelines"]["formula"]["corrupt"],
+        json!(["fx.onnx"]),
+        "'text ready, formula corrupt' must be explicit: {body}"
+    );
+    assert_eq!(body["pipelines"]["formula"]["complete"], false, "{body}");
+    assert_eq!(body["pipelines"]["formula"]["missing"], json!([]), "{body}");
+
+    // 公式队列 409（公式作用域），普通 OCR 照常成功——按管线的准入没有变。
+    let refused = server.post(
+        "/api/ocr?queue=formula",
+        &[("Content-Type", "application/octet-stream")],
+        b"formula image",
+    );
+    assert_eq!(refused.status, 409, "{}", refused.text());
+    assert_eq!(refused.code(), "models_corrupt");
+    assert_eq!(
+        refused.json()["detail"]["corrupt"],
+        json!(["fx.onnx"]),
+        "{}",
+        refused.text()
+    );
+    let text = server.submit_ocr(b"text image");
+    assert_eq!(text.status, 202, "{}", text.text());
+    let text_id = text.json()["job_id"].as_str().expect("id").to_string();
+    assert_eq!(
+        server.wait_terminal(&text_id, Duration::from_secs(20))["state"],
+        "succeeded"
+    );
+}
+
+/// 需求 4（HTTP 层）：集合之外的 `--formula-detector`（**没有声明摘要**）在计划里、
+/// 被 `/api/models` 与 A2 如实报告（`sha256: null`，摘要这一次真的算过），
+/// 而"存在 + 可读 + 像 ONNX"这条文档化规则在运行期准入上同样生效。
+#[test]
+fn an_external_detector_is_reported_honestly_without_a_declared_digest() {
+    // 进程级校验缓存：本用例会清缓存或断言精确的重算次数，必须与同类用例串行。
+    let _serial = cache_serial();
+    let dir = manifest_model_dir_text_only("plan-external-detector", &text_fixture_files(), None);
+    // 模型目录**之外**的检测模型：任何集合都没有声明它。
+    let outside = m2_root().join(format!("external-detector-{}.onnx", unique()));
+    let name = outside
+        .file_name()
+        .expect("file name")
+        .to_string_lossy()
+        .into_owned();
+
+    let server = TestServer::start(
+        TestOptions::new(dir.clone(), Scripted::fast()).with_formula_routing(&outside),
+    );
+    // 夹具的字节由 `with_formula_routing` 写定，因此在服务起来之后再取它的真实摘要。
+    let expected_sha = sha256_file(&outside).expect("hash the external detector");
+
+    // `/api/models`：它在**运行计划**里（旧实现把它整个排除在外）。
+    let models = server.get("/api/models").json();
+    assert_eq!(models["formula"]["routing"], true, "{models}");
+    assert_eq!(
+        models["pipelines"]["formula"]["files"],
+        json!(["fx.onnx", name.clone()]),
+        "{models}"
+    );
+    assert_eq!(
+        models["pipelines"]["formula"]["detector"]["sha256"],
+        Value::Null,
+        "no digest was declared, and the service must not invent one: {models}"
+    );
+    assert_eq!(
+        models["pipelines"]["formula"]["detector"]["state"], "present",
+        "exists + readable + plausible ONNX: {models}"
+    );
+    assert!(
+        !models.to_string().contains(&dir.display().to_string()),
+        "no absolute path may leak: {models}"
+    );
+
+    // A2：冷验证为它算了摘要（如实报告），但声明值是 `null`。
+    let body = server.post("/api/models/reverify", &[], b"").json();
+    assert_eq!(body["computed"].as_u64(), Some(5), "{body}");
+    let detector = body["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .find(|file| file["name"] == name.as_str())
+        .expect("the external detector must be in the plan");
+    assert_eq!(detector["declared_sha256"], Value::Null, "{body}");
+    assert_eq!(detector["has_declared_digest"], false, "{body}");
+    assert_eq!(
+        detector["sha256"], expected_sha,
+        "the digest computed by this call must be reported: {body}"
+    );
+    assert_eq!(detector["digest_computed_this_call"], true, "{body}");
+    assert_eq!(detector["state"], "present", "{body}");
+
+    // 公式队列可用（可读且像 ONNX），普通 OCR 也照常。
+    let accepted = server.post(
+        "/api/ocr?queue=formula",
+        &[("Content-Type", "application/octet-stream")],
+        b"formula image",
+    );
+    assert_eq!(accepted.status, 202, "{}", accepted.text());
+
+    // 文档化的存在/可读/像 ONNX 规则：内容不是 ONNX → 运行期就是 409（不必等重新校验）。
+    std::fs::write(&outside, b"not a model at all").expect("corrupt the detector");
+    let models = server.get("/api/models").json();
+    assert_eq!(
+        models["pipelines"]["formula"]["detector"]["state"], "corrupt",
+        "{models}"
+    );
+    assert_eq!(
+        models["pipelines"]["formula"]["corrupt"],
+        json!([name.clone()]),
+        "{models}"
+    );
+    let refused = server.request(
+        "POST",
+        "/api/ocr?queue=formula",
+        &[
+            ("Host", server.host.as_str()),
+            ("X-RapidOCR-Token", server.token.as_str()),
+            ("Origin", server.origin.as_str()),
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Length", "1048576"),
+        ],
+        None,
+    );
+    assert_eq!(refused.status, 409, "{}", refused.text());
+    assert_eq!(refused.code(), "models_corrupt");
+    assert_eq!(refused.json()["detail"]["corrupt"], json!([name.clone()]));
+    let text = server.submit_ocr(b"text image");
+    assert_eq!(text.status, 202, "{}", text.text());
+
+    std::fs::remove_file(&outside).ok();
+}
+
+/// 需求 5（身份断言）：A1、A2、`/api/models`、准入与加载路径读的是**同一份运行计划**。
+///
+/// 断言方式：先用**同一个** `ModelPlan::resolve` 算出期望的计划（这是唯一构造函数），
+/// 然后经四个入口把它读回来比对——任何一个入口另起一套清单都会让这条用例失败。
+#[test]
+fn every_entry_point_reads_the_same_run_plan() {
+    // 进程级校验缓存：本用例会清缓存或断言精确的重算次数，必须与同类用例串行。
+    let _serial = cache_serial();
+    let fixture = detector_model_dir("plan-identity");
+    let plan = ModelPlan::resolve(&fixture.dir, &test_engine_config(), None).expect("model plan");
+    let expected: Vec<&str> = plan
+        .plan_files()
+        .iter()
+        .map(|file| file.name.as_str())
+        .collect();
+    assert_eq!(
+        expected,
+        vec!["det.onnx", "rec.onnx", "dict.txt", "fx.onnx", "mfd.onnx"],
+        "{expected:?}"
+    );
+    let text_expected: Vec<&str> = plan
+        .plan_files_in(super::model_plan::Pipeline::Text)
+        .iter()
+        .map(|file| file.name.as_str())
+        .collect();
+    let formula_expected: Vec<&str> = plan
+        .plan_files_in(super::model_plan::Pipeline::Formula)
+        .iter()
+        .map(|file| file.name.as_str())
+        .collect();
+    assert_eq!(text_expected, vec!["det.onnx", "rec.onnx", "dict.txt"]);
+    assert_eq!(formula_expected, vec!["fx.onnx", "mfd.onnx"]);
+
+    let server = TestServer::start(TestOptions::new(fixture.dir.clone(), Scripted::fast()));
+
+    // 1) `/api/models` 的 `pipelines` 块（两个管线，按计划顺序）。
+    let models = server.get("/api/models").json();
+    assert_eq!(models["pipelines"]["text"]["files"], json!(text_expected));
+    assert_eq!(
+        models["pipelines"]["formula"]["files"],
+        json!(formula_expected)
+    );
+
+    // 2) A2 的逐文件结论与计划**同序同集**，且 `computed` 等于计划长度。
+    let body = server.post("/api/models/reverify", &[], b"").json();
+    let verified: Vec<&str> = body["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|file| file["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(verified, expected, "A2 must verify exactly this run's plan");
+    assert_eq!(
+        body["computed"].as_u64(),
+        Some(expected.len() as u64),
+        "{body}"
+    );
+    assert_eq!(
+        body["pipelines"]["text"]["files"],
+        json!(text_expected),
+        "the per-pipeline report is the same plan"
+    );
+    assert_eq!(
+        body["pipelines"]["formula"]["files"],
+        json!(formula_expected)
+    );
+
+    // 3) 加载路径（运行期）：`FormulaPolicy` 的两个路径与两个声明摘要都来自计划。
+    let policy = server
+        .shared()
+        .formula_policy()
+        .expect("formula is planned");
+    assert_eq!(
+        policy.model_path.as_deref(),
+        Some(
+            plan.plan_file(rapid_ocr_rs::ModelRole::FormulaRecognizer)
+                .expect("planned")
+                .path
+                .as_path()
+        )
+    );
+    assert_eq!(
+        policy.expected_model_sha256,
+        plan.plan_file(rapid_ocr_rs::ModelRole::FormulaRecognizer)
+            .expect("planned")
+            .declared_sha256
+    );
+    assert_eq!(
+        policy.detector_path.as_deref(),
+        Some(
+            plan.plan_file(rapid_ocr_rs::ModelRole::FormulaDetector)
+                .expect("planned")
+                .path
+                .as_path()
+        )
+    );
+    assert_eq!(
+        policy.expected_detector_sha256,
+        plan.plan_file(rapid_ocr_rs::ModelRole::FormulaDetector)
+            .expect("planned")
+            .declared_sha256
+    );
+
+    // 4) 准入：把计划里的检测模型写坏 → 公式队列 409 点名**同一个文件**，文本队列照常；
+    //    恢复 → 公式队列重新可用（判据与上面报告的是同一份状态）。
+    let original = std::fs::read(&fixture.detector).expect("read the detector");
+    std::fs::write(&fixture.detector, b"corrupted detector bytes").expect("corrupt");
+    let refused = server.post(
+        "/api/ocr?queue=formula",
+        &[("Content-Type", "application/octet-stream")],
+        b"formula image",
+    );
+    assert_eq!(refused.status, 409, "{}", refused.text());
+    assert_eq!(
+        refused.json()["detail"]["corrupt"],
+        json!(["mfd.onnx"]),
+        "admission names the same planned file the report does"
+    );
+    assert_eq!(server.submit_ocr(b"text image").status, 202);
+    std::fs::write(&fixture.detector, &original).expect("restore");
+    let accepted = server.post(
+        "/api/ocr?queue=formula",
+        &[("Content-Type", "application/octet-stream")],
+        b"formula image",
+    );
+    assert_eq!(accepted.status, 202, "{}", accepted.text());
 }
 
 // ---------------------------------------------------------------- M4：评估

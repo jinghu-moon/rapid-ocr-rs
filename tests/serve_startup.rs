@@ -32,21 +32,37 @@ use std::path::{Path, PathBuf};
 /// 与 `src/bin/serve/tests.rs` 的夹具同形状：这里刻意**不复用**私有测试模块
 /// （集成测试看不到 `#[cfg(test)]` 下的东西），也刻意不依赖 `target/` 下的任何旧产物。
 fn manifest_model_dir(root: &Path, name: &str) -> PathBuf {
+    manifest_model_dir_with(root, name, false)
+}
+
+/// 与 [`manifest_model_dir`] 相同，`with_detector` 时再声明一个 `formula_detector` role
+/// （`mfd.onnx`）——集合声明它就意味着"公式管线属于这次运行"。
+fn manifest_model_dir_with(root: &Path, name: &str, with_detector: bool) -> PathBuf {
     let dir = root.join(name);
     std::fs::create_dir_all(&dir).expect("create the model dir");
-    let files = [
+    let mut files: Vec<(&str, &str)> = vec![
         ("det.onnx", "detector"),
         ("rec.onnx", "recognizer"),
         ("dict.txt", "dictionary"),
         ("fx.onnx", "formula_recognizer"),
     ];
+    if with_detector {
+        files.push(("mfd.onnx", "formula_detector"));
+    }
     let mut manifest = String::from(
         "{\"schema_version\":1,\"id\":\"startup-set\",\"family\":\"PP-OCR\",\
          \"version\":\"v-test\",\"files\":[",
     );
     for (index, (file, role)) in files.iter().enumerate() {
         let path = dir.join(file);
-        std::fs::write(&path, format!("startup fixture {file}")).expect("write the model file");
+        let body: Vec<u8> = if *file == "mfd.onnx" {
+            // 没有声明摘要的规则不适用（清单会写下**真实**摘要），但内容仍然写成
+            // "像 ONNX"的样子，避免夹具本身成为结论的来源。
+            vec![0x08, 0x07, b'm', b'f', b'd']
+        } else {
+            format!("startup fixture {file}").into_bytes()
+        };
+        std::fs::write(&path, &body).expect("write the model file");
         let sha = sha256_file(&path);
         if index > 0 {
             manifest.push(',');
@@ -108,5 +124,61 @@ fn the_serve_command_refuses_to_start_when_the_plan_model_is_missing() {
     assert!(
         stdout.contains("--reverify-models rec.onnx") && stdout.contains("missing"),
         "the startup log must record the per-file conclusion before failing\nstdout:\n{stdout}"
+    );
+}
+
+/// 本轮（需求 1 的进程边界那一半）：**公式检测模型**损坏（内容与集合声明的摘要不符）时
+/// `--reverify-models` 同样拒绝启动，错误里点名那个文件**和它所属的管线**。
+///
+/// 旧实现的根因：`ModelPlan::required_files` 只收 detector/recognizer/dictionary +
+/// `formula_recognizer`，把 `formula_detector` 漏在外面——`--reverify-models` 因此从不
+/// 冷验证一个 `--formula-detector`（或集合声明的检测模型），一个"存在但内容错"的检测模型
+/// 可以一路留到第一次公式请求。
+#[test]
+fn the_serve_command_refuses_to_start_when_the_formula_detector_is_corrupt() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rapidocr"));
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/m1-serve-tests");
+    std::fs::create_dir_all(&root).expect("create the fixture root");
+    // 集合声明了 `formula_detector` → 公式管线属于这次运行（不需要 --formula-detector）。
+    let dir = manifest_model_dir_with(&root, "cli-reverify-detector", true);
+    std::fs::write(dir.join("mfd.onnx"), b"corrupted detector bytes")
+        .expect("corrupt the detector");
+
+    let output = std::process::Command::new(&binary)
+        .args([
+            "serve",
+            "--model-dir",
+            &dir.display().to_string(),
+            "--reverify-models",
+            "--port",
+            "0",
+        ])
+        .output()
+        .expect("the serve command must be runnable");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "a run whose formula detector is corrupt must refuse to start\nstdout:\n{stdout}\n\
+         stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("mfd.onnx") && stderr.contains("corrupt"),
+        "the locating error must name the detector and its state\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("formula pipeline"),
+        "the error must say which pipeline the file belongs to\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--reverify-models"),
+        "the error must say which switch caused the refusal\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("--reverify-models mfd.onnx")
+            && stdout.contains("digest computed by this call: true"),
+        "the startup log must record the detector's cold conclusion before failing\nstdout:\n\
+         {stdout}"
     );
 }
