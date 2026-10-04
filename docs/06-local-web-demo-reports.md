@@ -3846,3 +3846,588 @@ cargo test --lib formula_integration_tests -- --test-threads=1
    role 不重叠），因此那条组合只有代码路径上的同一实现，没有独立夹具。
 7. **`tests/baseline/evaluation-small.json` 的精度差异**（见验证 8）是既有事实；本阶段
    没有修改任何 baseline 文件，但审查时容易误判，故在此点名。
+
+---
+
+# M1 评审修复轮：P1-1 / P1-2 / P2-1 / P2-2 / P2-3 / P2-4 / P3 + `/api/models` 性能
+
+**基线**：HEAD `1b0f860`（M4 交付），**未提交**（按要求）。本轮**不改 `docs/03`**，
+`Temp/demo3-v2.html` 与 `src/bin/web/index.html` 一个字节都没动
+（前者 SHA-256 仍是 `14871FED…3D46EE`，与 M3/M4 记录相同；后者 `git status` 为空）。
+
+**本轮的性质**：M4 交付后的独立评审发现 6 个实现缺口 + 1 处文档陈旧状态。全部按
+"根因优先"修，不做最小补丁；`docs/05` 相应地改正了被实现否掉的表述（逐处见 §7）。
+
+| 编号 | 根因（一句话） | 修复位置 |
+| --- | --- | --- |
+| P1-1 | 检测模型只传路径、集合声明的 SHA-256 被丢掉，加载时**从不校验** | `model_plan.rs` / `run.rs` / `server.rs` / `api.rs` / `formula/detect.rs` / `rapid_ocr.rs` |
+| P1-2 | 公式准入只看**存在性**；会话缓存只按**路径**失效 | `model_verify.rs`（新）/ `model_set.rs` / `server.rs` / `http.rs` / `rapid_ocr.rs` |
+| P2-1 | 队列容量"先检查、后入队"是两个临界区 | `admit.rs` / `http.rs` / `server.rs` |
+| P2-2 | 无 body 的 `POST /api/engine/reload` 在 accept 线程上建会话 | `http.rs` / `server.rs` |
+| P2-3 | `/api/evaluate` 接受任意本机路径 | `evaluate.rs` / `cli.rs` / `run.rs` / `server.rs` |
+| P2-4 | 令牌熵来自时间/PID/计数器/栈地址（自认非密码学） | `security.rs` / `run.rs` |
+| P3 | `docs/05` 第 3 行仍写"M0 待冻结，未进入实现" | `docs/05` |
+
+**变更规模**：`git diff --stat` = 17 个跟踪文件 **+2138 / −311**，另加新文件
+`src/model_verify.rs`（368 行，含 5 个单测）。
+
+## 环境
+
+| 项目 | 值 |
+| --- | --- |
+| target | `x86_64-pc-windows-msvc`（Windows x64 + MSVC ABI） |
+| 工具链 | rustc 1.98.1 / cargo 1.98.1 |
+| crate | `rapid-ocr-rs` 0.7.0（独立 git 仓库，基线 `1b0f860`，**未提交**） |
+| 真实资产（文本） | `OCR-Model/small/`、`OCR-Model/test-config-small.yaml`、`OCR-test-image/`（12 图 + `golden-manifest.json`） |
+| 真实资产（公式） | `OCR-Model/Formula-Recognition-Models/onnx/pp_formulanet_plus_m.onnx`（593,915,961 B）、`OCR-Model/Formula-Detection-Model/pix2text-mfd-1.5.onnx`（80,311,115 B）、`Formula-TestSet/` |
+| 证据目录 | `target/review-gate/`（本轮全部门禁与实测）、`target/m1-review-evidence/`（脚本）、`target/m1-review-*/`（夹具） |
+
+**改动过的对外签名（新增/改变的部分）**：
+
+```rust
+// src/model_verify.rs（新模块，库内唯一的"校验证据"入口）
+pub struct FileIdentity { /* path + size + mtime */ }
+impl FileIdentity { pub fn of(&Path) -> Result<Self>; pub fn describe(&self) -> String; }
+pub struct VerificationOutcome { pub sha256: String, pub computed: bool, pub identity: FileIdentity }
+pub struct VerificationStats { pub cold_verifications: u64, pub cache_hits: u64,
+                               pub last_cold_micros: Option<u64>, pub last_cold_bytes: u64,
+                               pub entries: usize }
+pub fn verify_file(&Path) -> Result<VerificationOutcome>;          // computed 是**单次调用**的证据
+pub fn sha256_file_cached(&Path) -> Result<String>;
+pub fn verify_sha256(&Path, Option<&str>) -> Result<Option<String>>;
+pub fn verification_stats() -> VerificationStats;
+pub fn clear_verification_cache();
+
+// src/model_set.rs
+impl ModelFileSpec { pub fn state_in_probed(&self, root: &Path) -> (ModelFileState, bool) }
+impl ModelSet      { pub fn status_probed(&self, root: &Path) -> (ModelSetStatus, usize) }
+pub fn validate_model_files_probed(&[ModelFileSpec], &Path) -> (Vec<(ModelFileSpec, ModelFileState)>, usize);
+
+// src/api.rs —— 与 expected_model_sha256 **同一条规则**的第二个字段
+pub struct FormulaPolicy { /* … */ pub expected_detector_sha256: Option<String> }
+
+// src/formula/detect.rs —— 与识别器**对称**的入口
+impl FormulaDetector { pub fn from_model_with_hash(&Path, &RuntimeConfig, Option<&str>) -> Result<Self> }
+
+// src/bin/serve/admit.rs —— 判定即预留
+pub enum QueueAdmission<'a> { NotQueued, Reserve(&'a dyn QueueSlots) }
+pub trait QueueSlots { fn reserve(&self) -> Option<QueueReservation> }
+pub struct QueueReservation { /* Drop = 归还容量 */ }
+pub struct Admit { pub max_body: u64, pub expected_body: Option<u64>, pub reservation: Option<QueueReservation> }
+
+// src/bin/serve/model_plan.rs
+pub(super) struct FormulaDetectorSpec { pub path: PathBuf, pub expected_sha256: Option<String> }
+impl ModelPlan { pub fn resolve_formula_detector(&self, cli: Option<&Path>) -> Result<Option<FormulaDetectorSpec>, ModelPlanError> }
+// 删除：ModelPlan::missing_on_disk（"只看存在性"的第二套清单，正是 P1-2 的缺口）
+
+// src/bin/serve/server.rs
+impl ServeShared {
+    pub fn formula_models_ready(&self) -> bool;               // 取代 formula_models_on_disk
+    pub fn formula_detector_status(&self) -> Option<FormulaDetectorStatus>;
+    pub fn reserve_queue_slot(self: &Arc<Self>, class: QueueClass) -> Option<QueueReservation>;
+    pub fn submit_ocr(&self, Vec<u8>, QueueClass, Option<u32>, Option<QueueReservation>) -> Result<Value, ServeError>;
+    pub fn eval_root(&self) -> Option<&EvalRoot>;
+}
+// /api/models += verification 块；formula.detector += sha256/state；409 detail 去掉 missing_on_disk
+// 删除：ServeShared::queue_full / ServeShared::apply_provider_request
+
+// src/bin/serve/evaluate.rs
+pub(super) struct EvalRoot { /* 规范化后的沙箱根 */ }
+impl EvalRoot { pub fn new(&Path) -> Result<Self, String>;
+                pub fn root(&self) -> &Path;
+                pub fn resolve(&self, &Path, what: &str) -> Result<PathBuf, ServeError>;
+                pub fn resolve_case(&self, &Path, &EvaluationCase) -> Result<PathBuf, ServeError> }
+
+// src/bin/serve/security.rs
+pub enum RandomError { Bcrypt { status: i32 }, Empty }
+pub const RANDOM_SOURCE: &str = "windows:BCryptGenRandom(bcrypt.dll, BCRYPT_USE_SYSTEM_PREFERRED_RNG)";
+pub fn random_source() -> &'static str;
+pub fn random_hex(usize) -> Result<String, RandomError>;      // 旧签名返回 String（弱熵）
+impl ServeToken { pub fn generate() -> Result<Self, RandomError> }
+pub fn generate_nonce() -> Result<String, RandomError>;
+
+// CLI：--eval-root <DIR>（选项面 23 → 24，逐项枚举测试同步）
+```
+
+## P1-1 公式**检测**模型的哈希被丢掉，损坏的检测模型照样加载
+
+**根因**：`ModelPlan::formula_detector()` 只返回 `PathBuf`，`ModelFileSpec.sha256` 在解析处被丢弃；
+`FormulaDetector::from_model` 不校验任何东西；`FormulaPolicy` 只有识别模型的
+`expected_model_sha256`。于是完整性规则对两个公式模型**不对称**：识别模型有校验，检测模型没有。
+
+**修复**（统一到**同一条**规则、**同一个**机制，不新增第二套）：
+
+1. `FormulaPolicy` 增加 `expected_detector_sha256`（与 `expected_model_sha256` 对称）；
+2. `FormulaDetector::from_model_with_hash(path, runtime, expected)` 成为**对称入口**，
+   `from_model` 只是 `from_model_with_hash(.., None)`；校验发生在打开 ONNX **之前**；
+3. `ModelPlan::resolve_formula_detector(cli)` 返回**路径 + 集合声明的哈希**：
+   选中的路径正是模型集声明过的那个文件时（含 `--formula-detector` 指向同一文件、
+   只是写法不同的情况，用 `canonicalize` 比较）声明的 SHA-256 随路径一起传递；
+   CLI 指向集合没声明过的文件时如实为 `None`（"没有可信摘要"），而不是借用另一个哈希；
+4. 端到端接线：`run.rs → ServeContext.formula_detector: Option<FormulaDetectorSpec> →
+   ServeShared → formula_policy() → detect_formula_candidates() → from_model_with_hash`。
+
+**修改前后行为**：
+
+| 场景 | 修改前 | 修改后 |
+| --- | --- | --- |
+| 集合声明了检测模型 + 文件损坏 | 检测器**加载成功**（只检查存在性），公式任务产出错误结果或崩溃 | `HashMismatch{path, expected, actual}`（定位错误），绝不加载 |
+| `/api/models.formula.detector` | 只有 `{configured, file}` | `+ {sha256, state}`（`state ∈ present/corrupt/missing`） |
+| `--formula-detector` 指向集合声明的文件 | 声明的哈希被丢弃 | 声明的哈希随路径保留并校验 |
+| `--formula-detector` 指向集合外的文件 | — | `sha256: null` + `state: present`（如实说明"只能证明文件在"） |
+
+**证据（真实 80 MB 检测模型，`target/review-gate/detector-integrity.log`）**：
+
+```text
+A: formula.complete=True routing=True detector.state=present detector.file=mfd.onnx declared_sha256_matches=True
+A: POST /api/ocr?queue=formula -> HTTP 202
+A: job state=succeeded regions=50 formula_regions=8 detector_model=pp_formulanet_plus_m
+A: VALID_DETECTOR_REALLY_LOADED=True
+B: detector.state=corrupt formula.corrupt=mfd.onnx cold_this_call=1
+B: POST /api/ocr?queue=formula -> HTTP 409 code=models_corrupt scope=formula corrupt=mfd.onnx detector_state=corrupt
+B: raw bodyless request -> HTTP/1.1 409 Conflict in 4.4 ms
+B: REFUSED_WITHOUT_READING_THE_BODY=True
+C: valid bytes + wrong declared sha256 -> detector.state=corrupt declared=000…000 file=mfd.onnx
+C: DECLARED_HASH_IS_ENFORCED=True
+C: raw bodyless request -> HTTP/1.1 409 Conflict in 0.8 ms
+C: REFUSED_WHEN_THE_DECLARED_HASH_MISMATCHES=True
+```
+
+B 的原始请求**声明 1 MiB 却一个字节都没发**：服务端 4.4 ms 就回了 409（若它先读 body，
+这个请求会卡在 30 s 的读取超时里）。C 用的是**有效的**真实模型 + manifest 里一个错误的
+声明摘要（必须重启服务：期望摘要是启动期解析的，与其它模型集决策同源）。
+
+单元/集成层同样覆盖（不依赖资产的那两条在任何环境都跑）：
+
+```text
+formula::detect::tests::a_declared_detector_hash_is_verified_before_the_model_is_opened
+formula::detect::tests::a_valid_detector_of_the_declared_hash_still_loads          （真实模型，env-gated）
+serve::tests::a_corrupt_formula_detector_is_reported_and_refused_before_the_body
+serve::tests::a_cli_formula_detector_is_verified_by_the_same_rule
+serve::model_plan::tests::the_formula_detector_hash_travels_with_the_selected_file
+```
+
+## P1-2 损坏的公式模型溜过准入 + 流水线缓存会留住陈旧模型
+
+**根因（两半）**：
+
+1. `formula_models_on_disk()` 只 `stat`：损坏但存在的文件通过准入 → 客户端把整个 body 传完
+   → 建出任务 → worker 里才 409 `models_corrupt`。`docs/05` 要求的是**读 body 之前**的 409；
+2. `RapidOcrEngine` 的公式识别器/检测器缓存只比较**路径**：文件在第一次加载之后被替换或损坏，
+   第二次请求发现"路径没变"就继续用内存里那份旧会话——改对了也不生效、坏了也不报错。
+
+**修复**：
+
+1. **新增库内的身份键控校验缓存**（`src/model_verify.rs`，唯一实现）：键 = `路径 + 体积 + mtime`，
+   值 = 上一次真正算出的 SHA-256。三个原来看似无关的调用点
+   （`/api/models` 的逐文件状态、公式队列准入、两条公式加载路径）收口到**同一份证据**上；
+   冷验证真的读盘并记账（`VerificationStats`），命中只花一次 `stat`；每次调用都回答
+   `computed`（**单次调用**的属性，因此"命中不重新哈希"可以被直接断言，而不是靠计数器差值推断）；
+2. **准入按哈希状态**：`formula_models_ready()` 用与 `/api/models` 同一份报告判定，
+   检测模型的状态也算在公式管线里；`missing_on_disk` 与被它在 409 里暴露的 `missing_on_disk`
+   字段**删除**（那正是"第二套更弱的清单"）；
+3. **会话缓存按文件身份失效**：`formula_recognizer`/`formula_detector` 的键从 `PathBuf` 改为
+   `FileIdentity`；期望摘要由 `FormulaPolicy` 传进加载路径，**库自己**拒绝不匹配的文件。
+
+**修改前后行为**：
+
+| 场景 | 修改前 | 修改后 |
+| --- | --- | --- |
+| 公式模型存在但内容错 | 准入通过 → 读 body → 建任务 → worker 失败 | 读 body **之前** 409 `models_corrupt`，`detail.scope="formula"` |
+| 检测模型存在但内容错 / 不在磁盘上 | 同上 | 同上（检测模型同属公式管线） |
+| 模型文件在首次加载后被替换 | 继续用内存里的旧会话（按路径比较） | 身份变化 → 重新校验 → 不匹配即 `HashMismatch` |
+| `/api/models` 每次调用 | 重新哈希每个文件（566 MB ~313 ms） | 身份未变 → 只 `stat`；`verification.cold_this_call == 0` |
+
+**证据（真实资产）**：见上文 P1-1 的 A/B/C（B 与 C 同时是 P1-2 的准入证据），以及：
+
+```text
+target/review-gate/http-vs-cli.log:
+second /api/models: cold_this_call=0 cache_hits=8
+POLLING_DOES_NOT_REHASH=True
+
+公式集成测试（真实 566 MB + 真实检测器，0 skipped）:
+test ocr::pipeline::rapid_ocr::formula_integration_tests::a_replaced_formula_detector_is_reverified_instead_of_reused ... ok
+```
+
+单元层（不依赖资产，任何环境都跑）：
+
+```text
+model_verify::tests::{the_cached_digest_equals_the_uncached_one_and_is_only_computed_once,
+                      a_size_change_forces_a_reverification,
+                      a_mtime_change_forces_a_reverification,
+                      a_mismatch_is_a_locating_error_and_a_match_passes_through,
+                      a_missing_file_is_an_error_and_is_not_cached,
+                      clearing_the_cache_only_costs_another_read}
+serve::tests::{models_reuses_the_verified_digest_until_the_file_identity_changes,
+               a_cli_formula_detector_is_verified_by_the_same_rule}
+```
+
+**如实的残留盲区**：身份由 `(size, mtime)` 近似，**体积不变且 mtime 不变**的内容替换
+（例如 `SetFileTime` 把时间戳写回原值，或在同一时间戳粒度内原地改写）不会被识别为"变了"，
+缓存因此会返回旧摘要；`mtime` 不可得时身份里是 `None`，同类替换同样落在盲区。
+这一点同时写进 `src/model_verify.rs` 的模块文档、`docs/05` §4.2.1 与 `/api/models` 的
+`verification.residual_blind_spot`（响应里就能读到，不必翻文档）。
+
+## P2-1 队列容量预检不是原子的
+
+**根因**：`queue_full()`（第一个临界区：读 `queued_len >= capacity`）与 `submit_ocr()` 里的
+`enqueue`（第二个临界区）之间可以插入任意多个并发请求，每一个都已经把大 body 读进内存。
+"拒绝时不读 body"因此在并发下不成立。
+
+**修复**：把"检查"与"占位"合成**一个**动作——`admit()` 在第 4 步调用
+`QueueSlots::reserve()`，服务端在**同一把 `jobs` 锁**里同时判定与占用（容量判定改成
+`queued_len + reserved >= capacity`）；预留凭据随 `Admit` 一路传到 `submit_ocr`：
+入队成功即提交（**先入队、后释放**：多算的那一格只会让并发请求被保守拒绝，绝不超卖），
+任何提前返回/读 body 失败/panic 展开都由 `Drop` 归还容量。
+
+**修改前后行为**：见下表（表里"容量 1"指 `--max-queue-text 1`）。
+
+| 场景 | 修改前 | 修改后 |
+| --- | --- | --- |
+| 队列已满，N 个并发请求 | 理论上可能有请求通过预检、读入 body 后才拿到 503 | 全部 503，**没有一个**读 body（预留判定在读 body 之前） |
+| 预留凭据被丢弃（请求后续失败） | 不适用（没有预留） | 容量归还，不泄漏；多释放也不会放大容量（`saturating_sub`） |
+
+**证据**：`test result` 里的两条新用例（`target/review-gate/gates.log` 的 serve 段）：
+
+```text
+serve::tests::a_full_queue_rejects_every_concurrent_request_without_reading_a_body
+serve::tests::the_queue_reservation_is_atomic_and_never_leaks_capacity
+```
+
+第一条：队列满时 8 个并发请求**全部** 503 `busy`，每个都声明 1 MiB 而**一个字节都不发**
+（任何一个只要越过第 4 步就会卡在 30 s 读取超时里，测试因此会超时失败）。
+第二条：8 个线程抢同一个容量 1 的队列，**恰好 1 个**拿到凭据；全部归还后容量完好
+（下一次预留成功，再下一次仍然失败——既不泄漏也不放大）。
+
+**如实说明**：`accept_loop` 目前是**单线程**串行处理请求（准入 → 读 body → 入队都在
+`handle` 的一次调用里），因此这条竞态在**当前线程模型下**本来就不可达；修复的价值在于
+把这条保证变成**数据结构本身**的性质，而不是依赖那个线程模型的事实。并发本身在
+`reserve_queue_slot` 这一层被真正跑出来（8 线程竞争），测试注释里写明了这个分工。
+
+## P2-2 无 body 的 `POST /api/engine/reload` 仍然阻塞 accept 线程
+
+**根因**：`http.rs` 对**无 body** 的 reload 直接内联调用 `shared.reload_engine(None)`，
+ONNX Runtime 建会话发生在 accept 线程上；而带 `{"provider":…}` 的那一支早已在独立线程里跑。
+
+**修复**：把 `Dispatch::SwitchProvider(ProviderPreference)` 改成
+`Dispatch::EngineWork(Option<ProviderPreference>)`，两种形态走**同一条** `spawn_engine_work`
+线程路径（同一个"同时只有一个建会话序列"资格、同一个由那个线程写响应的契约）。
+删除了因此不再需要的 `ServeShared::apply_provider_request`。
+
+**修改前后行为**：
+
+| 场景 | 修改前 | 修改后 |
+| --- | --- | --- |
+| 无 body 的 reload 期间 `/api/status` | 阻塞（直到建会话结束） | 立即返回，`engine.state = "loading"` |
+| 无 body 的 reload 期间 `POST /api/ocr` | 阻塞 | 202 `queued`（`Loading` 期间入队） |
+| 客户端何时拿到响应 | 序列结束后 | **不变**：序列结束（或失败）之后 |
+
+**证据**：
+
+```text
+serve::tests::a_bodyless_reload_keeps_the_accept_loop_live
+  闸门把第 2 次建会话按住 → /api/status 显示 loading；POST /api/ocr 返回 202 state=queued；
+  放行后 reload 返回 200 outcome=ready load_ms 有值，建会话次数 = 2（明确是"重建"）。
+```
+
+## P2-3 `/api/evaluate` 可以读任意本机路径
+
+**根因**：端点接受请求体里的**任意清单路径**，并按清单里的 `image` 字段（相对清单目录解析、
+或绝对路径原样使用）读任意图片。loopback + token 让它不是越权入口，但它不是安全的发布默认值。
+
+**修复**：新增 `--eval-root <DIR>` 沙箱：
+
+- **默认不配置** → `/api/evaluate` 整体拒绝（400 `bad_request`，`detail.reason` 点名 `--eval-root`
+  并要求显式开启）；拒绝发生在碰任何本机路径之前；
+- 配置后，清单与清单引用的**每一张图**都必须 `canonicalize` 到该根之内：`..`、绝对路径逃逸、
+  符号链接逃逸都在规范化之后暴露，拒绝时是**可定位**错误并点名违规路径（清单与图片分别点名）；
+- 沙箱根在**启动期**规范化（不存在/不是目录 → 拒绝启动，`ServeStartError::EvalRoot`），
+  绝不"先开着、第一次评估才发现沙箱是空的"。
+
+**修改前后行为**：
+
+| 场景 | 修改前 | 修改后 |
+| --- | --- | --- |
+| 没有 `--eval-root` | 接受任意清单路径 | 400，`detail.reason` 点名 `--eval-root` |
+| 清单在沙箱外 | 读它 | 400，点名清单路径 + 沙箱根 |
+| 清单里的图片越界（绝对路径/`..`/符号链接） | 读它 | 400，点名图片路径 |
+| 根内的合法清单 | 工作 | 工作，且报告与 CLI **逐字段同值** |
+
+**证据（真实 12 图标注清单，`target/review-gate/evaluate-sandbox.log`）**：
+
+```text
+outside sandbox -> HTTP 400 code=bad_request reason=the manifest `…\outside-manifest.json`
+   resolves to `\\?\…\outside-manifest.json`, which is outside the --eval-root sandbox
+   \\?\D:\100_Projects\110_Daily\SnapClip\OCR-test-image; evaluation only reads files inside that directory
+OUTSIDE_REFUSED=True
+POST /api/evaluate (in-root) -> HTTP 200 in 12.3 s
+serve: cases=12 mean_cer=0.44765135645866394 exact_match_rate=0
+cli:   cases=12 mean_cer=0.44765135645866394 exact_match_rate=0
+MATCH_cases=True MATCH_mean_cer=True MATCH_exact_match_rate=True MATCH_per_case=True
+raw literals: serve=0.44765135645866394 cli=0.44765135645866394
+SERVE_MEAN_CER_IS_GATE_LITERAL=True    SERVE_LITERAL_EQUALS_CLI_LITERAL=True
+```
+
+（`SERVE_MEAN_CER_IS_GATE_LITERAL` 比较的是**原始 JSON 字面量**：PowerShell 的
+`double → string` 只保留 15 位有效数字，经 `ConvertFrom-Json` 比较会把
+`0.44765135645866394` 显示成 `0.447651356458664`——第一版脚本正是这样误报了一次 `False`，
+改为正则取字面量后为 `True`。这一点如实记录，避免后来者重踩。）
+
+单元测试：`serve::evaluate::tests::{the_eval_root_must_be_a_real_directory,
+the_sandbox_resolves_inside_and_refuses_outside}`（后者用 `sandbox-elsewhere` 同级目录证明
+"字符串前缀比较会误放行、规范化包含关系不会"）；HTTP 三条：
+`{evaluation_is_refused_without_an_explicit_eval_root,
+an_evaluation_manifest_outside_the_eval_root_is_refused,
+an_evaluation_image_outside_the_eval_root_is_refused}`（第三条覆盖绝对路径、`..`
+与符号链接；符号链接在无权限/无开发者模式的机器上会打印一行说明并跳过该子路径，
+另外两条走的是同一条规范化包含规则）。
+
+## P2-4 服务令牌不是 CSPRNG
+
+**根因**：`random_hex` 用时间（秒+纳秒）+ PID + 进程内计数器 + 栈地址哈希派生，注释自认
+"不是密码学 RNG"。令牌是防跨站触发的**共享密钥**，这些量对同机其它进程是可观察/可猜的。
+
+**修复**：手写 `unsafe extern "system"` 绑定 `bcrypt.dll` 的 `BCryptGenRandom`
+（`BCRYPT_USE_SYSTEM_PREFERRED_RNG`，不新增依赖，与 `runtime/memory.rs` 同一风格）：
+
+- `ServeToken::generate()` 与 `generate_nonce()` 返回 `Result<_, RandomError>`；
+- **fail-closed**：失败时 `run.rs` 直接**拒绝启动**（`ServeStartError::Random`），
+  不存在"退回弱熵"的分支；启动日志打印熵源字符串（`RANDOM_SOURCE`）；
+- 常量时间比较（`ServeToken::matches`）保持不变。
+
+**证据**：
+
+```text
+serve::security::tests::the_token_is_random_per_run_and_compared_exactly（生成成功、64 hex、
+   每次不同、熵源被报告、前缀/加长/首末字节翻转都不匹配）
+serve::security::tests::a_failing_entropy_source_is_propagated_and_never_falls_back
+   （注入一个必然失败的填充器 → RandomError 被传播、文案含 BCryptGenRandom 与 refuses to start；
+     0 字节同样是错误；生产填充器在健康主机上成功）
+```
+
+**关于失败分支的诚实说明**：`BCryptGenRandom` 在一台健康的 Windows 上无法被弄失败，因此
+**运行期**没有"RNG 真的返回非 0"的测试。失败分支通过 `random_hex_with` 的**注入点**被真实执行
+（不是只留注释）：注入失败 → 错误被传播。启动期拒绝本身是一个 `?`（`run.rs` 里两处调用点），
+没有独立的运行期用例——这是本轮**没有**做到的最后一米，如实记录。
+
+## 性能：`/api/models` 的冷验证 vs 缓存命中（实测）
+
+`target/m1-review-evidence/run-api-models-latency.ps1`（真实 release 服务 + 真实 566 MB 公式模型；
+"冷"用**只改 mtime**的方式让同一个文件的身份失效，因此走的是与旧实现完全相同的
+"重新读盘并哈希"路径，而不是估算）：
+
+```text
+startup: cold_this_call=0 cold_verifications=4 wall_ms=21.78
+
+round,wall_ms,cold_this_call,cold_verifications,cache_hits,last_cold_ms,last_cold_bytes
+cold round 1 (identity invalidated),312.7,1,5,7,311.016,593915961
+cold round 2 (identity invalidated),317.62,1,6,10,316.509,593915961
+cold round 3 (identity invalidated),315.03,1,7,13,313.779,593915961
+cache hit round 1,0.81,0,7,17,313.779,593915961
+cache hit round 2,0.65,0,7,21,313.779,593915961
+cache hit round 3,1.34,0,7,25,313.779,593915961
+cache hit round 4,0.66,0,7,29,313.779,593915961
+cache hit round 5,0.55,0,7,33,313.779,593915961
+
+COLD   /api/models (566 MB re-hashed): mean=315.12 ms over 3 rounds; per-call cold_this_call=1
+CACHED /api/models (identity unchanged): mean=0.80 ms, max=1.34 ms over 5 rounds; per-call cold_this_call=0
+SPEEDUP: 393.9x
+```
+
+- **冷验证**（= 旧实现**每一次** `/api/models` 的成本，也是页面 8 s 轮询一次的成本）：
+  566 MB 读+哈希 **≈313 ms**，端到端 **≈315 ms**；`verification.last_cold_ms/last_cold_bytes`
+  就是这次实测的原始数字（313.779 ms / 593,915,961 B）。
+  注：这里磁盘页缓存是热的（≈1.9 GB/s）；`docs/06` M4 一节记的"约 1 s"是更冷的状态，
+  两者不矛盾，本轮数字是**本机当下的实测**。
+- **缓存命中**（稳态）：**0.80 ms**（max 1.34 ms）——只做 5 次 `stat` + 5 次内存比较，
+  与文件大小无关；端到端 **约 394×**。
+- 页面 8 s 轮询的真实行为由 `target/review-gate/http-vs-cli.log` 的
+  `second /api/models: cold_this_call=0 cache_hits=8` / `POLLING_DOES_NOT_REHASH=True` 佐证。
+
+## 验证
+
+### 1. 静态检查、feature 矩阵与 release 构建（全部 exit 0）
+
+`target/review-gate/gates.log`：
+
+| # | 命令 | 结果 |
+| --- | --- | --- |
+| 1 | `cargo fmt --all -- --check` | 0 |
+| 2 | `cargo clippy --all-targets -- -D warnings` | 0 |
+| 3 | `cargo clippy --features serve --all-targets -- -D warnings` | 0 |
+| 4 | `cargo test --all-targets` | **393 passed**（lib）+ 2 + 4 + 14 + 0，**0 failed** |
+| 5 | `cargo test --features serve --all-targets` | **393 passed**（lib）+ 2 + 4 + 14 + **232 passed**（bin），**0 failed** |
+| 6 | `cargo build --release --bins` | 0 |
+| 7 | `cargo build --release --features serve --bins` | 0 |
+
+本轮新增 **9 个库单测**（384 → 393）与 **13 个 bin 测试**（219 → 232），没有跳过、没有弱化、
+没有删除任何既有断言。改动过的既有测试只有三类**预期行为发生正确变化**的原因：
+
+1. 公式路由的测试夹具必须让检测模型**真的在磁盘上**（新的准入按哈希状态判定；
+   `with_formula_routing` 现在会写一份占位检测模型，与 `run.rs` 的启动期不变量一致）；
+2. `an_incomplete_formula_set_is_409_while_text_ocr_keeps_working` 里的
+   `detail.missing_on_disk` 断言随该字段一起删除，替换为**更强**的断言：
+   `detail.detector.state == "present"` 且 `detail.sha256 == null`（"没有可信摘要"被如实报告），
+   并断言该字段确实不存在；
+3. `admit.rs` 的准入顺序用例的 `queue_full: true` 改成
+   `QueueAdmission::Reserve(&FullQueue)`（测试替身），并**新增**两条断言：
+   第 4 步只调用一次、以及第 5 步失败时预留被归还。
+
+### 2. 依赖隔离（三份依赖树与 M4 快照**逐行 0 差异**）
+
+`Cargo.toml` 未改，本轮也没有新增任何依赖（`bcrypt.dll` 是系统组件，用手写绑定调用）。
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo tree -e normal -p rapid-ocr-rs` | **606 行**，与 `target/m4-gate/tree-default.txt` **逐行相同**（规范化换行后 SHA-256 `CB12F133…59DF52`，三次采样稳定）；`tiny_http` **0** 次 |
+| `cargo tree -e normal --no-default-features` | **605 行**，与 M4 快照逐行相同；`tiny_http` **0** 次 |
+| `cargo tree -e normal -p rapid-ocr-rs --features serve` | **611 行**，与 M4 快照逐行相同；`tiny_http` **1** 次 |
+
+（`docs/06` 早期里程碑记的 `BD2AB5E4…` 是另一种字节序列化口径下的哈希；本轮改用
+"与保存的 M4 树文件逐行比较 + 规范化换行后的 SHA-256"，两者都指向同一个结论：**逐行 0 差异**。）
+
+### 3. `cargo package --allow-dirty`（库文件被改动，因此重跑）
+
+```text
+Packaged 190 files, 14.0MiB (3.3MiB compressed)
+Verifying rapid-ocr-rs v0.7.0 (…\target\package\rapid-ocr-rs-0.7.0)
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.63s      （exit 0）
+```
+
+`cargo package --list` 里 `src/model_verify.rs`、`src/bin/web/index.html`、
+`src/bin/serve/model_plan.rs` 都在；打包树上的 `cargo check --features serve --all-targets`
+（`target/package/rapid-ocr-rs-0.7.0`）**exit 0**（31.64 s），日志：`target/review-gate/package-serve-check.log`。
+
+### 4. 12 图硬门槛（`target/review-gate/`，**没有**覆盖 `tests/baseline/`）
+
+```powershell
+target\release\bench_warm_e2e.exe --config <OCR-Model>\test-config-small.yaml `
+  --images-dir <OCR-test-image> --warmup-rounds 1 --rounds 3 --max-side-len 2000 `
+  --intra-threads 16 --output target\review-gate\bench-cpu-2000.json
+target\release\rapidocr.exe evaluate --manifest <OCR-test-image>\golden-manifest.json `
+  --config <OCR-Model>\test-config-small.yaml --output target\review-gate\evaluation-cpu.json
+```
+
+| 门槛 | 要求 | 本次实测（release） | 比较方式 | 结论 |
+| --- | --- | --- | --- | --- |
+| 12 图区域数均值 | `34.833333333333336` | **`34.833333333333336`**（36 样本） | 原始 JSON 的**数字字面量**精确比较 | True |
+| 12 图 mean CER | `0.44765135645866394` | **`0.44765135645866394`**（12 例） | 同上 | True |
+
+`git status --porcelain -- tests/baseline` 为空；`tests/baseline/windows-baseline/bench-cpu-2000.json`
+的 `regions.avg` 与本次字面量相同。
+
+### 5. 12 图 HTTP 与 CLI 逐张一致（**12/12**，真实服务 + 真实模型）
+
+`target/m1-review-evidence/run-12-images.ps1`（`target/review-gate/http-vs-cli.log`）：
+
+```text
+models: complete=True formula.complete=True formula.routing=False
+…（逐张 regions 数与 recognition.text 序列全等，明细在 http-vs-cli.log）
+TOTAL serve=418 cli=418 images=12
+ALL_12_MATCH=True
+second /api/models: cold_this_call=0 cache_hits=8
+POLLING_DOES_NOT_REHASH=True
+```
+
+### 6. 环境变量门控的 `formula_integration_tests`（真实模型，0 skipped）
+
+```powershell
+$env:RAPID_OCR_MODEL_ROOT='D:\100_Projects\110_Daily\SnapClip\OCR-Model'
+$env:RAPID_OCR_FORMULA_TEST_ROOT='D:\100_Projects\110_Daily\SnapClip\Formula-TestSet'
+cargo test --lib formula_integration_tests -- --test-threads=1
+```
+
+**12 passed, 0 failed, 0 ignored**（98.47 s），`skipping test` 出现 **0** 次
+（→ 真的加载了 566 MB 公式识别模型与真实页面）。日志：`target/review-gate/formula-integration.log`。
+11 → 12 的那一条是本轮新增的
+`a_replaced_formula_detector_is_reverified_instead_of_reused`（真实检测器被替换后必须重新校验）。
+
+### 7. im2latex-100 smoke（**本轮的库公式路径被改动，因此必须跑**）
+
+```powershell
+target\release\formula_eval.exe --model <OCR-Model>\…\pp_formulanet_plus_m.onnx `
+  --dataset-root D:\100_Projects\110_Daily\SnapClip\Formula-TestSet `
+  --dataset im2latex --split test --limit 100 `
+  --expect-manifest target\formula-eval\manifest-im2latex-100.json `
+  --output target\review-gate\formula-im2latex-100.json
+```
+
+`target/review-gate/im2latex-smoke.log`：
+
+```text
+formula_eval: dataset=im2latex split=test samples=100 scored=100 batch=8 manifest=271424c18c000f95
+done: total=100 scored=100 exact=0.2400 normalized=0.2500 mean_cer=0.0863 pipeline_failures=0
+      model_mismatches=76 truncated=0 load_ms=1332.1 wall_ms=68456.8
+new summary: total=100 scored=100 pipeline_failures=0 exact=24 normalized=25 truncated=0
+             exact_rate=0.24 normalized_rate=0.25 mean_cer=0.0863135185950055
+old summary: 与上面逐字段相同
+manifest_sha256 new=271424c18c000f956c31facd68d137068254e4e93d7e6b27501e9ebce67c2b6d
+MANIFEST_MATCH=True  SAMPLE_SET_MATCH=True  CONTENT_MATCH=True
+records new=100 old=100   PER_SAMPLE_IDENTICAL=True   TOKEN_IDS_IDENTICAL=True
+GATE_EXACT_RATE_24=True  GATE_NORMALIZED_RATE_25=True
+GATE_MEAN_CER_LITERAL=0.0863135185950055  GATE_ZERO_PIPELINE_FAILURES=True
+```
+
+即 **24.00% / 25.00% / 0.0863 / 0 pipeline failures** 全部复现，且与上一里程碑的
+`target/formula-eval/im2latex-100.json` **逐样本**相同（路径、参考 LaTeX、输出 LaTeX、
+失败分类、CER、编辑距离、EOS、truncated、两个匹配标志，以及**全部 token ids**）。
+
+### 8. `docs/05` 的改动（只改被实现否掉的地方）
+
+| 位置 | 改动 |
+| --- | --- |
+| 第 3 行状态 | "M0 待冻结，未进入实现" → "M0–M4 已实现并通过验收"，并留下这一处陈旧声明的说明（同文件末尾的"实施完成记录（M0-M4）"当时已勾选全部里程碑） |
+| §1.1 哈希计算行 | 注明状态判定与公式加载路径改走 `model_verify` 的身份键控缓存 |
+| §3 | 新增 `--eval-root <DIR>`（含默认关闭与拒绝语义） |
+| §4.2 `/api/evaluate` 行 | 补 `--eval-root` 前置条件与三条越界拒绝 |
+| §4.2.1 409 行 | 删掉"只 `stat`、不哈希"的旧规则，改成"与 `/api/models` 同一份哈希状态"，并新增 P1-1/P1-2 三条修正与残留盲区 |
+| §4.4 第 4 步 | "队列容量预检" → "**队列容量预留**（判定与占位同一个动作）" |
+| §5.4 响应 | 新增 `verification` 块与 `formula.detector.{sha256,state}`，并解释"成本可被验证"的意义 |
+| §7.2 令牌行 | CSPRNG + fail-closed + 熵源可见；新增"评估的本机路径"一行 |
+| §10 | 新增第 10 条（校验结论按文件身份缓存） |
+| §11 | 新增"M1 评审修复轮（P1/P2/P3）"清单，逐条指向本文档被改正的章节 |
+| §12 | 新增 5 行验证计划（完整性、校验缓存、队列预留、引擎重建线程、评估沙箱、令牌熵） |
+| §13/§14/§15 | 陈旧标题"实施后填实测值"/"待确认问题（M0 冻结前）"改正；风险表新增 4 行（损坏模型静默加载、替换后旧会话、评估读任意路径、令牌熵） |
+
+`docs/03` 未改动（`git status --porcelain -- docs/03-…` 为空）。
+
+## 关键行为对比（AGENTS.md §9）
+
+| 项目 | 修改前 | 修改后 | 预期结果 |
+| --- | --- | --- | --- |
+| 损坏的公式**检测**模型 | 加载成功（只查存在性） | `HashMismatch` 定位错误；`/api/models` 报 `corrupt`；409 在读 body 前 | 完整性规则对两个公式模型对称 |
+| 损坏的公式**识别**模型（存在） | 准入通过 → 读 body → 建任务 → worker 409 | 读 body **之前** 409 `models_corrupt`（`detail.scope="formula"`） | §4.2.1 |
+| 模型在首次加载后被替换 | 继续用内存里的旧会话 | 身份变化 → 重新校验 → 拒绝/重建 | 改对了就生效，改坏了就报错 |
+| `/api/models`（566 MB 公式模型在盘） | 每次重读重哈希（≈315 ms/次，页面每 8 s 一次） | 命中：**0.80 ms**（max 1.34 ms），`cold_this_call=0` | 轮询不再产生持续磁盘 I/O |
+| 队列满时的并发请求 | 预检与入队分属两个临界区 | 判定即预留，全部 503 且不读 body | §4.4 |
+| 无 body 的 `POST /api/engine/reload` | 阻塞 accept 线程 | 独立线程；期间 `/api/status` 与 `/api/ocr` 照常 | §4.2、§7.6 |
+| `/api/evaluate` 的本机读取范围 | 任意路径 | 必须 `--eval-root`，越界即可定位 400 | §4.2、§7.2 |
+| 令牌熵 | 时间/PID/计数器/栈地址派生 | `BCryptGenRandom`，失败拒绝启动 | §7.2 |
+| 库依赖图 | 606/605/611 行 | **逐行相同**（`tiny_http` 0/0/1） | 不得泄漏进默认构建 |
+| 12 图硬门槛 / HTTP-vs-CLI / im2latex-100 | `34.833333333333336` / `0.44765135645866394` / 12-12 / 24.00%·25.00%·0.0863 | **完全相同** | 无回归 |
+
+## 未覆盖风险与**做不到的事**（如实）
+
+1. **未提交、未在干净 clone 上验证**：按要求不 commit；证据来自当前工作树（`1b0f860` + 本轮改动）。
+2. **RNG 的真失败路径没有运行期测试**：`BCryptGenRandom` 在健康 Windows 上无法失败；
+   失败分支通过注入点被真实执行（错误被传播），但"启动期拒绝"本身只是两处 `?`，
+   没有独立的运行期用例（见 P2-4）。
+3. **同体积 + 同 mtime 的内容替换是缓存盲区**：`(size, mtime)` 无法识别它；
+   已写进模块文档、`docs/05` 与 `/api/models.verification.residual_blind_spot`。
+4. **P2-1 的并发在 HTTP 层不可构造**：`accept_loop` 单线程串行处理，准入/读 body/入队不会交错；
+   并发在预留原语层被真实跑出来（8 线程竞争），HTTP 层只证明"满队列的 N 个并发请求全部 503
+   且不读 body"。修复的价值是让保证由数据结构成立，而不是依赖线程模型。
+5. **符号链接逃逸用例依赖机器权限**：Windows 上创建符号链接需要权限/开发者模式；
+   无权限时该子路径会打印一行说明并跳过，其余两条（绝对路径、`..`）走同一条规范化包含规则。
+6. **`--eval-root` 的符号链接与 junction/挂载点**：只验证了文件符号链接；
+   NTFS junction / 卷挂载点指向沙箱外的情况没有独立用例（`canonicalize` 会解析它们，
+   但没有实测证据）。
+7. **冷/缓存延迟数字是单机、单次采样**：3 次冷 + 5 次命中，页缓存是热的；
+   磁盘更冷时冷验证会更慢（M4 记录过约 1 s），命中侧（`stat` + 比较）与文件大小无关，
+   因此结论不依赖那个假设，但**倍数**会随冷侧变化。
+8. **`cargo package` 的 serve 检查在打包树上跑**（`target/package/rapid-ocr-rs-0.7.0`），
+   不是在一个全新的干净 clone 上；依赖来自本机 cargo 缓存，无网络。
+9. **`docs/05` 的 M0-M4 章节仍保留历史表述**（例如 §1.1 的"实现前必须先补齐"表格、
+   §5.3 里"当前 `ModelManifest` 与 `default_models.yaml` 是两套权威"这类**设计时**的描述）。
+   本轮只改正了**与实现状态矛盾**的地方（状态行、§3/§4.2/§4.2.1/§4.4/§5.4/§7.2/§10/§11/§12/§13/§14/§15），
+   没有重写历史盘点章节——那会让"当时的判断"不可追溯。

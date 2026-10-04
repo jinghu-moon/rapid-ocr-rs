@@ -511,13 +511,20 @@ pub struct RapidOcrEngine {
     model_id: String,
     base_min_side_len: usize,
     base_max_side_len: usize,
-    /// 懒加载的公式识别器（模型路径 -> 实例），避免每次请求重建 594 MB session。
+    /// 懒加载的公式识别器（**文件身份** -> 实例），避免每次请求重建 594 MB session。
+    ///
+    /// 键是 `(路径, 体积, mtime)` 而不是路径：模型文件在第一次加载之后被替换/改写时，
+    /// 身份会变，缓存因此**重建**而不是继续用内存里那份旧会话。仅按路径比较会让
+    /// "同一个路径、不同的内容"被静默当成同一个模型。
     formula_recognizer: Option<(
-        std::path::PathBuf,
+        crate::model_verify::FileIdentity,
         crate::formula::recognizer::FormulaRecognizer,
     )>,
-    /// 懒加载的页面公式检测器。
-    formula_detector: Option<(std::path::PathBuf, crate::formula::detect::FormulaDetector)>,
+    /// 懒加载的页面公式检测器（键同上）。
+    formula_detector: Option<(
+        crate::model_verify::FileIdentity,
+        crate::formula::detect::FormulaDetector,
+    )>,
 }
 
 impl RapidOcrEngine {
@@ -1200,14 +1207,20 @@ impl RapidOcrEngine {
         };
         // 公式检测器与三个阶段共享同一份运行时档案，而不是再读一遍 rec 阶段配置。
         let runtime = self.inner.runtime_profile().session_runtime();
+        // 文件**身份**（路径 + 体积 + mtime）决定要不要重建：文件被替换后不会继续用旧会话。
+        let identity = crate::model_verify::FileIdentity::of(&path)?;
         if self
             .formula_detector
             .as_ref()
-            .is_none_or(|(current, _)| *current != path)
+            .is_none_or(|(current, _)| *current != identity)
         {
             self.formula_detector = Some((
-                path.clone(),
-                crate::formula::detect::FormulaDetector::from_model(&path, &runtime)?,
+                identity,
+                crate::formula::detect::FormulaDetector::from_model_with_hash(
+                    &path,
+                    &runtime,
+                    policy.expected_detector_sha256.as_deref(),
+                )?,
             ));
         }
         let detector = self
@@ -1230,10 +1243,11 @@ impl RapidOcrEngine {
             .collect())
     }
 
-    /// 懒加载公式识别器；模型路径变化时重建。
+    /// 懒加载公式识别器；模型**文件身份**（路径 + 体积 + mtime）变化时重建。
     ///
     /// 会话设置与批大小都来自引擎唯一的运行时档案：公式识别不是一条可以自己决定
-    /// 线程数与批大小的旁路。
+    /// 线程数与批大小的旁路。期望摘要由策略传入，由库在加载时校验——**磁盘上的那份**
+    /// 必须是声明的那一份，而不是"第一次加载时是哪一份就永远是哪一份"。
     fn formula_recognizer(
         &mut self,
         policy: &crate::api::FormulaPolicy,
@@ -1242,10 +1256,11 @@ impl RapidOcrEngine {
             crate::error::RapidOcrError::InvalidInput("formula policy requires `model_path`".into())
         })?;
         let runtime = self.inner.runtime_profile().session_runtime();
+        let identity = crate::model_verify::FileIdentity::of(&path)?;
         let rebuild = self
             .formula_recognizer
             .as_ref()
-            .is_none_or(|(current, _)| *current != path);
+            .is_none_or(|(current, _)| *current != identity);
         if rebuild {
             let mut recognizer =
                 crate::formula::recognizer::FormulaRecognizer::from_model_with_hash(
@@ -1254,7 +1269,7 @@ impl RapidOcrEngine {
                     policy.expected_model_sha256.as_deref(),
                 )?;
             recognizer.set_max_batch_size(runtime.formula_batch)?;
-            self.formula_recognizer = Some((path, recognizer));
+            self.formula_recognizer = Some((identity, recognizer));
         }
         self.formula_recognizer
             .as_mut()
@@ -1791,6 +1806,74 @@ rec:
             model_path: Some(assets.formula_model.clone()),
             detector_path: Some(assets.detector.clone()),
             ..FormulaPolicy::default()
+        }
+    }
+
+    /// 评审 P1-2：公式检测器的会话缓存必须按**文件身份**（路径 + 体积 + mtime）失效。
+    ///
+    /// 旧实现只比较**路径**：模型文件在第一次加载之后被替换/损坏，第二次请求会发现
+    /// "路径没变"，于是继续用内存里那份旧会话——损坏被静默吞掉。这里用真实检测模型的
+    /// 一份**副本**（绝不改动仓库资产）证明：追加一个字节之后，同一个路径上的下一次请求
+    /// 必须重新校验并因摘要不匹配而失败。
+    ///
+    /// 用"没有公式区域的页面"（`09竖排文本.png`，实测检测器返回 0 个候选）就不需要加载
+    /// 566 MB 的识别模型：本用例考察的是**检测器**的缓存失效。
+    #[test]
+    fn a_replaced_formula_detector_is_reverified_instead_of_reused() {
+        let Some(model_root) = crate::test_support::ocr_model_root() else {
+            return;
+        };
+        let Some(detector) = crate::test_support::formula_detector_path() else {
+            return;
+        };
+        let Some(formula_model) = crate::test_support::formula_model_path() else {
+            return;
+        };
+        let Some(page) = crate::test_support::page_fixture("09竖排文本.png") else {
+            return;
+        };
+        let dir = crate::test_support::TempDir::new("pipeline-detector-identity");
+        let copy = dir.path().join("pix2text-mfd-1.5.onnx");
+        std::fs::copy(&detector, &copy).expect("copy the real detector");
+        let declared = crate::model_store::sha256_file(&copy).expect("hash the copy");
+
+        let mut engine =
+            RapidOcrEngine::new(engine_config(&model_root)).expect("engine should load");
+        let policy = FormulaPolicy {
+            enabled: true,
+            model_path: Some(formula_model),
+            expected_model_sha256: None,
+            detector_path: Some(copy.clone()),
+            expected_detector_sha256: Some(declared.clone()),
+            ..FormulaPolicy::default()
+        };
+        let bytes = std::fs::read(&page).expect("page readable");
+        engine
+            .recognize(request(bytes.clone(), policy.clone()))
+            .expect("the first load must succeed");
+
+        // 追加一个字节：体积变化 → 身份变化 → 必须重新校验并拒绝（而不是复用旧会话）。
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&copy)
+            .expect("open the copy for append");
+        std::io::Write::write_all(&mut file, b"x").expect("append one byte");
+        drop(file);
+
+        let error = engine
+            .recognize(request(bytes, policy))
+            .expect_err("a replaced detector must not be reused");
+        match error {
+            crate::error::RapidOcrError::HashMismatch {
+                path: reported,
+                expected,
+                actual,
+            } => {
+                assert_eq!(reported, copy, "the error must name the replaced file");
+                assert_eq!(expected, declared);
+                assert_ne!(actual, declared);
+            }
+            other => panic!("expected a hash mismatch from the re-verification, got {other:?}"),
         }
     }
 

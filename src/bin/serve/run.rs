@@ -26,12 +26,13 @@ use std::process::Command;
 
 use super::cli::ServeArgs;
 use super::download;
+use super::evaluate;
 use super::http::{BoundServer, ServeHandle};
 use super::limits::{DEFAULT_ALLOW_DOWNLOAD, DEFAULT_ALLOW_PROVIDER_FALLBACK, DEFAULT_PROVIDER};
 use super::model_plan::{ModelPlan, ModelPlanError, ModelSnapshot};
 use super::security::{
-    NonLoopbackBindError, PlaceholderError, ServeToken, TOKEN_PLACEHOLDER,
-    assert_no_placeholders_left, generate_nonce, inject,
+    NonLoopbackBindError, PlaceholderError, RandomError, ServeToken, TOKEN_PLACEHOLDER,
+    assert_no_placeholders_left, generate_nonce, inject, random_source,
 };
 use super::server::ServeContext;
 use super::state::{ServeStartup, StartupConfigError};
@@ -57,6 +58,14 @@ pub(crate) enum ServeStartError {
     Page(PageError),
     /// `--formula-detector` 指向的文件不存在（M4：配置错误在启动期失败）。
     FormulaDetector { path: std::path::PathBuf },
+    /// `--eval-root` 不可用（不存在、不是目录、或无法规范化）——启动期失败，
+    /// 绝不"先开着、第一次评估才发现沙箱是空的"。
+    EvalRoot {
+        path: std::path::PathBuf,
+        detail: String,
+    },
+    /// 操作系统 CSPRNG 不可用（评审 P2-4 的 fail-closed 行为）。
+    Random(RandomError),
     /// 运行期无法启动（线程创建失败）。
     Runtime(std::io::Error),
 }
@@ -81,6 +90,18 @@ impl std::fmt::Display for ServeStartError {
                 path.display()
             ),
             Self::Runtime(error) => write!(f, "cannot start the serve runtime: {error}"),
+            Self::Random(error) => write!(
+                f,
+                "refusing to start: {error}; the service token and the CSP nonce must come from a \
+                 cryptographic RNG (docs/05 §7.2, M1 review P2-4)"
+            ),
+            Self::EvalRoot { path, detail } => write!(
+                f,
+                "--eval-root {} is not usable as an evaluation sandbox: {detail}; \
+                 POST /api/evaluate must not read local paths outside an explicitly configured \
+                 root (docs/05 §4.2, M1 review P2-3)",
+                path.display()
+            ),
         }
     }
 }
@@ -148,9 +169,12 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
     let bound = BoundServer::bind(args.port)?;
     let local = super::security::LocalOrigin::from_bound(bound.local_addr())?;
     let model_dir = args.model_dir();
-    let token = ServeToken::generate();
-    let nonce = generate_nonce();
+    // 评审 P2-4：令牌与 nonce 的熵**只**来自操作系统 CSPRNG。拿不到就拒绝启动
+    // （fail-closed），而不是继续用一个弱熵令牌。
+    let token = ServeToken::generate().map_err(ServeStartError::Random)?;
+    let nonce = generate_nonce().map_err(ServeStartError::Random)?;
     let page = render_page(&token, &nonce)?;
+    println!("serve: token/nonce entropy source: {}", random_source());
 
     // §7.6 第 2 步：运行配置（上限 / provider / 引擎配置）。
     let raw_engine = args.engine_config()?;
@@ -181,18 +205,32 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
     // `--formula-detector` 是显式配置，模型集里的 `formula_detector` role（本地清单可以声明）
     // 是"这个目录自己描述了它"；两者都没有时公式路由不可用（§10.8 默认关闭），
     // 但**普通 OCR 完全不受影响**。
-    let formula_detector = match args.formula_detector.clone() {
-        Some(path) => {
-            // 启动期就校验它真的存在：一个打错的文件名应该在启动时报出来，
-            // 而不是等到第一次公式请求（§7.6 第 2 步的"配置错误在启动期失败"）。
-            if !path.is_file() {
-                return Err(ServeStartError::FormulaDetector { path });
+    //
+    // 评审 P1-1：解析结果是"路径 + 集合声明的 SHA-256"，两者一起交给 `FormulaPolicy`，
+    // 库在加载检测器时校验——与识别模型完全对称，不再存在"检测器从不校验"的缺口。
+    if let Some(path) = args.formula_detector.as_ref()
+        && !path.is_file()
+    {
+        // 启动期就校验它真的存在：一个打错的文件名应该在启动时报出来，
+        // 而不是等到第一次公式请求（§7.6 第 2 步的"配置错误在启动期失败"）。
+        return Err(ServeStartError::FormulaDetector { path: path.clone() });
+    }
+    let formula_detector = model_plan.resolve_formula_detector(args.formula_detector.as_deref())?;
+    let routing =
+        super::server::routing_for(formula_detector.as_ref().map(|spec| spec.path.as_path()));
+
+    // M1 评审 P2-3：`--eval-root` 沙箱。缺少它时 `/api/evaluate` **整体关闭**
+    // （而不是"接受任意本机路径"）：评估是唯一接受"路径"而不是"上传字节"的端点，
+    // 因此必须由启动参数显式开启，并且清单与它引用的每张图都必须落在该目录内。
+    let eval_root = match args.eval_root.as_ref() {
+        Some(directory) => Some(evaluate::EvalRoot::new(directory).map_err(|detail| {
+            ServeStartError::EvalRoot {
+                path: directory.clone(),
+                detail,
             }
-            Some(path)
-        }
-        None => model_plan.formula_detector()?,
+        })?),
+        None => None,
     };
-    let routing = super::server::routing_for(formula_detector.as_deref());
 
     log_startup(
         &args,
@@ -204,7 +242,8 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
         yaml_max_side,
         yaml_provider,
         &routing,
-        formula_detector.as_deref(),
+        formula_detector.as_ref().map(|spec| spec.path.as_path()),
+        eval_root.as_ref(),
     );
 
     let port = local.port();
@@ -225,6 +264,8 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
         // 请求侧没有第二个开关：`queue=formula` **就是**公式管线的选择。
         routing,
         formula_detector,
+        // M1 评审 P2-3：`/api/evaluate` 的沙箱（`None` = 端点整体关闭）。
+        eval_root,
         engine_factory: super::engine::real_engine_factory(),
         downloader: super::download::real_downloader_factory(),
         free_space: super::server::real_free_space(),
@@ -324,6 +365,7 @@ fn log_startup(
     yaml_provider: rapid_ocr_rs::ProviderPreference,
     routing: &super::server::OcrRouting,
     formula_detector: Option<&std::path::Path>,
+    eval_root: Option<&evaluate::EvalRoot>,
 ) {
     println!(
         "serve: listening on {} (IPv4 loopback only; there is deliberately no --host option)",
@@ -362,6 +404,19 @@ fn log_startup(
                  unaffected)",
                 formula_blocking.join(", ")
             )
+        }
+    );
+    println!(
+        "serve: evaluation {}",
+        match eval_root {
+            Some(root) => format!(
+                "enabled with --eval-root {} (the manifest and every image it references must \
+                 resolve inside that directory)",
+                root.root().display()
+            ),
+            None => "disabled (no --eval-root): POST /api/evaluate refuses with a locating error, \
+                     because evaluation reads local paths instead of uploaded bytes"
+                .to_string(),
         }
     );
     println!(

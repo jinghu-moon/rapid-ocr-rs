@@ -62,6 +62,8 @@ mod model_source;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod model_store;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+mod model_verify;
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod ocr;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod output;

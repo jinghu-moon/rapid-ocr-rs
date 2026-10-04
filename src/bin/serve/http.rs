@@ -33,7 +33,8 @@ use tiny_http::{Header, Request, Response, Server, StatusCode};
 use rapid_ocr_rs::ProviderPreference;
 
 use super::admit::{
-    self, AdmissionError, BodySource, ChunkOutcome, HttpMethod, RequestDescriptor, RouteDecision,
+    self, AdmissionError, BodySource, ChunkOutcome, HttpMethod, QueueAdmission, RequestDescriptor,
+    RouteDecision,
 };
 use super::cli::ProviderChoice;
 use super::error::ServeError;
@@ -263,6 +264,9 @@ fn handle(shared: &Arc<ServeShared>, mut request: Request) {
         Route::Ocr => shared.routing().class_for(query_param(query, "queue")).ok(),
         _ => None,
     };
+    // 第 4 步的**原子预留**入口（评审 P2-1）：`admit` 在判定容量的同一次加锁里占位，
+    // 因此两个并发请求不可能都通过预检、都读入大 body。
+    let slot_source = class.map(|class| QueueSlotSource { shared, class });
 
     // 头字段先取成自有字符串：`RequestDescriptor` 借用的是这份局部数据，而不是
     // `Request` 本身，否则下面读 body 需要的可变借用会与之冲突。
@@ -284,8 +288,12 @@ fn handle(shared: &Arc<ServeShared>, mut request: Request) {
                 .is_some_and(|candidate| shared.token().matches(candidate)),
         host: host_header.as_deref(),
         origin: origin_header.as_deref(),
-        // 第 4 步：队列容量（**尚未读取 body**）。下载 channel 的容量由 `try_send` 兜底。
-        queue_full: class.is_some_and(|class| shared.queue_full(class)),
+        // 第 4 步：队列容量（**尚未读取 body**）。判定与预留是同一次加锁；
+        // 下载 channel 的容量由 `try_send` 兜底。
+        queue: match &slot_source {
+            Some(source) => QueueAdmission::Reserve(source),
+            None => QueueAdmission::NotQueued,
+        },
         content_length,
         // tiny_http 不暴露"预读进缓冲区的字节数"；上限由第 6 步的流式账本兜住。
         body_so_far: 0,
@@ -319,14 +327,16 @@ fn handle(shared: &Arc<ServeShared>, mut request: Request) {
         }
     };
 
-    // §4.4 第 4 步之后、第 6 步（读 body）之前：公式队列的**廉价**模型存在性预检。
+    // §4.4 第 4 步之后、第 6 步（读 body）之前：公式队列的模型**可用性**预检。
     //
-    // 只 `stat`（公式模型约 566 MB，把它放进每个请求的准入路径会让吞吐崩掉），
-    // 但足以在**读入请求体之前**给出可定位的 409（"先下载它"）；权威的哈希判定发生在
-    // 识别器加载时（模型集声明的 SHA-256）。文本队列不受影响。
+    // 判定用的是与 `/api/models` **同一份**哈希状态（库的身份键控校验缓存：键 = 路径 +
+    // 体积 + mtime）。首次见到某个身份时真的读盘（启动快照已经算过一次），命中只花一次
+    // `stat`，因此"损坏但存在"的公式文件/检测模型在**读入请求体之前**就是 409
+    // `models_corrupt`（评审 P1-2：只 `stat` 的旧预检会让它溜到 worker 里才失败）。
+    // 文本队列不受影响。
     if matches!(route, Route::Ocr)
         && class == Some(QueueClass::Formula)
-        && !shared.formula_models_on_disk()
+        && !shared.formula_models_ready()
     {
         let _ = respond(request, shared.formula_blocked_body(), &[]);
         return;
@@ -337,11 +347,11 @@ fn handle(shared: &Arc<ServeShared>, mut request: Request) {
         Ok(Dispatch::Respond(body, headers)) => {
             let _ = respond(request, body, &headers);
         }
-        // 响应由另一个线程写（M3 的 provider 切换）：本线程立刻回到 accept 循环，
-        // 否则 `/api/status` 与 `/api/ocr` 会在整个切换序列期间停摆。
-        Ok(Dispatch::SwitchProvider(provider)) => {
-            if let Err(failure) = spawn_provider_switch(shared, provider, request) {
-                // 请求没人接手（已有切换在跑 / 线程起不来）：由本线程如实回答。
+        // 响应由另一个线程写（M3 的 provider 切换 / M2 的按当前文件重建）：本线程立刻回到
+        // accept 循环，否则 `/api/status` 与 `/api/ocr` 会在整个建会话序列期间停摆。
+        Ok(Dispatch::EngineWork(provider)) => {
+            if let Err(failure) = spawn_engine_work(shared, provider, request) {
+                // 请求没人接手（已有建会话序列在跑 / 线程起不来）：由本线程如实回答。
                 let (error, request) = *failure;
                 let _ = respond(request, Body::error(&error), &[]);
             }
@@ -360,12 +370,31 @@ fn handle(shared: &Arc<ServeShared>, mut request: Request) {
     }
 }
 
+/// §4.4 第 4 步的 `QueueSlots` 生产实现：把 `Arc<ServeShared>` 的预留入口交给准入层。
+///
+/// 它只有两个字段（共享状态 + 队列类别），因此"预留"这件事在 http 层不引入任何新的状态：
+/// 容量账目始终只有 `ServeShared.jobs` 一个所有者。
+struct QueueSlotSource<'a> {
+    shared: &'a Arc<ServeShared>,
+    class: QueueClass,
+}
+
+impl admit::QueueSlots for QueueSlotSource<'_> {
+    fn reserve(&self) -> Option<admit::QueueReservation> {
+        self.shared.reserve_queue_slot(self.class)
+    }
+}
+
 /// 端点分发的结论（见 [`dispatch`]）。
 enum Dispatch {
     /// 本线程写响应。
     Respond(Body, Vec<(String, String)>),
-    /// 交给 [`spawn_provider_switch`]：它拥有请求对象（含写响应的责任）。
-    SwitchProvider(ProviderPreference),
+    /// 交给 [`spawn_engine_work`]：它拥有请求对象（含写响应的责任）。
+    ///
+    /// `None` = 无 body 的 `POST /api/engine/reload`（按磁盘上的当前文件重建会话）；
+    /// `Some(provider)` = M3 的显式 provider 设置应用。**两者走同一条线程路径**：
+    /// ONNX Runtime 建会话绝不在 accept 线程上发生（评审 P2-2）。
+    EngineWork(Option<ProviderPreference>),
     /// 交给 [`spawn_evaluation`]（M4）：评估是批量动作，同样由独立线程写响应。
     Evaluate(PathBuf),
 }
@@ -397,23 +426,24 @@ fn dispatch(
         )),
         Route::Ocr => {
             descriptor.check_content_type()?;
-            let bytes = read_body(request, admitted)?;
+            let bytes = read_body(request, &admitted)?;
             let max_side = parse_max_side(query_param(query, "max_side"), shared.min_side_len())?;
             let class = shared.routing().class_for(query_param(query, "queue"))?;
-            let value = shared.submit_ocr(bytes, class, max_side)?;
+            // 第 4 步预留的槽位随请求一路传到这里：入队成功即提交，任何提前返回都会归还容量。
+            let value = shared.submit_ocr(bytes, class, max_side, admitted.reservation)?;
             // §4.2：任务提交返回 **202**（异步任务，不存在"同步返回结果"的第二套语义）。
             Ok(Dispatch::Respond(json_body(202, value)?, Vec::new()))
         }
         Route::ModelsDownload => {
             check_json_content_type(descriptor.content_type)?;
-            let bytes = read_body(request, admitted)?;
+            let bytes = read_body(request, &admitted)?;
             let set_id = parse_set_id(&bytes)?;
             let value = shared.submit_download(&set_id)?;
             Ok(Dispatch::Respond(json_body(202, value)?, Vec::new()))
         }
         Route::Evaluate => {
             check_json_content_type(descriptor.content_type)?;
-            let bytes = read_body(request, admitted)?;
+            let bytes = read_body(request, &admitted)?;
             let manifest = evaluate::parse_manifest_body(&bytes)?;
             // **委派**：一次评估最多 `--max-eval-cases` 张图、每张一次完整推理；在 accept
             // 线程上跑会让 `/api/status`、两个 OCR 队列与下载在整个评估期间停摆。
@@ -423,18 +453,13 @@ fn dispatch(
         Route::EngineReload => {
             // 显式创建/重建引擎（§4.2、§7.6）：无 body = M2 的"按当前文件重建"；
             // 带 `{"provider": …}` = M3 的显式 provider 设置应用（含 Rebuilding 序列）。
-            let provider = parse_provider_body(read_body(request, admitted)?)?;
-            let Some(provider) = provider else {
-                return Ok(Dispatch::Respond(
-                    json_body(200, shared.reload_engine(None)?)?,
-                    Vec::new(),
-                ));
-            };
-            // **委派**：切换序列要排空在跑的推理、再建两次会话，在 accept 线程上执行
-            // 会让整个服务（包括 `/api/status` 与 `POST /api/ocr`）在它结束前停摆，
-            // 而那两件事正是"`Rebuilding` 可见""新请求入队而不是被拒绝"的证据来源。
-            // 请求对象由 `handle` 交给那个线程（这里只做"要不要委派"的判定）。
-            Ok(Dispatch::SwitchProvider(provider))
+            let body = read_body(request, &admitted)?;
+            let provider = parse_provider_body(body)?;
+            // **委派（两种形态都委派）**：建会话要排空在跑的推理、再建（最多两次）会话。
+            // 在 accept 线程上执行会让整个服务（包括 `/api/status` 与 `POST /api/ocr`）
+            // 在它结束前停摆，而"`Loading`/`Rebuilding` 可见""新请求入队而不是被拒绝"
+            // 正是要观察的行为（评审 P2-2：无 body 的那一支以前漏了这一步）。
+            Ok(Dispatch::EngineWork(provider))
         }
         Route::Job(id) => Ok(Dispatch::Respond(
             json_body(200, shared.job_view(id)?)?,
@@ -469,17 +494,20 @@ fn dispatch(
     }
 }
 
-/// 在独立线程里执行 provider 切换，并由那个线程写响应（§7.5、§7.6、M3）。
+/// 在独立线程里执行一次"建/重建引擎"序列，并由那个线程写响应（M2 的按当前文件重建、
+/// M3 的 provider 切换、评审 P2-2 的无 body reload 都走这一条路径）。
 ///
-/// - 同一时刻只允许一个切换（[`ServeShared::begin_provider_switch`]）：第二个请求立刻得到
-///   503 `busy`，不排队；
-/// - 线程创建失败 / 已有切换在跑 → 把请求连同错误原样还给调用方
+/// - 同一时刻只允许一个建会话序列（[`ServeShared::begin_provider_switch`]）：第二个请求
+///   立刻得到 503 `busy`，不排队；
+/// - 线程创建失败 / 已有序列在跑 → 把请求连同错误原样还给调用方
 ///   （`Err(Box::new((error, request)))`，装箱只为不让 `Result` 的 `Err` 变体过大），
 ///   由它写出对应的错误响应，绝不留下"没有响应的连接"；
-/// - 客户端仍然**只在序列结束（或失败）之后**才拿到响应，因此"显式设置应用"的语义不变。
-fn spawn_provider_switch(
+/// - **accept 线程立刻回到循环**（`/api/status` 与 `POST /api/ocr` 在整个序列期间照常可用），
+///   而客户端仍然**只在序列结束（或失败）之后**才拿到响应——无 body 的 reload 与显式
+///   provider 切换的这一点行为完全一致。
+fn spawn_engine_work(
     shared: &Arc<ServeShared>,
-    provider: ProviderPreference,
+    provider: Option<ProviderPreference>,
     request: Request,
 ) -> Result<(), Box<(ServeError, Request)>> {
     let Some(guard) = shared.begin_provider_switch() else {
@@ -490,15 +518,14 @@ fn spawn_provider_switch(
     // 因此线程创建失败时它还在这里，可以由调用方写出错误响应。
     let (tx, rx) = std::sync::mpsc::sync_channel::<Request>(1);
     let spawned = thread::Builder::new()
-        .name("serve-provider-switch".to_string())
+        .name("serve-engine-work".to_string())
         .spawn(move || {
             // 资格在线程退出时释放（含 panic）。
             let _guard = guard;
             let Ok(request) = rx.recv() else {
                 return;
             };
-            let started = Instant::now();
-            let body = match shared.apply_provider_request(provider, started) {
+            let body = match shared.reload_engine(provider) {
                 Ok(value) => match serde_json::to_vec(&value) {
                     Ok(bytes) => Body::json(200, bytes),
                     Err(_) => Body::error(&ServeError::Internal),
@@ -514,7 +541,7 @@ fn spawn_provider_switch(
             Ok(())
         }
         Err(error) => {
-            eprintln!("serve: cannot start the provider-switch thread: {error}");
+            eprintln!("serve: cannot start the engine-work thread: {error}");
             Err(Box::new((ServeError::Internal, request)))
         }
     }
@@ -606,7 +633,10 @@ fn json_body(status: u16, value: Value) -> Result<Body, ServeError> {
 }
 
 /// 有界读取（§4.4 第 6 步）：总字节上限 + 截止时间。
-fn read_body(request: &mut Request, admitted: admit::Admit) -> Result<Vec<u8>, ServeError> {
+///
+/// 借用 `Admit` 而不是取走它：第 4 步预留的队列槽位必须留到 `submit_ocr` 才提交，
+/// 中途任何失败都让它在 `dispatch` 返回时被丢弃（= 归还容量）。
+fn read_body(request: &mut Request, admitted: &admit::Admit) -> Result<Vec<u8>, ServeError> {
     let mut source = HttpBody {
         request,
         deadline: Instant::now() + BODY_READ_TIMEOUT,

@@ -515,6 +515,14 @@ pub struct FormulaPolicy {
     pub expected_model_sha256: Option<String>,
     /// 页面公式检测模型（`pix2text-mfd-1.5.onnx`）；为 `None` 时只处理 `input_regions`。
     pub detector_path: Option<PathBuf>,
+    /// 检测模型的可选 SHA-256 校验。
+    ///
+    /// **与 [`Self::expected_model_sha256`] 是同一条规则**（而不是第二套机制）：给出即校验，
+    /// 不匹配就是 [`crate::RapidOcrError::HashMismatch`]（路径 + 期望 + 实际），
+    /// 绝不静默加载一个损坏的检测模型。为 `None` 表示"调用方没有可信摘要"（例如
+    /// 用户显式给出的本机路径、模型集也没有声明它的哈希），此时如实记录"无法校验"，
+    /// 而不是假装校验过。
+    pub expected_detector_sha256: Option<String>,
     /// 公式检测置信度阈值。
     pub confidence_threshold: f32,
     /// 公式检测 NMS IoU 阈值。
@@ -536,6 +544,7 @@ impl Default for FormulaPolicy {
             model_path: None,
             expected_model_sha256: None,
             detector_path: None,
+            expected_detector_sha256: None,
             confidence_threshold: crate::formula::detect::DEFAULT_FORMULA_DETECT_CONFIDENCE,
             iou_threshold: crate::formula::detect::DEFAULT_FORMULA_DETECT_IOU,
             max_regions: 64,

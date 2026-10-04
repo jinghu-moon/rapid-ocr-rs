@@ -20,7 +20,7 @@ use crate::{
         tokenizer_metadata::FormulaTokenizerMetadata,
     },
     input::image_loader::{LoadImage, OcrInput},
-    model_store::sha256_file,
+    model_verify::verify_sha256,
     runtime::provider::ProviderResolution,
 };
 
@@ -95,16 +95,10 @@ impl FormulaRecognizer {
         if !model_path.is_file() {
             return Err(RapidOcrError::FileNotFound(model_path.to_path_buf()));
         }
-        if let Some(expected) = expected_sha256 {
-            let actual = sha256_file(model_path)?;
-            if !actual.eq_ignore_ascii_case(expected) {
-                return Err(RapidOcrError::HashMismatch {
-                    path: model_path.to_path_buf(),
-                    expected: expected.to_string(),
-                    actual,
-                });
-            }
-        }
+        // 校验走**共享的**身份键控缓存（`crate::model_verify`）：`/api/models` 的逐文件
+        // 状态、公式队列的准入判定与这里问的是同一个问题，因此必须是同一份证据。
+        // 不匹配是可定位错误，绝不静默加载。
+        verify_sha256(model_path, expected_sha256)?;
 
         let session = FormulaSession::new(model_path, runtime_cfg)?;
         let character_metadata = session.character_metadata()?.ok_or_else(|| {

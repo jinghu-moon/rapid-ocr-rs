@@ -119,6 +119,9 @@ impl ModelPlan {
         // 这里立刻解析一次，让"公式集合声明了同一 role 的两个不同文件"这类
         // 结构性错误在**启动期**就带上管线信息报出来，而不是等到第一次公式请求。
         plan.formula_recognizer()?;
+        // 公式检测模型是可选的（默认表不登记它），但**歧义不是可选的**：同一个 role 声明
+        // 两个不同文件时同样在启动期拒绝，而不是等第一次公式请求才挑一个。
+        plan.resolve_formula_detector(None)?;
         Ok(plan)
     }
 
@@ -146,39 +149,28 @@ impl ModelPlan {
 
     /// 每个集合的逐文件状态（§5.2 的唯一实现是库里的 `validate_model_files`）。
     ///
-    /// **每次调用都会重新读盘并重新哈希**（文本模型 10–30 MB，公式模型约 566 MB）：
-    /// `/api/models` 与 `/api/ocr` 的 409 因此总是报告磁盘上的**当前**事实，而不是启动时的
-    /// 快照（M2 下载完成后页面必须看到 `present`），两者也就必然一致。请求路径上**不**调它
-    /// （公式队列的准入用 [`Self::missing_on_disk`] 的廉价存在性检查，哈希在识别器加载时
-    /// 由库用 `expected_model_sha256` 完成）。
+    /// 每次调用都会重新读盘：状态永远报告磁盘上的**当前**事实，而不是启动时的快照
+    /// （M2 下载完成后页面必须看到 `present`）。哈希走库的**身份键控校验缓存**
+    /// （`model_verify`：键 = 路径 + 体积 + mtime），因此同一个身份只算一次——
+    /// 首次真的读盘（566 MB 公式模型约 1 s，实测值记在 `/api/models` 的 `verification`
+    /// 块里），命中只花一次 `stat`。请求路径与 `/api/models` **共用这一份证据**
+    /// （见 [`super::server::ServeShared::formula_models_ready`]），因此"报告的"与
+    /// "准入判定的"不可能分叉。
     pub fn report(&self) -> ModelReport {
+        let mut cold_this_call = 0_usize;
+        let statuses = self
+            .sets
+            .iter()
+            .map(|set| {
+                let (status, computed) = set.status_probed(&self.model_dir);
+                cold_this_call += computed;
+                status
+            })
+            .collect();
         ModelReport {
-            statuses: self
-                .sets
-                .iter()
-                .map(|set| set.status(&self.model_dir))
-                .collect(),
+            statuses,
+            cold_this_call,
         }
-    }
-
-    /// 某个管线里**磁盘上不存在**的文件名（只 `stat`，**不哈希**）。
-    ///
-    /// 这是"请求路径上的廉价预检"：真正的权威判定是库在加载文件时用集合声明的
-    /// SHA-256 做的校验（`FormulaRecognizer::from_model_with_hash`）。两者分工明确：
-    /// 这里回答"要不要现在就去下载"，那里回答"下到的东西对不对"。
-    pub fn missing_on_disk(&self, pipeline: Pipeline) -> Vec<String> {
-        let mut out = Vec::new();
-        for set in &self.sets {
-            for file in &set.files {
-                if Pipeline::of(file.role) != pipeline {
-                    continue;
-                }
-                if !self.model_dir.join(&file.name).is_file() {
-                    out.push(file.name.clone());
-                }
-            }
-        }
-        out
     }
 
     /// 启动期快照：引擎状态机的输入（§7.6 第 3 步）。**引擎只看文本管线**。
@@ -276,15 +268,59 @@ impl ModelPlan {
         Ok((self.model_dir.join(&spec.name), spec.sha256.clone()))
     }
 
-    /// 公式检测模型（`formula_detector` role）。
+    /// 启动期解析公式检测模型：CLI（`--formula-detector`）优先，其次是模型集声明的
+    /// `formula_detector` role。
     ///
-    /// 它在 `FormulaPolicy` 里是**可选**的（默认表不把它登记为集合成员：没有可信的公开
-    /// 下载来源），因此 `None` 是正常结果，不是错误；但一旦集合声明了它，就只认集合里的
-    /// 那一个文件（不静默回落到别的路径）。
-    pub fn formula_detector(&self) -> Result<Option<PathBuf>, ModelPlanError> {
-        Ok(self
-            .spec_for(ModelRole::FormulaDetector)?
-            .map(|spec| self.model_dir.join(&spec.name)))
+    /// **哈希跟随被选中的那个文件**——完整性规则与识别模型**完全对称**：
+    ///
+    /// - 选中的路径正是模型集声明过的那一个文件（无论它来自 CLI 覆盖还是 role 本身），
+    ///   且集合声明了 SHA-256 → 摘要随路径一起交给 `FormulaPolicy`，库在加载检测器时校验；
+    /// - CLI 给了一个集合没有声明过的路径 → 没有可信摘要，`expected_sha256 = None`，
+    ///   如实表示"这个文件无法校验"，而不是挑一个别的哈希来"看起来校验过"。
+    ///
+    /// 它在 `FormulaPolicy` 里是**可选**的（默认表不登记它：没有可信的公开下载来源），
+    /// 因此 `None` 是正常结果；但一旦集合声明了它，就只认集合里的那一个文件
+    /// （不静默回落到别的路径），歧义同样在这里被拒绝。
+    pub fn resolve_formula_detector(
+        &self,
+        cli: Option<&Path>,
+    ) -> Result<Option<FormulaDetectorSpec>, ModelPlanError> {
+        let declared = self.spec_for(ModelRole::FormulaDetector)?;
+        let Some(cli) = cli else {
+            return Ok(declared.map(|spec| FormulaDetectorSpec {
+                path: self.model_dir.join(&spec.name),
+                expected_sha256: spec.has_hash().then(|| spec.sha256.clone()),
+            }));
+        };
+        let expected_sha256 = declared
+            .filter(|spec| same_file(&self.model_dir.join(&spec.name), cli))
+            .filter(|spec| spec.has_hash())
+            .map(|spec| spec.sha256.clone());
+        Ok(Some(FormulaDetectorSpec {
+            path: cli.to_path_buf(),
+            expected_sha256,
+        }))
+    }
+}
+
+/// 启动期解析出的公式检测模型：路径 + **集合声明的** SHA-256（`None` = 没有可信摘要）。
+///
+/// 两者必须一起传递：只有路径的旧形状正是"检测模型从不校验"的根因。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FormulaDetectorSpec {
+    pub path: PathBuf,
+    pub expected_sha256: Option<String>,
+}
+
+/// 两个路径是否指向同一个文件（先规范化；规范化失败时退回字面比较）。
+///
+/// `--formula-detector` 与模型集里的声明可能一个带 `\\?\` 前缀、一个不带，
+/// 也可能一个相对一个绝对；用规范化后的路径比较，CLI 与 role 指向同一个文件时
+/// 声明的哈希才不会被丢掉。
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
     }
 }
 
@@ -338,6 +374,11 @@ pub(super) fn pending_download(status: &ModelSetStatus) -> PendingDownload {
 #[derive(Debug, Clone)]
 pub(super) struct ModelReport {
     statuses: Vec<ModelSetStatus>,
+    /// 这一份报告里**真的**重算了摘要的文件数（其余命中身份键控的校验缓存）。
+    ///
+    /// 它是"轮询不再重新哈希 566 MB"的可断言证据：页面每 8 s 拉一次 `/api/models`，
+    /// 第二次开始这个数字必须是 0。
+    cold_this_call: usize,
 }
 
 /// 一个集合里"需要下载"的文件规模（§6.5 的核算口径）。
@@ -354,6 +395,11 @@ pub(super) struct PendingDownload {
 impl ModelReport {
     pub fn statuses(&self) -> &[ModelSetStatus] {
         &self.statuses
+    }
+
+    /// 这一份报告里真的重算了摘要的文件数（`/api/models.verification.cold_this_call`）。
+    pub fn cold_this_call(&self) -> usize {
+        self.cold_this_call
     }
 
     /// 某个集合里待下载文件的规模；集合不存在时为 `None`。
@@ -663,14 +709,15 @@ mod tests {
         assert_eq!(report.formula_missing_names(), vec![name.clone()]);
         assert!(!report.formula_complete());
         assert_eq!(snapshot.formula_blocking_names(), vec![name.clone()]);
-        // 廉价存在性检查与哈希结论在这一场景下一致（空目录）。
-        assert_eq!(plan.missing_on_disk(Pipeline::Formula), vec![name]);
-        assert_eq!(
-            plan.missing_on_disk(Pipeline::Text),
-            set.files
-                .iter()
-                .map(|(file, _)| file.name.clone())
-                .collect::<Vec<_>>()
+        // 请求路径的判定与 `/api/models` **同源**（同一份身份键控的哈希状态）：
+        // 没有第二套"只看存在性"的清单。
+        assert_eq!(report.formula_blocking_names(), vec![name.clone()]);
+        assert_eq!(report.blocking_names(), declared);
+        // 默认表不登记公式检测模型：解析结果是 `None`（正常），不是错误。
+        assert!(
+            plan.resolve_formula_detector(None)
+                .expect("optional role")
+                .is_none()
         );
     }
 
@@ -717,12 +764,13 @@ mod tests {
                 "the engine list must stay text-scoped: {name}"
             );
         }
-        // 存在性检查（请求路径上的廉价预检）只看磁盘。
-        assert!(plan.missing_on_disk(Pipeline::Text).is_empty());
+        // 请求路径的判定来自**同一份哈希状态**：文本三个占位文件是 `corrupt`
+        // （而不是 `missing`），公式文件是 `missing`——两者都在这一份报告里。
         assert_eq!(
-            plan.missing_on_disk(Pipeline::Formula),
+            report.formula_blocking_names(),
             vec!["pp_formulanet_plus_m.onnx"]
         );
+        assert_eq!(report.corrupt_names(), text_files);
         // 引擎状态机因此只看文本清单：公式缺失不进 `BlockedModelsMissing` 的清单。
         let snapshot = plan.snapshot();
         assert_eq!(snapshot.blocking_names(), text_files);
@@ -743,7 +791,71 @@ mod tests {
         assert_eq!(path, dir.join("pp_formulanet_plus_m.onnx"));
         assert_eq!(sha256.len(), 64, "the set's SHA-256 travels with the path");
         // 默认表不登记公式检测模型：`None` 是正常结果，不是错误。
-        assert_eq!(plan.formula_detector().expect("optional"), None);
+        assert!(
+            plan.resolve_formula_detector(None)
+                .expect("optional")
+                .is_none()
+        );
+    }
+
+    /// 评审 P1-1 的根因回归：检测模型的 SHA-256 必须与识别模型**同一条规则**地
+    /// 跟着"被选中的那个文件"走，而不是在解析时被丢掉。
+    #[test]
+    fn the_formula_detector_hash_travels_with_the_selected_file() {
+        let dir = fixture_dir().join("detector-hash");
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let declared = "a".repeat(64);
+        std::fs::write(
+            dir.join("manifest.json"),
+            format!(
+                r#"{{"schema_version":1,"id":"t","family":"PP-OCR","version":"v6",
+                    "files":[{{"name":"det.onnx","role":"detector","sha256":"aa"}},
+                             {{"name":"rec.onnx","role":"recognizer","sha256":"bb"}},
+                             {{"name":"dict.txt","role":"dictionary","sha256":"cc"}},
+                             {{"name":"fx.onnx","role":"formula_recognizer","sha256":"dd"}},
+                             {{"name":"mfd.onnx","role":"formula_detector","sha256":"{declared}"}}]}}"#
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(dir.join("mfd.onnx"), b"placeholder").expect("fixture file");
+        let plan = ModelPlan::resolve(&dir, &EngineConfig::default()).expect("manifest source");
+
+        // role 本身：路径 + 集合声明的哈希一起给出。
+        let spec = plan
+            .resolve_formula_detector(None)
+            .expect("ok")
+            .expect("the role is declared");
+        assert_eq!(spec.path, dir.join("mfd.onnx"));
+        assert_eq!(
+            spec.expected_sha256.as_deref(),
+            Some(declared.as_str()),
+            "the declared hash must not be dropped"
+        );
+
+        // CLI 指向**同一个**文件（写法不同）→ 声明的哈希仍然跟随。
+        let indirect = dir.join(".").join("mfd.onnx");
+        let spec = plan
+            .resolve_formula_detector(Some(&indirect))
+            .expect("ok")
+            .expect("cli override");
+        assert_eq!(
+            spec.expected_sha256.as_deref(),
+            Some(declared.as_str()),
+            "a CLI path that resolves to the declared file keeps its hash"
+        );
+
+        // CLI 指向集合没有声明过的文件 → 没有可信摘要（如实为 `None`，
+        // 而不是借用另一个文件的哈希来"看起来校验过"）。
+        let other = dir.join("other-mfd.onnx");
+        std::fs::write(&other, b"placeholder").expect("fixture file");
+        let spec = plan
+            .resolve_formula_detector(Some(&other))
+            .expect("ok")
+            .expect("cli override");
+        assert_eq!(spec.path, other);
+        assert_eq!(spec.expected_sha256, None);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// det/rec 的 model_type 冲突在默认表下必须报可定位错误，而不是静默选一个。

@@ -145,35 +145,56 @@ impl ModelFileSpec {
     /// 它既不是 `Present`（没有证据），也不能是 `Missing`（`Missing` 会被前端
     /// 解读为“请下载它”，而这个文件按定义不属于本集合）。
     pub fn state_in(&self, root: &Path) -> ModelFileState {
+        self.state_in_probed(root).0
+    }
+
+    /// 与 [`Self::state_in`] 相同，但额外回答"**这一次**是否真的读了盘算摘要"。
+    ///
+    /// 这个布尔量是"身份键控的校验缓存确实命中了"的唯一证据来源：它是**单次调用**的
+    /// 属性，不受同一进程里其它线程的影响（见 [`crate::model_verify`] 的模块文档）。
+    /// 它也是 `/api/models` 的 `verification.cold_this_call` 的来源：页面每 8 s 轮询一次
+    /// 就绪状态时，这个数字必须是 0，而不是"我们相信它命中了"。
+    pub fn state_in_probed(&self, root: &Path) -> (ModelFileState, bool) {
         if self.validate_name().is_err() {
-            return ModelFileState::Corrupt {
-                expected: self.sha256.clone(),
-                actual: format!(
-                    "invalid file name `{}` escapes the model directory",
-                    self.name
-                ),
-            };
+            return (
+                ModelFileState::Corrupt {
+                    expected: self.sha256.clone(),
+                    actual: format!(
+                        "invalid file name `{}` escapes the model directory",
+                        self.name
+                    ),
+                },
+                false,
+            );
         }
 
         let path = root.join(&self.name);
         if !path.is_file() {
-            return ModelFileState::Missing;
+            return (ModelFileState::Missing, false);
         }
         if !self.has_hash() {
-            // 存在但无哈希：只能证明“存在”，无法证明“正确”。
-            return ModelFileState::Present;
+            // 存在但无哈希：只能证明“存在”，无法证明“正确”，因此不需要读盘。
+            return (ModelFileState::Present, false);
         }
 
-        match crate::model_store::sha256_file(&path) {
-            Ok(actual) if actual.eq_ignore_ascii_case(&self.sha256) => ModelFileState::Present,
-            Ok(actual) => ModelFileState::Corrupt {
-                expected: self.sha256.clone(),
-                actual,
-            },
-            Err(error) => ModelFileState::Corrupt {
-                expected: self.sha256.clone(),
-                actual: format!("unreadable: {error}"),
-            },
+        match crate::model_verify::verify_file(&path) {
+            Ok(outcome) if outcome.sha256.eq_ignore_ascii_case(&self.sha256) => {
+                (ModelFileState::Present, outcome.computed)
+            }
+            Ok(outcome) => (
+                ModelFileState::Corrupt {
+                    expected: self.sha256.clone(),
+                    actual: outcome.sha256,
+                },
+                outcome.computed,
+            ),
+            Err(error) => (
+                ModelFileState::Corrupt {
+                    expected: self.sha256.clone(),
+                    actual: format!("unreadable: {error}"),
+                },
+                false,
+            ),
         }
     }
 }
@@ -287,6 +308,11 @@ impl ModelSet {
     pub fn status(&self, root: &Path) -> ModelSetStatus {
         model_set_status(self, root)
     }
+
+    /// 见 [`model_set_status_probed`]。
+    pub fn status_probed(&self, root: &Path) -> (ModelSetStatus, usize) {
+        model_set_status_probed(self, root)
+    }
 }
 
 /// 一个模型集合在某个目录下的完整状态。
@@ -338,26 +364,52 @@ pub fn validate_model_files(
     files: &[ModelFileSpec],
     root: &Path,
 ) -> Vec<(ModelFileSpec, ModelFileState)> {
-    files
+    validate_model_files_probed(files, root).0
+}
+
+/// 与 [`validate_model_files`] 相同，但额外回答"这一轮里有几个文件真的重新算过摘要"。
+///
+/// 成本账：命中身份键控缓存的文件不计数，因此这个数字就是"这次调用实际读了多少盘"。
+pub fn validate_model_files_probed(
+    files: &[ModelFileSpec],
+    root: &Path,
+) -> (Vec<(ModelFileSpec, ModelFileState)>, usize) {
+    let mut computed = 0_usize;
+    let statuses = files
         .iter()
-        .map(|file| (file.clone(), file.state_in(root)))
-        .collect()
+        .map(|file| {
+            let (state, did_compute) = file.state_in_probed(root);
+            if did_compute {
+                computed += 1;
+            }
+            (file.clone(), state)
+        })
+        .collect();
+    (statuses, computed)
 }
 
 /// 见 [`ModelSet::status`]。
 pub fn model_set_status(set: &ModelSet, root: &Path) -> ModelSetStatus {
-    let files = validate_model_files(&set.files, root);
+    model_set_status_probed(set, root).0
+}
+
+/// 见 [`ModelSet::status_probed`]：状态 + "这一轮真的算了几次摘要"。
+pub fn model_set_status_probed(set: &ModelSet, root: &Path) -> (ModelSetStatus, usize) {
+    let (files, computed) = validate_model_files_probed(&set.files, root);
     let complete = !files.is_empty()
         && files
             .iter()
             .all(|(file, state)| state.is_present() && file.has_hash());
     let download_bytes_total = missing_download_bytes(&files);
-    ModelSetStatus {
-        set_id: set.id.clone(),
-        files,
-        complete,
-        download_bytes_total,
-    }
+    (
+        ModelSetStatus {
+            set_id: set.id.clone(),
+            files,
+            complete,
+            download_bytes_total,
+        },
+        computed,
+    )
 }
 
 /// 缺失文件大小之和；有未知大小或求和溢出时为 `None`。

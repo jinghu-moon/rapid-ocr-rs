@@ -105,9 +105,24 @@ impl FormulaDetector {
     /// provider 语义与 `formula::session::FormulaSession` 一致：请求了加速器却只拿到
     /// CPU 回退时必须失败，不能静默降级。
     pub fn from_model(model_path: &Path, runtime_cfg: &RuntimeConfig) -> Result<Self> {
+        Self::from_model_with_hash(model_path, runtime_cfg, None)
+    }
+
+    /// 与 [`crate::formula::recognizer::FormulaRecognizer::from_model_with_hash`] **对称**的
+    /// 入口：期望摘要在场时必须匹配，否则返回可定位的
+    /// [`RapidOcrError::HashMismatch`]（路径 + 期望 + 实际），绝不静默加载一个损坏的检测模型。
+    ///
+    /// 检测模型与识别模型走**同一条**完整性规则、**同一个**身份键控校验缓存
+    /// （`crate::model_verify`），因此"完整性只对识别模型成立"这种不对称不可能再出现。
+    pub fn from_model_with_hash(
+        model_path: &Path,
+        runtime_cfg: &RuntimeConfig,
+        expected_sha256: Option<&str>,
+    ) -> Result<Self> {
         if !model_path.is_file() {
             return Err(RapidOcrError::FileNotFound(model_path.to_path_buf()));
         }
+        crate::model_verify::verify_sha256(model_path, expected_sha256)?;
         let inner = OrtSession::open_unchecked(model_path, runtime_cfg)?;
         // 公式域契约：请求了加速器却只拿到 CPU 回退时必须失败，不能静默降级。
         require_requested_provider(inner.provider_resolution())?;
@@ -1211,6 +1226,75 @@ mod tests {
         let error = FormulaDetector::from_model(&path, &RuntimeConfig::default())
             .expect_err("missing model must fail");
         assert!(matches!(error, RapidOcrError::FileNotFound(_)), "{error}");
+        // 带期望摘要时，**存在性**仍然是第一个判定：缺失文件不能因为"哈希也算不出来"
+        // 而变成一个含混的错误。
+        let error = FormulaDetector::from_model_with_hash(
+            &path,
+            &RuntimeConfig::default(),
+            Some(&"0".repeat(64)),
+        )
+        .expect_err("missing model must fail");
+        assert!(matches!(error, RapidOcrError::FileNotFound(_)), "{error}");
+    }
+
+    /// 评审 P1-1：检测模型与识别模型走**同一条**完整性规则——声明了 SHA-256 就必须匹配，
+    /// 不匹配是**可定位**错误（路径 + 期望 + 实际），而且要发生在打开 ONNX 之前。
+    ///
+    /// 这里不需要真实模型即可证明顺序：`golden.json` 是仓库里的普通文件，
+    /// 摘要不匹配时**必须**返回 `HashMismatch`；摘要匹配时才轮到"这不是一个 ONNX 模型"。
+    #[test]
+    fn a_declared_detector_hash_is_verified_before_the_model_is_opened() {
+        let path = fixture_dir().join("golden.json");
+        let wrong = "0".repeat(64);
+        let error =
+            FormulaDetector::from_model_with_hash(&path, &RuntimeConfig::default(), Some(&wrong))
+                .expect_err("a mismatching digest must refuse to load");
+        match error {
+            RapidOcrError::HashMismatch {
+                path: reported,
+                expected,
+                actual,
+            } => {
+                assert_eq!(reported, path);
+                assert_eq!(expected, wrong);
+                assert_ne!(actual, wrong);
+            }
+            other => panic!("expected HashMismatch, got {other:?}"),
+        }
+
+        // 摘要正确 → 哈希校验通过，失败来自"这不是 ONNX"（因此与哈希无关）。
+        let actual = crate::model_store::sha256_file(&path).expect("hash the fixture");
+        let error =
+            FormulaDetector::from_model_with_hash(&path, &RuntimeConfig::default(), Some(&actual))
+                .expect_err("a JSON file is not an ONNX model");
+        assert!(
+            !matches!(error, RapidOcrError::HashMismatch { .. }),
+            "a matching digest must not produce a hash error: {error}"
+        );
+    }
+
+    /// 评审 P1-1 的第三条要求：**有效的**检测模型 + 集合声明的正确摘要仍然必须加载成功
+    /// （不能因为加了校验就把正常路径弄坏）。模型缺失时按既有约定跳过。
+    #[test]
+    fn a_valid_detector_of_the_declared_hash_still_loads() {
+        let Some(path) = detect_model_path() else {
+            return;
+        };
+        let declared = crate::model_store::sha256_file(&path).expect("hash the real detector");
+        FormulaDetector::from_model_with_hash(&path, &RuntimeConfig::default(), Some(&declared))
+            .expect("a valid detector with its declared hash must load");
+
+        // 同一个文件 + 一个不同的摘要 → 定位错误（绝不静默加载）。
+        let mut wrong = declared.clone();
+        let flip = if declared.starts_with('0') { '1' } else { '0' };
+        wrong.replace_range(0..1, &flip.to_string());
+        let error =
+            FormulaDetector::from_model_with_hash(&path, &RuntimeConfig::default(), Some(&wrong))
+                .expect_err("a mismatching digest must refuse to load");
+        assert!(
+            matches!(error, RapidOcrError::HashMismatch { .. }),
+            "{error}"
+        );
     }
 
     /// 纯函数 decode：手工构造 `[6, A]` 输出，锁定“不再叠加 anchor 偏移”的语义。

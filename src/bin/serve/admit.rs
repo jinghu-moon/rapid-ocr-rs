@@ -20,6 +20,8 @@
 //! 404/405 变体，§11.1 也没定义对应 `code`，因此本模块不伪造一个，
 //! 而是把路由结论原样回传（[`AdmissionError::Route`]）。
 
+use std::fmt;
+
 use super::error::ServeError;
 use super::security::LocalOrigin;
 
@@ -87,7 +89,7 @@ impl RouteDecision {
 }
 
 /// 一次请求的判定输入（纯数据，不含任何 HTTP 库类型）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct RequestDescriptor<'a> {
     pub method: HttpMethod,
     pub path: &'a str,
@@ -97,8 +99,8 @@ pub struct RequestDescriptor<'a> {
     pub has_token: bool,
     pub host: Option<&'a str>,
     pub origin: Option<&'a str>,
-    /// 目标队列是否已满（第 4 步；此时**没有**读取请求体）。
-    pub queue_full: bool,
+    /// 第 4 步的队列准入（**判定即预留**；此时**没有**读取请求体）。
+    pub queue: QueueAdmission<'a>,
     /// `Content-Length`（chunked 请求没有）。
     pub content_length: Option<u64>,
     /// 判定时已经在 socket/缓冲区里的 body 字节数（tiny_http 可能已预读一部分 chunked 体）。
@@ -106,6 +108,96 @@ pub struct RequestDescriptor<'a> {
     pub content_type: Option<&'a str>,
     /// 是否为 `Transfer-Encoding: chunked`。
     pub is_chunked: bool,
+}
+
+/// §4.4 第 4 步的队列准入。
+///
+/// **判定与预留必须是同一次加锁**（评审 P2-1 的根因）：M1 的实现先读一个 `queue_full`
+/// 布尔值（第一个临界区），通过之后才在 `submit_ocr` 里入队（第二个临界区）。两个并发
+/// 请求因此可以都通过预检、都读入大 body，然后其中一个才拿到 503——"拒绝时没有读 body"
+/// 这条保证在并发下不成立。
+///
+/// 这里把"检查"与"占位"合成一个动作：[`QueueSlots::reserve`] 在服务端的**同一把锁**下
+/// 判定并占位，返回的 [`QueueReservation`] 要么被提交成真正的队列条目，要么在请求
+/// 失败/中止时释放。
+#[derive(Clone, Copy)]
+pub enum QueueAdmission<'a> {
+    /// 该路由不进 OCR 队列（例如 `POST /api/engine/reload`）。
+    NotQueued,
+    /// 由服务端裁决：第 4 步调用 [`QueueSlots::reserve`]。
+    Reserve(&'a dyn QueueSlots),
+}
+
+impl fmt::Debug for QueueAdmission<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotQueued => f.write_str("NotQueued"),
+            Self::Reserve(_) => f.write_str("Reserve(<server queue>)"),
+        }
+    }
+}
+
+impl QueueAdmission<'_> {
+    /// 第 4 步：预留一个槽位；队列已满（含其它请求**已经预留但尚未提交**的槽位）时 `None`。
+    fn reserve(&self) -> Option<QueueReservation> {
+        match self {
+            Self::NotQueued => None,
+            Self::Reserve(slots) => slots.reserve(),
+        }
+    }
+
+    /// 该路由是否需要队列容量（拒绝时用 503 而不是放行）。
+    fn is_queued(&self) -> bool {
+        matches!(self, Self::Reserve(_))
+    }
+}
+
+/// 队列槽位的来源（生产实现：[`super::server::ServeShared::reserve_queue_slot`]）。
+pub trait QueueSlots {
+    /// 原子地预留一个槽位；没有容量时返回 `None`。
+    fn reserve(&self) -> Option<QueueReservation>;
+}
+
+/// 一个**已经预留、尚未提交**的队列槽位。
+///
+/// - 提交：`ServeShared::submit_ocr` 入队成功之后释放它（入队在先、释放在后，
+///   因此"多算一格"只会让并发请求被保守拒绝，绝不超卖容量）；
+/// - 释放：`Drop` 无条件归还槽位——请求被后续步骤拒绝、读 body 失败、连接中止、
+///   panic 展开都会走到这里，容量不会泄漏。
+pub struct QueueReservation {
+    /// `None` = 已经被提交（或已经释放）。`Drop` 只在它还持有动作时归还。
+    release: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl QueueReservation {
+    /// 由一个释放动作构造（**唯一**的生产构造点在 `ServeShared::reserve_queue_slot`）。
+    pub fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            release: Some(Box::new(release)),
+        }
+    }
+}
+
+impl Drop for QueueReservation {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
+impl fmt::Debug for QueueReservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "QueueReservation({})",
+            if self.release.is_some() {
+                "pending"
+            } else {
+                "released"
+            }
+        )
+    }
 }
 
 impl RequestDescriptor<'_> {
@@ -149,12 +241,17 @@ impl From<ServeError> for AdmissionError {
 }
 
 /// 准入通过：允许读取请求体。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `reservation` 是第 4 步**已经预留**的队列槽位（只有需要队列的路由才有）。
+/// 它随本值一路传到 `submit_ocr`：提交 = 槽位变成真正的队列条目，丢弃 = 归还容量。
+#[derive(Debug)]
 pub struct Admit {
     /// 允许读取的最大字节数。
     pub max_body: u64,
     /// 声明的 body 长度；chunked 或没有 `Content-Length` 时为 `None`。
     pub expected_body: Option<u64>,
+    /// 第 4 步预留的槽位（非队列路由为 `None`）。
+    pub reservation: Option<QueueReservation>,
 }
 
 /// 按 §4.4 的顺序判定一次请求。
@@ -181,10 +278,16 @@ pub fn admit(
     policy.check_host(descriptor.host)?;
     policy.check_origin(descriptor.origin, descriptor.method.is_state_changing())?;
 
-    // 4. 队列容量——**在读 body 之前**，满了直接回 Busy 让连接关闭。
-    if descriptor.queue_full {
-        return Err(AdmissionError::Rejected(ServeError::Busy));
-    }
+    // 4. 队列容量——**在读 body 之前**，而且是**判定即预留**：
+    //    满则直接回 Busy 让连接关闭；通过则凭据随 `Admit` 一路走到入队。
+    //    第 5 步失败时这个凭据在 `admit` 返回前被丢弃 → 容量归还（不会泄漏）。
+    let reservation = match descriptor.queue.is_queued() {
+        true => match descriptor.queue.reserve() {
+            Some(reservation) => Some(reservation),
+            None => return Err(AdmissionError::Rejected(ServeError::Busy)),
+        },
+        false => None,
+    };
 
     // 5. Content-Length 预检（chunked 没有 Content-Length，走第 6 步的流式上限）。
     let expected_body = if descriptor.is_chunked {
@@ -209,6 +312,7 @@ pub fn admit(
     Ok(Admit {
         max_body,
         expected_body,
+        reservation,
     })
 }
 
@@ -345,10 +449,12 @@ pub fn check_content_type(content_type: Option<&str>) -> Result<(), ServeError> 
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        AdmissionError, Admit, BodyBudget, BodySource, ChunkOutcome, HttpMethod, RequestDescriptor,
-        RouteDecision, admit, check_content_type, read_body,
+        AdmissionError, BodyBudget, BodySource, ChunkOutcome, HttpMethod, QueueAdmission,
+        QueueReservation, QueueSlots, RequestDescriptor, RouteDecision, admit, check_content_type,
+        read_body,
     };
     use crate::serve::error::ServeError;
     use crate::serve::security::LocalOrigin;
@@ -357,6 +463,56 @@ mod tests {
 
     fn policy() -> LocalOrigin {
         LocalOrigin::for_port(8760)
+    }
+
+    /// 一个**总是满**的队列：第 4 步必须在这里拒绝，且**不读 body**。
+    ///
+    /// 预留次数是这台测试替身的唯一状态：它同时证明"检查与占位是同一个动作"
+    /// （`admit` 一返回错误，就没有任何凭据留在外面）。
+    struct FullQueue {
+        attempts: AtomicUsize,
+    }
+
+    impl FullQueue {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl QueueSlots for FullQueue {
+        fn reserve(&self) -> Option<QueueReservation> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+    }
+
+    /// 一个**有空位**的队列：预留必须被交到 `Admit.reservation` 上，
+    /// 且释放动作必须真的执行（计数是它的唯一状态）。
+    struct FreeQueue {
+        released: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl FreeQueue {
+        fn new() -> Self {
+            Self {
+                released: std::sync::Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn released(&self) -> usize {
+            self.released.load(Ordering::SeqCst)
+        }
+    }
+
+    impl QueueSlots for FreeQueue {
+        fn reserve(&self) -> Option<QueueReservation> {
+            let released = std::sync::Arc::clone(&self.released);
+            Some(QueueReservation::new(move || {
+                released.fetch_add(1, Ordering::SeqCst);
+            }))
+        }
     }
 
     /// 一份"全部合法"的请求：每个用例只破坏其中一项。
@@ -368,7 +524,7 @@ mod tests {
             has_token: true,
             host: Some("127.0.0.1:8760"),
             origin: Some("http://127.0.0.1:8760"),
-            queue_full: false,
+            queue: QueueAdmission::NotQueued,
             content_length: Some(128),
             body_so_far: 0,
             content_type: Some("application/octet-stream"),
@@ -379,25 +535,45 @@ mod tests {
     #[test]
     fn a_fully_valid_request_is_admitted() {
         let admitted = admit(&ok_descriptor(), &policy(), MAX_BODY).expect("admitted");
+        assert_eq!(admitted.max_body, MAX_BODY);
+        assert_eq!(admitted.expected_body, Some(128));
+        assert!(
+            admitted.reservation.is_none(),
+            "a route that does not use a queue must not hold a slot"
+        );
+    }
+
+    /// 评审 P2-1：`admit` 在**第 4 步**就预留槽位，凭据随 `Admit` 交给调用方；
+    /// 凭据被丢弃即归还容量（这里是"准入之后就没有再提交"的最短路径）。
+    #[test]
+    fn a_queue_admission_reserves_a_slot_and_releases_it_on_drop() {
+        let queue = FreeQueue::new();
+        let mut descriptor = ok_descriptor();
+        descriptor.queue = QueueAdmission::Reserve(&queue);
+        let admitted = admit(&descriptor, &policy(), MAX_BODY).expect("admitted");
+        assert!(admitted.reservation.is_some(), "a slot must be reserved");
+        assert_eq!(queue.released(), 0);
+        drop(admitted);
         assert_eq!(
-            admitted,
-            Admit {
-                max_body: MAX_BODY,
-                expected_body: Some(128),
-            }
+            queue.released(),
+            1,
+            "dropping an uncommitted reservation must return the slot"
         );
     }
 
     /// §4.4 的顺序表：逐个破坏前面的条件，断言"最先失败的那一步"赢。
     #[test]
     fn the_admission_order_is_enforced_step_by_step() {
+        let full = FullQueue::new();
+        let full_queue = QueueAdmission::Reserve(&full);
+
         // 1. 路由未命中：即使 token/Host/Origin/队列/长度全都成问题，也先回路由结论。
         let mut descriptor = ok_descriptor();
         descriptor.route = RouteDecision::NotFound;
         descriptor.has_token = false;
         descriptor.host = Some("evil.example:8760");
         descriptor.origin = Some("null");
-        descriptor.queue_full = true;
+        descriptor.queue = full_queue;
         descriptor.content_length = Some(u64::MAX);
         match admit(&descriptor, &policy(), MAX_BODY).expect_err("route wins") {
             AdmissionError::Route { decision, path, .. } => {
@@ -422,7 +598,7 @@ mod tests {
         descriptor.has_token = false;
         descriptor.host = Some("evil.example:8760");
         descriptor.origin = Some("null");
-        descriptor.queue_full = true;
+        descriptor.queue = full_queue;
         descriptor.content_length = Some(u64::MAX);
         let error = admit(&descriptor, &policy(), MAX_BODY).expect_err("token wins");
         assert_eq!(error.rejected().expect("a ServeError").status_code(), 401);
@@ -431,7 +607,7 @@ mod tests {
         let mut descriptor = ok_descriptor();
         descriptor.host = Some("evil.example:8760");
         descriptor.origin = Some("null");
-        descriptor.queue_full = true;
+        descriptor.queue = full_queue;
         descriptor.content_length = Some(u64::MAX);
         let error = admit(&descriptor, &policy(), MAX_BODY).expect_err("host wins");
         assert_eq!(error.rejected().expect("a ServeError").status_code(), 421);
@@ -439,19 +615,37 @@ mod tests {
         // 3b. Origin 先于队列容量与长度。
         let mut descriptor = ok_descriptor();
         descriptor.origin = None;
-        descriptor.queue_full = true;
+        descriptor.queue = full_queue;
         descriptor.content_length = Some(u64::MAX);
         let error = admit(&descriptor, &policy(), MAX_BODY).expect_err("origin wins");
         assert_eq!(error.rejected().expect("a ServeError").status_code(), 403);
 
         // 4. 队列容量先于 Content-Length 预检：**500 MB 的 Content-Length 也不会被读**。
         let mut descriptor = ok_descriptor();
-        descriptor.queue_full = true;
+        descriptor.queue = full_queue;
         descriptor.content_length = Some(500 * 1024 * 1024);
         let error = admit(&descriptor, &policy(), MAX_BODY).expect_err("queue wins");
         let error = error.rejected().expect("a ServeError");
         assert_eq!(error.status_code(), 503);
         assert_eq!(error.code(), "busy");
+        assert_eq!(
+            full.attempts.load(Ordering::SeqCst),
+            1,
+            "the queue step must run exactly once for this descriptor"
+        );
+
+        // 第 5 步失败时，第 4 步已经预留的槽位必须被归还（否则容量会泄漏）。
+        let queue = FreeQueue::new();
+        let mut descriptor = ok_descriptor();
+        descriptor.queue = QueueAdmission::Reserve(&queue);
+        descriptor.content_length = Some(MAX_BODY + 1);
+        let error = admit(&descriptor, &policy(), MAX_BODY).expect_err("length wins");
+        assert_eq!(error.rejected().expect("a ServeError").status_code(), 413);
+        assert_eq!(
+            queue.released(),
+            1,
+            "a rejected request must return its reserved slot"
+        );
 
         // 5. 最后才是 Content-Length 预检。
         let mut descriptor = ok_descriptor();

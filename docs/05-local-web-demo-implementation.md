@@ -1,9 +1,14 @@
 # 本地 Web 评估界面（`rapidocr serve`）实施文档
 
-> 状态：**M0 待冻结，未进入实现**
+> 状态：**M0–M4 已实现并通过验收**（逐里程碑证据见 `docs/06-local-web-demo-reports.md`；协议已冻结，冻结结论见下）
 > 已定决策：**仅本机（loopback）** · **模型下载默认关闭、显式触发** · **实现为 `rapidocr serve` 子命令**
 > 关联文档：`docs/03-windows-only-optimization-tasks.md`、`docs/04-windows-phase-reports.md`
 > 参考规范：MDN（Fetch / XMLHttpRequest.upload / AbortController）、`tiny_http::Server`、OWASP SSRF Prevention、WCAG 2.2
+>
+> **本行曾在实现完成后仍写着"M0 待冻结，未进入实现"**——那是 M4 交付时遗留的陈旧状态声明，已按
+> 事实改正（同一文件末尾的"实施完成记录（M0-M4）"当时已经勾选了全部里程碑）。本轮还纠正了
+> §4.2.1/§4.4/§5.4/§7.2/§13/§15 里与实现不一致的表述，逐处见
+> `docs/06-local-web-demo-reports.md` 的"M1 评审修复轮"记录。
 
 ---
 
@@ -40,7 +45,7 @@
 | 能力 | 位置 | 复用方式 |
 | --- | --- | --- |
 | 检测框叠加 | `output::visualize::draw_output(img: &RecImage, output: &OcrOutput) -> RgbImage` | `annotated.png` |
-| 哈希计算 | `model_store::sha256_file` | 状态判定与下载校验 |
+| 哈希计算 | `model_store::sha256_file` | 状态判定与下载校验。**M1 评审 P1-2 之后的实际形态**：状态判定与两条公式加载路径改走 `model_verify` 的**身份键控缓存**（`path + size + mtime`），`sha256_file` 仍是唯一的底层实现与下载校验入口 |
 | 默认模型目录 | `model_store::default_model_store_dir()` | 默认 `--model-dir` |
 | 模型来源表 | `assets/default_models.yaml` | 构造 `ModelSet`（§5） |
 | 结果序列化 | `to_output_json` / `to_output_items` / `plain_text(TextOrder)` | API 响应 |
@@ -134,6 +139,11 @@ rapidocr serve [OPTIONS]
                              （§4.2、§10.8）。缺省时 `queue=formula` 仍是 400，
                              理由进 `/api/models` 的 `formula.disabled_reason`
   --max-eval-cases <N>       `POST /api/evaluate` 一张清单最多评估多少张图，默认 32
+  --eval-root <DIR>          `POST /api/evaluate` 的沙箱根（**默认不配置**）。端点是唯一
+                             接收**本机路径**的端点，因此读取范围必须显式开启：
+                             给出后清单与它引用的每张图都必须规范化到该目录内
+                             （拒绝 `..`、绝对路径逃逸与符号链接逃逸）；**不给时整个
+                             端点拒绝**并给出可定位理由（§4.2、M1 评审 P2-3）
 ```
 
 **参数优先级（必须一致并记录）**：**CLI flag > `--config` YAML > 内建默认**。
@@ -175,7 +185,7 @@ OCR（尤其公式路径）单图可达数秒至数十秒，**不得长期占用
 | `GET` | `/api/models` | 模型集状态（§5.4；M4 起顶层字段是**文本管线**作用域，公式管线在 `formula` 块里） |
 | `POST` | `/api/models/download` | 启动下载任务（需 `--allow-download` **且** token）；请求体 `{"set_id": "<id>"}`，未知 id → **404 `model_set_not_found`**（绝不回落 `sets[0]`）。公式集合（566 MB）与文本集合同一条路径、同一个按钮语义 |
 | `POST` | `/api/ocr` | 提交识别 → **202** `{job_id, queue, position, state:"queued"}`。队列由 `?queue=text\|formula` 选择，**队列类别就是管线选择**（M4，见下） |
-| `POST` | `/api/evaluate` | **M4 新增**：批量评估一份已标注清单 → 200 + 库的评估报告。请求体**恰好**一个键 `{"manifest": "<本机清单路径>"}`（与 `rapidocr evaluate --manifest` 同格式：`[{image, text, boxes}]`，`image` 相对清单目录解析）。报告字段与 CLI 的 `rapidocr evaluate` **同一份实现**（`cases[]` + `mean_cer` + `exact_match_rate` + `mean_detection_*` + `peak_working_set_bytes` + `memory_source` + `ort_runtime` + `ort_runtime_version`），另加 `iou_threshold` 与 `manifest_file`（只给文件名）。可定位的拒绝是 **400 `bad_request`** + `detail.reason`（清单读不出来/格式不对/用例数超过 `--max-eval-cases`/某张图读不出来）；模型缺失与引擎不可用分别是 409 `models_missing` / 503 `engine_unavailable`（与 `/api/ocr` 同一份错误体） |
+| `POST` | `/api/evaluate` | **M4 新增**：批量评估一份已标注清单 → 200 + 库的评估报告。**必须先配置 `--eval-root <DIR>`**（M1 评审 P2-3）：未配置时整个端点拒绝（400 `bad_request`，`detail.reason` 点名 `--eval-root`）；配置后清单与清单引用的**每张图**都必须规范化到该目录内，越界（`..`、绝对路径、符号链接）是可定位的 400。请求体**恰好**一个键 `{"manifest": "<本机清单路径>"}`（与 `rapidocr evaluate --manifest` 同格式：`[{image, text, boxes}]`，`image` 相对清单目录解析）。报告字段与 CLI 的 `rapidocr evaluate` **同一份实现**（`cases[]` + `mean_cer` + `exact_match_rate` + `mean_detection_*` + `peak_working_set_bytes` + `memory_source` + `ort_runtime` + `ort_runtime_version`），另加 `iou_threshold` 与 `manifest_file`（只给文件名）。可定位的拒绝是 **400 `bad_request`** + `detail.reason`（没有 `--eval-root`/清单越界/格式不对/用例数超过 `--max-eval-cases`/某张图越界或读不出来）；模型缺失与引擎不可用分别是 409 `models_missing` / 503 `engine_unavailable`（与 `/api/ocr` 同一份错误体） |
 | `GET` | `/api/jobs/{id}` | `{id, kind, queue, state, position, queued_ms, started_ms, elapsed_ms, error}` + M2 追加的 `{failure, download, cancel_requested}`（见 §4.3） |
 | `GET` | `/api/jobs/{id}/result` | 结果（未完成 409 `job_not_finished`；已淘汰 410 `job_evicted`） |
 | `GET` | `/api/jobs/{id}/annotated.png` | 叠加检测框 PNG（原图淘汰 → 410 `original_evicted`） |
@@ -202,8 +212,26 @@ POST /api/ocr?queue=formula             → 公式管线，进公式队列
 | 情况 | 结论 |
 | --- | --- |
 | 路由可用、公式模型齐备 | 202 `{queue:"formula"}`，进公式队列，由公式管线执行 |
-| 路由可用、公式模型**缺失/损坏** | **409** `models_missing` / `models_corrupt`，`detail.scope="formula"`、`missing`/`corrupt`/`missing_on_disk` 列出公式 role 的文件。存在性检查在**读 body 之前**完成（只 `stat`，不哈希 566 MB）；权威哈希判定由库在加载识别器时按集合声明的 SHA-256 执行 |
+| 路由可用、公式模型**缺失/损坏** | **409** `models_missing` / `models_corrupt`，`detail.scope="formula"`、`missing`/`corrupt`/`blocked` 列出公式 role 的文件，`detail.detector` 给出检测模型的 `{configured, file, sha256, state}`。判定在**读 body 之前**完成，用的是与 `/api/models` **同一份哈希状态**（库的身份键控校验缓存：键 = 路径 + 体积 + mtime，冷验证真的读盘、命中只花一次 `stat`）；`state` 取 `present`/`corrupt`/`missing`，`sha256` 为 `null` 表示没有可信摘要（只能证明"存在"） |
 | 路由**不可用**（没配 `--formula-detector`） | **400** `bad_request`（M1 起不变），理由在 `/api/models` 的 `formula.disabled_reason` 里 |
+
+**M1 评审 P1-1/P1-2 的修正（本节上一版的说法已经被实现否掉，如实记录）**：上一版写的是
+"存在性检查在**读 body 之前**完成（只 `stat`，不哈希 566 MB）；权威哈希判定由库在加载识别器时
+按集合声明的 SHA-256 执行"。那条规则有两个缺口，现在已经从根上修掉：
+
+1. **检测模型从不校验**：`formula_detector` 的路径被单独传递、集合声明的 SHA-256 被丢掉，
+   `FormulaDetector::from_model` 不校验任何东西——一个"文件在、内容错"的检测模型因此能一路
+   加载成功。现在检测模型的声明摘要与识别模型走**同一条**规则、**同一个**入口形状
+   （`FormulaPolicy.expected_detector_sha256` ↔ `expected_model_sha256`），不匹配是
+   `HashMismatch`（路径 + 期望 + 实际）；
+2. **请求路径只看存在性**：损坏但存在的公式文件会溜过准入、读出整个 body、建出任务，最后才在
+   worker 里失败。现在准入与 `/api/models` 共用同一份哈希状态（缓存命中是 `stat` 级），
+   损坏文件在**读 body 之前**就是 409；
+3. 同时修掉的是**缓存失效**：识别器/检测器的会话缓存从"按路径"改为"按文件身份"，文件被替换或
+   损坏后不会被内存里那份旧会话静默继续使用。
+
+残留盲区（如实）：身份由 `(size, mtime)` 近似，**体积不变且 mtime 不变**的内容替换不会被缓存
+识别（例如把时间戳写回原值），这一点在 `/api/models.verification.residual_blind_spot` 里同样写明。
 
 **普通 OCR 永不因公式缺口而失败**：`/api/ocr` 的 409 只报告**文本管线**的缺失文件，
 `EngineState::BlockedModelsMissing` 的清单同样是文本作用域（§5.4、§7.6）。
@@ -241,10 +269,14 @@ queued ──► running ──► succeeded
 1. 方法与路径匹配 → 否则 405/404；
 2. token 校验 → 401；
 3. `Host` 校验 → 421；`Origin` 校验（仅 `POST/PUT/DELETE`）→ 403；
-4. **队列容量预检** → 满则 **503**（此时**尚未读取请求体**，直接回 `Request` 让连接关闭）；
+4. **队列容量预留** → 满则 **503**（此时**尚未读取请求体**，直接回 `Request` 让连接关闭）。
+   M1 评审 P2-1：这一步是**判定与占位同一个动作**——预留凭据随请求一路传到入队，入队成功即提交、
+   任何失败/中止即归还容量。上一版的"先读一个 `queue_full` 布尔值、通过后再入队"是**两个临界区**，
+   "拒绝时不读 body"在并发下不成立；
 5. `Content-Length` 预检（> `--max-body-mb` → **413**）；
 6. 有界流式读取：总字节上限 + **读取超时**（chunked 请求同样受这两条约束）；
-7. 仅在以上全部通过后才解码与建任务。
+7. 仅在以上全部通过后才解码与建任务（OCR 的第 4 步凭据在这里被提交）。
+   `queue=formula` 的模型可用性（哈希状态）检查发生在第 4 步之后、第 6 步之前（§4.2.1）。
 
 ### 4.5 结果存储、淘汰与 tombstone
 
@@ -363,7 +395,22 @@ pub struct ManifestFile { pub name: String, pub role: ModelRole, pub sha256: Str
     "routing": true,
     "disabled_reason": null,
     "required_roles": ["formula_recognizer"],
-    "detector": { "configured": true, "file": "pix2text-mfd-1.5.onnx" }
+    "detector": {
+      "configured": true,
+      "file": "pix2text-mfd-1.5.onnx",
+      "sha256": "…|null",
+      "state": "present | corrupt | missing"
+    }
+  },
+  "verification": {
+    "identity": "path + size + mtime",
+    "cold_this_call": 0,
+    "cold_verifications": 4,
+    "cache_hits": 37,
+    "entries": 4,
+    "last_cold_ms": 1180.4,
+    "last_cold_bytes": 593915961,
+    "residual_blind_spot": "a same-size, same-mtime content swap is not detected by the cache"
   },
   "sets": [
     { "id": "PP-OCRv6", "complete": false, "download_bytes_total": 42106880,
@@ -372,6 +419,16 @@ pub struct ManifestFile { pub name: String, pub role: ModelRole, pub sha256: Str
   ]
 }
 ```
+
+**M1 评审 P1-1/P1-2 对形状的两处补充（本文件上一版没有这两块）**：
+
+- `formula.detector` 增加 `sha256` 与 `state`：检测模型与识别模型**同一条**完整性规则。
+  `sha256` 为 `null` 表示没有可信摘要（`--formula-detector` 指向一个模型集没有声明过的文件），
+  此时 `state` 只能是 `present`（"文件在"）或 `missing`，绝不假装校验过；
+- `verification` 是**校验成本账**：`cold_this_call` 是这一份报告里真的重算了摘要的文件数
+  （页面每 8 s 轮询时必须是 0），`cold_verifications`/`cache_hits`/`entries` 是进程累计，
+  `last_cold_ms`/`last_cold_bytes` 是最近一次冷验证的实测耗时与被读字节数。
+  它存在的意义是让"不再重新哈希 566 MB"这句话**可被验证**，而不是一句承诺。
 
 **M4 的作用域修正（本文件上一版把四个顶层字段写成"所有集合"的并集，那是错的）**：
 
@@ -485,10 +542,11 @@ pub fn download_verified(req: &DownloadRequest<'_>) -> Result<PathBuf>;
 | --- | --- |
 | `Host` 校验 | 不在允许集合 → **421 `bad_host`**（防 DNS rebinding） |
 | `Origin` 校验 | **所有** `POST/PUT/DELETE` 必须带 `Origin` 且等于当前服务 origin；缺失、`null`、不匹配 → **403 `bad_origin`** |
-| 令牌 | 启动时随机生成，注入页面下发；客户端用 `X-RapidOCR-Token`；**所有 `/api/*` 都需要**（`GET /` 除外） |
+| 令牌 | 启动时随机生成，注入页面下发；客户端用 `X-RapidOCR-Token`；**所有 `/api/*` 都需要**（`GET /` 除外）。熵**只**来自操作系统 CSPRNG（Windows `BCryptGenRandom`，`BCRYPT_USE_SYSTEM_PREFERRED_RNG`；非密码学的时间/PID/栈地址派生已删除），比较保持常量时间；**fail-closed**：CSPRNG 不可用时服务**拒绝启动**，绝不退回弱熵（M1 评审 P2-4）。CSP nonce 用同一个 CSPRNG |
 | CORS | **不发送任何** `Access-Control-Allow-Origin`；绝不 `*` |
 | Cookie | **不使用** |
 | 下载 | 同时要求 `--allow-download` **与** token；请求体**不得**携带 URL（防 SSRF） |
+| 评估的本机路径 | `/api/evaluate` 是唯一按**路径**读取本机文件的端点：必须显式给 `--eval-root <DIR>`，清单与每张图都要规范化到该目录内；未配置时整个端点拒绝（M1 评审 P2-3） |
 | 下载的跳转（出站 SSRF） | 重定向**不得盲从**：逐跳校验 scheme（仅 `https`）与 host（编译期白名单 ∪ 显式 `--allow-download-host`），上限 5 跳，相对 `Location` 按当前 URL 解析，凭据不跨跳，越界/超限是可定位错误（§6.1 第 2 条） |
 | 路径 | 一律经 `ModelSet` / 共享校验函数 / `model_store`，禁止用请求内容拼路径 |
 
@@ -700,7 +758,10 @@ img-src 'self' blob: data:; connect-src 'self'; base-uri 'none'; form-action 'no
 8. 公式路由**默认关闭**（避免意外加载 566 MB 模型）。M4 的落地方式：页面上的开关默认关；
    服务端侧"路由是否可用"由 `--formula-detector` 唯一决定（§4.2.1），而**加载**是惰性的——
    只有真的提交了 `queue=formula` 的任务，库才会去建那个 566 MB 的会话；
-9. `/api/status` 路径脱敏（§7.4）。
+9. `/api/status` 路径脱敏（§7.4）；
+10. **模型文件的校验结论按文件身份缓存**（键 = 路径 + 体积 + mtime）：冷验证真的读盘并如实记账，
+    命中只花一次 `stat`。`/api/models` 的 `verification` 块把成本报出来，页面 8 s 轮询因此不再
+    反复读 566 MB（M1 评审 P1-2 / 性能一节）。
 
 ---
 
@@ -782,6 +843,25 @@ pub enum ServeError {
 - [x] 公式区域展示与诊断
 - [x] 上传标注样本 → CER / 精确匹配（复用 `evaluation`，不另写指标）
 
+### M1 评审修复轮（P1/P2/P3，逐条证据见 `docs/06`）
+
+M4 交付后的独立评审发现的问题；每条都在本文档的对应章节改成了实现证明的表述（"改哪里"逐条列出）：
+
+- [x] **P1-1 检测模型的完整性**：`formula_detector` 的声明 SHA-256 端到端传递并**在加载路径上校验**
+      （与识别模型同一条规则、同一个入口形状）。改动：§4.2.1、§5.2 的实现说明、§5.4 的 `detector` 块
+- [x] **P1-2 准入按哈希状态 + 会话缓存按文件身份**：新增库内的身份键控校验缓存
+      （`path + size + mtime`），`/api/models`、公式准入与两条公式加载路径共用它；
+      识别器/检测器的会话缓存改为按文件身份失效。改动：§3（性能）、§4.2.1、§4.4 第 4 步、§5.4、§10
+- [x] **P2-1 队列容量预留是原子的**：判定与占位合成同一个临界区，凭据提交或归还。改动：§4.4 第 4 步
+- [x] **P2-2 无 body 的 `POST /api/engine/reload` 走独立线程**：建会话不再发生在 accept 线程上
+      （两种形态同一条线程路径）。改动：§4.2 的 `POST /api/engine/reload` 行
+- [x] **P2-3 `--eval-root` 沙箱**：不给即拒绝整个评估端点；清单与图片都必须规范化到根内。改动：§3、§4.2、§7.2
+- [x] **P2-4 令牌熵为 CSPRNG 且 fail-closed**：`BCryptGenRandom`，失败拒绝启动。改动：§7.2
+- [x] **P3 文档状态**：本文件第 3 行的陈旧状态声明与 §13/§15 的陈旧标题已改正（状态行、§13、§15）
+
+**这一轮改动的是实现，也是文档**：上面每一条都不是"实现没做"，而是"M4 的实现/表述在这几点上不完整"，
+因此 `docs/05` 相应章节按实现改正；`docs/03` 未改动。
+
 ---
 
 ## 12. 验证计划
@@ -813,12 +893,18 @@ pub enum ServeError {
 | 公式模型（M4） | `/api/models` 报告公式集合的 role/体积/SHA-256；下载按钮按集合（566 MB 显式点击，绝不自动下载）；剔除公式文件后路由变 409 且普通 OCR 不受影响 |
 | 手工 | 浏览器闭环、粘贴、上传进度、标注图、键盘与焦点可用 |
 | 性能 | 诊断面板数据与 CLI 报告同值（不重新测量） |
+| 完整性（M1 评审 P1-1/P1-2） | 损坏但**存在**的公式检测模型 → 加载是 `HashMismatch`（路径 + 期望 + 实际）；`/api/models` 报 `corrupt`；`queue=formula` 在读 body 前 409 `models_corrupt` 且 `detail.scope="formula"`；有效的检测模型 + 声明摘要仍加载成功 |
+| 校验缓存（M1 评审 P1-2 / 性能） | 第二份 `/api/models` 的 `verification.cold_this_call == 0`（命中不重新哈希）；替换文件（体积/mtime 变化）后**只有它**被重新验证；同体积 + mtime 变化同样触发重新验证；公式检测器被替换后**不**复用内存里的旧会话 |
+| 队列预留（M1 评审 P2-1） | 容量 1 时 8 个并发请求全部 503 且**都没有读入 body**（声明 1 MiB、一个字节不发）；8 个线程抢同一个槽位只有 1 个成功，释放后容量完好（不泄漏、也不放大） |
+| 引擎重建线程（M1 评审 P2-2） | 无 body 的 `POST /api/engine/reload` 在建会话被闸门按住的整段时间里：`/api/status` 显示 `loading` 且 `POST /api/ocr` 仍返回 202 |
+| 评估沙箱（M1 评审 P2-3） | 没有 `--eval-root` → 400 且理由点名开关；清单越界 / 图片越界（绝对路径、`..`、符号链接）→ 400 且点名违规路径；根内清单照常返回与 CLI 逐字段同值的报告 |
+| 令牌熵（M1 评审 P2-4） | 生成成功且每次不同、是十六进制；熵源字符串被报告；注入一个必然失败的填充器时错误被传播（fail-closed 分支被真的执行） |
 
 **证据要求**：每个里程碑在 `docs/06-local-web-demo-reports.md`（新建）记录命令、关键输出、与验收标准对照、未覆盖风险。**不得**以"界面看起来正常"作为验证通过。
 
 ---
 
-## 13. 参考命令（实施后填实测值）
+## 13. 参考命令（已实现后的实测命令；`<...>` 是每次运行都要替换的值）
 
 ```powershell
 cargo run --features serve -- serve --port 8760 --open
@@ -874,7 +960,11 @@ curl.exe -s -X POST http://127.0.0.1:8760/api/engine/reload `
 | --- | --- | --- |
 | 契约反复变更 | 破坏性重写 | **M0 先冻结**并配套测试 |
 | 恶意网页调用本机服务 | 耗尽算力/触发下载 | Host + Origin + token；下载还需显式开关（§7） |
-| 拒绝前读入大 body | 内存/带宽被消耗 | 准入顺序：**先查队列与长度，再读**（§4.4） |
+| 拒绝前读入大 body | 内存/带宽被消耗 | 准入顺序：**先原子预留队列槽位与检查长度，再读**（§4.4；M1 评审 P2-1 之前"先检查后入队"是两个临界区，并发下会读入 body 才拒绝） |
+| 损坏的模型被静默加载 | 结果错/崩溃难定位 | 检测模型与识别模型**同一条**哈希规则（`HashMismatch`）；准入按哈希状态在**读 body 之前** 409（§4.2.1，M1 评审 P1-1/P1-2） |
+| 模型文件被替换后继续用旧会话 | 改对了也不生效 | 会话缓存按**文件身份**（路径 + 体积 + mtime）失效（§4.2.1，M1 评审 P1-2） |
+| 评估端点读取任意本机路径 | 本机文件的可读范围不受控 | `--eval-root` 沙箱，未配置即拒绝整个端点（§4.2、§7.2，M1 评审 P2-3） |
+| 令牌熵可预测 | 本机恶意页面可猜出共享密钥 | 操作系统 CSPRNG + fail-closed（§7.2，M1 评审 P2-4） |
 | tombstone 无界增长 | 内存泄漏 | 容量 + TTL 双上限（§4.5） |
 | 结果序列化爆内存 | OOM | `--max-result-mb` + 有界写入器（§4.6） |
 | Windows 覆盖语义 | 文件损坏/丢失 | `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` + 回归测试（§6.7） |
@@ -886,14 +976,18 @@ curl.exe -s -X POST http://127.0.0.1:8760/api/engine/reload `
 
 ---
 
-## 15. 待确认问题（M0 冻结前）
+## 15. 冻结过程中的待确认问题（**已定案**，取值即 §3 的默认值）
 
-1. 默认端口 `8760` 是否可接受？
-2. 默认模型集：只提供 `PP-OCRv6`，还是同时提供 `PP-OCRv4/v5` 切换？
-3. `--max-download-mb` 默认 1024 MB 是否合适（公式模型 566 MB + 普通模型约 40 MB + 余量）？
-4. 结果上限默认 8 MB / 保留 32 个 64 MB 是否合适？
-5. 队列默认（text 4 / formula 2）与配额（text 连续 4 / formula 连续 1）是否合适？
-6. `--max-export-mb` 默认 32 MB 是否够（3200×2000 标注 PNG base64 后约为原文件的 1.33 倍）？
+以下问题在 M0 冻结时以 §3 表格里的默认值定案，并已随实现生效（唯一来源是
+`src/bin/serve/limits.rs` 的 `DEFAULT_*` 常量，选项面由 `cli.rs` 的逐项枚举测试锁定）。
+保留这一节是为了让"当时的取舍"可追溯，而**不是**表示它们仍未决：
+
+1. 默认端口 `8760` → 采用（占用时报可定位错误，不静默换端口）。
+2. 默认模型集 → 由 `--config` 的 `model_type`/`lang` 选择，默认表提供 `PP-OCRv6`。
+3. `--max-download-mb` 默认 1024 MB → 采用（公式模型 566 MB + 普通模型约 40 MB + 余量）。
+4. 结果上限默认 8 MB / 保留 32 个 64 MB → 采用。
+5. 队列默认（text 4 / formula 2）与配额（text 连续 4 / formula 连续 1）→ 采用。
+6. `--max-export-mb` 默认 32 MB → 采用。
 
 ---
 

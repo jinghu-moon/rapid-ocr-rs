@@ -57,11 +57,19 @@ pub use crate::input::image_loader::{LoadImage, OcrInput};
 pub use crate::model_registry::DefaultModelSelection;
 pub use crate::model_set::{
     ModelFileSpec, ModelFileState, ModelRole, ModelSet, ModelSetStatus, model_set_status,
-    validate_model_file_name, validate_model_files,
+    model_set_status_probed, validate_model_file_name, validate_model_files,
+    validate_model_files_probed,
 };
 pub use crate::model_source::{
     MANIFEST_FILE_NAME, ManifestFile, ModelManifest, ModelRequest, ModelSource, ModelSourceKind,
     SUPPORTED_MANIFEST_SCHEMA_VERSION,
+};
+// 文件身份键控的 SHA-256 校验缓存（`src/model_verify.rs`）：`/api/models` 的逐文件状态、
+// 公式队列的准入判定与库的两条公式加载路径共用**同一份**校验证据。
+// `verification_stats` 是"第一次验证真的哈希了、之后只花一次 stat"的如实成本账。
+pub use crate::model_verify::{
+    FileIdentity, VerificationOutcome, VerificationStats, clear_verification_cache,
+    sha256_file_cached, verification_stats, verify_file, verify_sha256,
 };
 // 加固下载器（`docs/05` §6）：库侧的**唯一**下载入口与唯一的错误分类。
 // `ensure_downloaded`（可传 `None` 哈希的旧入口）已按 §6.4 删除，不保留兼容层。

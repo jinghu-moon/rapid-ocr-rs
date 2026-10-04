@@ -152,6 +152,14 @@ pub struct ServeArgs {
     /// `POST /api/evaluate` 一张清单最多评估多少张图（默认 32）。
     #[arg(long = "max-eval-cases", default_value_t = DEFAULT_MAX_EVAL_CASES, value_name = "N")]
     pub max_eval_cases: usize,
+
+    /// `POST /api/evaluate` 的沙箱目录（M1 评审 P2-3）。
+    ///
+    /// 端点接收的是**本机路径**（清单 + 清单里的图片），因此读取范围必须显式配置：
+    /// 给出本开关时，清单与它引用的每张图都必须规范化到该目录内（拒绝 `..`、绝对路径
+    /// 逃逸与符号链接逃逸）；**不给时 `/api/evaluate` 整体拒绝**并给出可定位理由。
+    #[arg(long = "eval-root", value_name = "DIR")]
+    pub eval_root: Option<PathBuf>,
 }
 
 impl ServeArgs {
@@ -231,7 +239,7 @@ mod tests {
     };
 
     /// §3 的完整选项名清单（**唯一**的一处枚举）。
-    const DOCUMENTED_OPTION_NAMES: [&str; 23] = [
+    const DOCUMENTED_OPTION_NAMES: [&str; 24] = [
         "port",
         "model-dir",
         "config",
@@ -256,6 +264,8 @@ mod tests {
         // M4：公式队列的检测模型与评估用例上限（§3、§4.2）。
         "formula-detector",
         "max-eval-cases",
+        // 评审 P2-3：评估的沙箱根（不给即拒绝整个端点）。
+        "eval-root",
     ];
 
     /// 测试用的最小 `Parser` 包装。
@@ -366,6 +376,8 @@ mod tests {
         // M4：公式检测模型默认**不给**（路由默认关闭，§10.8），用例上限是文档默认值。
         assert_eq!(args.formula_detector, None);
         assert_eq!(args.max_eval_cases, DEFAULT_MAX_EVAL_CASES);
+        // 评审 P2-3：默认**没有**沙箱 → `/api/evaluate` 整体拒绝。
+        assert_eq!(args.eval_root, None);
 
         // §3 表格里的数字本身（防止常量被改歪还自洽）。
         assert_eq!(args.max_body_mb, 32);
@@ -438,6 +450,8 @@ mod tests {
             "D:\\models\\pix2text-mfd-1.5.onnx",
             "--max-eval-cases",
             "8",
+            "--eval-root",
+            "D:\\eval-root",
         ]);
         assert_eq!(args.port, 9000);
         assert_eq!(
@@ -478,6 +492,10 @@ mod tests {
         assert_eq!(
             args.formula_detector.as_deref(),
             Some(std::path::Path::new("D:\\models\\pix2text-mfd-1.5.onnx"))
+        );
+        assert_eq!(
+            args.eval_root.as_deref(),
+            Some(std::path::Path::new("D:\\eval-root"))
         );
         assert!(!args.uses_documented_defaults());
     }

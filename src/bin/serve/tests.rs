@@ -41,13 +41,14 @@ use rapid_ocr_rs::{
     ProviderResolutionInfo, RapidOcrError, RecognitionOutcome, RegionSource, ResolvedProvider,
     StageReports, sha256_file,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::download::{DownloadJob, DownloadSink, DownloaderFactory, ModelDownloader};
 use super::engine::{BackendProvider, EngineFactory, OcrBackend};
+use super::evaluate::EvalRoot;
 use super::http::{BoundServer, ServeHandle};
 use super::limits::RawServeLimits;
-use super::model_plan::ModelPlan;
+use super::model_plan::{FormulaDetectorSpec, ModelPlan};
 use super::queue::QueueClass;
 use super::run::render_page;
 use super::security::{LocalOrigin, ServeToken, generate_nonce};
@@ -237,8 +238,10 @@ struct TestOptions {
     allow_provider_fallback: bool,
     routing: OcrRouting,
     /// `--formula-detector`（M4）；路由打开时它必须有值，否则 `FormulaPolicy` 会是
-    /// "只处理显式区域"的退化形状。
-    formula_detector: Option<PathBuf>,
+    /// "只处理显式区域"的退化形状。它是**路径 + 集合声明的哈希**（评审 P1-1）。
+    formula_detector: Option<FormulaDetectorSpec>,
+    /// `--eval-root` 沙箱（评审 P2-3）：默认指向测试模型目录（评估夹具就写在那里）。
+    eval_root: Option<EvalRoot>,
     engine_factory: EngineFactory,
     downloader: DownloaderFactory,
     free_space: FreeSpaceFactory,
@@ -248,6 +251,7 @@ struct TestOptions {
 
 impl TestOptions {
     fn new(model_dir: PathBuf, scripted: Scripted) -> Self {
+        let eval_root = EvalRoot::new(&model_dir).ok();
         Self {
             limits: RawServeLimits::default(),
             allow_download: false,
@@ -257,6 +261,7 @@ impl TestOptions {
                 "test server: no --formula-detector, so the formula queue is refused (§10.8)",
             ),
             formula_detector: None,
+            eval_root,
             engine_factory: scripted.factory(),
             downloader: ScriptedDownload::default().factory(),
             free_space: Arc::new(|_dir: &Path| Ok(1 << 40)),
@@ -270,9 +275,40 @@ impl TestOptions {
     /// `detector` 只需是一个路径：脚本化后端不加载它（真实启动期的存在性校验在 `run.rs`），
     /// 但 `FormulaPolicy.detector_path` 必须真的有值——否则接上的就是"只处理显式区域"的
     /// 退化形状，公式任务会静默地一个区域都产不出来。
+    ///
+    /// **文件必须真的在磁盘上**：评审 P1-2 之后，公式队列的准入按检测模型的哈希状态判定，
+    /// "配置了检测模型但文件不在"同样是 409。`run.rs` 在启动期就拒绝这种配置，因此测试
+    /// 夹具也复现这个不变量（缺文件时写一份占位内容）。
     fn with_formula_routing(mut self, detector: &Path) -> Self {
+        if !detector.is_file() {
+            let name = detector
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "detector.onnx".to_string());
+            std::fs::write(detector, model_file_bytes(&name)).expect("write the detector fixture");
+        }
         self.routing = OcrRouting::formula_enabled();
-        self.formula_detector = Some(detector.to_path_buf());
+        self.formula_detector = Some(FormulaDetectorSpec {
+            path: detector.to_path_buf(),
+            expected_sha256: None,
+        });
+        self
+    }
+
+    /// 与 [`Self::with_formula_routing`] 相同，但检测模型带**集合声明的** SHA-256
+    /// （评审 P1-1：损坏的检测模型必须在准入/加载时被抓住）。
+    fn with_verified_formula_detector(mut self, detector: &Path, sha256: &str) -> Self {
+        self.routing = OcrRouting::formula_enabled();
+        self.formula_detector = Some(FormulaDetectorSpec {
+            path: detector.to_path_buf(),
+            expected_sha256: Some(sha256.to_string()),
+        });
+        self
+    }
+
+    /// 关闭评估沙箱（评审 P2-3：不给 `--eval-root` 时端点必须拒绝）。
+    fn without_eval_root(mut self) -> Self {
+        self.eval_root = None;
         self
     }
 
@@ -313,8 +349,8 @@ impl TestServer {
         let bound = BoundServer::bind(0).expect("an ephemeral port must bind");
         let addr = bound.local_addr();
         let local = LocalOrigin::from_bound(addr).expect("loopback");
-        let token = ServeToken::generate();
-        let nonce = generate_nonce();
+        let token = ServeToken::generate().expect("the OS CSPRNG must be available");
+        let nonce = generate_nonce().expect("the OS CSPRNG must be available");
         let page = render_page(&token, &nonce).expect("the page must inject cleanly");
         let startup = ServeStartup::validate(
             options.limits,
@@ -342,6 +378,7 @@ impl TestServer {
             allow_provider_fallback: options.allow_provider_fallback,
             routing: options.routing,
             formula_detector: options.formula_detector,
+            eval_root: options.eval_root,
             engine_factory: options.engine_factory,
             downloader: options.downloader,
             free_space: options.free_space,
@@ -1435,6 +1472,127 @@ fn a_full_queue_is_503_without_reading_the_body() {
     server.wait_terminal(&first, Duration::from_secs(20));
 }
 
+/// 评审 P2-1：队列在容量上限时，**并发**到达的一批请求必须全部 503，
+/// 且**没有一个**读入了请求体。
+///
+/// 证据与 413 的用例同一手法：声明 1 MiB 却一个字节都不发。任何一个请求只要越过了
+/// 第 4 步，就会阻塞在读取 body 上（直到 30 s 的读取超时），而这些请求必须是**立刻**
+/// 503——因此"全部 503"本身就证明它们都没有读 body。
+#[test]
+fn a_full_queue_rejects_every_concurrent_request_without_reading_a_body() {
+    let server = TestServer::start(TestOptions {
+        limits: limits(1, 1),
+        ..TestOptions::new(
+            complete_model_dir("reserve-full"),
+            Scripted::slow(Duration::from_millis(600)),
+        )
+    });
+
+    // 一个长任务占住 worker，队列里再放一个 → 队列满（容量 1）。
+    let running = server.submit_ocr(b"a").json()["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_string();
+    assert!(wait_until(Duration::from_secs(10), || {
+        server.get(&format!("/api/jobs/{running}")).json()["state"] == "running"
+    }));
+    let queued = server.submit_ocr(b"b");
+    assert_eq!(queued.status, 202, "{}", queued.text());
+
+    let addr = server.addr;
+    let host = server.host.clone();
+    let origin = server.origin.clone();
+    let token = server.token.clone();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let mut threads = Vec::new();
+    for _ in 0..8 {
+        let (host, origin, token) = (host.clone(), origin.clone(), token.clone());
+        let barrier = Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            raw_request(
+                addr,
+                "POST",
+                "/api/ocr",
+                &[
+                    ("Host", host.as_str()),
+                    ("X-RapidOCR-Token", token.as_str()),
+                    ("Origin", origin.as_str()),
+                    ("Content-Type", "application/octet-stream"),
+                    ("Content-Length", "1048576"),
+                ],
+                None,
+            )
+        }));
+    }
+    let mut refused = 0;
+    for thread in threads {
+        let response = thread.join().expect("the request thread must finish");
+        assert_eq!(response.status, 503, "{}", response.text());
+        assert_eq!(response.code(), "busy");
+        refused += 1;
+    }
+    assert_eq!(refused, 8);
+
+    // 被占住的那些请求**都没有**消耗容量：任务照常跑完。
+    let view = server.wait_terminal(&running, Duration::from_secs(20));
+    assert_eq!(view["state"], "succeeded", "{view}");
+}
+
+/// 评审 P2-1 的核心：**预留是原子的，而且不会泄漏容量**。
+///
+/// 为什么这条断言在 `reserve_queue_slot` 这一层而不是 HTTP 层：`accept_loop` 今天在
+/// **单线程**里处理请求（准入 → 读 body → 入队都在 `handle` 的一次调用内），因此
+/// HTTP 上那三个步骤本来就不可能交错。把"判定 + 占位"合成同一个临界区之后，
+/// 这条保证不再依赖那个线程模型的事实——它由数据结构本身成立。
+/// 并发因此在这里被真正地跑出来（8 个线程抢同一个容量 1 的队列）。
+#[test]
+fn the_queue_reservation_is_atomic_and_never_leaks_capacity() {
+    let server = TestServer::start(TestOptions {
+        limits: limits(1, 1),
+        ..TestOptions::new(complete_model_dir("reserve-atomic"), Scripted::fast())
+    });
+    let shared = server.shared();
+
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let mut threads = Vec::new();
+    for _ in 0..8 {
+        let shared = Arc::clone(&shared);
+        let barrier = Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            let reservation = shared.reserve_queue_slot(QueueClass::Text);
+            let held = reservation.is_some();
+            // 抢到的那个凭据被**故意保留**一会儿（不提交、也不提前释放），
+            // 因此容量 1 的队列最多只能有一个赢家。
+            std::thread::sleep(Duration::from_millis(50));
+            drop(reservation);
+            held
+        }));
+    }
+    let mut winners = 0;
+    for thread in threads {
+        if thread.join().expect("the contender must finish") {
+            winners += 1;
+        }
+    }
+    assert_eq!(winners, 1, "exactly one contender may hold the only slot");
+
+    // 全部释放之后，容量必须**完好无损**：下一个请求又能拿到那个槽位（没有泄漏，
+    // 也没有反向的"多释放"把容量变大——后者用两次连续预留来证明）。
+    let first = shared
+        .reserve_queue_slot(QueueClass::Text)
+        .expect("the released slot must be available again");
+    assert!(
+        shared.reserve_queue_slot(QueueClass::Text).is_none(),
+        "capacity 1 must admit exactly one reservation"
+    );
+    drop(first);
+    shared
+        .reserve_queue_slot(QueueClass::Text)
+        .expect("dropping a reservation must return the slot");
+}
+
 #[test]
 fn evicted_jobs_are_410_and_after_the_ttl_they_become_404() {
     let mut raw = limits(2, 1);
@@ -2015,10 +2173,13 @@ fn an_incomplete_formula_set_is_409_while_text_ocr_keeps_working() {
     let detail = &formula.json()["detail"];
     assert_eq!(detail["scope"], "formula");
     assert_eq!(detail["missing"], serde_json::json!(["fx.onnx"]));
-    assert_eq!(
-        detail["missing_on_disk"],
-        serde_json::json!(["fx.onnx"]),
-        "the request-path pre-check is existence based (no hashing)"
+    // 评审 P1-2：请求路径**不再**有"只看存在性"的第二套清单——判定与 `/api/models`
+    // 同源（哈希状态）。检测模型在场且没有声明哈希时它如实报告 `present`/`sha256: null`。
+    assert_eq!(detail["detector"]["state"], "present");
+    assert_eq!(detail["detector"]["sha256"], Value::Null);
+    assert!(
+        detail.get("missing_on_disk").is_none(),
+        "the existence-only field is gone: {detail}"
     );
 
     // 普通 OCR 照常可用（脚本化后端），并且它拿到的策略**没有**启用公式。
@@ -2058,6 +2219,224 @@ fn removing_the_formula_model_turns_the_route_into_a_409() {
     assert_eq!(formula.status, 409, "{}", formula.text());
     assert_eq!(formula.json()["detail"]["scope"], "formula");
     assert_eq!(server.submit_ocr(b"text").status, 202);
+}
+
+// ------------------------------------------------- M1 评审：检测模型完整性 / 校验缓存
+
+/// 一个带 `formula_detector` role 的本地清单目录（评审 P1-1 的夹具）。
+///
+/// 五个文件：文本三个 + 公式识别 + 公式检测。检测模型的**声明哈希**就是写盘时那一份
+/// 内容的哈希，因此测试可以随后把它改写来构造"存在但内容不对"。
+struct DetectorFixture {
+    dir: PathBuf,
+    detector: PathBuf,
+    detector_sha: String,
+}
+
+fn detector_model_dir(name: &str) -> DetectorFixture {
+    let dir = m2_root().join(format!("detector-{name}-{}", unique()));
+    std::fs::create_dir_all(&dir).expect("create the model dir");
+    let files = [
+        ("det.onnx", "detector"),
+        ("rec.onnx", "recognizer"),
+        ("dict.txt", "dictionary"),
+        ("fx.onnx", "formula_recognizer"),
+        ("mfd.onnx", "formula_detector"),
+    ];
+    let mut manifest = String::from(
+        "{\"schema_version\":1,\"id\":\"test-set\",\"family\":\"PP-OCR\",\"version\":\"v-test\",\
+         \"languages\":[\"en\"],\"files\":[",
+    );
+    let mut detector_sha = String::new();
+    for (index, (file, role)) in files.iter().enumerate() {
+        let bytes = model_file_bytes(file);
+        let path = dir.join(file);
+        std::fs::write(&path, &bytes).expect("write the model file");
+        let sha = sha256_file(&path).expect("hash the model file");
+        if *file == "mfd.onnx" {
+            detector_sha = sha.clone();
+        }
+        if index > 0 {
+            manifest.push(',');
+        }
+        manifest.push_str(&format!(
+            "{{\"name\":\"{file}\",\"role\":\"{role}\",\"sha256\":\"{sha}\",\"size_bytes\":{},\
+             \"source_url\":\"https://www.modelscope.cn/models/{file}\"}}",
+            bytes.len()
+        ));
+    }
+    manifest.push_str("]}");
+    std::fs::write(dir.join("manifest.json"), manifest).expect("write the manifest");
+    DetectorFixture {
+        detector: dir.join("mfd.onnx"),
+        detector_sha,
+        dir,
+    }
+}
+
+/// 评审 P1-1：损坏的公式**检测**模型必须被抓住——`/api/models` 如实报 `corrupt`，
+/// 并且 `queue=formula` 在**读 body 之前**就是 409 `models_corrupt`。
+///
+/// 旧实现的缺口（本用例的根因）：检测模型的路径被单独传递、集合声明的 SHA-256 被丢掉，
+/// 而请求路径只做存在性预检——于是"文件在、内容错"能一路走到 worker 里才失败。
+#[test]
+fn a_corrupt_formula_detector_is_reported_and_refused_before_the_body() {
+    let fixture = detector_model_dir("corrupt-detector");
+    std::fs::write(&fixture.detector, b"corrupted detector bytes").expect("corrupt the detector");
+    let server = TestServer::start(
+        TestOptions::new(fixture.dir.clone(), Scripted::fast())
+            .with_verified_formula_detector(&fixture.detector, &fixture.detector_sha),
+    );
+
+    // `/api/models`：集合里的检测模型是损坏的，且**只给文件名**（§7.4 脱敏）。
+    let models = server.get("/api/models").json();
+    assert_eq!(models["formula"]["complete"], false, "{models}");
+    assert_eq!(
+        models["formula"]["corrupt"],
+        json!(["mfd.onnx"]),
+        "{models}"
+    );
+    assert_eq!(models["formula"]["detector"]["configured"], true);
+    assert_eq!(models["formula"]["detector"]["file"], "mfd.onnx");
+    assert_eq!(
+        models["formula"]["detector"]["state"], "corrupt",
+        "{models}"
+    );
+    assert_eq!(
+        models["formula"]["detector"]["sha256"], fixture.detector_sha,
+        "the declared hash must be reported (not dropped)"
+    );
+    assert!(
+        !models
+            .to_string()
+            .contains(&fixture.dir.display().to_string()),
+        "no absolute path may leak: {models}"
+    );
+
+    // 请求体**没有被读**：声明 1 MiB 却一个字节都不发。若服务端在这里读 body，
+    // 这个请求会一直等到读取超时（测试因此会超时失败），所以 409 本身就是证据。
+    let refused = server.request(
+        "POST",
+        "/api/ocr?queue=formula",
+        &[
+            ("Host", server.host.as_str()),
+            ("X-RapidOCR-Token", server.token.as_str()),
+            ("Origin", server.origin.as_str()),
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Length", "1048576"),
+        ],
+        None,
+    );
+    assert_eq!(refused.status, 409, "{}", refused.text());
+    assert_eq!(refused.code(), "models_corrupt");
+    let detail = &refused.json()["detail"];
+    assert_eq!(detail["scope"], "formula");
+    assert_eq!(detail["corrupt"], json!(["mfd.onnx"]));
+    assert_eq!(detail["detector"]["state"], "corrupt");
+
+    // 普通 OCR 完全不受影响（那是公式队列的缺口，不是引擎的）。
+    let text = server.submit_ocr(b"text image");
+    assert_eq!(text.status, 202, "{}", text.text());
+}
+
+/// 评审 P1-1：检测模型来自 `--formula-detector`（**不在任何集合里**）时同样要被校验，
+/// 而且它是唯一阻塞项时 `detail.corrupt` 仍要点名它——否则 `code=models_corrupt` 会
+/// 列不出任何一个文件名。
+#[test]
+fn a_cli_formula_detector_is_verified_by_the_same_rule() {
+    let dir = manifest_model_dir_text_only("cli-detector", &text_fixture_files(), None);
+    let detector = dir.join("pix2text-mfd-1.5.onnx");
+    std::fs::write(&detector, b"a detector the manifest never declared").expect("write detector");
+    let declared = sha256_file(&detector).expect("hash the detector");
+    let server = TestServer::start(
+        TestOptions::new(dir.clone(), Scripted::fast())
+            .with_verified_formula_detector(&detector, &declared),
+    );
+
+    // 内容正确 → 公式集合齐备、检测模型 `present`、公式队列照常 202。
+    let models = server.get("/api/models").json();
+    assert_eq!(models["formula"]["complete"], true, "{models}");
+    assert_eq!(models["formula"]["detector"]["state"], "present");
+    assert_eq!(models["formula"]["detector"]["sha256"], declared);
+    let accepted = server.post(
+        "/api/ocr?queue=formula",
+        &[("Content-Type", "application/octet-stream")],
+        b"formula image",
+    );
+    assert_eq!(accepted.status, 202, "{}", accepted.text());
+
+    // 同一个路径、内容被替换 → 身份变化 → 必须重新校验并拒绝（不能继续用旧结论）。
+    std::fs::write(&detector, b"corrupted after the first verification").expect("corrupt");
+    let models = server.get("/api/models").json();
+    assert_eq!(
+        models["formula"]["detector"]["state"], "corrupt",
+        "{models}"
+    );
+    let refused = server.request(
+        "POST",
+        "/api/ocr?queue=formula",
+        &[
+            ("Host", server.host.as_str()),
+            ("X-RapidOCR-Token", server.token.as_str()),
+            ("Origin", server.origin.as_str()),
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Length", "1048576"),
+        ],
+        None,
+    );
+    assert_eq!(refused.status, 409, "{}", refused.text());
+    assert_eq!(refused.code(), "models_corrupt");
+    assert_eq!(
+        refused.json()["detail"]["corrupt"],
+        json!(["pix2text-mfd-1.5.onnx"]),
+        "the detector is the only blocker and must be named"
+    );
+}
+
+/// 评审 P1-2 + 性能一节：`/api/models` 复用**身份键控**的校验结论，而不是每次重新哈希。
+///
+/// `cold_this_call` 是**单次报告**里真的重算了摘要的文件数：启动快照已经验证过一次，
+/// 因此稳态下必须是 0；一个文件被替换（体积/mtime 变化）时，只有它必须重新验证。
+#[test]
+fn models_reuses_the_verified_digest_until_the_file_identity_changes() {
+    let fixture = detector_model_dir("verify-cache");
+    let server = TestServer::start(TestOptions::new(fixture.dir.clone(), Scripted::fast()));
+
+    let first = server.get("/api/models").json();
+    assert_eq!(
+        first["verification"]["cold_this_call"], 0,
+        "the startup snapshot already verified every declared file: {first}"
+    );
+    assert_eq!(first["verification"]["identity"], "path + size + mtime");
+    assert!(first["verification"]["last_cold_ms"].is_number(), "{first}");
+    assert!(
+        first["verification"]["cold_verifications"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 5,
+        "the five declared files were verified at least once: {first}"
+    );
+    let hits = first["verification"]["cache_hits"].as_u64().unwrap_or(0);
+
+    let second = server.get("/api/models").json();
+    assert_eq!(
+        second["verification"]["cold_this_call"], 0,
+        "a cache hit must not re-hash: {second}"
+    );
+    assert!(
+        second["verification"]["cache_hits"].as_u64().unwrap_or(0) >= hits + 5,
+        "five files were answered from the cache: {second}"
+    );
+
+    // 替换公式识别模型：身份变化 → **只有它**重新验证，并且结论变为 corrupt。
+    std::fs::write(fixture.dir.join("fx.onnx"), b"replaced formula model").expect("replace");
+    let third = server.get("/api/models").json();
+    assert_eq!(
+        third["verification"]["cold_this_call"], 1,
+        "only the replaced file may be re-hashed: {third}"
+    );
+    assert_eq!(third["formula"]["complete"], false, "{third}");
+    assert_eq!(third["formula"]["corrupt"], json!(["fx.onnx"]));
 }
 
 // ---------------------------------------------------------------- M4：评估
@@ -2176,6 +2555,170 @@ fn an_invalid_evaluation_request_is_a_locating_400() {
         .expect("reason")
         .to_string();
     assert!(reason.contains("--max-eval-cases"), "{reason}");
+}
+
+/// 评审 P2-3：没有 `--eval-root` 时 `/api/evaluate` **整体拒绝**，
+/// 而且理由点名要加哪个开关（可定位，而不是一句"评估不可用"）。
+#[test]
+fn evaluation_is_refused_without_an_explicit_eval_root() {
+    let dir = complete_model_dir("m4-evaluate-no-root");
+    let server =
+        TestServer::start(TestOptions::new(dir.clone(), Scripted::fast()).without_eval_root());
+    // 清单本身是合法的、就在模型目录里：拒绝必须来自"没有沙箱"，不是输入问题。
+    let manifest = eval_manifest(&dir, "eval-no-root", &[("01.png", "x")]);
+    let response = server.post(
+        "/api/evaluate",
+        &[("Content-Type", "application/json")],
+        format!("{{\"manifest\":{:?}}}", manifest.display().to_string()).as_bytes(),
+    );
+    assert_eq!(response.status, 400, "{}", response.text());
+    assert_eq!(response.code(), "bad_request");
+    let reason = response.json()["detail"]["reason"]
+        .as_str()
+        .expect("reason")
+        .to_string();
+    assert!(reason.contains("--eval-root"), "{reason}");
+    assert!(reason.contains("disabled"), "{reason}");
+}
+
+/// 评审 P2-3：清单**自己**在沙箱外 → 拒绝，并点名那个路径。
+#[test]
+fn an_evaluation_manifest_outside_the_eval_root_is_refused() {
+    let dir = complete_model_dir("m4-evaluate-escape");
+    let server = TestServer::start(TestOptions::new(dir.clone(), Scripted::fast()));
+
+    // 清单写在沙箱之外（`m2_root()` 与模型目录是两棵不同的树）。
+    let outside = m2_root().join(format!("outside-manifest-{}", unique()));
+    std::fs::create_dir_all(&outside).expect("create the outside dir");
+    let manifest = outside.join("manifest.json");
+    std::fs::write(&manifest, br#"[{"image":"01.png","text":"x","boxes":[]}]"#).expect("write");
+    std::fs::write(outside.join("01.png"), b"image bytes").expect("write the image");
+
+    let response = server.post(
+        "/api/evaluate",
+        &[("Content-Type", "application/json")],
+        format!("{{\"manifest\":{:?}}}", manifest.display().to_string()).as_bytes(),
+    );
+    assert_eq!(response.status, 400, "{}", response.text());
+    let reason = response.json()["detail"]["reason"]
+        .as_str()
+        .expect("reason")
+        .to_string();
+    assert!(reason.contains("--eval-root sandbox"), "{reason}");
+    assert!(
+        reason.contains("manifest"),
+        "the offending path must be named: {reason}"
+    );
+    std::fs::remove_dir_all(&outside).ok();
+}
+
+/// 评审 P2-3：清单在沙箱内，但它引用的**图片**越界（绝对路径、`..`、符号链接）
+/// → 拒绝，并点名那个图片路径。三条路径都必须被抓住，而不是只看清单。
+#[test]
+fn an_evaluation_image_outside_the_eval_root_is_refused() {
+    let dir = complete_model_dir("m4-evaluate-image-escape");
+    let server = TestServer::start(TestOptions::new(dir.clone(), Scripted::fast()));
+
+    // 沙箱之外的**真实存在**的一张图片：越界必须由"规范化后的包含关系"判定，
+    // 而不是"路径不存在"这种偶然原因。
+    let outside_dir = test_root().join(format!("outside-image-{}", unique()));
+    std::fs::create_dir_all(&outside_dir).expect("create the outside dir");
+    let outside_image = outside_dir.join("01.png");
+    std::fs::write(&outside_image, b"image bytes outside the sandbox").expect("write the image");
+    let outside_name = outside_dir
+        .file_name()
+        .expect("a directory name")
+        .to_string_lossy()
+        .into_owned();
+
+    let sandbox_dir = dir.join(format!("escape-images-{}", unique()));
+    std::fs::create_dir_all(&sandbox_dir).expect("create the sandbox subdir");
+
+    // 1) 绝对路径越界。
+    let absolute = sandbox_dir.join("absolute.json");
+    std::fs::write(
+        &absolute,
+        format!(
+            "[{{\"image\":{:?},\"text\":\"x\",\"boxes\":[]}}]",
+            outside_image.display().to_string()
+        ),
+    )
+    .expect("write the absolute manifest");
+    let response = server.post(
+        "/api/evaluate",
+        &[("Content-Type", "application/json")],
+        format!("{{\"manifest\":{:?}}}", absolute.display().to_string()).as_bytes(),
+    );
+    assert_eq!(response.status, 400, "{}", response.text());
+    let reason = response.json()["detail"]["reason"]
+        .as_str()
+        .expect("reason")
+        .to_string();
+    assert!(
+        reason.contains("outside the --eval-root sandbox"),
+        "an escaping absolute path must be named as an escape, not as a missing file: {reason}"
+    );
+    assert!(reason.contains("01.png"), "{reason}");
+
+    // 2) `..` 相对路径越界：沙箱根是 `<test_root>/complete-…`，清单在它下面的子目录里，
+    //    因此 `../../<outside>/01.png` 是一条**真实存在**却在沙箱外的路径。
+    let relative = sandbox_dir.join("relative.json");
+    std::fs::write(
+        &relative,
+        format!(
+            "[{{\"image\":{:?},\"text\":\"x\",\"boxes\":[]}}]",
+            format!("../../{outside_name}/01.png")
+        ),
+    )
+    .expect("write the relative manifest");
+    let response = server.post(
+        "/api/evaluate",
+        &[("Content-Type", "application/json")],
+        format!("{{\"manifest\":{:?}}}", relative.display().to_string()).as_bytes(),
+    );
+    assert_eq!(response.status, 400, "{}", response.text());
+    let reason = response.json()["detail"]["reason"]
+        .as_str()
+        .expect("reason")
+        .to_string();
+    assert!(
+        reason.contains("outside the --eval-root sandbox"),
+        "a `..` escape must be refused as an escape: {reason}"
+    );
+
+    // 3) 符号链接逃逸：规范化会解析它，因此指向沙箱外的链接同样越界。
+    //    Windows 上创建符号链接需要权限/开发者模式：环境不允许时如实说明这一条没有
+    //    在本机跑，而绝对路径与 `..` 两条已经覆盖同一条"规范化后必须落在根内"的规则。
+    let link = sandbox_dir.join("link.png");
+    match std::os::windows::fs::symlink_file(&outside_image, &link) {
+        Ok(()) => {
+            let linked = sandbox_dir.join("symlink.json");
+            std::fs::write(&linked, br#"[{"image":"link.png","text":"x","boxes":[]}]"#)
+                .expect("write the symlink manifest");
+            // 链接的**字面路径**在沙箱内，规范化后却指向沙箱外——这正是"只做字符串
+            // 前缀判断"会漏掉的情形。
+            let response = server.post(
+                "/api/evaluate",
+                &[("Content-Type", "application/json")],
+                format!("{{\"manifest\":{:?}}}", linked.display().to_string()).as_bytes(),
+            );
+            assert_eq!(response.status, 400, "{}", response.text());
+            assert!(
+                response.json()["detail"]["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("outside the --eval-root sandbox"),
+                "a symlink escape must be refused: {}",
+                response.text()
+            );
+        }
+        Err(error) => eprintln!(
+            "serve tests: cannot create a symlink to prove the symlink-escape case ({error}); \
+             the absolute and `..` cases exercise the same canonical-containment rule"
+        ),
+    }
+
+    std::fs::remove_dir_all(&outside_dir).ok();
 }
 
 /// 模型缺失时评估与 OCR 一样是 409（同一条准入），而不是在建会话时崩掉。
@@ -3005,6 +3548,76 @@ fn the_engine_is_created_lazily_on_the_next_ocr_request_and_loading_is_visible()
         status["engine_load_ms"].as_u64().is_some(),
         "the session creation time must be reported: {status}"
     );
+}
+
+/// 评审 P2-2：**无 body** 的 `POST /api/engine/reload` 也必须在独立线程上建立会话。
+///
+/// 旧实现在 accept 线程上直接调 `reload_engine(None)`：ONNX Runtime 建会话的那几百毫秒
+/// 到几秒里，`/api/status` 与 `POST /api/ocr` 全都停摆。这里用闸门把建会话按在中间，
+/// 断言两件事在**reload 还没完成时**就成立：`loading` 可见、新任务照常 202。
+#[test]
+fn a_bodyless_reload_keeps_the_accept_loop_live() {
+    let dir = manifest_model_dir(
+        "m2-bodyless-reload",
+        &["det.onnx", "rec.onnx", "dict.txt"],
+        None,
+    );
+    let gate = Gate::new();
+    let plan = SessionPlan {
+        // 第 2 次建会话（= reload）阻塞在闸门上。
+        gate_at: Some(2),
+        ..SessionPlan::new()
+    };
+    let server = TestServer::start(TestOptions {
+        engine_factory: plan.factory(Some(Arc::clone(&gate))),
+        ..TestOptions::new(dir, Scripted::fast())
+    });
+    assert_eq!(server.get("/api/status").json()["engine"]["state"], "ready");
+
+    let addr = server.addr;
+    let host = server.host.clone();
+    let origin = server.origin.clone();
+    let token = server.token.clone();
+    let reload = std::thread::spawn(move || {
+        raw_request(
+            addr,
+            "POST",
+            "/api/engine/reload",
+            &[
+                ("Host", host.as_str()),
+                ("X-RapidOCR-Token", token.as_str()),
+                ("Origin", origin.as_str()),
+                ("Content-Length", "0"),
+            ],
+            Some(b""),
+        )
+    });
+    // 断言失败也一定放行，否则这个测试会从"一条红"变成"挂死整个测试进程"。
+    let release = ReleaseOnDrop::new(Arc::clone(&gate));
+
+    gate.arrive(); // 第二次建会话正在运行
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            server.get("/api/status").json()["engine"]["state"] == "loading"
+        }),
+        "the bodyless reload must be observable through /api/status while it blocks"
+    );
+    // accept 线程仍然活着：提交一个新任务（`Loading` 期间入队，不是拒绝）。
+    let queued = server.submit_ocr(b"during-bodyless-reload");
+    assert_eq!(queued.status, 202, "{}", queued.text());
+    assert_eq!(queued.json()["state"], "queued");
+
+    release.release();
+    drop(release);
+    let response = reload.join().expect("the reload thread must finish");
+    assert_eq!(response.status, 200, "{}", response.text());
+    let body = response.json();
+    assert_eq!(body["outcome"], "ready", "{body}");
+    assert!(body["load_ms"].as_u64().is_some(), "{body}");
+    assert_eq!(plan.calls(), 2, "an explicit reload rebuilds the session");
+
+    let status = server.get("/api/status").json();
+    assert_eq!(status["engine"]["state"], "ready", "{status}");
 }
 
 // ---------------------------------------------------------------- M3：标注图与导出

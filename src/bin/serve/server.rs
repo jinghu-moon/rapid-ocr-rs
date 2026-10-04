@@ -26,7 +26,7 @@
 //! 两把锁从不同时持有，因此没有锁序问题。
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -34,18 +34,21 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use rapid_ocr_rs::{
-    ALLOWED_DOWNLOAD_HOSTS, DetectionPolicy, DownloadError, FormulaPolicy, ImageInput, OcrOutput,
-    OcrRequest, OrtRuntimeFingerprint, OutputPolicy, PreprocessPolicy, ProviderPreference,
-    RapidOcrError, RecognitionPolicy, StagePlan, WordOutputMode, available_disk_bytes,
-    ort_runtime_fingerprint, ort_runtime_version, peak_memory_source, peak_working_set_bytes,
+    ALLOWED_DOWNLOAD_HOSTS, DetectionPolicy, DownloadError, FormulaPolicy, ImageInput,
+    ModelFileSpec, ModelFileState, ModelRole, OcrOutput, OcrRequest, OrtRuntimeFingerprint,
+    OutputPolicy, PreprocessPolicy, ProviderPreference, RapidOcrError, RecognitionPolicy,
+    StagePlan, WordOutputMode, available_disk_bytes, ort_runtime_fingerprint, ort_runtime_version,
+    peak_memory_source, peak_working_set_bytes, verification_stats,
 };
 use serde_json::{Value, json};
 
+use super::admit::QueueReservation;
 use super::download::{
     self, DOWNLOAD_QUEUE_CAPACITY, DownloadCommand, DownloadJob, DownloaderFactory,
 };
 use super::engine::{BackendProvider, EngineFactory, OcrBackend};
 use super::error::{ErrorBody, ServeError};
+use super::evaluate::EvalRoot;
 use super::export::{self, ExportError, ExportFormat, ExportRequest};
 use super::jobs::{
     CancelOutcome, DownloadProgress, JobFailure, JobIdGenerator, JobKind, JobQueue,
@@ -53,7 +56,7 @@ use super::jobs::{
 };
 use super::limits::ServeLimits;
 use super::model_plan::{
-    ModelPlan, ModelReport, ModelSnapshot, PendingDownload, Pipeline, source_label,
+    FormulaDetectorSpec, ModelPlan, ModelReport, ModelSnapshot, PendingDownload, source_label,
 };
 use super::queue::{DualQueueScheduler, QueueClass, ScheduledJob, SchedulerConfig};
 use super::results::{Outcome, ResultStore, SerializeError, Succeeded, serialize_bounded};
@@ -142,6 +145,14 @@ pub(super) fn routing_for(detector: Option<&Path>) -> OcrRouting {
     }
 }
 
+/// 配置好的公式检测模型在磁盘上的状态（评审 P1-1：检测模型与识别模型同一条完整性规则）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FormulaDetectorStatus {
+    /// 文件名（§7.4 脱敏；绝不把本机绝对路径写进响应）。
+    pub name: String,
+    pub state: ModelFileState,
+}
+
 /// 磁盘可用空间的来源（可注入，§6.5 的任务级预检）。
 ///
 /// 与库内 `FreeSpaceProbe` 同一个思路：生产实现是库的 `available_disk_bytes`
@@ -185,7 +196,12 @@ pub(super) struct ServeContext {
     pub routing: OcrRouting,
     /// 页面公式检测模型（M4）：`--formula-detector` 优先，其次是模型集里声明的
     /// `formula_detector` role。`None` = 公式路由不可用（见 [`OcrRouting`]）。
-    pub formula_detector: Option<PathBuf>,
+    ///
+    /// **哈希跟着路径走**（评审 P1-1）：集合声明过这个文件时它带着声明的 SHA-256，
+    /// 库在加载检测器时校验，与识别模型完全对称。
+    pub formula_detector: Option<FormulaDetectorSpec>,
+    /// `--eval-root` 沙箱（M1 评审 P2-3）：`None` = `/api/evaluate` 整体关闭。
+    pub eval_root: Option<EvalRoot>,
     pub engine_factory: EngineFactory,
     pub downloader: DownloaderFactory,
     pub free_space: FreeSpaceFactory,
@@ -214,9 +230,50 @@ struct JobState {
     ids: JobIdGenerator,
     /// 仍在保留区里的原图编码字节（§4.5）。任务被淘汰 / 原图被释放时同步移除。
     originals: HashMap<String, RetainedOcr>,
+    /// **已经预留、尚未提交**的队列槽位（§4.4 第 4 步，评审 P2-1）。
+    ///
+    /// 与调度器在**同一把锁**下：容量判定因此是"已排队 + 已预留 >= 容量"，
+    /// 两个并发请求不可能都通过检查（先检查后入队的两个临界区正是那个缺口）。
+    reserved_text: usize,
+    reserved_formula: usize,
 }
 
 impl JobState {
+    /// 原子地预留一个槽位：容量判定与占位在同一次加锁里完成。
+    ///
+    /// 预留会让队列"看起来更满"（保守方向），因此提交顺序必须是**先入队、后释放预留**：
+    /// 多算的那一格只会让并发请求被保守拒绝，绝不超卖容量。
+    fn reserve(&mut self, class: QueueClass) -> bool {
+        let used = self.scheduler.queued_len(class) + self.reserved(class);
+        if used >= self.scheduler.config().capacity(class) {
+            return false;
+        }
+        *self.reserved_mut(class) += 1;
+        true
+    }
+
+    /// 归还一个预留（请求被拒绝、读 body 失败、连接中止、panic 展开都会走到这里）。
+    fn release(&mut self, class: QueueClass) {
+        let slot = self.reserved_mut(class);
+        // 只有提交路径会消耗预留；这里仍然用 `saturating_sub`，因为一次"多释放"
+        // 绝不能让容量凭空变大（宁可少一格，也不能超卖）。
+        *slot = slot.saturating_sub(1);
+    }
+
+    fn reserved(&self, class: QueueClass) -> usize {
+        match class {
+            QueueClass::Text => self.reserved_text,
+            QueueClass::Formula => self.reserved_formula,
+        }
+    }
+
+    fn reserved_mut(&mut self, class: QueueClass) -> &mut usize {
+        match class {
+            QueueClass::Text => &mut self.reserved_text,
+            QueueClass::Formula => &mut self.reserved_formula,
+        }
+    }
+
     /// 把 `JobStore` 刚释放掉原图的任务从保留区里真正丢弃（§4.5）。
     ///
     /// `JobStore` 负责**记账**（`retained_bytes`、`original_retained`），字节本身在这里；
@@ -277,7 +334,9 @@ pub(super) struct ServeShared {
     allow_provider_fallback: bool,
     routing: OcrRouting,
     /// 页面公式检测模型（M4）；`None` = 公式路由不可用。
-    formula_detector: Option<PathBuf>,
+    formula_detector: Option<FormulaDetectorSpec>,
+    /// `--eval-root` 沙箱（M1 评审 P2-3）；`None` = `/api/evaluate` 整体关闭。
+    eval_root: Option<EvalRoot>,
     engine_state: Mutex<EngineStateMachine>,
     engine: Mutex<Option<Box<dyn OcrBackend>>>,
     /// 引擎加载的互斥：`POST /api/ocr` 的惰性创建、`POST /api/engine/reload` 与 M3 的
@@ -367,8 +426,8 @@ impl ServeShared {
         self.routing.clone()
     }
 
-    /// 公式队列任务的 `FormulaPolicy`（M4）：识别模型与**集合声明的 SHA-256** 都来自模型集，
-    /// 检测模型来自启动期解析的显式路径。
+    /// 公式队列任务的 `FormulaPolicy`（M4）：识别模型、**集合声明的 SHA-256** 与检测模型
+    /// （路径 + **它的**声明哈希）都来自模型集，检测模型只可能来自启动期解析的那一个文件。
     ///
     /// 返回 `None` 只有一种情况：模型集里没有公式识别模型（启动期已拒绝，理论上不可达）。
     pub fn formula_policy(&self) -> Option<FormulaPolicy> {
@@ -377,21 +436,28 @@ impl ServeShared {
             enabled: true,
             model_path: Some(model_path),
             expected_model_sha256: Some(sha256),
-            detector_path: self.formula_detector.clone(),
+            detector_path: self.formula_detector.as_ref().map(|spec| spec.path.clone()),
+            // 评审 P1-1：检测模型的哈希与识别模型走**同一条**规则。集合没有声明它时
+            // 这里是 `None`（如实表示"没有可信摘要"），而不是留空后静默加载。
+            expected_detector_sha256: self
+                .formula_detector
+                .as_ref()
+                .and_then(|spec| spec.expected_sha256.clone()),
             ..FormulaPolicy::default()
         })
     }
 
-    /// 公式队列的**廉价**准入预检（§4.4 第 4 步之后、读 body 之前）：公式 role 的文件
-    /// 是否都在磁盘上。
+    /// 公式队列的准入判定（§4.4 第 4 步之后、读 body 之前）：公式 role 的文件是否**可用**。
     ///
-    /// 只 `stat`，**不哈希**——公式模型约 566 MB，把它加进每个请求的准入路径会让吞吐
-    /// 直接崩掉。权威判定是库在加载识别器时的 SHA-256 校验（`expected_model_sha256`），
-    /// 损坏的文件因此会在任务里以 409 `models_corrupt` 失败，而不是在这里被误报为缺失。
-    pub fn formula_models_on_disk(&self) -> bool {
-        self.model_plan
-            .missing_on_disk(Pipeline::Formula)
-            .is_empty()
+    /// 判定用的是与 `/api/models` **同一份**逐文件哈希状态（`file.state_in` →
+    /// 身份键控的校验缓存），因此"报告损坏"与"拒绝请求"不可能分叉：损坏但存在的公式文件
+    /// 现在在**读 body 之前**就是 409 `models_corrupt`，而不是先建任务、再由 worker 失败。
+    /// 配置好的检测模型同属公式管线，因此它的状态也在这里判定。
+    ///
+    /// 成本如实：冷验证真的读盘（启动快照已经做过一次，566 MB 公式模型的实测耗时记在
+    /// `/api/models` 的 `verification` 块里）；命中只花一次 `stat`，与文件大小无关。
+    pub fn formula_models_ready(&self) -> bool {
+        self.models().formula_blocking_names().is_empty() && !self.formula_detector_blocks()
     }
 
     /// 上面那条预检的响应体（与 `/api/models` 的 `formula` 块同源同序）。
@@ -401,9 +467,9 @@ impl ServeShared {
 
     /// 公式队列的 409 载荷（`code` 由磁盘上的哈希结论决定，`detail` 是公式作用域）。
     fn formula_missing_failure(&self) -> ErrorBody {
-        let report = self.models();
+        let (_, corrupt) = self.formula_blocking_lists();
         ErrorBody {
-            code: if report.formula_corrupt_names().is_empty() {
+            code: if corrupt.is_empty() {
                 "models_missing"
             } else {
                 "models_corrupt"
@@ -413,19 +479,97 @@ impl ServeShared {
         }
     }
 
-    /// 公式队列 409 的 `detail`（**公式**作用域；与 `/api/models` 的 `formula` 块同值）。
-    pub fn formula_detail(&self) -> Value {
+    /// 公式管线的阻塞清单 `(missing, corrupt)`：模型集里的公式 role **加上**启动期解析出的
+    /// 检测模型。
+    ///
+    /// 检测模型可能来自 `--formula-detector`（不在任何集合里），因此它必须**单独**补进来，
+    /// 否则"检测模型损坏"会得到一份空清单：`code` 是 `models_corrupt` 却列不出文件名。
+    /// 已经在集合里报过的名字不重复列出（同一个 role 两种来源只报一次）。
+    fn formula_blocking_lists(&self) -> (Vec<String>, Vec<String>) {
         let report = self.models();
+        let mut missing = report.formula_missing_names();
+        let mut corrupt = report.formula_corrupt_names();
+        if let Some(status) = self.formula_detector_status()
+            && !missing.contains(&status.name)
+            && !corrupt.contains(&status.name)
+        {
+            match status.state {
+                ModelFileState::Missing => missing.push(status.name),
+                ModelFileState::Corrupt { .. } => corrupt.push(status.name),
+                ModelFileState::Present => {}
+            }
+        }
+        (missing, corrupt)
+    }
+
+    /// 配置好的公式检测模型在磁盘上的状态（评审 P1-1 的根因回归）。
+    ///
+    /// 与识别模型**同一条规则**：复用库的 [`ModelFileSpec::state_in`]（唯一的逐文件状态
+    /// 实现）与它背后的身份键控校验缓存，因此"`/api/models` 报告它是损坏的"与
+    /// "加载它时被拒绝"是同一个结论，不可能分叉。
+    ///
+    /// `None` = 没有配置检测模型（公式路由本来就不该可用）。没有声明哈希时状态是
+    /// `Present`——库只能证明"文件在"，这一点由 `/api/models` 的 `sha256: null` 如实说明。
+    pub fn formula_detector_status(&self) -> Option<FormulaDetectorStatus> {
+        let spec = self.formula_detector.as_ref()?;
+        let name = file_name(&spec.path.to_string_lossy());
+        let root = spec.path.parent().unwrap_or_else(|| Path::new("."));
+        let expected = spec.expected_sha256.clone().unwrap_or_default();
+        let state = match ModelFileSpec::new(
+            name.clone(),
+            ModelRole::FormulaDetector,
+            None,
+            expected.clone(),
+            String::new(),
+        ) {
+            Ok(file) => file.state_in(root),
+            Err(error) => ModelFileState::Corrupt {
+                expected,
+                actual: format!("cannot describe the detector file: {error}"),
+            },
+        };
+        Some(FormulaDetectorStatus { name, state })
+    }
+
+    /// 检测模型是否**阻塞**公式队列（缺失或损坏）。`Present`（含"存在但没有可信摘要"）
+    /// 不阻塞：没有摘要时库无法判定内容对错，把它当成损坏是伪造证据。
+    fn formula_detector_blocks(&self) -> bool {
+        matches!(
+            self.formula_detector_status().map(|status| status.state),
+            Some(ModelFileState::Missing | ModelFileState::Corrupt { .. })
+        )
+    }
+
+    /// 公式队列 409 的 `detail`（**公式**作用域；与 `/api/models` 的 `formula` 块同值）。
+    ///
+    /// `missing`/`corrupt`/`blocked` 都来自那一份**哈希判定过的**状态：请求路径上不再有
+    /// 第二套"只看存在性"的清单（评审 P1-2 的根因是那种廉价清单让损坏文件溜过准入）。
+    pub fn formula_detail(&self) -> Value {
+        let (missing, corrupt) = self.formula_blocking_lists();
+        let mut blocked = missing.clone();
+        blocked.extend(corrupt.iter().cloned());
         json!({
             "scope": "formula",
-            "missing": report.formula_missing_names(),
-            "corrupt": report.formula_corrupt_names(),
-            "blocked": report.formula_blocking_names(),
-            "missing_on_disk": self
-                .model_plan
-                .missing_on_disk(Pipeline::Formula),
+            "missing": missing,
+            "corrupt": corrupt,
+            "blocked": blocked,
             "source": source_label(self.model_plan.source()),
             "model_dir": REDACTED_MODEL_DIR,
+            "detector": self.formula_detector_detail(),
+        })
+    }
+
+    /// `detail.detector` / `/api/models.formula.detector` 的**同一份**取值。
+    fn formula_detector_detail(&self) -> Value {
+        let status = self.formula_detector_status();
+        json!({
+            "configured": self.formula_detector.is_some(),
+            "file": status.as_ref().map(|status| status.name.clone()),
+            "sha256": self
+                .formula_detector
+                .as_ref()
+                .and_then(|spec| spec.expected_sha256.clone()),
+            "state": status.as_ref().map(|status| status.state.as_str()),
         })
     }
 
@@ -585,6 +729,7 @@ impl ServeShared {
             "corrupt": report.corrupt_names(),
             "blocked": report.blocking_names(),
             "formula": self.formula_status_json(&report),
+            "verification": verification_json(report.cold_this_call()),
             "sets": report.statuses().iter().map(set_status_json).collect::<Vec<_>>(),
         })
     }
@@ -602,14 +747,7 @@ impl ServeShared {
             "routing": self.routing.formula,
             "disabled_reason": self.routing.disabled_reason,
             "required_roles": ["formula_recognizer"],
-            "detector": {
-                "configured": self.formula_detector.is_some(),
-                // §7.4 脱敏：只给文件名，绝不把本机绝对路径写进响应。
-                "file": self
-                    .formula_detector
-                    .as_deref()
-                    .map(|path| file_name(&path.to_string_lossy())),
-            },
+            "detector": self.formula_detector_detail(),
         })
     }
 
@@ -661,10 +799,25 @@ impl ServeShared {
         }
     }
 
-    /// 目标队列是否已满（§4.4 第 4 步：**读 body 之前**的判定）。
-    pub fn queue_full(&self, class: QueueClass) -> bool {
-        let state = lock(&self.jobs);
-        state.scheduler.queued_len(class) >= state.scheduler.config().capacity(class)
+    /// **原子地**预留一个 OCR 队列槽位（§4.4 第 4 步；评审 P2-1 的根因修复）。
+    ///
+    /// 准入层在第 4 步调用它：判定与占位是同一次加锁，因此两个并发请求不可能都通过
+    /// "队列没满"的预检。返回的凭据要么被 [`Self::submit_ocr`] 提交成真正的队列条目，
+    /// 要么在请求失败/中止时由 `Drop` 释放（容量不会泄漏）。
+    ///
+    /// 为什么不是"先 `queue_full()` 再 `enqueue()`"：那是两个临界区，中间可以插入任意多个
+    /// 并发请求，每一个都已经把大 body 读进内存——"拒绝时不读 body"这条保证因此不成立。
+    pub fn reserve_queue_slot(self: &Arc<Self>, class: QueueClass) -> Option<QueueReservation> {
+        {
+            let mut state = lock(&self.jobs);
+            if !state.reserve(class) {
+                return None;
+            }
+        }
+        let shared = Arc::clone(self);
+        Some(QueueReservation::new(move || {
+            lock(&shared.jobs).release(class);
+        }))
     }
 
     /// 调度器里是否还有任务（OCR worker 在**取任务之前**判断"要不要建引擎"）。
@@ -673,13 +826,19 @@ impl ServeShared {
     }
 
     /// `POST /api/ocr`：准入已经在 http 层完成，这里只建任务并入队（§4.4 第 7 步）。
+    ///
+    /// `reservation` 是第 4 步预留的槽位（准入层给出）。它让"检查 → 入队"之间不再有
+    /// 并发窗口：入队成功即提交；本函数任何一次提前返回都会让凭据被丢弃并归还容量。
     pub fn submit_ocr(
         &self,
         bytes: Vec<u8>,
         class: QueueClass,
         max_side: Option<u32>,
+        reservation: Option<QueueReservation>,
     ) -> Result<Value, ServeError> {
         // §7.6 + M2 的惰性创建：模型缺失/引擎不可用在这里拒绝（不建任务、不入队）。
+        // 提前返回时 `reservation` 在函数结束时被丢弃 → 槽位归还（锁在它之前释放，
+        // 因为局部变量先于参数析构）。
         self.admit_ocr()?;
 
         let original_bytes = bytes.len() as u64;
@@ -711,6 +870,9 @@ impl ServeShared {
         state.sync_originals();
         state.sync_positions();
         drop(state);
+        // **提交完成**：队列入队已经在同一个临界区里发生，现在归还预留（入队在先、
+        // 释放在后：多算的那一格只会让并发请求被保守拒绝，绝不超卖）。
+        drop(reservation);
         self.queue_signal.notify_all();
         Ok(json!({
             "job_id": id,
@@ -1269,6 +1431,10 @@ impl ServeShared {
     /// `{"state":"blocked_models_missing","missing":[…]}`——**不是**一句模糊的失败。
     /// `missing`/`corrupt` 与 `/api/models` 同源同值；`load_ms` 是**本次调用**的墙钟耗时
     /// （`/api/status` 的 `engine_load_ms` 是上一次真正建立会话的耗时）。
+    ///
+    /// **两种形态都由 `http.rs` 在独立线程里调用**（那个线程负责写响应），因此
+    /// `/api/status` 与 `POST /api/ocr` 在整个建会话序列期间照常可用——无 body 的
+    /// "按当前文件重建"与显式 provider 切换在这一条上没有区别（评审 P2-2）。
     pub fn reload_engine(&self, provider: Option<ProviderPreference>) -> Result<Value, ServeError> {
         let started = Instant::now();
         let Some(requested) = provider else {
@@ -1278,19 +1444,7 @@ impl ServeShared {
         self.apply_provider(requested, started)
     }
 
-    /// M3 的 provider 设置应用：**入口与实现**（见 [`Self::apply_provider`] 的文档）。
-    ///
-    /// `http.rs` 在独立线程里调用它（那个线程负责写响应），因此 `/api/status` 与
-    /// `POST /api/ocr` 在切换期间照常可用。
-    pub fn apply_provider_request(
-        &self,
-        requested: ProviderPreference,
-        started: Instant,
-    ) -> Result<Value, ServeError> {
-        self.apply_provider(requested, started)
-    }
-
-    /// 取得"由我执行这次 provider 切换"的资格（同时只允许一个）。
+    /// 取得"由我执行这次建会话序列"的资格（同时只允许一个）。
     ///
     /// 第二个并发请求拿到 `None` → 503 `busy`（**不排队**：排队只会让两个客户端都等到
     /// 一个很长的序列结束，而结果还是后者的设置生效）。凭据持有 `Arc`，因此它可以被
@@ -1320,6 +1474,11 @@ impl ServeShared {
     /// `POST /api/evaluate` 的用例上限（`--max-eval-cases`）。
     pub fn max_eval_cases(&self) -> usize {
         self.limits.max_eval_cases
+    }
+
+    /// `--eval-root` 沙箱；`None` = 评估端点整体关闭（见 [`super::evaluate::EvalRoot`]）。
+    pub fn eval_root(&self) -> Option<&EvalRoot> {
+        self.eval_root.as_ref()
     }
 
     /// 运行期切换 provider 的**唯一**入口（§7.5、§7.6、M3）。
@@ -1644,6 +1803,7 @@ impl ServeRuntime {
             allow_provider_fallback: context.allow_provider_fallback,
             routing: context.routing,
             formula_detector: context.formula_detector,
+            eval_root: context.eval_root,
             engine_state: Mutex::new(machine),
             engine: Mutex::new(backend),
             engine_load: Mutex::new(()),
@@ -1659,6 +1819,8 @@ impl ServeRuntime {
                 ),
                 ids: JobIdGenerator::default(),
                 originals: HashMap::new(),
+                reserved_text: 0,
+                reserved_formula: 0,
             }),
             queue_signal: Condvar::new(),
             download_tx,
@@ -2063,6 +2225,31 @@ fn set_status_json(status: &rapid_ocr_rs::ModelSetStatus) -> Value {
 
 fn render_error_body(body: &ErrorBody) -> Vec<u8> {
     serde_json::to_vec(body).expect("ErrorBody serialization cannot fail")
+}
+
+/// `/api/models` 的 `verification` 块：**哈希校验的成本账**。
+///
+/// `/api/models` 对每个文件都用库的**身份键控校验缓存**（键 = 路径 + 体积 + mtime）：
+/// 首次见到某个身份时真的读盘哈希（566 MB 公式模型约 1 s），命中只花一次 `stat`。
+/// 页面每 8 s 轮询一次就绪状态，因此这里把三件事都说清楚：
+///
+/// - `cold_this_call`：**这一份报告**真的重算了几个文件的摘要（稳态下必须是 0）；
+/// - `cold_verifications`/`cache_hits`：进程启动以来的累计；
+/// - `last_cold_ms`/`last_cold_bytes`：最近一次冷验证的实测耗时与被读的字节数。
+///
+/// 读者不必相信一句"已缓存"：`cold_this_call == 0` 就是"这次没有读那 566 MB"的证据。
+fn verification_json(cold_this_call: usize) -> Value {
+    let stats = verification_stats();
+    json!({
+        "identity": "path + size + mtime",
+        "cold_this_call": cold_this_call,
+        "cold_verifications": stats.cold_verifications,
+        "cache_hits": stats.cache_hits,
+        "entries": stats.entries,
+        "last_cold_ms": stats.last_cold_ms(),
+        "last_cold_bytes": stats.last_cold_bytes,
+        "residual_blind_spot": "a same-size, same-mtime content swap is not detected by the cache",
+    })
 }
 
 #[cfg(test)]

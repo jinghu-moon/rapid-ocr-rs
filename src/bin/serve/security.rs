@@ -19,20 +19,23 @@
 //!
 //! # 令牌
 //!
-//! 每进程随机生成（[`ServeToken::generate`]），比较使用常量时间实现
-//! （[`ServeToken::matches`]）。威胁模型：本机浏览器里的**恶意页面**可能向 loopback
-//! 端口发请求，但拿不到注入到我们页面里的 token（受同源策略与 §9.5 的 nonce CSP 保护）。
-//! 因此 token 是"防跨站触发"的共享密钥，不承担会话/密码学身份语义（§0.2 明确不引入 cookie）。
+//! 每进程由**操作系统 CSPRNG** 生成（[`ServeToken::generate`] → `BCryptGenRandom`，
+//! 见 [`RANDOM_SOURCE`]），比较使用常量时间实现（[`ServeToken::matches`]）。威胁模型：
+//! 本机浏览器里的**恶意页面**可能向 loopback 端口发请求，但拿不到注入到我们页面里的
+//! token（受同源策略与 §9.5 的 nonce CSP 保护）。因此 token 是"防跨站触发"的共享密钥，
+//! 不承担会话/密码学身份语义（§0.2 明确不引入 cookie）——但它是**不可预测的密钥**，
+//! 因此熵必须是密码学安全的：早期实现用时间 + PID + 计数器 + 栈地址派生（并自认不是
+//! 密码学 RNG），那对一个可被本机其它进程观察的密钥是不够的。
+//!
+//! **fail-closed**：CSPRNG 不可用（`BCryptGenRandom` 返回非 0）时 [`ServeToken::generate`]
+//! 与 [`generate_nonce`] 返回 [`RandomError`]，`run.rs` 把它变成拒绝启动。不存在
+//! "退回弱熵"的分支：一个拿不到密码学随机数的服务不该发出一个看起来正常的令牌。
 
 use std::{
     fmt,
     fmt::Write as _,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
 };
-
-use sha2::{Digest, Sha256};
 
 use super::error::ServeError;
 
@@ -183,8 +186,11 @@ pub struct ServeToken(String);
 
 impl ServeToken {
     /// 生成本进程的令牌（每次都不同）。
-    pub fn generate() -> Self {
-        Self(random_hex(TOKEN_BYTES))
+    ///
+    /// 熵来自操作系统 CSPRNG；**不可用时不返回一个弱令牌，而是返回错误**，
+    /// 由 `run.rs` 转成启动失败（fail-closed，见 [`RandomError`]）。
+    pub fn generate() -> Result<Self, RandomError> {
+        Ok(Self(random_hex(TOKEN_BYTES)?))
     }
 
     pub fn as_str(&self) -> &str {
@@ -222,36 +228,114 @@ const TOKEN_BYTES: usize = 32;
 const NONCE_BYTES: usize = 16;
 
 /// 生成 CSP nonce（§9.5：主页面 CSP 用 nonce，不用 `unsafe-inline`）。
-pub fn generate_nonce() -> String {
+///
+/// 与令牌用**同一个** CSPRNG（[`random_hex`]）：nonce 是 CSP 的唯一随机量，
+/// 弱 nonce 会让注入脚本成为可能。失败同样向上传播（调用方拒绝启动）。
+pub fn generate_nonce() -> Result<String, RandomError> {
     random_hex(NONCE_BYTES)
 }
 
-/// 无新增依赖的随机十六进制串。
-///
-/// 熵来源：系统时间（秒 + 纳秒）、进程 ID、进程内单调计数器、以及一个栈地址
-/// （ASLR 提供的地址空间随机化）。这不是密码学 RNG，但足以让"每进程一次、
-/// 不可被本机其他进程预测"成立；本项目**不**为它新增依赖（§2.2 只允许 `tiny_http`）。
-fn random_hex(byte_len: usize) -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+/// 熵源不可用（fail-closed：服务拒绝启动，绝不用弱熵继续）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RandomError {
+    /// `BCryptGenRandom` 返回非 0 状态码。
+    Bcrypt { status: i32 },
+    /// 调用方请求了 0 字节（编程错误，不是运行期状态）。
+    Empty,
+}
 
-    let mut hasher = Sha256::new();
-    hasher.update(b"rapidocr-serve-entropy-v1");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    hasher.update(now.as_secs().to_le_bytes());
-    hasher.update(now.subsec_nanos().to_le_bytes());
-    hasher.update(std::process::id().to_le_bytes());
-    hasher.update(COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-    let stack_marker = 0_u8;
-    hasher.update((&stack_marker as *const u8 as usize).to_le_bytes());
-    let digest = hasher.finalize();
+impl fmt::Display for RandomError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bcrypt { status } => write!(
+                f,
+                "BCryptGenRandom (bcrypt.dll) failed with NTSTATUS {status:#x}; rapidocr serve \
+                 refuses to start instead of falling back to weak entropy"
+            ),
+            Self::Empty => write!(f, "cannot generate an empty random string"),
+        }
+    }
+}
+
+impl std::error::Error for RandomError {}
+
+/// 熵源的**名字**（启动日志与测试都读它，因此"用什么产生密钥"永远不是猜测）。
+pub const RANDOM_SOURCE: &str =
+    "windows:BCryptGenRandom(bcrypt.dll, BCRYPT_USE_SYSTEM_PREFERRED_RNG)";
+
+/// [`RANDOM_SOURCE`] 的函数形式（报告/日志用）。
+pub fn random_source() -> &'static str {
+    RANDOM_SOURCE
+}
+
+/// `BCryptGenRandom` 的 `BCRYPT_USE_SYSTEM_PREFERRED_RNG` 标志。
+///
+/// 用它时 `hAlgorithm` 必须为 `NULL`：内核提供的系统首选 CSPRNG
+/// （`\Device\KsecDD`，即 AES 计数器模式 DRBG），这是文档规定的用法。
+const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+
+// 与 `runtime/memory.rs` 同一风格的手写 Win32 绑定：本 crate 不为一个函数引入
+// `windows-sys`（§2.2）。`bcrypt.dll` 是 Windows 自带组件，随系统提供。
+#[link(name = "bcrypt")]
+unsafe extern "system" {
+    fn BCryptGenRandom(
+        algorithm: *mut core::ffi::c_void,
+        buffer: *mut u8,
+        length: u32,
+        flags: u32,
+    ) -> i32;
+}
+
+/// 用操作系统 CSPRNG 填满缓冲区。**任何失败都是错误**，没有后备熵源。
+fn fill_random(buffer: &mut [u8]) -> Result<(), RandomError> {
+    if buffer.is_empty() {
+        return Err(RandomError::Empty);
+    }
+    let length = u32::try_from(buffer.len()).map_err(|_| RandomError::Empty)?;
+    // SAFETY: `buffer` is a valid, exclusively borrowed slice of exactly `length` bytes;
+    // `BCRYPT_USE_SYSTEM_PREFERRED_RNG` requires `algorithm` to be null and ignores it.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr(),
+            length,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        return Err(RandomError::Bcrypt { status });
+    }
+    Ok(())
+}
+
+/// 密码学随机的十六进制串（长度 = `byte_len * 2` 个十六进制字符）。
+///
+/// 熵**只**来自操作系统 CSPRNG（[`fill_random`]）：时间、PID、计数器与栈地址都不再参与
+/// ——它们不是密码学安全的，而令牌是一个必须不可预测的共享密钥。失败即返回错误，
+/// 由调用方**拒绝启动**（fail-closed）。
+pub fn random_hex(byte_len: usize) -> Result<String, RandomError> {
+    random_hex_with(byte_len, &fill_random)
+}
+
+/// [`random_hex`] 的唯一实现，熵的注入点。
+///
+/// `fill` 只出现在这里，因此"失败会怎样"是可测的：测试传入一个必然失败的填充器，
+/// 断言错误真的被传播出去（而不是静默地退化到某个弱熵分支）。
+fn random_hex_with(
+    byte_len: usize,
+    fill: &dyn Fn(&mut [u8]) -> Result<(), RandomError>,
+) -> Result<String, RandomError> {
+    if byte_len == 0 {
+        return Err(RandomError::Empty);
+    }
+    let mut bytes = vec![0_u8; byte_len];
+    fill(&mut bytes)?;
 
     let mut out = String::with_capacity(byte_len * 2);
-    for byte in digest.iter().take(byte_len) {
+    for byte in &bytes {
         write!(out, "{byte:02x}").expect("writing into a String cannot fail");
     }
-    out
+    Ok(out)
 }
 
 /// 全部响应都必须带的三个响应头（§7.3）。
@@ -313,9 +397,10 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use super::{
-        CSP_NONCE_PLACEHOLDER, LOOPBACK_BIND_ADDRESS, LocalOrigin, SECURITY_HEADERS, ServeToken,
-        TOKEN_PLACEHOLDER, assert_loopback, assert_no_placeholders_left, bind_address,
-        generate_nonce, inject,
+        CSP_NONCE_PLACEHOLDER, LOOPBACK_BIND_ADDRESS, LocalOrigin, RANDOM_SOURCE, RandomError,
+        SECURITY_HEADERS, ServeToken, TOKEN_PLACEHOLDER, assert_loopback,
+        assert_no_placeholders_left, bind_address, fill_random, generate_nonce, inject, random_hex,
+        random_hex_with, random_source,
     };
 
     fn policy() -> LocalOrigin {
@@ -493,10 +578,12 @@ mod tests {
         );
     }
 
+    /// 令牌与 nonce 都来自操作系统 CSPRNG：生成必须成功、必须每次都不同、必须是十六进制，
+    /// 并且**报告熵源**（评审 P2-4 要求"来源可见"，而不是一句"随机"）。
     #[test]
     fn the_token_is_random_per_run_and_compared_exactly() {
-        let token = ServeToken::generate();
-        let other = ServeToken::generate();
+        let token = ServeToken::generate().expect("BCryptGenRandom must be available");
+        let other = ServeToken::generate().expect("BCryptGenRandom must be available");
         assert_eq!(token.as_str().len(), 64, "256 bit of hex");
         assert_ne!(
             token.as_str(),
@@ -508,6 +595,8 @@ mod tests {
             "the token must be hex: {}",
             token.as_str()
         );
+        assert_eq!(random_source(), RANDOM_SOURCE);
+        assert!(RANDOM_SOURCE.contains("BCryptGenRandom"), "{RANDOM_SOURCE}");
 
         assert!(token.matches(token.as_str()));
         assert!(!token.matches(other.as_str()));
@@ -540,9 +629,42 @@ mod tests {
         assert!(!token.matches(&last_flipped));
     }
 
+    /// **fail-closed 分支**：熵源失败时错误必须被传播出去，而不是静默退化到弱熵。
+    ///
+    /// 注入点是 [`random_hex_with`] 的填充器（生产路径用的是 [`fill_random`]，它只会在
+    /// `BCryptGenRandom` 失败时返回错误——在一台健康的 Windows 上无法让它失败，
+    /// 因此这里注入失败来**真的执行**那条分支，而不是只留一句注释）。
+    #[test]
+    fn a_failing_entropy_source_is_propagated_and_never_falls_back() {
+        let failing = |_buffer: &mut [u8]| {
+            Err(RandomError::Bcrypt {
+                status: 0xC000_0001u32 as i32,
+            })
+        };
+        let error = random_hex_with(32, &failing).expect_err("a failing RNG must fail generation");
+        assert_eq!(
+            error,
+            RandomError::Bcrypt {
+                status: 0xC000_0001u32 as i32
+            }
+        );
+        let text = error.to_string();
+        assert!(text.contains("BCryptGenRandom"), "{text}");
+        assert!(text.contains("refuses to start"), "{text}");
+
+        // 0 字节同样是错误（不会返回一个"看起来成功"的空串）。
+        assert_eq!(random_hex_with(0, &failing), Err(RandomError::Empty));
+        assert_eq!(random_hex(0), Err(RandomError::Empty));
+
+        // 生产路径的填充器在健康主机上必须成功，且写入的确实是随机字节。
+        let mut buffer = [0_u8; 32];
+        fill_random(&mut buffer).expect("the OS CSPRNG must be available");
+        assert!(buffer.iter().any(|byte| *byte != 0));
+    }
+
     #[test]
     fn the_token_is_redacted_in_debug_output() {
-        let token = ServeToken::generate();
+        let token = ServeToken::generate().expect("the OS CSPRNG must be available");
         let text = format!("{token:?}");
         assert!(
             !text.contains(token.as_str()),
@@ -553,8 +675,8 @@ mod tests {
 
     #[test]
     fn nonces_are_random_and_hex() {
-        let first = generate_nonce();
-        let second = generate_nonce();
+        let first = generate_nonce().expect("the OS CSPRNG must be available");
+        let second = generate_nonce().expect("the OS CSPRNG must be available");
         assert_eq!(first.len(), 32, "128 bit of hex");
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()), "{first}");
         assert_ne!(first, second);
@@ -583,8 +705,8 @@ mod tests {
     fn inject_replaces_both_placeholders_and_leaves_nothing_behind() {
         let page = "<script nonce=\"__CSP_NONCE__\">let t='__SRV_TOKEN__';</script>\
                     <style nonce=\"__CSP_NONCE__\"></style>";
-        let nonce = generate_nonce();
-        let token = ServeToken::generate();
+        let nonce = generate_nonce().expect("the OS CSPRNG must be available");
+        let token = ServeToken::generate().expect("the OS CSPRNG must be available");
         let injected = inject(page, &nonce, token.as_str());
 
         assert_eq!(
