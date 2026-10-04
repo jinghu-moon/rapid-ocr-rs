@@ -157,10 +157,26 @@ rapidocr serve [OPTIONS]
                              给出后清单与它引用的每张图都必须规范化到该目录内
                              （拒绝 `..`、绝对路径逃逸与符号链接逃逸）；**不给时整个
                              端点拒绝**并给出可定位理由（§4.2、M1 评审 P2-3）
+
+  # M5：流动日志
+  --log-level <off|flow>     流动日志级别，**默认 `off`**。`flow` 时：
+                             · 每个 HTTP 请求一行 —— 请求 id、方法、路径、状态码、
+                               响应字节数、耗时；
+                             · 每个任务另有准入/运行/终态三类行 —— 任务 id、队列、准入结论
+                               **与它的原因**、入队位置、等待时长、运行时长、终态、结果字节数，
+                               失败时还有状态码 + `code` + `detail`；
+                             · 两类行共用**同一个请求 id**，因此一次上传可以从请求行一路
+                               追到任务终态。环境变量 `RAPID_OCR_SERVE_LOG` 是同一个开关，
+                               **CLI 优先**；取值非法（不只是 `off`/`flow`）**拒绝启动**并点名它。
+                             关闭时所有记录函数在第一次判断就返回，不做任何格式化
 ```
 
 **参数优先级（必须一致并记录）**：**CLI flag > `--config` YAML > 内建默认**。
 `serve` 会用 CLI 值覆盖配置中的 `max_side_len` 与 `provider_preference`，并在启动日志中打印"哪个值生效、被覆盖的值是什么"。未启用 `serve` feature 时子命令仍可解析，但返回可定位错误（提示 `cargo build --features serve`）。
+
+`--log-level` 没有 YAML 面（它不是引擎配置），因此它只有两层：**CLI > `RAPID_OCR_SERVE_LOG` > `off`**。
+启动时那一行同时打印生效级别与 `RAPID_OCR_SERVE_LOG` 的当前值（未设置时是 `<unset>`），
+因此"开关到底生效没有"不需要猜。
 
 **M4 的两处实现结论（改的是文档没写清的地方）**：
 
@@ -198,7 +214,7 @@ OCR（尤其公式路径）单图可达数秒至数十秒，**不得长期占用
 | `GET` | `/api/models` | 模型集状态（§5.4；顶层字段是**本次运行计划**的**文本管线**作用域，公式管线在 `formula` 块（库存）与 `pipelines.formula`（计划）里） |
 | `POST` | `/api/models/download` | 启动下载任务（需 `--allow-download` **且** token）；请求体 `{"set_id": "<id>"}`，未知 id → **404 `model_set_not_found`**（绝不回落 `sets[0]`）。公式集合（566 MB）与文本集合同一条路径、同一个按钮语义 |
 | `POST` | `/api/models/reverify` | **A2 新增**：一次动作完成"重新读盘"——①清掉校验缓存，②**冷验证这次运行的整份模型计划**（含 `--formula-detector`/集合声明的公式检测模型），③**引擎此前就绪则重建会话**（否则"清缓存"只是一个按下去什么都不会变的按钮：流水线的会话缓存可能仍在服务一个磁盘上已经不是这个文件的模型）。请求体**必须为空**（有 body → 400）；单飞（第二个并发调用 **503 `busy`**，与 `POST /api/engine/reload` **同一把**资格），且整个序列在**独立线程**里执行（accept 线程绝不建会话）。响应**按管线**给结论（`text.outcome` 与 `formula.*` 分开），见 §5.5 |
-| `POST` | `/api/ocr` | 提交识别 → **202** `{job_id, queue, position, state:"queued"}`。队列由 `?queue=text\|formula` 选择，**队列类别就是管线选择**（M4，见下） |
+| `POST` | `/api/ocr` | 提交识别 → **202** `{job_id, queue, position, state:"queued"}`。队列由 `?queue=text\|formula` 选择，**队列类别就是管线选择**（M4，见下）。**页面必须显式发送它**（M5：旧的 `submitImage` 发的是无查询串的 `/api/ocr`，于是公式开关实际上什么都没改变；页面源码里的这一条由 `serve::tests::the_page_reads_exactly_the_pinned_result_paths` 断言） |
 | `POST` | `/api/evaluate` | **M4 新增**：批量评估一份已标注清单 → 200 + 库的评估报告。**必须先配置 `--eval-root <DIR>`**（M1 评审 P2-3）：未配置时整个端点拒绝（400 `bad_request`，`detail.reason` 点名 `--eval-root`）；配置后清单与清单引用的**每张图**都必须规范化到该目录内，越界（`..`、绝对路径、符号链接）是可定位的 400。请求体**恰好**一个键 `{"manifest": "<本机清单路径>"}`（与 `rapidocr evaluate --manifest` 同格式：`[{image, text, boxes}]`，`image` 相对清单目录解析）。报告字段与 CLI 的 `rapidocr evaluate` **同一份实现**（`cases[]` + `mean_cer` + `exact_match_rate` + `mean_detection_*` + `peak_working_set_bytes` + `memory_source` + `ort_runtime` + `ort_runtime_version`），另加 `iou_threshold` 与 `manifest_file`（只给文件名）。可定位的拒绝是 **400 `bad_request`** + `detail.reason`（没有 `--eval-root`/清单越界/格式不对/用例数超过 `--max-eval-cases`/某张图越界或读不出来）；模型缺失与引擎不可用分别是 409 `models_missing` / 503 `engine_unavailable`（与 `/api/ocr` 同一份错误体） |
 | `GET` | `/api/jobs/{id}` | `{id, kind, queue, state, position, queued_ms, started_ms, elapsed_ms, error}` + M2 追加的 `{failure, download, cancel_requested}`（见 §4.3） |
 | `GET` | `/api/jobs/{id}/result` | 结果（未完成 409 `job_not_finished`；已淘汰 410 `job_evicted`） |
@@ -1256,6 +1272,62 @@ curl.exe -s -X POST http://127.0.0.1:8760/api/engine/reload `
 
 ---
 
+## 17. 流动日志与契约钉住（M5）
+
+### 17.1 一次上传的流动日志
+
+服务端（`--log-level flow` / `RAPID_OCR_SERVE_LOG=flow`）为每个请求与每个任务各写若干行，
+**共用同一个请求 id**：
+
+```text
+serve-flow: req=7 POST /api/ocr -> 202 bytes=334 in 6ms
+serve-flow: req=7 job=job-0000000000000003 queue=text admission=accepted decision=run queued position=0
+serve-flow: req=7 job=job-0000000000000003 queue=text running wait_ms=3
+serve-flow: req=7 job=job-0000000000000003 queue=text terminal state=succeeded result_bytes=35201 backend_ms=881
+```
+
+失败时同一形状，只是终态行换成状态码 + `code` + `detail`（与 `/result` 上重放的是**同一份**错误体）：
+
+```text
+serve-flow: req=9 queue=formula admission=rejected status=409 code=models_corrupt detail={"scope":"formula",...}
+serve-flow: req=11 job=job-0000000000000005 queue=text terminal state=failed status=422 code=unsupported_input detail=... backend_ms=12
+```
+
+被拒绝的上传**没有**任务 id —— 请求 id 就是它唯一的关联键，这正是"上传没有任何反应"时
+最需要的那条事实。写入点是唯一的：请求行只由 `http::respond` 落笔（所有响应都经过它，
+包括由引擎工作线程/评估线程写出的那两条），任务行只由 `submit_ocr` / `ocr_worker` /
+下载 worker 落笔；行内 `detail` 被压平到**一行**，因此按请求 id `grep` 永远有效。
+
+### 17.2 页面侧的详细模式
+
+页面对应的开关是 **`?verbose=1`（`?verbose=0` 关闭）或 `Ctrl+Alt+L`**，选择记在
+`localStorage`；诊断面板顶部因此出现"最近请求"一节：方法、URL、HTTP 状态、耗时、错误码，
+**失败时附响应体原文**（截断到 4 KB）。关闭时这一节只在**最近一次请求失败**时出现——
+"什么都没渲染"正是它的用途，因此答案不必先打开 devtools 也不必先想起这个开关。
+
+### 17.3 契约钉住（四条互相独立的腿）
+
+| 腿 | 位置 | 钉住什么 |
+| --- | --- | --- |
+| Rust（服务端） | `serve::tests::the_served_result_carries_every_path_the_page_reads` | 真实端点产出的 `/result` 满足页面读的每一个路径：`regions` 数组、`kind` ∈ {text, formula}、`polygon.points` **恰好四点**且每点**恰好两个有限数**、文本区域有 `recognition.text`/`recognition.score`、公式区域有 `formula.latex`（且**不要求** `recognition`）、`plain_text`/`timings`/`timing_ledger` |
+| Rust（页面） | `serve::tests::the_page_reads_exactly_the_pinned_result_paths` | 页面源码里**逐字**存在上表对应的访问表达式（`PAGE_RESULT_CONTRACT` 的右列），且**不再出现**任何别名（`r.boxes`/`r.items`/`polygon.box`/`polygon.coords`…）；`POST /api/ocr` 必须带 `?queue=` |
+| Rust（真实字节） | `serve::tests::the_captured_real_result_body_still_satisfies_the_page_contract` | 报告者那次真实运行捕获的 35 203 字节 `/result` 体（42 区域，SHA-256 钉住 `fda2f713…fd27`）满足同一份契约 |
+| node（页面自己的解析器） | `tools/check-page-result-contract.mjs` | 把页面自己的 `normalizeResult`/`parsePolygon`/`parseRecognition`/`parseFormula`/`contractFail`/`diagPush` 抽出来在 `node:vm` 里跑**真实捕获的响应体**：42 个区域必须渲染出来；随后 9 个变异用例（改名/删除/截断每一个必需字段）必须**拒绝渲染并点名字段路径** |
+
+第四条是"检查本身能不能失败"的证据：一个不会失败的检查不是检查。它同时是唯一
+**执行**页面解析器的地方（前三条只断言源码文本与序列化结果）。
+`tools/extract-page-scripts.mjs` 把页面的两个 `<script nonce=…>` 块分别抽出交给
+`node --check`（页面自身语法）。
+
+### 17.4 任务生命周期的所有者（页面）
+
+`beginJob()` / `endJob()` 是页面里**仅有的**两个改 `state.job` 与扫描动画的地方，
+`clearResult()` 只重置"上一次的结果"、`clearJob()` 只重置"任务状态行"。任何终结路径
+（成功、失败、取消、淘汰、契约失败、HTTP 错误、连续轮询失败到上限）都必须走 `endJob()`，
+因此不存在"某条分支忘了关动画"的形状。
+
+---
+
 ## 实施完成记录（M0-M4）
 
 上面的 M0-M4 清单已全部勾选，每项的证据在 docs/06-local-web-demo-reports.md 对应里程碑记录里（命令、结果、前后行为对比、未覆盖风险）。提交序列：
@@ -1276,5 +1348,10 @@ curl.exe -s -X POST http://127.0.0.1:8760/api/engine/reload `
 1. 公式模型 566 MB 的真实下载没有重跑：/api/models 的大小、哈希与来源，以及页面上的下载按钮（含体积提示）都验证过，但该文件本机已存在；同一套与集合无关的下载路径已在 M2b 用真实网络验证（v6-tiny 权重集 3/3 文件、三个 SHA-256 全部匹配）。
 2. 评估以 manifest 路径而非浏览器上传：POST /api/evaluate 接收 manifest 路径，因为设计明确不引入 multipart；数值与 CLI 逐位一致（12 张标注图 mean CER 0.44765135645866394）。
 3. 没有真实浏览器手工点击闭环：交互只在数据层，以及"在 node 里直接运行页面自身的 modelsReadyFor / renderBanner"层面验证过。
+   **M5 已补上这一条**：用 headless Chrome + CDP 对**真实** serve 做了完整的"选图 → 点开始识别 → 轮询 → 渲染 42 个区域"闭环，
+   并因此发现了下面那条根因。见 §17。
 
 其他已记录的未覆盖风险见各里程碑记录（真实加速器上的 provider 切换成功路径、original_evicted 只能由单任务超预算触发、M2 的目标损坏重下只在库层验证等）。
+
+---
+

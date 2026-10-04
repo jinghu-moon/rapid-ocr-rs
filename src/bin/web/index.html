@@ -385,6 +385,14 @@ main{flex:1;min-height:0;display:grid;grid-template-columns:minmax(400px,46fr) 5
   color:var(--fg2);line-height:1.9;word-break:break-all}
 .diag-note{font-size:11.5px;color:var(--fg3);line-height:1.9;margin-top:16px;
   border-left:2px solid var(--line);padding-left:12px}
+/* 流动日志（详细模式）：最近请求一行 + 失败响应体原文。
+   页面是**单色**设计（没有红色语义色），因此成功/失败用字重与明度区分，不引入新色相。 */
+.flow-ok{color:var(--fg2)}
+.flow-bad{color:var(--fg);font-weight:600}
+.flow-body{font-family:"JetBrains Mono",Consolas,monospace;font-size:11px;color:var(--fg2);
+  background:var(--surface);border:1px solid var(--line);padding:10px 12px;margin:0 0 10px;
+  white-space:pre-wrap;word-break:break-all;max-height:220px;overflow:auto}
+.diag-line label{cursor:pointer}
 .foot-note{font-family:"JetBrains Mono",Consolas,monospace;font-size:10px;
   letter-spacing:.14em;color:var(--fg3);margin-top:30px}
 
@@ -679,7 +687,13 @@ const state = {
   diag:[],              /* 协议/契约错误记录（渲染进诊断面板；同时 toast 一次） */
   verifying:false,      /* "重新校验"进行中（按钮禁用，避免重复提交） */
   verifyOut:null,       /* 上一次 POST /api/models/reverify 的结论 {value} 或 {error} */
-  netFail:false         /* 真实模式：本地服务不可达 */
+  netFail:false,        /* 真实模式：本地服务不可达 */
+  /* 页面侧流动日志（详细模式，默认关闭）：每一次 XHR 的方法/URL/状态/耗时/错误码，
+     失败时还留响应体原文。目的只有一个——"什么都没渲染"时**不打开 devtools**
+     也能看见是哪一次请求、以什么状态、返回了什么。开关见 flowVerboseInitial()。 */
+  verbose:false,
+  flow:[],              /* 最近 20 次请求，最新在前 */
+  flowSeq:0
 };
 
 const demo = {           /* 离线预览模式的内部状态 */
@@ -804,7 +818,20 @@ function errText(e){
   if(e.code && ERR_TEXT[e.code]) return ERR_TEXT[e.code];
   return '请求失败' + (e.status ? `（HTTP ${e.status}）` : '');
 }
-function toastErr(e){ toast(errText(e), 'err'); }
+/* 失败文案：人话（§11.1 的错误码文案）+ **机器可读的** HTTP 状态与错误码。
+   两者都要有：只说人话无法与 serve 的流动日志（`RAPID_OCR_SERVE_LOG=flow`）逐条对上，
+   只说状态码用户不知道为什么。 */
+function failText(what, e){
+  const ids = [e && e.status ? `HTTP ${e.status}` : null, (e && e.code) || null]
+    .filter(Boolean).join(' ');
+  return (what ? what + '：' : '') + errText(e) + (ids ? ` — ${ids}` : '');
+}
+function toastErr(e){ toast(failText('请求失败', e), 'err'); }
+/* 诊断面板的一条留痕：**可见**（toast）之外还有**可查**（此处）的一条。 */
+function diagPush(line){
+  state.diag = [line].concat(state.diag).slice(0, 12);
+  renderDiag();
+}
 
 /* 保存附件（blob 下载，不经过 <a href>，因为 /api/* 均需令牌头） */
 function saveBlob(blob, name){
@@ -815,9 +842,80 @@ function saveBlob(blob, name){
   setTimeout(() => URL.revokeObjectURL(u), 4000);
 }
 
-/* ================= API 层（XHR，统一携带令牌） ================= */
+/* ================= 页面侧流动日志（详细模式，默认关闭） =================
+   报告者的要求："不打开 devtools 也能看见为什么什么都没渲染"。
+   - `?verbose=1` / `?verbose=0` 设定，或按 Ctrl+Alt+L 切换；选择记在 localStorage；
+   - 诊断面板出现"最近请求"一节：方法、URL、HTTP 状态、耗时、错误码，
+     **失败时附响应体原文**（截断到 4 KB，避免把诊断面板变成内存黑洞）；
+   - 关闭时不做任何记录以外的事，也不渲染这一节（除非最近一次请求失败——
+     那条**永远**显示，因为"什么都没渲染"正是它的用途）。
+   服务端对应开关：`RAPID_OCR_SERVE_LOG=flow`（docs/05 §17）。 */
+const VERBOSE_KEY = 'rrocr-verbose';
+function flowVerboseInitial(){
+  let q = null;
+  try { q = new URLSearchParams(location.search).get('verbose'); } catch{}
+  if(q === '1' || q === 'true') return true;
+  if(q === '0' || q === 'false') return false;
+  try { return localStorage.getItem(VERBOSE_KEY) === '1'; } catch{ return false; }
+}
+function setFlowVerbose(on, quiet){
+  state.verbose = !!on;
+  try { localStorage.setItem(VERBOSE_KEY, state.verbose ? '1' : '0'); } catch{}
+  renderDiag();
+  if(!quiet) toast(state.verbose ? '详细模式已开启：诊断面板展示最近请求与失败响应体'
+                                 : '详细模式已关闭', 'ok', 'info');
+}
+function flowPush(rec){
+  state.flowSeq += 1;
+  rec.seq = state.flowSeq;
+  state.flow = [rec].concat(state.flow).slice(0, 20);
+  if(state.verbose) renderDiag();
+  else if(rec.status === 0 || rec.status >= 400) renderDiag();   /* 失败永远留痕 */
+}
+/* 供详细模式与失败留痕共用：一次请求的一行（+ 失败时的响应体原文）。 */
+function flowRowHtml(r, withBody){
+  const ok = r.status >= 200 && r.status < 300;
+  const cls = r.status === 0 ? 'flow-bad' : (ok ? 'flow-ok' : 'flow-bad');
+  const when = new Date().toLocaleTimeString();
+  const head = `<span class="${cls}">${esc(String(r.status || '—'))}</span> ` +
+    `<b>${esc(r.method)}</b> ${esc(r.url)} · ${r.ms}ms` +
+    (r.note ? ` · ${esc(r.note)}` : '') + (r.code ? ` · ${esc(r.code)}` : '');
+  const body = (withBody && r.body)
+    ? `<pre class="flow-body">${esc(String(r.body).slice(0, 4000))}</pre>` : '';
+  return `<p class="diag-line">${when} · ${head}</p>${body}`;
+}
+function flowHtml(){
+  const failed = state.flow.find(r => r.status === 0 || r.status >= 400);
+  const rows = state.verbose ? state.flow.slice(0, 12) : (failed ? [failed] : []);
+  const toggle = `<p class="diag-line"><label><input type="checkbox" id="flowToggle"` +
+    (state.verbose ? ' checked' : '') + `> 详细模式（?verbose=1 或 Ctrl+Alt+L）：` +
+    `显示最近请求与失败响应体</label></p>`;
+  /* 开关**永远**在诊断面板里：一个只有知道 URL 参数的人才能打开的开关不算可用，
+     而"为什么什么都没渲染"恰恰是用户在最需要它的时候才会来找的东西。 */
+  if(!rows.length){
+    return `<div class="diag-sec">最近请求</div>${toggle}` +
+      `<p class="diag-line">${state.verbose ? '尚无请求记录。'
+        : '详细模式关闭；最近一次请求失败时会自动在此列出。'}</p>`;
+  }
+  return `<div class="diag-sec">最近请求${state.verbose ? ' · 详细模式' : ' · 最近一次失败'}</div>` +
+    toggle + rows.map(r => flowRowHtml(r, true)).join('') +
+    `<p class="diag-note">这里的每一行都与服务端的流动日志
+     （<code>RAPID_OCR_SERVE_LOG=flow</code>，行内有请求 id）对应：同一次上传可以先看这里的
+     URL/状态/响应体，再按请求 id 到服务端日志里追同一个请求的准入与任务生命周期。</p>`;
+}
+
+/* 详细模式的初值来自 URL 查询串 / localStorage（见 flowVerboseInitial）。
+   在启动渲染（renderDiag）之前求值，因此开关状态在首屏就正确。 */
+state.verbose = flowVerboseInitial();
+
+/* ================= API 层（XHR，统一携带令牌 + 记录流动日志） ================= */
+function recordFlow(method, url, started, status, code, text, note){
+  flowPush({ method, url, status, code: code || null, ms: Date.now() - started,
+             note: note || null, body: text == null ? null : String(text) });
+}
 function xhrSend(method, url, body, opts){
   opts = opts || {};
+  const started = Date.now();
   return new Promise((resolve, reject) => {
     const x = new XMLHttpRequest();
     x.open(method, url, true);
@@ -830,12 +928,17 @@ function xhrSend(method, url, body, opts){
     x.onload = () => {
       let data = null;
       try { data = JSON.parse(x.responseText); } catch{}
-      if(x.status >= 200 && x.status < 300) resolve(data);
-      else reject({ status:x.status, code:data && data.code, body:data });
+      if(x.status >= 200 && x.status < 300){
+        recordFlow(method, url, started, x.status, null, null);
+        resolve(data);
+      } else {
+        recordFlow(method, url, started, x.status, data && data.code, x.responseText);
+        reject({ status:x.status, code:data && data.code, body:data, raw:x.responseText });
+      }
     };
-    x.onerror  = () => reject({ status:0 });
-    x.onabort  = () => reject({ aborted:true });
-    x.ontimeout = () => reject({ status:0 });
+    x.onerror  = () => { recordFlow(method, url, started, 0, null, null, '网络错误'); reject({ status:0 }); };
+    x.onabort  = () => { recordFlow(method, url, started, 0, null, null, '已取消'); reject({ aborted:true }); };
+    x.ontimeout = () => { recordFlow(method, url, started, 0, null, null, '超时'); reject({ status:0 }); };
     if(opts.getXhr) opts.getXhr(x);
     x.send(body || null);
   });
@@ -844,18 +947,23 @@ const apiJson = (m, p, b) => xhrSend(m, p, b);
 /* JSON 请求体：Content-Type 必须是 application/json（§4.2 契约），body 为已序列化字符串 */
 const apiSendJson = (m, p, obj) => xhrSend(m, p, JSON.stringify(obj), { contentType:'application/json' });
 function apiBlob(path){
+  const started = Date.now();
   return new Promise((resolve, reject) => {
     const x = new XMLHttpRequest();
     x.open('GET', path, true);
     x.responseType = 'blob';
     x.setRequestHeader('X-RapidOCR-Token', TOKEN);
     x.onload = async () => {
-      if(x.status >= 200 && x.status < 300) return resolve(x.response);
-      let code = null, body = null;
-      try { body = JSON.parse(await x.response.text()); code = body.code; } catch{}
+      if(x.status >= 200 && x.status < 300){
+        recordFlow('GET', path, started, x.status, null, null);
+        return resolve(x.response);
+      }
+      let code = null, body = null, text = null;
+      try { text = await x.response.text(); body = JSON.parse(text); code = body.code; } catch{}
+      recordFlow('GET', path, started, x.status, code, text);
       reject({ status:x.status, code, body });
     };
-    x.onerror = () => reject({ status:0 });
+    x.onerror = () => { recordFlow('GET', path, started, 0, null, null, '网络错误'); reject({ status:0 }); };
     x.send(null);
   });
 }
@@ -976,9 +1084,9 @@ function normalizeResult(r){
 function contractFail(paths){
   const list = paths.slice(0, 4);
   const more = paths.length > list.length ? ` 等 ${paths.length} 处` : '';
-  state.diag = list.map(p => `响应字段缺失: ${p}`)
-    .concat(state.diag).slice(0, 12);
   state.result = null;
+  /* 逆序压栈，使最早出错的那条排在最上面。 */
+  list.map(p => `响应字段缺失: ${p}`).reverse().forEach(diagPush);
   renderDiag();
   toast(`响应字段缺失: ${list.join('、')}${more} — 前端按冻结契约解析 /api/jobs/{id}/result，不做别名兼容`, 'err', 'alert');
 }
@@ -1054,6 +1162,7 @@ function setImage(file){
   if(!file || state.uploading) return false;
   if(jobActive()){ toast('当前任务进行中，请等待完成后再更换图像', 'err', 'info'); return false; }
   if(state.image) URL.revokeObjectURL(state.image.url);       /* 替换即释放 */
+  clearJob();
   clearResult(false);
   const url = URL.createObjectURL(file);
   state.image = { file, url, w:0, h:0 };
@@ -1078,9 +1187,48 @@ function setImage(file){
   drop.classList.add('has-image');
   return true;
 }
+/* ================= 任务生命周期：beginJob / endJob 是**仅有的**两个所有者 =================
+   报告者看到的症状（上传后左栏一直转、右栏永远没有结果）的根因就在这里：
+   旧实现的 submitImage 先 `state.job = {...}`，紧接着调用 `clearResult(false)`，而
+   clearResult 里有一句 `state.job = null` —— 刚被 202 接受的任务在下一行就被上一次的
+   清场吃掉了。于是 renderJob() 看到"没有任务"（隐藏任务行）、scanOn() 点亮扫描动画、
+   startPolling() 的 tick() 在 `if(!j) return;` 直接返回：**页面一次 GET /api/jobs/{id}
+   都不会发出**，扫描动画因此永不停止，右栏永远是空状态。
+
+   设计上的修法不是调换两行的顺序（那只是掩盖"谁负责清场"的模糊），而是把两件事拆开：
+   - `clearResult()` 只重置**上一次的识别结果**；
+   - `clearJob()` 只重置**任务状态行**；
+   - `beginJob()` 是唯一的入队入口，`endJob()` 是唯一的终结入口，两者一起管住
+     `state.job` 与扫描动画。任何终结路径（成功、失败、取消、淘汰、契约失败、
+     HTTP 错误）都必须走 `endJob()`，因此"某条分支忘了关动画"不再可能出现。 */
+function clearJob(){
+  state.job = null;
+  scanOff();
+  renderJob();
+  renderButton();
+}
+function beginJob(submitted, queueFallback, poll){
+  state.job = {
+    id: submitted.job_id,
+    kind: submitted.kind || 'text',
+    /* 队列以服务端返回为准（公式任务进公式队列）；缺失时按本次请求的队列推断，仅用于展示 */
+    queue: submitted.queue || queueFallback || 'text',
+    state: submitted.state || 'queued', position: submitted.position, queued_ms:0, elapsed_ms:0
+  };
+  pollFails = 0;
+  renderJob(); renderButton(); scanOn();
+  /* `poll === false` 只用于离线预览：它自带进度，不轮询真实端点。 */
+  if(poll !== false) startPolling();
+}
+function endJob(message, type, icon){
+  scanOff();
+  state.job = null;
+  renderJob(); renderButton();
+  if(message) toast(message, type || 'err', icon);
+}
 function clearResult(resetList){
-  state.result = null; state.selected = -1; state.job = null;
-  scanOff(); renderJob(); drawOverlays();
+  state.result = null; state.selected = -1;
+  drawOverlays();
   ['copyAllBtn','expJson','expMd','expHtml'].forEach(id => $(id).disabled = true);
   $('annotatedBtn').hidden = true;
   if(resetList !== false){ renderRegions(); renderDiag(); }
@@ -1091,6 +1239,7 @@ function clearImage(){
   state.image = null;
   imgEl.onerror = null;
   imgEl.removeAttribute('src');
+  clearJob();
   clearResult();
   stage.style.width = '';                       /* 撤销缩放尺寸（CSSOM，标记里无 style 属性） */
   stage.style.height = '';
@@ -1238,6 +1387,11 @@ function intakePaste(f, from){
 /* Esc：关闭高亮与提示（§9.4）；+ / - / 0 缩放（文本框内、带修饰键时不劫持，保留浏览器快捷键） */
 document.addEventListener('keydown', e => {
   if(e.key === 'Escape'){ selectRegion(-1); dismissToasts(); return; }
+  /* 详细模式开关：Ctrl+Alt+L（等价的 URL 形式是 ?verbose=1 / ?verbose=0）。
+     放在最前面，因为它与是否有图像、是否在文本框里都无关。 */
+  if(e.ctrlKey && e.altKey && (e.key === 'l' || e.key === 'L')){
+    e.preventDefault(); setFlowVerbose(!state.verbose); return;
+  }
   if(!state.image || e.ctrlKey || e.metaKey || e.altKey || isTextField(e.target)) return;
   if(e.key === '+' || e.key === '='){ e.preventDefault(); zoomBy(ZOOM_STEP); }
   else if(e.key === '-' || e.key === '_'){ e.preventDefault(); zoomBy(1 / ZOOM_STEP); }
@@ -1824,78 +1978,124 @@ function submitImage(){
   if(DEMO) return demoUpload();
   state.uploading = true; showUp(true); setUpProgress(0); renderButton();
   drop.classList.add('no-click');
+  /* 队列类别就是管线选择（docs/05 §2.2 / §4.2）：**只有** `?queue=` 一个表达，
+     没有第二个开关。公式开关关闭时显式发 `queue=text`，因此"开关到底发了什么"
+     在流动日志里一眼可见，不靠默认值推断。 */
+  const queue = state.formula ? 'formula' : 'text';
   /* 正文仍是 application/octet-stream 原始图像字节（docs/05 §2.2）；
      公式路由与队列不在请求体里，因此这里不发送任何 JSON body。 */
-  xhrSend('POST', '/api/ocr', state.image.file, {
+  xhrSend('POST', '/api/ocr?queue=' + queue, state.image.file, {
     octet: true,
     onProgress: setUpProgress,
     getXhr: x => { state.xhr = x; }
   }).then(data => {
     state.xhr = null; state.uploading = false; showUp(false);
-    drop.classList.remove('no-click');
-    state.job = {
-      id: data.job_id, kind: data.kind || 'text',
-      /* 队列以服务端返回为准（公式任务进公式队列）；缺失时按当前开关推断，仅用于展示 */
-      queue: data.queue || (state.formula ? 'formula' : 'text'),
-      state: data.state || 'queued', position: data.position, queued_ms:0, elapsed_ms:0
-    };
-    clearResult(false);
-    toast('任务已提交（202）', 'ok');
-    renderJob(); renderButton(); scanOn();
-    startPolling();
+    drop.classList.remove('no-click'); renderButton();
+    /* 202 的响应体同样是冻结契约：没有 job_id 就无法轮询，必须**可见地**失败，
+       绝不允许进入"永远转圈"的状态。 */
+    if(!data || typeof data.job_id !== 'string' || data.job_id === ''){
+      state.result = null;
+      diagPush('响应字段缺失: job_id');
+      toast('响应字段缺失: job_id — 前端按冻结契约解析 POST /api/ocr（202 {job_id,queue,position,state}）', 'err', 'alert');
+      endJob();
+      return;
+    }
+    clearResult(false);                    /* 只清上一次的结果：刚建好的任务不受影响 */
+    toast('任务已提交（202）· ' + zhQueue(data.queue || queue) + '队列', 'ok');
+    beginJob(data, queue);
   }).catch(e => {
     state.xhr = null; state.uploading = false; showUp(false);
-    drop.classList.remove('no-click'); renderButton();
-    toastErr(e);
+    drop.classList.remove('no-click');
+    /* 提交失败也走统一的终结路径：扫描动画是全局状态，任何返回路径都必须清掉它。 */
+    endJob(failText('提交失败', e), 'err');
   });
 }
 
 /* ================= 任务轮询（GET /api/jobs/{id}，§4.2/§9.1） ================= */
 let pollTimer = null;
+/* 连续失败上限：瞬时错误（网络抖动 / 500）照旧退避重试，但**有限**次。
+   旧实现对 404/410 之外的任何错误都无限退避重试，于是一个永久 401 就能让扫描动画
+   转到天荒地老——那正是"不要用超时掩盖问题"要避免的另一面：必须有**终点**。
+   上限取 8 次、退避从 480 ms 翻倍到 4 s（约 23 s 的重试窗口）：真正的瞬时抖动会自愈，
+   而一个不会自愈的错误会在 ~23 s 内变成一条**点名原因**的可见错误。 */
+let pollFails = 0;
+const POLL_FAIL_LIMIT = 8;
+function pollBackoff(){
+  return Math.min(4000, 480 * Math.pow(2, Math.max(0, pollFails - 1)));
+}
 function startPolling(){
   clearTimeout(pollTimer);
   const tick = async () => {
     const j = state.job;
     if(!j) return;
+    let d;
     try{
-      const d = await apiJson('GET', '/api/jobs/' + j.id);
-      Object.assign(j, d);
-      renderJob();
-      if(j.state === 'queued' || j.state === 'running'){
-        pollTimer = setTimeout(tick, document.hidden ? 1600 : 480);
-      } else if(j.state === 'succeeded'){
-        await fetchResult();
-      } else {
-        onJobEnd();
-      }
+      d = await apiJson('GET', '/api/jobs/' + j.id);
     }catch(e){
+      /* 每次 catch 都必然终结或重试；终结一律经 endJob()，动画不可能留下。 */
       if(e.status === 410 || e.status === 404){
-        toast(e.status === 410 ? '结果已被淘汰，请重新识别' : '任务不存在', 'err');
-        state.job = null; renderJob(); renderButton();
-      } else {
-        pollTimer = setTimeout(tick, 1600);   /* 瞬时错误：退避重试 */
+        diagPush(`任务终结: ${e.status === 410 ? '结果已被淘汰' : '任务不存在'}（HTTP ${e.status}${e.code ? ' ' + e.code : ''}）`);
+        endJob(failText(e.status === 410 ? '结果已被淘汰，请重新识别' : '任务不存在', e), 'err');
+        return;
       }
+      if(e.status === 401 || e.status === 403 || e.status === 400 || e.status === 409){
+        /* 鉴权/契约类：重试不会变好，立刻如实报错。 */
+        diagPush(`轮询被拒绝: ${failText('', e).replace(/^：/, '')}`);
+        endJob(failText('轮询被拒绝', e), 'err');
+        return;
+      }
+      pollFails += 1;
+      if(pollFails >= POLL_FAIL_LIMIT){
+        diagPush(`轮询连续失败 ${pollFails} 次: ${failText('', e).replace(/^：/, '')}`);
+        endJob(failText(`轮询连续失败 ${pollFails} 次，已停止`, e), 'err');
+        return;
+      }
+      /* 瞬时错误：指数退避重试（后台标签页里不加快节奏）。 */
+      pollTimer = setTimeout(tick, document.hidden ? 1600 : pollBackoff());
+      return;
+    }
+    pollFails = 0;
+    Object.assign(j, d);
+    renderJob();
+    if(j.state === 'queued' || j.state === 'running'){
+      pollTimer = setTimeout(tick, document.hidden ? 1600 : 480);
+    } else if(j.state === 'succeeded'){
+      await fetchResult();
+    } else {
+      onJobEnd();
     }
   };
   tick();
 }
 async function fetchResult(){
   const j = state.job;
+  if(!j) return;
+  let r;
   try{
-    const r = await apiJson('GET', '/api/jobs/' + j.id + '/result');
-    state.result = normalizeResult(r);
-    scanOff(); finishJob();
+    r = await apiJson('GET', '/api/jobs/' + j.id + '/result');
   }catch(e){
-    if(e.code === 'job_not_finished'){ pollTimer = setTimeout(startPolling, 480); }
-    else toastErr(e);
+    if(e.code === 'job_not_finished'){ pollTimer = setTimeout(startPolling, 480); return; }
+    /* 其它任何错误（404/410/413/422/503/…）都是终态：**必须**清场并给出具体原因。 */
+    diagPush(`结果获取失败: ${failText('', e).replace(/^：/, '')}`);
+    endJob(failText('结果获取失败', e), 'err');
+    return;
   }
+  const parsed = normalizeResult(r);
+  if(!parsed){
+    /* 契约失败：normalizeResult 已经 toast + 记诊断（逐字段点名路径）。
+       这里同样要清场——旧实现在这条路上会留下永不停止的扫描动画。 */
+    endJob('响应不符合冻结契约，结果未渲染（诊断面板已点名具体字段路径）', 'err');
+    return;
+  }
+  state.result = parsed;
+  scanOff();                     /* finishJob 之前先熄动画：finishJob 抛错也不会留下动画 */
+  finishJob();
 }
 function onJobEnd(){
   const j = state.job;
-  scanOff();
-  if(j && j.state === 'failed') toast('识别失败：' + (j.error || '未知错误'), 'err');
-  else if(j && j.state === 'cancelled') toast('任务已取消', 'err', 'info');
-  state.job = null; renderJob(); renderButton();
+  if(j && j.state === 'failed') endJob('识别失败：' + (j.error || '未知错误'), 'err');
+  else if(j && j.state === 'cancelled') endJob('任务已取消', 'err', 'info');
+  else endJob();
 }
 function finishJob(){
   renderJob(); renderRegions(); renderDiag(); renderMeta(); renderButton();
@@ -1935,7 +2135,8 @@ function renderJob(){
   const j = state.job;
   if(!j) return;
   if(DEMO){
-    if(j.state === 'queued'){ j.state = 'cancelled'; onJobEnd(); toast('任务已取消', 'err', 'info'); }
+    /* 演示模式没有服务端可问：把状态改成终态后走**同一个**终结路径（onJobEnd → endJob）。 */
+    if(j.state === 'queued'){ j.state = 'cancelled'; onJobEnd(); }
     else toast('推理进行中，当前版本不支持中断', 'err');
     return;
   }
@@ -1943,7 +2144,9 @@ function renderJob(){
     await apiJson('POST', '/api/jobs/' + j.id + '/cancel');
     toast('已请求取消', 'ok');
   }catch(e){
-    toastErr(e);                                 /* 409 not_cancellable / job_finished 如实提示 */
+    /* 409 not_cancellable / job_finished 如实提示；两条路径都不动扫描动画——
+       任务仍在跑（或已经在跑），动画本来就该继续，终结由轮询看到终态时统一清场。 */
+    toastErr(e);
     if(e.code === 'not_cancellable') $('cancelJobBtn').disabled = true;
   }
 });
@@ -2076,6 +2279,15 @@ function renderEvaluation(rep){
  $('evalBtn').addEventListener('click', runEvaluation);
  $('evalPath').addEventListener('keydown', e => { if(e.key === 'Enter') runEvaluation(); });
 
+/* 详细模式开关（诊断面板里的复选框）。`renderDiag` 每次重写 innerHTML，
+   因此用事件委托而不是逐个绑定（页面其余列表用的是同一手法）。 */
+ $('diagBody').addEventListener('change', e => {
+  if(e.target && e.target.id === 'flowToggle') setFlowVerbose(!!e.target.checked, true);
+});
+ $('diagBody').addEventListener('click', e => {
+  if(e.target && e.target.id === 'flowToggle') e.stopPropagation();   /* 不要把 <details> 收起 */
+});
+
 /* ================= 渲染：诊断面板（复用 timings / 指纹，不重新测量，§7.5/§10.6） ================= */
 /* 诊断面板顶部永远先渲染契约错误：字段缺失/改名在这里留痕，
    与 toast 一起构成"可见 + 可查"的两条路径（P2-2）。
@@ -2090,8 +2302,11 @@ function diagContractHtml(){
 function renderDiag(){
   const d = $('diagBody');
   const head = diagContractHtml();
+  /* "最近请求"永远排在最前：报告者要的是"什么都没渲染时不用打开 devtools"，
+     而诊断面板本来就是唯一常驻的可查处（§9.2）。 */
+  const flow = flowHtml();
   if(!state.result){
-    d.innerHTML = head + '<p class="diag-line">识别完成后，此处展示逐阶段耗时（时间账本）与运行时指纹。</p>';
+    d.innerHTML = head + flow + '<p class="diag-line">识别完成后，此处展示逐阶段耗时（时间账本）与运行时指纹。</p>';
     return;
   }
   const t = state.result.timings;
@@ -2100,7 +2315,7 @@ function renderDiag(){
     : rows.reduce((a, [, v]) => a + v, 0));
   const s = state.status || emptyStatus();
   const fp = s.fingerprint;
-  d.innerHTML = head +
+  d.innerHTML = head + flow +
     `<div class="diag-sec">逐阶段耗时（MS）</div>
      <table class="diag-table">${rows.map(([k, v]) =>
         `<tr><td>${esc(k)}</td><td>${v.toFixed(1)}</td></tr>`).join('')}
@@ -2304,10 +2519,11 @@ async function demoUpload(){
   if(demo.upAbort){ toast('已取消上传', 'err', 'info'); return; }
   await sleep(240);   /* 模拟 202 往返 */
   clearResult(false);
-  state.job = { id:'demo-' + Math.random().toString(36).slice(2, 8), kind:'text',
-                queue:'text', state:'queued', position:1, queued_ms:0, elapsed_ms:0 };
-  toast('任务已提交（202）', 'ok');
-  renderJob(); renderButton(); scanOn();
+  /* 离线预览走**同一条**任务生命周期（beginJob / 取消 → endJob），
+     因此"动画归谁清"在演示模式与真实模式里是同一个答案。 */
+  toast('任务已提交（202）· 文本队列', 'ok');
+  beginJob({ job_id:'demo-' + Math.random().toString(36).slice(2, 8), kind:'text',
+             queue:'text', state:'queued', position:1 }, 'text', false);
   await sleep(850);
   if(!state.job || state.job.state !== 'queued') return;   /* 排队阶段被取消 */
   state.job.state = 'running'; renderJob();
@@ -2320,6 +2536,7 @@ async function demoUpload(){
   }
   state.job.state = 'succeeded';
   state.result = demoResult(state.image.w, state.image.h);
+  scanOff();
   finishJob();
 }
 /* 演示区域：按上传图实际尺寸的相对布局生成，保证叠框在任何图上都成立 */

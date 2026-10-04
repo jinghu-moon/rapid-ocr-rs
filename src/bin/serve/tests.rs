@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 use super::download::{DownloadJob, DownloadSink, DownloaderFactory, ModelDownloader};
 use super::engine::{BackendProvider, EngineFactory, OcrBackend};
 use super::evaluate::EvalRoot;
+use super::flowlog::FlowSink;
 use super::http::{BoundServer, ServeHandle};
 use super::limits::RawServeLimits;
 use super::model_plan::ModelPlan;
@@ -48,10 +49,10 @@ use super::server::{FreeSpaceFactory, ServeContext, ServeShared};
 use super::state::ServeStartup;
 use rapid_ocr_rs::{
     CoordinateSpace, DetectionOutcome, DownloadError, EngineConfig, EngineInfo, FileIdentity,
-    FormulaPolicy, GenericProviderPreference, ImageInfo, ImageSize, LangDet, LangRec,
-    ModelFileSpec, ModelType, OcrOutput, OcrRegion, OcrRequest, OcrTimings, OcrVersion, Polygon,
-    ProviderInfo, ProviderResolutionInfo, RapidOcrError, RecognitionOutcome, RegionSource,
-    ResolvedProvider, StageReports, sha256_file,
+    FormulaOutcome, FormulaPolicy, GenericProviderPreference, ImageInfo, ImageSize, LangDet,
+    LangRec, ModelFileSpec, ModelType, OcrOutput, OcrRegion, OcrRequest, OcrTimings, OcrVersion,
+    Polygon, ProviderInfo, ProviderResolutionInfo, RapidOcrError, RecognitionOutcome, RegionKind,
+    RegionSource, ResolvedProvider, StageReports, sha256_file,
 };
 use serde_json::{Value, json};
 
@@ -75,6 +76,9 @@ struct Scripted {
     /// 可选的闸门：识别在返回**之前**阻塞，直到测试放行（M4 的单飞测试用它把
     /// "评估正在跑"变成确定性事实，而不是靠 sleep 猜时序）。
     gate: Option<Arc<Gate>>,
+    /// 输出里附加的**公式**区域数（M5 的契约用例：`/result` 的 `formula.latex`
+    /// 只有真的有一条公式区域时才被这条端到端路径覆盖）。
+    formula_regions: usize,
 }
 
 impl Scripted {
@@ -90,7 +94,14 @@ impl Scripted {
             served: Arc::new(Mutex::new(Vec::new())),
             formulas: Arc::new(Mutex::new(Vec::new())),
             gate: None,
+            formula_regions: 0,
         }
+    }
+
+    /// 输出里附带 `count` 条公式区域（M5 的契约用例）。
+    fn with_formula_regions(mut self, count: usize) -> Self {
+        self.formula_regions = count;
+        self
     }
 
     fn slow(delay: Duration) -> Self {
@@ -155,7 +166,11 @@ impl OcrBackend for ScriptedBackend {
                 "scripted failure: the image cannot be decoded".to_string(),
             ));
         }
-        Ok(scripted_output(self.state.regions, self.state.text_bytes))
+        Ok(scripted_output_with(
+            self.state.regions,
+            self.state.text_bytes,
+            self.state.formula_regions,
+        ))
     }
 
     fn provider(&self) -> BackendProvider {
@@ -170,6 +185,18 @@ impl OcrBackend for ScriptedBackend {
 ///
 /// `pub(crate)`：`results.rs` 的单元测试也用它构造成功载荷（同一份样例，避免两处各写一套）。
 pub(crate) fn scripted_output(regions: usize, text_bytes: usize) -> OcrOutput {
+    scripted_output_with(regions, text_bytes, 0)
+}
+
+/// 同上，另外附带 `formula_regions` 条 [`RegionKind::Formula`] 区域（M5 的契约用例）。
+///
+/// 公式区域**不带** `recognition`（`src/api.rs` 的语义：公式模型没有可与 CTC 平行解释的
+/// 逐字置信度），页面因此只要求它有 `formula.latex`——这正是契约里最容易写错的一处。
+pub(crate) fn scripted_output_with(
+    regions: usize,
+    text_bytes: usize,
+    formula_regions: usize,
+) -> OcrOutput {
     let provider = ProviderResolutionInfo {
         requested: GenericProviderPreference::Cpu,
         selected_ep: ResolvedProvider::Cpu,
@@ -198,6 +225,26 @@ pub(crate) fn scripted_output(regions: usize, text_bytes: usize) -> OcrOutput {
                 }),
             )
         })
+        .chain((0..formula_regions).map(|index| OcrRegion {
+            source: RegionSource::Detected {
+                detector_index: regions + index,
+            },
+            kind: RegionKind::Formula,
+            polygon: Some(Polygon {
+                points: [[2.0, 2.0], [20.0, 2.0], [20.0, 9.0], [2.0, 9.0]],
+            }),
+            detection: Some(DetectionOutcome { score: 0.88 }),
+            classification: None,
+            // 公式区域刻意**不带** `recognition`：这正是契约里"公式区域没有 CTC 文本"的语义。
+            recognition: None,
+            formula: Some(FormulaOutcome {
+                latex: format!("E = mc^{{{index}}}"),
+                eos_index: Some(3),
+                truncated: false,
+                model_id: "scripted-formula".to_string(),
+                token_ids: None,
+            }),
+        }))
         .collect();
     OcrOutput {
         schema_version: 1,
@@ -254,6 +301,11 @@ struct TestOptions {
     /// 有了它，测试可以在"第一个调用已经写完校验结论、但还没有回响应"的**精确窗口**里
     /// 发第二个请求。
     post_verify: Option<Box<dyn Fn() + Send + Sync>>,
+    /// 流动日志出口（M5）：默认 `FlowSink::Off`（与生产的默认一致）。
+    ///
+    /// 需要断言的用例用 [`TestOptions::with_flow_capture`] 换成内存捕获——**同一个**出口
+    /// 类型、**同一份**格式化实现，因此测试断言的就是生产会打印的那些行。
+    flow: FlowSink,
 }
 
 impl TestOptions {
@@ -272,7 +324,17 @@ impl TestOptions {
             model_dir,
             engine_config: test_engine_config(),
             post_verify: None,
+            flow: FlowSink::Off,
         }
+    }
+
+    /// 把流动日志收进内存（M5）：返回 `(options, lines)`，`lines` 是逐行可见的记录。
+    fn with_flow_capture(mut self) -> (Self, Arc<Mutex<Vec<String>>>) {
+        let FlowSink::Capture(lines) = FlowSink::capture() else {
+            unreachable!("FlowSink::capture always yields a Capture sink");
+        };
+        self.flow = FlowSink::Capture(Arc::clone(&lines));
+        (self, lines)
     }
 
     /// 打开公式路由（M4）：给出 `--formula-detector` 的路径，公式队列因此可达。
@@ -371,6 +433,7 @@ impl TestServer {
             // §7.5：`ServeStartup::validate` 用的是同一个开关，运行期切换 provider 也用它。
             allow_provider_fallback: options.allow_provider_fallback,
             eval_root: options.eval_root,
+            flow: options.flow,
             engine_factory: options.engine_factory,
             downloader: options.downloader,
             free_space: options.free_space,
@@ -389,6 +452,11 @@ impl TestServer {
 
     fn shared(&self) -> Arc<ServeShared> {
         Arc::clone(self.handle.as_ref().expect("running").shared())
+    }
+
+    /// 捕获到的流动日志行（`FlowSink::Off` 时为空；`with_flow_capture` 才有内容）。
+    fn flow_lines(&self) -> Vec<String> {
+        self.shared().flow().lines()
     }
 
     /// 一次 GET（默认带 token 与 Host）。
@@ -5832,4 +5900,469 @@ fn real_default_table_download_lands_and_verifies(
         .filter(|name| name.contains(".part-"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+// ============================================================ M5：流动日志与契约钉住
+//
+// 本轮的根因（报告者看到的"上传后一直转圈、右栏永远没有结果"）在**页面**一侧，
+// 但让它被发现的证据来自两侧可对照的记录。下面两组用例分别是：
+//
+// 1. 流动日志：一次上传的请求行与任务行必须能被**同一个请求 id**串起来，且默认关闭；
+// 2. 契约钉住：`/result` 的字段与嵌套必须与**页面真正读取的那些路径**逐条一致——
+//    任何一侧改名都要在这里失败，而不是在用户的浏览器里变成一个永远转圈的动画。
+
+/// 从捕获的行里挑出含有给定片段的行。
+fn flow_lines_with(lines: &[String], needle: &str) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|line| line.contains(needle))
+        .cloned()
+        .collect()
+}
+
+/// 从一个 `key=value` 形式的流动日志行里取出 `key` 的值（token 以空格分隔）。
+fn flow_field(line: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    line.split(' ')
+        .find_map(|token| token.strip_prefix(&prefix).map(str::to_string))
+}
+
+/// **默认关闭**：没有人要求日志时，一行都不产生。
+///
+/// 这条同时是"代价"的证据：`FlowSink::Off` 下所有记录函数在第一次判断就返回，
+/// 不格式化、不分配、不写 stderr。
+#[test]
+fn the_flow_log_is_silent_until_it_is_asked_for() {
+    let server = TestServer::start(TestOptions::new(
+        complete_model_dir("flow-off"),
+        Scripted::fast(),
+    ));
+    let accepted = server.submit_ocr(b"image bytes").json();
+    let id = accepted["job_id"].as_str().expect("job id").to_string();
+    server.wait_terminal(&id, Duration::from_secs(20));
+    let _ = server.get(&format!("/api/jobs/{id}/result"));
+    assert!(
+        server.flow_lines().is_empty(),
+        "flow logging must be off unless --log-level/RAPID_OCR_SERVE_LOG asks for it: {:#?}",
+        server.flow_lines()
+    );
+}
+
+/// 一次上传可以按请求 id 从头追到尾：请求行、准入行、running 行、终态行共享同一个 id。
+#[test]
+fn one_upload_is_followable_end_to_end_by_its_request_id() {
+    let (options, lines) =
+        TestOptions::new(complete_model_dir("flow-on"), Scripted::fast()).with_flow_capture();
+    let server = TestServer::start(options);
+
+    let response = server.submit_ocr(b"image bytes");
+    assert_eq!(response.status, 202, "{}", response.text());
+    let accepted = response.json();
+    let id = accepted["job_id"].as_str().expect("job id").to_string();
+    let view = server.wait_terminal(&id, Duration::from_secs(20));
+    assert_eq!(view["state"], "succeeded", "{view}");
+    let result = server.get(&format!("/api/jobs/{id}/result"));
+    assert_eq!(result.status, 200, "{}", result.text());
+    let result_bytes = result.body.len();
+
+    let captured = lines.lock().expect("flow lines").clone();
+    assert!(
+        !captured.is_empty(),
+        "flow logging was asked for but wrote nothing"
+    );
+
+    // 请求行：方法、路径、状态码、响应字节数、耗时、请求 id 一个都不少。
+    let request_lines = flow_lines_with(&captured, "POST /api/ocr -> 202");
+    assert_eq!(request_lines.len(), 1, "{captured:#?}");
+    let request_line = &request_lines[0];
+    for field in ["req=", "> 202", "bytes=", "in ", "ms"] {
+        assert!(
+            request_line.contains(field),
+            "the request line must carry {field}: {request_line}"
+        );
+    }
+    let request_id = flow_field(request_line, "req").expect("a request id");
+
+    // 任务行：准入结论 + 入队位置、running、终态，全部是**同一个**请求 id。
+    let admitted = flow_lines_with(&captured, "admission=accepted");
+    assert_eq!(admitted.len(), 1, "{captured:#?}");
+    assert!(
+        admitted[0].contains(&format!("req={request_id}"))
+            && admitted[0].contains(&format!("job={id}"))
+            && admitted[0].contains("queue=text")
+            && admitted[0].contains("decision=run")
+            && admitted[0].contains("queued position="),
+        "the admission line must name the request, the job, the queue, the reason and the \
+         position: {}",
+        admitted[0]
+    );
+    let running = flow_lines_with(&captured, "running wait_ms=");
+    assert_eq!(running.len(), 1, "{captured:#?}");
+    assert!(
+        running[0].contains(&format!("req={request_id}"))
+            && running[0].contains(&format!("job={id}")),
+        "{}",
+        running[0]
+    );
+    let terminal = flow_lines_with(&captured, "terminal state=succeeded");
+    assert_eq!(terminal.len(), 1, "{captured:#?}");
+    assert!(
+        terminal[0].contains(&format!("req={request_id}"))
+            && terminal[0].contains(&format!("job={id}"))
+            && terminal[0].contains(&format!("result_bytes={result_bytes}"))
+            && terminal[0].contains("backend_ms="),
+        "the terminal line must carry the request id, the job, the **measured** result size \
+         ({result_bytes}) and the backend duration: {}",
+        terminal[0]
+    );
+
+    // 这次上传的**全部**记录行就是四条，且都带同一个请求 id：请求行 + 准入 + running + 终态。
+    // 多一条少一条都说明"一次上传"的轨迹里混进了别的东西。
+    assert_eq!(
+        flow_lines_with(&captured, &format!("req={request_id} ")).len(),
+        4,
+        "{captured:#?}"
+    );
+}
+
+/// 被拒绝的上传**没有**任务，唯一能把它与"用户看到的失败"对上的就是请求 id + 原因。
+///
+/// 这条同时钉住"准入结论必须带原因"：`409 models_missing` 的 `code` 与 `detail` 直接来自
+/// 用户实际收到的响应体（同一个 `ServeError`），不是日志里另拼的一句话。
+#[test]
+fn a_rejected_upload_leaves_its_reason_in_the_flow_log() {
+    let (options, lines) =
+        TestOptions::new(empty_model_dir("flow-reject"), Scripted::fast()).with_flow_capture();
+    let server = TestServer::start(options);
+
+    let response = server.submit_ocr(b"image bytes");
+    assert_eq!(response.status, 409, "{}", response.text());
+    let body = response.json();
+    let code = body["code"].as_str().expect("a code");
+    assert_eq!(code, "models_missing", "{body}");
+
+    let captured = lines.lock().expect("flow lines").clone();
+    let rejected = flow_lines_with(&captured, "admission=rejected");
+    assert_eq!(rejected.len(), 1, "{captured:#?}");
+    assert!(
+        rejected[0].contains("status=409")
+            && rejected[0].contains(&format!("code={code}"))
+            && rejected[0].contains("detail="),
+        "a refusal must carry the status, the code and the detail: {}",
+        rejected[0]
+    );
+    // 拒绝的请求仍然有请求行（它就是"上传确实到了服务端"的证据）。
+    assert_eq!(flow_lines_with(&captured, "POST /api/ocr -> 409").len(), 1);
+    // 而且**没有**任何任务行：拒绝的上传没有变成任务。
+    assert!(
+        flow_lines_with(&captured, "terminal ").is_empty(),
+        "{captured:#?}"
+    );
+}
+
+/// 失败的识别任务：终态行必须带状态码 + `code` + `detail`（与 `/result` 重放的是同一份）。
+#[test]
+fn a_failed_job_carries_its_code_and_detail_in_the_flow_log() {
+    let (options, lines) = TestOptions::new(
+        complete_model_dir("flow-failed"),
+        Scripted {
+            fail: true,
+            ..Scripted::fast()
+        },
+    )
+    .with_flow_capture();
+    let server = TestServer::start(options);
+
+    let accepted = server.submit_ocr(b"broken").json();
+    let id = accepted["job_id"].as_str().expect("job id").to_string();
+    let view = server.wait_terminal(&id, Duration::from_secs(20));
+    assert_eq!(view["state"], "failed", "{view}");
+
+    let captured = lines.lock().expect("flow lines").clone();
+    let terminal = flow_lines_with(&captured, "terminal state=failed");
+    assert_eq!(terminal.len(), 1, "{captured:#?}");
+    assert!(
+        terminal[0].contains("status=")
+            && terminal[0].contains("code=")
+            && terminal[0].contains("detail="),
+        "a failed job's terminal line must carry status, code and detail: {}",
+        terminal[0]
+    );
+    // 与 `/api/jobs/{id}` 的分类同源：状态码与 code 逐字相同。
+    let status = view["failure"]["status"].as_u64().expect("a status");
+    let code = view["failure"]["code"].as_str().expect("a code");
+    assert!(
+        terminal[0].contains(&format!("status={status}"))
+            && terminal[0].contains(&format!("code={code}")),
+        "the log and the job view must tell the same story: {} vs {view}",
+        terminal[0]
+    );
+}
+
+/// 页面解析器**真正读取**的 `/result` 路径（唯一的一处枚举）。
+///
+/// 这个清单不是"我们觉得 API 应该有什么"，而是**页面自己读的那些名字**：
+/// `src/bin/web/index.html` 的 `normalizeResult` / `parsePolygon` / `parseRecognition` /
+/// `parseFormula`。两侧任何一边改名，本组用例都会失败（见
+/// [`the_page_reads_exactly_the_pinned_result_paths`]，它直接在页面源码里断言这些访问表达式）。
+///
+/// 左列是字段路径，右列是页面里**必须逐字存在**的那段代码。
+const PAGE_RESULT_CONTRACT: [(&str, &str); 11] = [
+    ("regions", "Array.isArray(r.regions)"),
+    ("kind", "pget(x, 'kind')"),
+    ("polygon.points", "pget(r.polygon, 'points')"),
+    (
+        "polygon.points 恰好四点",
+        "!Array.isArray(pts) || pts.length !== 4",
+    ),
+    (
+        "polygon.points[k] 恰好两个数",
+        "!Array.isArray(p) || p.length !== 2",
+    ),
+    ("recognition", "const rec = r && r.recognition;"),
+    ("recognition.text", "pget(rec, 'text')"),
+    ("recognition.score", "pget(rec, 'score')"),
+    ("formula.latex", "pget(f, 'latex')"),
+    ("plain_text", "r.plain_text"),
+    ("timing_ledger", "r.timing_ledger"),
+];
+
+/// 断言一份 `/result` 响应体满足页面契约；返回区域数。
+///
+/// 这里检查的是**嵌套形状**，与页面逐字相同：`polygon.points` 恰好四点、每点恰好两个
+/// 有限数；文本区域必须有 `recognition.text`（字符串）与 `recognition.score`（数字）；
+/// 公式区域必须有 `formula.latex`（字符串）且**不要求** `recognition`
+/// （`RegionKind::Formula` 的语义就是"不携带 CTC 文本结果"）。
+fn assert_result_satisfies_page_contract(value: &Value) -> usize {
+    let regions = value["regions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the page reads `regions` as an array: {value}"));
+    for (index, region) in regions.iter().enumerate() {
+        let kind = region["kind"].as_str().unwrap_or_else(|| {
+            panic!("regions[{index}].kind must be a string (`text` | `formula`): {region}")
+        });
+        assert!(
+            matches!(kind, "text" | "formula"),
+            "regions[{index}].kind must be `text` or `formula`, got {kind}"
+        );
+        let points = region["polygon"]["points"].as_array().unwrap_or_else(|| {
+            panic!("regions[{index}].polygon.points must be an array (exactly four pairs)")
+        });
+        assert_eq!(
+            points.len(),
+            4,
+            "regions[{index}].polygon.points must be exactly four points, got {}",
+            points.len()
+        );
+        for (corner, point) in points.iter().enumerate() {
+            let pair = point.as_array().unwrap_or_else(|| {
+                panic!("regions[{index}].polygon.points[{corner}] must be a pair: {point}")
+            });
+            assert_eq!(
+                pair.len(),
+                2,
+                "regions[{index}].polygon.points[{corner}] must be [x, y]"
+            );
+            for (axis, raw) in pair.iter().enumerate() {
+                assert!(
+                    raw.as_f64().is_some_and(f64::is_finite),
+                    "regions[{index}].polygon.points[{corner}][{axis}] must be a finite number, \
+                     got {raw}"
+                );
+            }
+        }
+        if kind == "text" {
+            assert!(
+                region["recognition"]["text"].is_string(),
+                "regions[{index}].recognition.text must be a string for a text region: {region}"
+            );
+            assert!(
+                region["recognition"]["score"]
+                    .as_f64()
+                    .is_some_and(f64::is_finite),
+                "regions[{index}].recognition.score must be a finite number: {region}"
+            );
+        } else {
+            assert!(
+                region["formula"]["latex"].is_string(),
+                "regions[{index}].formula.latex must be a string for a formula region: {region}"
+            );
+        }
+    }
+    assert!(
+        value["plain_text"].is_string(),
+        "the page's copy-all reads `plain_text` as a string: {value}"
+    );
+    assert!(
+        value["timings"].is_object(),
+        "the page's timing table reads `timings` as an object"
+    );
+    assert!(
+        value["timing_ledger"].is_object(),
+        "the page's ledger section reads `timing_ledger` as an object"
+    );
+    regions.len()
+}
+
+/// **契约钉住（服务端一侧）**：真实端点产出的 `/result` 必须满足页面读取的每一个路径。
+///
+/// 走过的是完整链路：脚本化后端产出一份含**文本 + 公式**区域的 `OcrOutput` →
+/// worker 用 [`super::export::result_json`] + 有界序列化 → `GET /api/jobs/{id}/result`。
+#[test]
+fn the_served_result_carries_every_path_the_page_reads() {
+    let server = TestServer::start(TestOptions::new(
+        complete_model_dir("contract-result"),
+        Scripted::fast().with_formula_regions(1),
+    ));
+    let accepted = server.submit_ocr(b"image bytes").json();
+    let id = accepted["job_id"].as_str().expect("job id").to_string();
+    assert_eq!(
+        server.wait_terminal(&id, Duration::from_secs(20))["state"],
+        "succeeded"
+    );
+    let result = server.get(&format!("/api/jobs/{id}/result"));
+    assert_eq!(result.status, 200, "{}", result.text());
+    let value = result.json();
+    let regions = assert_result_satisfies_page_contract(&value);
+    assert_eq!(
+        regions, 4,
+        "three text regions + one formula region: {value}"
+    );
+    // 公式区域确实走了真实序列化路径（不是测试自己拼的 JSON）。
+    assert!(
+        value["regions"]
+            .as_array()
+            .expect("regions")
+            .iter()
+            .any(|region| region["kind"] == "formula" && region["formula"]["latex"] == "E = mc^{0}"),
+        "{value}"
+    );
+}
+
+/// **契约钉住（页面一侧）**：页面读的就是上面清单里的那些名字。
+///
+/// 这一条与上一条合起来才是"两侧都钉住"：上一条保证服务端改名会失败，这一条保证页面
+/// 改读别的名字（或退回别名兼容）也会失败。
+#[test]
+fn the_page_reads_exactly_the_pinned_result_paths() {
+    let page = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/bin/web/index.html"),
+    )
+    .expect("the inlined page must be readable");
+
+    // 页面读的字段名（`pget(r, '...')` / 直接属性）。逐条来自 PAGE_RESULT_CONTRACT，
+    // 因此"契约清单"与"页面源码里真的存在这些访问"是同一个证据的两面。
+    for (path, accessor) in PAGE_RESULT_CONTRACT {
+        assert!(
+            page.contains(accessor),
+            "the page must keep reading `{path}` as `{accessor}`: the result contract is pinned \
+             to these exact names (rename it here **and** in src/api.rs, never add an alias)"
+        );
+    }
+    // `plain_text`（复制全文）与 `timings`（逐阶段耗时表）同样在页面里。
+    assert!(
+        page.contains("typeof r.plain_text === 'string'"),
+        "the page's copy-all must keep reading `plain_text`"
+    );
+    assert!(
+        page.contains("state.result.timings"),
+        "the page's timing table must keep reading `timings`"
+    );
+    // 冻结契约：页面上不允许再出现别名兼容分支（历史轮次删掉的那些名字）。
+    for alias in [
+        "r.boxes",
+        "r.items",
+        "region.text",
+        "polygon.box",
+        "polygon.coords",
+    ] {
+        assert!(
+            !page.contains(alias),
+            "the page must not re-introduce the alias `{alias}`: a rename has to fail visibly"
+        );
+    }
+    // 队列契约（docs/05 §2.2）：**只有** `?queue=` 一个表达。
+    assert!(
+        page.contains("'/api/ocr?queue=' + queue"),
+        "the page must express the pipeline choice as `?queue=` on POST /api/ocr"
+    );
+    assert!(
+        !page.contains("'/api/ocr',"),
+        "the page must not post to /api/ocr without the documented queue parameter"
+    );
+}
+
+/// **契约钉住（真实字节）**：报告者那次真实运行捕获的 `/result` 体（42 个区域）也满足同一份契约。
+///
+/// 夹具的字节被 SHA-256 钉住：它一旦被改动（哪怕是格式化），这条用例就会失败——
+/// "真实捕获的响应体"因此不能被悄悄换成一份手写的样例。
+#[test]
+fn the_captured_real_result_body_still_satisfies_the_page_contract() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/serve/result-real-42-regions.json");
+    let bytes = std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "the captured real result body must exist at {}: {error}",
+            path.display()
+        )
+    });
+    assert_eq!(
+        rapid_ocr_rs::sha256_file(&path).expect("hash the captured body"),
+        "fda2f71337aa8b03f147d5fb4b0065981fe0444703c30dfb74573439f691fd27",
+        "the captured body must be exactly the bytes the reporter's server returned"
+    );
+    let value: Value = serde_json::from_slice(&bytes).expect("the captured body is JSON");
+    let regions = assert_result_satisfies_page_contract(&value);
+    assert_eq!(regions, 42, "the captured response carried 42 regions");
+    // 顶层字段名也在契约里（页面读 `plain_text`；`export::result_json` 是唯一生产者）。
+    for key in [
+        "schema_version",
+        "image",
+        "stages",
+        "regions",
+        "timings",
+        "engine",
+        "plain_text",
+        "timing_ledger",
+    ] {
+        assert!(
+            value.get(key).is_some(),
+            "the captured body must still carry `{key}`: {}",
+            value
+                .as_object()
+                .map(|map| map.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+                .join(", ")
+        );
+    }
+}
+
+/// 页面的**提交契约**：`POST /api/ocr?queue=<text|formula>` 是唯一的队列表达（docs/05 §2.2）。
+///
+/// 这条同时钉住服务端一侧：`?queue=text` 是 202；公式路由没启用时 `?queue=formula` 是 400
+/// （**不降级成文本**）。页面的公式开关只有在 `/api/models` 说公式管线可用时才会打开，
+/// 因此它发出去的 `queue=formula` 一定落在 202 那一支。
+#[test]
+fn the_queue_is_expressed_as_the_documented_query_parameter() {
+    let server = TestServer::start(TestOptions::new(
+        complete_model_dir("contract-queue"),
+        Scripted::fast(),
+    ));
+    let text = server.post(
+        "/api/ocr?queue=text",
+        &[("Content-Type", "application/octet-stream")],
+        b"image bytes",
+    );
+    assert_eq!(text.status, 202, "{}", text.text());
+    let id = text.json()["job_id"].as_str().expect("job id").to_string();
+    server.wait_terminal(&id, Duration::from_secs(20));
+
+    // 公式路由未启用：不降级、不静默按文本跑。
+    let formula = server.post(
+        "/api/ocr?queue=formula",
+        &[("Content-Type", "application/octet-stream")],
+        b"image bytes",
+    );
+    assert_eq!(formula.status, 400, "{}", formula.text());
+    assert_eq!(formula.code(), "bad_request");
 }

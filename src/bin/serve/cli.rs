@@ -169,6 +169,17 @@ pub struct ServeArgs {
     /// 不是默认表里的每一个文件。
     #[arg(long = "reverify-models")]
     pub reverify_models: bool,
+
+    /// 流动日志级别：`off`（默认）或 `flow`。
+    ///
+    /// `flow` 时每个 HTTP 请求一行（方法、路径、状态码、响应字节数、耗时、请求 id），
+    /// 每个任务另有准入/排队/运行/终态四类行，行内带**同一个**请求 id——一次上传因此
+    /// 可以从请求行一路追到任务终态。失败的任务行带状态码 + `code` + `detail`。
+    ///
+    /// 环境变量 `RAPID_OCR_SERVE_LOG` 提供同一个开关；**CLI 优先**。默认 `off`：
+    /// 关闭时所有记录函数在第一次判断就返回，不做任何格式化。
+    #[arg(long = "log-level", value_name = "off|flow")]
+    pub log_level: Option<String>,
 }
 
 impl ServeArgs {
@@ -199,6 +210,16 @@ impl ServeArgs {
     /// CLI 的 `--allow-provider-fallback`（默认 `false`，§7.5）。
     pub fn allow_provider_fallback(&self) -> bool {
         self.allow_provider_fallback
+    }
+
+    /// 生效的流动日志级别：`--log-level` > `RAPID_OCR_SERVE_LOG` > `off`。
+    ///
+    /// 解析失败是**可定位的启动期错误**（不是静默降级到 `off`）：把级别名写错的用户
+    /// 会看到"期望 `off` 或 `flow`"，而不是"日志开关看起来没生效"。
+    pub fn log_level(&self) -> Result<super::flowlog::LogLevel, StartupConfigError> {
+        let env = std::env::var("RAPID_OCR_SERVE_LOG").ok();
+        super::flowlog::LogLevel::resolve(self.log_level.as_deref(), env.as_deref())
+            .map_err(StartupConfigError::LogLevel)
     }
 
     /// 生效的模型目录：CLI > 库默认。
@@ -248,7 +269,7 @@ mod tests {
     };
 
     /// §3 的完整选项名清单（**唯一**的一处枚举）。
-    const DOCUMENTED_OPTION_NAMES: [&str; 25] = [
+    const DOCUMENTED_OPTION_NAMES: [&str; 26] = [
         "port",
         "model-dir",
         "config",
@@ -277,6 +298,8 @@ mod tests {
         "eval-root",
         // A1：启动期冷验证这次运行会用到的模型文件，缺失/损坏即拒绝启动。
         "reverify-models",
+        // M5：流动日志级别（`off` 默认 / `flow`），与 `RAPID_OCR_SERVE_LOG` 同义、CLI 优先。
+        "log-level",
     ];
 
     /// 测试用的最小 `Parser` 包装。

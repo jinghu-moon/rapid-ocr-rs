@@ -284,6 +284,8 @@ pub struct JobRecord {
     pub cancel_requested: bool,
     /// 插入序号：同一时刻结束的任务用它做稳定排序。
     pub seq: u64,
+    /// 创建任务的 HTTP 请求的流动日志 id（M5，仅用于日志关联；不进 `/api/jobs/{id}`）。
+    pub request_id: u64,
 }
 
 impl JobRecord {
@@ -425,6 +427,11 @@ impl JobStore {
     }
 
     /// 建任务（`Queued`）。`original_bytes` 是要保留的编码图片字节数。
+    ///
+    /// `request_id` 是**创建这个任务的那个 HTTP 请求**的流动日志 id（M5）：它随任务记录
+    /// 一起存活，因此 worker 在 `running`/终态那两行里能写出同一个 id 的日志——
+    /// "一次上传"因此可以从请求行一路追到任务终态，而不需要把 id 穿进调度器。
+    /// 它**不进** `/api/jobs/{id}` 的响应（那是冻结契约，不因为日志需要一个内部字段而改变）。
     pub fn insert(
         &mut self,
         id: impl Into<String>,
@@ -432,6 +439,7 @@ impl JobStore {
         queue: JobQueue,
         original_bytes: u64,
         now: Millis,
+        request_id: u64,
     ) -> Result<(), ServeError> {
         let id = id.into();
         if self.jobs.contains_key(&id) {
@@ -456,6 +464,7 @@ impl JobStore {
             download: None,
             cancel_requested: false,
             seq,
+            request_id,
         };
         self.retained_bytes = self.retained_bytes.saturating_add(record.total_bytes());
         self.jobs.insert(id, record);
@@ -853,6 +862,12 @@ mod tests {
     };
     use crate::serve::error::ServeError;
 
+    /// 测试用的流动日志请求 id（M5）：任务记录里的关联字段。
+    ///
+    /// 这些用例考察的是存储语义而不是日志关联，因此统一用一个固定值；"请求 id 与任务真的
+    /// 对得上"的证据在 `serve::tests` 的端到端用例里（那里比对的是真实请求 id）。
+    const TEST_REQUEST_ID: u64 = 1;
+
     fn limits(
         max_retained: usize,
         bytes: u64,
@@ -868,7 +883,14 @@ mod tests {
 
     fn insert_ocr(store: &mut JobStore, id: &str, bytes: u64, now: Millis) {
         store
-            .insert(id, JobKind::Ocr, JobQueue::Text, bytes, now)
+            .insert(
+                id,
+                JobKind::Ocr,
+                JobQueue::Text,
+                bytes,
+                now,
+                TEST_REQUEST_ID,
+            )
             .expect("fresh ids");
     }
 
@@ -957,7 +979,7 @@ mod tests {
         // 重复插入同一 ID 也必须被拒绝。
         assert!(matches!(
             store
-                .insert("job-0", JobKind::Ocr, JobQueue::Text, 0, 1)
+                .insert("job-0", JobKind::Ocr, JobQueue::Text, 0, 1, TEST_REQUEST_ID)
                 .expect_err("duplicate id"),
             ServeError::Internal
         ));
@@ -1347,7 +1369,14 @@ mod tests {
     fn model_download_jobs_are_stored_with_their_own_kind_and_queue() {
         let mut store = store();
         store
-            .insert("dl-0", JobKind::ModelDownload, JobQueue::Download, 0, 0)
+            .insert(
+                "dl-0",
+                JobKind::ModelDownload,
+                JobQueue::Download,
+                0,
+                0,
+                TEST_REQUEST_ID,
+            )
             .expect("fresh id");
         store
             .set_download_progress("dl-0", DownloadProgress::planned(2, Some(300)))
@@ -1387,7 +1416,14 @@ mod tests {
     fn a_running_download_can_be_cancelled_at_a_file_boundary_but_ocr_cannot() {
         let mut downloads = store();
         downloads
-            .insert("dl-0", JobKind::ModelDownload, JobQueue::Download, 0, 0)
+            .insert(
+                "dl-0",
+                JobKind::ModelDownload,
+                JobQueue::Download,
+                0,
+                0,
+                TEST_REQUEST_ID,
+            )
             .expect("fresh id");
         downloads.start("dl-0", 1).expect("-> running");
         assert_eq!(
@@ -1413,7 +1449,14 @@ mod tests {
 
         // 没有取消请求就落地 = 伪造取消 → 内部错误。
         downloads
-            .insert("dl-1", JobKind::ModelDownload, JobQueue::Download, 0, 0)
+            .insert(
+                "dl-1",
+                JobKind::ModelDownload,
+                JobQueue::Download,
+                0,
+                0,
+                TEST_REQUEST_ID,
+            )
             .expect("fresh id");
         downloads.start("dl-1", 1).expect("-> running");
         assert!(matches!(
@@ -1429,7 +1472,14 @@ mod tests {
 
         // 排队中的下载取消之后，worker 的 `start` 必须失败（它会如实跳过，而不是改回排队）。
         downloads
-            .insert("dl-2", JobKind::ModelDownload, JobQueue::Download, 0, 0)
+            .insert(
+                "dl-2",
+                JobKind::ModelDownload,
+                JobQueue::Download,
+                0,
+                0,
+                TEST_REQUEST_ID,
+            )
             .expect("fresh id");
         assert_eq!(
             downloads.cancel("dl-2", 3).expect("queued cancel"),
@@ -1460,7 +1510,14 @@ mod tests {
     fn a_classified_failure_carries_its_code_and_detail() {
         let mut store = store();
         store
-            .insert("dl-0", JobKind::ModelDownload, JobQueue::Download, 0, 0)
+            .insert(
+                "dl-0",
+                JobKind::ModelDownload,
+                JobQueue::Download,
+                0,
+                0,
+                TEST_REQUEST_ID,
+            )
             .expect("fresh id");
         store.start("dl-0", 1).expect("-> running");
         store

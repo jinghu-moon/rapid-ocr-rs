@@ -5350,3 +5350,437 @@ done: total=100 scored=100 exact=0.2400 normalized=0.2500 mean_cer=0.0863 pipeli
    不持有它的用例不断言精确的 `cold_this_call`，因此不受影响；但这条依赖是**约定**，
    将来新增"精确计数"用例必须一并持有它。
 
+
+---
+
+## 流程轮（浏览器闭环）：上传后一直转圈的根因、流动日志与契约钉住
+
+本轮由报告者的**真实浏览器行为**驱动，而不是由 curl 驱动的既有 12 图门槛：
+
+```powershell
+.\target\release\rapidocr.exe serve --port 8760 `
+  --model-dir "D:\100_Projects\110_Daily\SnapClip\OCR-Model\small" `
+  --config    "D:\100_Projects\110_Daily\SnapClip\OCR-Model\test-config-small.yaml" `
+  --reverify-models --open
+```
+
+启动健康（BCryptGenRandom 熵、3 个文件 17 ms 冷验证、监听 127.0.0.1:8760、模型目录
+`<...>\OCR-Model\small` source `default_table`、文本管线齐备、公式不在本次运行里、
+provider cpu / selected_ep cpu / fallback false、`service state = Ready, engine state = ready`、
+浏览器已打开）。**症状**：上传一张图之后，左栏的扫描动画一直转，右栏永远没有结果。
+
+### 1. 先确认服务端没问题（把"引擎 / 任务流水线"从嫌疑名单里划掉）
+
+按**页面发请求的方式**（不带查询串、`application/octet-stream`、`X-RapidOCR-Token` +
+`Origin: http://127.0.0.1:8760`）驱动报告者**仍在运行的那个进程**：
+
+```text
+token=cb48aa2ebef941e70ae55731c987ba5b48e0abf5345e7ef1956bde56def8bfba   （从 GET / 里按页面的方式取出）
+POST /api/ocr -> 202 in 18.3 ms
+body: {"job_id":"job-0000000000000001","kind":"ocr","position":0,"queue":"text","state":"queued"}
+polls=6 terminal state=succeeded
+GET /result -> 200 content-type=application/json; charset=utf-8 bytes=35203
+```
+
+原始响应体的形状（**逐字段**核对，不看推测）：
+
+```text
+TOP KEYS: engine,formulas,image,items,plain_text,regions,schema_version,stages,text,timing_ledger,timings
+regions is Array: true len: 42
+first region keys: classification,detection,kind,polygon,recognition,source
+kind counts: {"text":42}
+regions without polygon: 0
+regions whose polygon.points is not exactly 4: 0
+text regions without recognition: 0
+regions with bad recognition.text/score: 0
+plain_text present: string      timings present: object      timing_ledger present: object
+```
+
+即**失败模式 (a)（响应形状被页面拒绝）不成立**：这份字节完全符合页面冻结契约里的每一个
+必需路径。原始体已存为夹具 `tests/fixtures/serve/result-real-42-regions.json`
+（35 203 字节，SHA-256 `fda2f71337aa8b03f147d5fb4b0065981fe0444703c30dfb74573439f691fd27`）。
+
+### 2. 真实浏览器点击闭环：稳定复现，并定位到**页面控制流**
+
+用 headless Chrome + CDP 打开**真实服务**上的**真实页面**，用
+`DOM.setFileInputFiles` 选一张 `OCR-test-image` 里的真图，再点"开始识别"——即报告者的动作。
+仪器是页面**自己**的 `XMLHttpRequest`（`Page.addScriptToEvaluateOnNewDocument` 包装
+`open`/`send`，记录方法 / URL / 状态 / 耗时 / 响应体），因此"页面到底发了什么"不是推断：
+
+```text
+=== 页面自己的 XHR 记录（修复前）===
+  GET  /api/status   -> 200
+  GET  /api/models   -> 200
+  POST /api/ocr      -> 202  6ms
+  GET  /api/status   -> 200          ← 8 秒一次的状态轮询
+  GET  /api/status   -> 200
+```
+
+**页面一次 `GET /api/jobs/{id}` 都没发。** 同一时刻的 DOM 状态（20 秒采样，每 500 ms 一次）：
+
+```text
+stage class: "stage scanning"     ← 扫描动画一直在转
+region items: 0                   ← 右栏永远空
+#jobLine hidden: true             ← 任务行从未出现
+toasts: ["任务已提交（202）"]      ← 202 收到了
+console exceptions: []            ← 没有任何异常
+network failures: []              ← 没有任何失败的请求
+```
+
+于是**失败模式 (b) 成立，但成因不是 HTTP 错误**：没有 401/403/409/413/415/422/503，
+也没有契约失败——**页面在收到 202 之后把任务丢了**，所以既没有轮询，也没有任何一条
+"终结路径"来关掉动画。服务端 meanwhile 把活干完了：报告者那个进程里被页面丢弃的任务
+（`job-0000000000000003`…`0000000000000006`，含浏览器那一次收到的
+`job-0000000000000006`）逐个查回来都是：
+
+```text
+job-0000000000000003 state=succeeded elapsed_ms=1277 /result=200 bytes=35221 regions=42
+job-0000000000000004 state=succeeded elapsed_ms=858  /result=200 bytes=35215 regions=42
+job-0000000000000005 state=succeeded elapsed_ms=1181 /result=200 bytes=35202 regions=42
+job-0000000000000006 state=succeeded elapsed_ms=885  /result=200 bytes=35201 regions=42
+```
+
+### 3. 根因：`state.job` 在装好之后**下一行**就被清掉了
+
+`src/bin/web/index.html` 的 `submitImage()` 成功分支（修复前）：
+
+```js
+state.job = { id: data.job_id, kind: data.kind || 'text', … };   // ① 装好刚被 202 接受的任务
+clearResult(false);                                             // ② 它里面有一句 state.job = null
+toast('任务已提交（202）', 'ok');
+renderJob(); renderButton(); scanOn();                          // ③ 看到"没有任务"：隐藏任务行
+startPolling();                                                 // ④ tick() 在 if(!j) return; 直接返回
+```
+
+而 `clearResult()`（第 1082 行）是：
+
+```js
+function clearResult(resetList){
+  state.result = null; state.selected = -1; state.job = null;   // ← 把①装好的任务清掉
+  scanOff(); renderJob(); drawOverlays();
+  …
+}
+```
+
+链条因此完全闭合，且与上面每一条观测一一对应：
+
+| 观测 | 由哪一行造成 |
+| --- | --- |
+| 页面一次 `GET /api/jobs/{id}` 都没发 | ④ `startPolling` 的 `tick()` 第一句 `if(!j) return;` |
+| `#jobLine` 隐藏 | ③ `renderJob()` 的第一句 `if(!j){ jl.hidden = true; return; }` |
+| `stage scanning` 一直在 | ③ 的 `scanOn()` 点亮，而 `scanOff()`（只在 `fetchResult`/`onJobEnd` 里）永远到不了 |
+| 右栏永远空 | `finishJob()` / `renderRegions()` 永远到不了 |
+| 没有任何异常 / 报错 toast | 代码路径本身"成功"了：它只是做了一件错的事 |
+
+**这是"职责边界"的错，不是"两行顺序写反"的错**：`clearResult()` 同时承担了两件事
+（清上一次的**结果** / 清上一次的**任务**），于是任何"刚装好一个新任务"的调用方都会被它
+吃掉。旁证：离线预览的 `demoUpload()` 里顺序是 `clearResult(false); state.job = {…}`——
+同一个函数、同一个意图，只因为顺序不同就正常工作。
+
+**顺带发现的第二个契约漂移（同一段代码）**：`docs/05` §2.2/§4.2 写着"页面的公式识别路由
+开关**只**通过 `?queue=formula` 表达"，"而页面本来就已经按开关发送 `queue=formula`"。
+实际上 `submitImage()` 发的是**不带查询串**的 `/api/ocr`：公式开关点开之后没有任何效果
+（服务端按 `queue=text` 跑文本管线）。修复后页面显式发送 `?queue=<text|formula>`，
+并由 `serve::tests::the_page_reads_exactly_the_pinned_result_paths` 钉住源码里这一句。
+
+### 4. 修复：把任务生命周期交给**唯一的**所有者，并让每条终结路径都清场
+
+**页面**（`src/bin/web/index.html`）：
+
+1. **拆职责**：`clearResult()` 只重置上一次的**结果**（不再碰 `state.job`）；
+   新增 `clearJob()` 只重置**任务状态行**；`setImage()`/`clearImage()` 显式调用两者。
+2. **两个所有者**：`beginJob(submitted, queueFallback, poll)` 是唯一的入队入口，
+   `endJob(message, type, icon)` 是唯一的终结入口——`scanOff()` + `state.job = null` +
+   `renderJob()` + `renderButton()` 只在 `endJob()` 里做一次。**每一条**终结路径都走它：
+   成功、失败、取消、淘汰（404/410）、鉴权/契约类拒绝（401/403/400/409）、
+   结果获取失败（413/422/503/…）、**契约失败**（`normalizeResult` 返回 null）、
+   `POST /api/ocr` 失败。
+3. **202 的响应体也校验**：`job_id` 不是非空字符串就**可见地**失败（toast + 诊断面板），
+   绝不进入"没有 job id 却在轮询"的状态。
+4. **瞬时错误有终点**：轮询失败从"无限退避重试"改成 8 次上限 + 指数退避（480 ms → 4 s，
+   约 23 s 窗口），到顶时给出**点名原因**的可见错误。这不是"用超时掩盖问题"：它把一个
+   原本永远不会出现的结论变成一条明确的消息，而 404/410/401/403/400/409 立即终结。
+5. **不再有"只有一个 toast"的失败**：终结与失败同时进诊断面板（`diagPush`），
+   因此"看得见"（toast）与"查得到"（诊断面板）两条路径都有。
+
+**页面侧的详细模式**（报告者要的"不打开 devtools 也能看见为什么什么都没渲染"）：
+`?verbose=1`（`?verbose=0` 关闭）或 **Ctrl+Alt+L** 切换，选择记在 `localStorage`；
+诊断面板顶部因此出现"最近请求"一节：方法、URL、HTTP 状态、耗时、错误码，**失败时附响应体原文**
+（截断 4 KB）。开关那个复选框**永远**在面板里（一个只有知道 URL 参数的人才能打开的开关不算可用）；
+关闭时这一节只在最近一次请求失败时出现。
+
+**修复后的同一条真实浏览器闭环**（`tools/run-page-flow-cdp.ps1`，同一个服务、同一张图，
+跑的是**最终** release 二进制）：
+
+```text
+=== 页面自己的 XHR 记录（修复后）===
+  GET  /api/status                     -> 200
+  GET  /api/models                     -> 200
+  POST /api/ocr?queue=text             -> 202
+  GET  /api/jobs/job-0000000000000000  -> 200
+  GET  /api/jobs/job-0000000000000000  -> 200
+  GET  /api/jobs/job-0000000000000000  -> 200
+  GET  /api/jobs/job-0000000000000000  -> 200
+  GET  /api/jobs/job-0000000000000000/result -> 200
+
+.stage class            -> stage        ← 动画已停
+rendered regions        -> 42           ← 右栏 42 个区域
+#jobLine hidden         -> false
+toasts                  -> ["任务已提交（202）· 文本队列", "识别完成 · 1.22 s"]
+console exceptions      -> []
+first region            -> "01 文本 VISUAL TEXT BENCHMARK"
+```
+
+**如实说明**：为了验证修复，我停掉了报告者那个仍在运行的 `rapidocr serve`（PID 50568，
+命令行与报告里的命令逐字相同）——它锁住了 `target\release\rapidocr.exe`，任何 release 构建
+都会失败（`os error 5`）。"修复前"的全部证据（页面自己的 XHR 记录、DOM 采样、原始 `/result`
+字节、被丢弃任务的回查结果）在停掉它之前已经落盘到 `target/flow-gate/`。之后的"修复后"
+验证用的是**同一条命令行**（只去掉 `--open`，避免自动弹出桌面浏览器与自动化打架）。
+
+### 5. 服务端流动日志（报告者明确要求的那一条）
+
+新增 `src/bin/serve/flowlog.rs`。开关：`--log-level <off|flow>`（默认 **off**）或环境变量
+`RAPID_OCR_SERVE_LOG`，**CLI 优先**。真实输出（`target/flow-gate/flow-demo-output.txt`）：
+
+```text
+unknown level: exit=1
+unknown level stderr: error: startup configuration rejected: --log-level / RAPID_OCR_SERVE_LOG
+  rejected: unknown log level `chatty`; expected `off` or `flow`
+
+=== startup line with --log-level flow ===
+serve: flow logging: --log-level=flow (RAPID_OCR_SERVE_LOG=<unset>); one line per HTTP request and
+  per job lifecycle is on: request id, method/path/status/bytes/duration, and the job's
+  admission/running/terminal lines share that request id
+
+=== startup line with the default (off) ===
+serve: flow logging: --log-level=off (RAPID_OCR_SERVE_LOG=<unset>); one line per HTTP request and
+  per job lifecycle is off (pass --log-level flow to turn it on)
+flow lines written while off: 0
+```
+
+`--log-level flow` 下的一次真实上传（14 行里属于这次上传的 4 行都带 `req=3`）：
+
+```text
+serve-flow: req=3 job=job-0000000000000000 queue=text admission=accepted decision=run queued position=0
+serve-flow: req=3 job=job-0000000000000000 queue=text running wait_ms=0
+serve-flow: req=3 POST /api/ocr -> 202 bytes=91 in 5ms
+serve-flow: req=3 job=job-0000000000000000 queue=text terminal state=succeeded result_bytes=35215 backend_ms=876
+```
+
+（`RAPID_OCR_SERVE_LOG=flow` 走同一个开关，实测写出 3 行；**默认 `off` 时一行都没有**。
+请求行按响应写出的顺序出现，因此 `POST /api/ocr` 那一行排在 `running` 之后——worker 在响应
+写回之前就把它取走了；把一次上传串起来靠的是请求 id，不是行序。）
+
+设计要点（都可核对）：
+
+| 要点 | 实现 |
+| --- | --- |
+| 请求行覆盖**每一个**请求 | 只在 `http::respond` 落笔；它是所有响应的唯一出口（accept 线程、引擎工作线程、评估线程都经过它） |
+| 一次请求只有**一个**请求 id | `RequestFlow` 在 `handle()` 里创建一次；交给别的线程时传**克隆**（同一个 id），线程起不来时原件仍在调用方手里，绝不因为换了分支就换 id |
+| 请求 id 贯穿任务生命周期 | 建任务时把 `flow.id()` 存进 `JobRecord.request_id`（**不进** `/api/jobs/{id}`——冻结契约不因为日志需要内部字段而变），worker 的 `running`/终态行从记录里读回它 |
+| 准入结论**带原因** | `admit_ocr()` 返回原因串，取值直接来自驱动判定的那一份 `OcrAdmission`（`run` / `queue waiting_for=loading\|rebuilding` / `models_on_disk`），不是日志里另拼的说法 |
+| 被拒绝的上传也留痕 | 没有任务 id，请求 id 就是唯一关联键；`code`/`detail` 来自用户实际收到的**同一个** `ServeError`（含读 body 之前的队列满 / token / Host / Origin / 长度拒绝，以及公式模型的 409 预检、下载准入的拒绝）。`?queue=formla` 这种非法取值记的是**原值**，不冒充 `text` |
+| 失败的任务行自带原因 | `status=` + `code=` + `detail=`（与 `/result` 上重放的是同一份错误体） |
+| 后端时长是**实测**的 | `ocr_worker` 在调用两侧取 `Instant`；引擎建不起来那一支根本不调后端，因此 `backend_ms=0` 是事实而不是缺省值 |
+| 关闭时不付代价 | 只有一个级别开关（`Off` 默认 / `Flow`）；`Off` 下每个记录函数第一句就返回，不做任何格式化。测试出口 `FlowSink::Capture` 在 `#[cfg(test)]` 之下，**发布二进制里根本不存在**这段代码 |
+| 可断言 | `serve::flowlog` 的 **6** 条单元用例 + `serve::tests` 的 **4** 条流动日志端到端用例逐行断言这些行（含"同一个请求 id 恰好 4 行""默认一行都不写""失败带 code+detail"） |
+
+### 6. 契约钉住：四条互相独立的腿，外加"检查会失败"的证据
+
+| 腿 | 名字 | 钉住什么 |
+| --- | --- | --- |
+| Rust（服务端） | `serve::tests::the_served_result_carries_every_path_the_page_reads` | 真实端点（脚本化后端产出 3 个文本 + 1 个公式区域）的 `/result` 满足页面读的每个路径：`regions` 数组、`kind` ∈ {text,formula}、`polygon.points` **恰好四点**且每点**恰好两个有限数**、文本区域有 `recognition.text`/`recognition.score`、公式区域有 `formula.latex`（且**不要求** `recognition`）、`plain_text`/`timings`/`timing_ledger` |
+| Rust（页面源码） | `serve::tests::the_page_reads_exactly_the_pinned_result_paths` | `PAGE_RESULT_CONTRACT` 表里的 11 条访问表达式在页面源码里**逐字**存在（含 `!Array.isArray(pts) \|\| pts.length !== 4` 与 `p.length !== 2`）、`POST /api/ocr` 必须带 `?queue=`、且**不再出现**任何别名（`r.boxes`/`r.items`/`region.text`/`polygon.box`/`polygon.coords`） |
+| Rust（真实字节） | `serve::tests::the_captured_real_result_body_still_satisfies_the_page_contract` | 报告者那次真实运行的 35 203 字节 `/result` 体（42 区域，SHA-256 钉住）满足同一份契约，且顶层 8 个字段仍在 |
+| node（页面**自己的**解析器） | `tools/check-page-result-contract.mjs` | 把页面自己的 `normalizeResult`/`parsePolygon`/`parseRecognition`/`parseFormula`/`diagPush`/`contractFail` 抽出来在 `node:vm` 里对**真实捕获的响应体**执行：**42 个区域必须渲染出来**；随后 9 个变异用例必须**拒绝渲染并点名字段路径** |
+
+第 4 条既是"检查本身能不能失败"的证据（不会失败的检查不是检查），也是唯一**执行**页面
+解析器的地方。它的真实输出（`target/flow-gate/page-contract-check.log`）：
+
+```text
+regions 42
+extracted 9 page functions (4377 bytes)
+=== the page parses the real captured body ===
+regions rendered: 42
+first three: VISUAL TEXT BENCHMARK | 多位置文本定位实验 | 状态：识别队列运行中
+plain text: 1011 chars, ledger: read
+=== the check bites: a renamed or missing field is reported with its path ===
+  ok   regions renamed to items -> ["响应字段缺失: regions"]
+  ok   region kind renamed to type -> ["响应字段缺失: regions[0].kind"]
+  ok   polygon.points truncated to three corners -> ["响应字段缺失: regions[0].polygon.points"]
+  ok   polygon point flattened to a number -> ["响应字段缺失: regions[0].polygon.points[1]"]
+  ok   recognition.text removed -> ["响应字段缺失: regions[0].recognition.text"]
+  ok   recognition.score removed -> ["响应字段缺失: regions[0].recognition.score"]
+  ok   recognition renamed to rec -> ["响应字段缺失: regions[0].recognition"]
+  ok   a formula region without formula.latex -> ["响应字段缺失: regions[0].formula.latex"]
+  ok   a polygon missing on a detected region -> ["响应字段缺失: regions[0].polygon"]
+```
+
+另外 `tools/extract-page-scripts.mjs` 把页面的两个 `<script nonce=…>` 块分别抽出交给
+`node --check`（页面自身语法）；这也是本轮改了页面之后的第一道闸。
+
+### 7. 本轮的回归测试：`tools/check-page-flow-cdp.mjs`
+
+**上面那四条契约测试都抓不到本轮这个 bug**——它们钉的是"字段名与嵌套"，而这次的响应体
+逐字节正确、页面解析器也逐字正确；坏掉的是页面在 `state.job` 上的**控制流**。
+因此把报告者的动作本身变成一条可执行的检查（`tools/check-page-flow-cdp.mjs` +
+`tools/run-page-flow-cdp.ps1`，headless Chrome + CDP，对**真实**服务与**真实**图片）：
+
+四条不变量（修复前的页面**每一条都不满足**）：
+
+1. 上传之后页面**至少发一次** `GET /api/jobs/{id}`；
+2. 它到达 `GET /api/jobs/{id}/result` 且是 **200**；
+3. `.stage` 不再带 `scanning`；
+4. `#regionList` 至少渲染出一个区域，且该区域带文本。
+
+**它确实会失败**：对修复前的捕获跑同一条检查（`target/flow-gate/page-flow-check-before.log`）：
+
+```text
+capture: http://127.0.0.1:8760
+FAIL the page must poll GET /api/jobs/{id} at least once — this is exactly what the pre-M5 page never did
+FAIL the page must fetch GET /api/jobs/{id}/result
+FAIL the scanning animation must be cleared, stage class was `stage scanning`
+FAIL the region list must render at least one region, got 0
+FAIL the first rendered region must carry text, got ""
+page flow check FAILED (5 problem(s))
+exit against PRE-FIX capture: 1
+```
+
+对修复后的最终二进制：`page flow check PASSED`（见 §8 第 17 项）。
+
+**逐条回答"这个测试本来能抓到什么"**（如实，不含推测）：
+
+| 检查 | 本轮这个 bug | 之后哪一类漂移会被它抓到 |
+| --- | --- | --- |
+| `check-page-result-contract.mjs`（9 个变异 + 真实体） | **抓不到**（响应体与解析器都是对的） | 任一侧把 `regions`/`kind`/`polygon.points`/`recognition.text`/`recognition.score`/`formula.latex` 改名、删字段、把四点写成三点、把点写成数字——都会被点名路径 |
+| `the_page_reads_exactly_the_pinned_result_paths` | **抓不到** | 页面改成读别的名字、或偷偷加回别名兼容；页面不再发 `?queue=`（**这个它抓得到**——那正是本轮第二个缺陷） |
+| `the_served_result_carries_every_path_the_page_reads` | **抓不到** | 服务端序列化改了字段名 / 嵌套（例如把 `polygon.points` 变成 `box`，或让文本区域不再带 `score`） |
+| `the_captured_real_result_body_still_satisfies_the_page_contract` | **抓不到** | 契约在真实数据上失效（例如公式区域不再带 `latex`）；同时防止夹具被悄悄换掉 |
+| **`check-page-flow-cdp.mjs`** | **抓得到**（对修复前的捕获它报 5 条失败） | 页面在 `state.job` 上的任何控制流回归：不再轮询、把任务丢掉、动画没关、结果不渲染、页面抛异常 |
+
+因此"契约不会再漂"由前四条负责，"用户看到永远转圈"这一类由第五条负责——两者互补，
+本轮两个缺陷各自都有对应的闸（第二个缺陷由 Rust 的页面源码断言直接钉住）。
+
+### 8. 验证（全部 exit 0；`target/flow-gate/run-gates.ps1` → `gates.log`）
+
+| # | 命令 | 结果 |
+| --- | --- | --- |
+| 1 | `cargo fmt --all -- --check` | 0 |
+| 2 | `cargo clippy --all-targets -- -D warnings` | 0 |
+| 3 | `cargo clippy --features serve --all-targets -- -D warnings` | **0**（本轮先失败过一次：`flowlog::job_terminal` 8 个参数触发 `clippy::too_many_arguments`；修法是把任务身份收进 `JobIdentity`，不是 `#[allow]`） |
+| 4 | `cargo test --all-targets` | **401 passed**（lib）+ 2 + 4 + 14 + 0，**0 failed** |
+| 5 | `cargo test --features serve --all-targets` | **401 passed**（lib）+ 2 + 4 + 14 + **271 passed**（bin）+ **2 passed**（`serve_startup`），**0 failed** |
+| 6 | `cargo build --release --bins` | 0 |
+| 7 | `cargo build --release --features serve --bins` | 0 |
+
+第 5 项比上一轮的 257 条多 **14** 条，全部是本轮新增：`serve::flowlog` **6** 条单元用例
++ `serve::tests` **8** 条端到端用例（4 条流动日志：默认不写 / 一次上传可按请求 id 追到尾 /
+准入拒绝带原因 / 失败终态带 code+detail；4 条契约：服务端产物 / 页面源码 / 真实捕获字节 /
+`?queue=` 契约）。
+
+**依赖隔离（三份依赖树与上一轮快照逐行 0 差异）**：
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo tree -e normal -p rapid-ocr-rs` | **606 行**，与 `target/plan-gate/tree-default.txt` **逐行相同**；`tiny_http` **0** 次 |
+| `cargo tree -e normal --no-default-features` | **605 行**，逐行相同；`tiny_http` **0** 次 |
+| `cargo tree -e normal -p rapid-ocr-rs --features serve` | **611 行**，逐行相同；`tiny_http` **1** 次 |
+
+`Cargo.toml` 的 `[dependencies]`/`[features]` 一个字未改（`--log-level` 是 clap 选项，
+不引入任何新依赖）。`tiny_http` 仍然只在 `src/bin/serve/http.rs`：本轮新增的
+`flowlog.rs` 不含它（`serve::dependency_boundary` 的两条边界断言同时通过）。
+
+**页面自身语法**：`node tools/extract-page-scripts.mjs`（两个 nonce script 块）→
+`node --check` ×2，均通过。
+
+**12 图硬门槛**（`target/flow-gate/`，**没有**覆盖 `tests/baseline/`）：
+
+| 门槛 | 要求 | 本次实测（release） | 比较方式 | 结论 |
+| --- | --- | --- | --- | --- |
+| 12 图区域数均值 | `34.833333333333336` | **`34.833333333333336`**（36 样本） | 原始 JSON 的**数字字面量**精确比较 | True |
+| 12 图 mean CER | `0.44765135645866394` | **`0.44765135645866394`**（12 例） | 同上 | True |
+
+`tests/baseline` 未被改动（脚本内 `git status --porcelain -- tests/baseline` 为空；
+`bench-cpu-2000.json` 的 `regions.avg` 与本次字面量相同 = True）。
+
+**12 图 HTTP 与 CLI 逐张一致（12/12）**：
+
+```text
+01基础多位置文本 serve= 42 cli= 42 count=True texts=True      07小字号与密集排版 serve= 37 cli= 37 count=True texts=True
+02多语言与RTL混排 serve= 21 cli= 21 count=True texts=True      08数字公式与符号   serve= 51 cli= 51 count=True texts=True
+03旋转与倾斜     serve= 13 cli= 13 count=True texts=True      09竖排文本         serve= 14 cli= 14 count=True texts=True
+04表格与键值对   serve= 61 cli= 61 count=True texts=True      10长段落与分栏     serve= 37 cli= 37 count=True texts=True
+05代码与等宽字体 serve= 38 cli= 38 count=True texts=True      11文字样式与特效   serve= 22 cli= 22 count=True texts=True
+06低对比度与深色背景 serve= 21 cli= 21 count=True texts=True  12综合压力测试     serve= 61 cli= 61 count=True texts=True
+TOTAL serve=418 cli=418 images=12
+ALL_12_MATCH=True
+POLLING_DOES_NOT_REHASH=True
+```
+
+**环境变量门控的 `formula_integration_tests`（真实模型，0 skipped）**：
+
+```powershell
+$env:RAPID_OCR_MODEL_ROOT='D:\100_Projects\110_Daily\SnapClip\OCR-Model'
+$env:RAPID_OCR_FORMULA_TEST_ROOT='D:\100_Projects\110_Daily\SnapClip\Formula-TestSet'
+cargo test --lib formula_integration_tests -- --test-threads=1
+```
+
+**12 passed, 0 failed, 0 ignored**（95.29 s），`skipping test` 出现 **0** 次。
+
+**第 17 项（本轮新增的浏览器闸）**：
+
+```text
+serve ready: http://127.0.0.1:8763 (pid …)
+capture: http://127.0.0.1:8763
+  POST /api/ocr           -> 202
+  GET /api/jobs/{id}      -> 4 poll(s) 200,200,200,200
+  GET /api/jobs/{id}/result -> 1 fetch(es) 200
+  .stage class            -> stage
+  rendered regions        -> 42
+  first region            -> "01 文本 VISUAL TEXT BENCHMARK"
+page flow check PASSED: one upload polls its job, fetches its result, clears the animation and renders regions
+```
+
+**没有重跑 im2latex-100 smoke**：本轮**没有改库代码**（`src/` 下除 `src/bin/` 之外零改动，
+见 `git status --porcelain`），而该 smoke 考察的是库的公式管线精度；按"库代码变化才需要重跑"
+的约定它不属于本轮。
+
+### 9. `docs/05` 与 `README` 的改动
+
+| 位置 | 改动 |
+| --- | --- |
+| `docs/05` §3 | 新增 `--log-level <off\|flow>`；说明它的优先级只有两层（CLI > `RAPID_OCR_SERVE_LOG` > `off`）、无 YAML 面、非法取值拒绝启动，以及关闭时的零代价 |
+| `docs/05` §4.2 端点表 | `/api/ocr` 那一行补上"页面**必须显式发送** `?queue=`"，并点名它由哪条测试钉住 |
+| `docs/05` §9.2 缺口第 3 条 | 标注 **M5 已补上真实浏览器闭环**，并指向 §17 |
+| `docs/05` §17（新增节） | 流动日志的两种行与真实样例、页面侧详细模式（`?verbose=1`/Ctrl+Alt+L/复选框）、契约钉住的四条腿、页面的任务生命周期所有者 |
+| `README` "Model integrity" | 新增 "Flow logging: following one upload end to end"（开关、真实行样例、`?verbose=1`）与 "The `/result` contract is pinned from both sides"（四条腿的对照表）。**注意**：`README` 在本轮开始前就已经带着上一轮未提交的 67 行（`git diff HEAD -- README.md` 的净增是本轮 + 上一轮之和），我没有动那 67 行 |
+
+`docs/03` 未改动（`git status` 为空）。
+
+### 10. 未覆盖风险与**做不到的事**（如实）
+
+1. **未提交、未在干净 clone 上验证**：按要求不 commit；证据来自当前工作树
+   （`7500e3a` + 上一轮与本轮的未提交改动）。
+2. **停掉了报告者的进程**：为了能重建 release 二进制，我终止了报告者那个仍在监听的
+   `rapidocr serve`（PID 50568，命令行与报告逐字相同）。"修复前"证据已先落盘；
+   我没有在报告者的**桌面浏览器**里点过——我用的是 headless Chrome + CDP（同一套页面代码、
+   同一个服务、同一张图），这是任务允许并且优先的做法。
+3. **第 17 项闸依赖本机 Chrome 与 node**：`tools/check-page-flow-cdp.mjs` 需要
+   `C:\Program Files\Google\Chrome\Application\chrome.exe`；`check-page-result-contract.mjs`
+   与 `extract-page-scripts.mjs` 需要 node。它们因此**不在 `cargo test` 里**（cargo 测试保持
+   自足），而是在 `target/flow-gate/run-gates.ps1` 的第 12/13/17 项里跑——本轮这三项都是真跑的，
+   但它们的"可重复性"依赖开发机装了这两个工具。
+4. **`clippy --features serve` 第一次是失败的**（8 个参数）。我没有保留它作为"已知通过"，
+   而是改了签名重跑（第 8 节第 3 项）。这条如实记下来，因为"先失败再修"与"一开始就对"
+   是两件不同的事。
+5. **流动日志没有为下载任务的**成功**路径写 `admission`/`queued` 行**：下载不经过双队列，
+   因此它没有 `position`，也就没有"入队位置"这个事实可写。它有的是**请求行** +
+   **准入拒绝行**（拒绝时带 `code`+`detail`）+ **终态行**。这是有意的不对称，已写在
+   `http.rs` 的注释里。
+6. **页面的详细模式只在诊断面板里**：它是"可查"的那一半；"可见"的那一半仍是 toast 与
+   任务状态行。没有做"把请求日志导出成文件"这种能力。
+7. **轮询的瞬时错误上限是启发式**：8 次 / ~23 s 是一个取舍（足够长的自愈窗口 vs 不会无限
+   转圈），不是从实测抖动分布里推出来的数字；它到顶时给的是**点名原因**的错误而不是静默放弃。
+8. **`?queue=` 的修复只覆盖了页面**：服务端一侧的 `?queue=text|formula` 语义（含路由未启用时
+   400、模型损坏时 409）在 M4 就已经有测试；本轮新增的是"页面必须显式发送它"这条断言，
+   以及真实浏览器闭环里 `POST /api/ocr?queue=text` 的出现。

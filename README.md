@@ -296,6 +296,131 @@ Keep model weights outside the crate source tree and record their upstream URL,
 revision, checksum, and redistribution terms in the consuming application's
 manifest (see `assets/manifest.example.json`).
 
+### What the digest cache does — and does not — guarantee
+
+Every per-file state question (`/api/models`, the formula admission check, and the
+two formula load paths) is answered through one process-wide identity-keyed cache
+(`src/model_verify.rs`). A file's **identity** is its path, size, mtime **and the
+SHA-256 of its first and last 64 KiB**; the cached value is the full SHA-256 that
+was actually computed for that identity. A hit costs one `stat` plus one 128 KiB
+read, independent of file size; a full re-hash happens on first sight, and again
+whenever the size, the content windows, or (for reporting) the mtime change. For
+files of 128 KiB or less the two windows overlap and cover the whole content.
+
+The promise is deliberately narrow and exact:
+
+> content is verified at first use and re-verified whenever the file's identity
+> changes; the service does **not** claim that the on-disk content is trusted at
+> all times.
+
+The residual blind spot is a same-size, same-mtime edit that also keeps the first
+and last 64 KiB byte-identical (edit the middle only). The partial digest is a
+**heuristic that narrows the window, not a security boundary** — an attacker who
+can write the file can also preserve its head and tail. The deterministic escape
+hatches are `--reverify-models` at startup (cold-verifies every file the run will
+load and refuses to start when one is missing or corrupt) and
+`POST /api/models/reverify` while running (clears the cache, cold-verifies, and
+rebuilds the engine session so a replaced file cannot keep being served from
+memory).
+
+### One run model plan
+
+`rapidocr serve` resolves **one** list of "files this run will load" at startup and
+everything reads it: `--reverify-models`, `POST /api/models/reverify`, the
+`pipelines` block of `/api/models`, admission on both queues, and the two loading
+paths (`pin_engine_paths` and `FormulaPolicy`).
+
+- Text pipeline: `detector` + `recognizer` + `dictionary`, plus `classifier` when
+  `use_cls` is on.
+- Formula pipeline: **only when formula routing is enabled** (a detector is
+  configured through `--formula-detector`, or declared by the model set as the
+  `formula_detector` role) — `formula_recognizer` **and** `formula_detector`.
+- Formula routing disabled ⇒ the formula models are not in the plan at all: neither
+  entry point reads the 566 MB recognizer, and a corrupt one neither blocks startup
+  nor ordinary OCR.
+
+The two semantics are compatible and both hold:
+
+- `--reverify-models` is an explicit opt-in meaning "verify this run's whole plan at
+  startup and refuse to start if any file in it is unusable". With formula enabled a
+  corrupt formula model (detector or recognizer) fails startup, and the error names
+  the file and which pipeline it belongs to.
+- Runtime admission stays scoped per pipeline: a corrupt formula model yields a 409
+  with `detail.scope = "formula"` on the formula queue while ordinary OCR keeps
+  working. `POST /api/models/reverify` reports per pipeline — the text engine outcome
+  (`pipelines.text.outcome`) and the formula result plus its routing state
+  (`pipelines.formula.*`) — so "text ready, formula corrupt" is explicit instead of a
+  bare `ready`.
+
+### What "verified" means without a declared digest
+
+An external `--formula-detector` that no model set declares has **no trusted digest**.
+"Verified" then means exactly three things: the file exists, it is readable, and it
+looks like an ONNX `ModelProto` (its protobuf prologue starts with the `ir_version`
+field: tag `0x08` followed by a varint in `1..=64`; an empty file is rejected). This
+is a heuristic, not an integrity proof: the service reports `sha256: null` for such a
+file and never claims its content was checked. The cold verification still computes
+and reports the actual digest it read. When a model set does declare a digest, that
+declared value is always enforced by hash.
+
+### Flow logging: following one upload end to end
+
+`rapidocr serve` writes **no** flow log by default. Turn it on with `--log-level flow`
+or the equivalent environment variable:
+
+```text
+rapidocr serve --model-dir <DIR> --log-level flow
+RAPID_OCR_SERVE_LOG=flow rapidocr serve --model-dir <DIR>     # same switch, CLI wins
+```
+
+Every HTTP request then gets one line (request id, method, path, status, response
+bytes, duration) and every job gets lifecycle lines (id, queue, the admission
+decision **and its reason**, queue position, wait time, run time, terminal state,
+result size; on failure the status code plus `code` and `detail`). Both kinds share
+**the same request id**, so one upload can be followed from the request line to the
+terminal line:
+
+```text
+serve-flow: req=7 POST /api/ocr -> 202 bytes=334 in 6ms
+serve-flow: req=7 job=job-0000000000000003 queue=text admission=accepted decision=run queued position=0
+serve-flow: req=7 job=job-0000000000000003 queue=text running wait_ms=3
+serve-flow: req=7 job=job-0000000000000003 queue=text terminal state=succeeded result_bytes=35201 backend_ms=881
+```
+
+A refused upload has no job id — the request id is its only correlation key, which is
+exactly what is needed when "the upload did nothing" has to be explained:
+
+```text
+serve-flow: req=9 queue=formula admission=rejected status=409 code=models_corrupt detail={...}
+```
+
+An unknown level (`--log-level chatty`) refuses to start and names the switch, rather
+than silently behaving as `off`. The startup banner always prints the effective level
+and the current value of `RAPID_OCR_SERVE_LOG` (`<unset>` when unset).
+
+The page has a matching switch: **`?verbose=1`** (or `?verbose=0` to turn it off, or
+`Ctrl+Alt+L`; the choice is remembered in `localStorage`). The diagnostics panel then
+lists the most recent requests with their method, URL, HTTP status, duration and error
+code, **including the response body of failures**. With verbose off, that section still
+appears whenever the last request failed — so "why did nothing render?" is answerable
+without opening devtools.
+
+### The `/result` contract is pinned from both sides
+
+The inline page parses `/api/jobs/{id}/result` against a frozen field set and refuses
+to render anything that does not match it (`regions[]`, `kind`, `polygon.points` as
+exactly four `[x, y]` pairs, `recognition.text`, `recognition.score`, `formula.latex`,
+`plain_text`, `timings`, `timing_ledger`). A renamed or missing field is reported with
+its exact path and never silently tolerated. Four independent checks keep the two sides
+from drifting apart:
+
+| Check | Command / test | What it pins |
+| --- | --- | --- |
+| served body | `cargo test --features serve the_served_result_carries_every_path_the_page_reads` | the real endpoint's `/result` satisfies every path the page reads, including the exact polygon nesting |
+| page source | `cargo test --features serve the_page_reads_exactly_the_pinned_result_paths` | the page still contains those exact accessor expressions, still sends `?queue=`, and re-introduces no alias |
+| captured bytes | `cargo test --features serve the_captured_real_result_body_still_satisfies_the_page_contract` | a real captured 42-region body (SHA-256 pinned) still satisfies the same contract |
+| page's own parser | `node tools/check-page-result-contract.mjs` | runs the page's own `normalizeResult` over that captured body in node (42 regions must render) and requires nine field-rename mutations to be rejected **by path** |
+
 ## CLI and benchmark
 
 ### Visual OCR report

@@ -366,6 +366,11 @@ pub enum StartupConfigError {
     Engine(RapidOcrError),
     /// provider 名称或对应 feature 非法（库内 `runtime::provider` 的既有措辞）。
     Provider(RapidOcrError),
+    /// `--log-level` / `RAPID_OCR_SERVE_LOG` 的取值不是 `off` / `flow`（M5）。
+    ///
+    /// 非法取值**拒绝启动**而不是静默按 `off` 处理：把开关名写错的用户看到的应该是
+    /// "期望 off 或 flow"，而不是"日志开关看起来没生效"。
+    LogLevel(String),
 }
 
 impl std::fmt::Display for StartupConfigError {
@@ -377,6 +382,9 @@ impl std::fmt::Display for StartupConfigError {
             }
             Self::Engine(error) => write!(f, "engine configuration rejected: {error}"),
             Self::Provider(error) => write!(f, "provider configuration rejected: {error}"),
+            Self::LogLevel(error) => {
+                write!(f, "--log-level / RAPID_OCR_SERVE_LOG rejected: {error}")
+            }
         }
     }
 }

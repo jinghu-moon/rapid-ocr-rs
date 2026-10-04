@@ -50,6 +50,7 @@ use super::engine::{BackendProvider, EngineFactory, OcrBackend};
 use super::error::{ErrorBody, ServeError};
 use super::evaluate::EvalRoot;
 use super::export::{self, ExportError, ExportFormat, ExportRequest};
+use super::flowlog::{self, FlowSink, JobIdentity, RequestFlow};
 use super::jobs::{
     CancelOutcome, DownloadProgress, JobFailure, JobIdGenerator, JobKind, JobQueue,
     JobState as JobLifecycle, JobStore, JobStoreLimits, Millis,
@@ -199,6 +200,8 @@ pub(super) struct ServeContext {
     pub allow_provider_fallback: bool,
     /// `--eval-root` 沙箱（M1 评审 P2-3）：`None` = `/api/evaluate` 整体关闭。
     pub eval_root: Option<EvalRoot>,
+    /// 流动日志出口（M5）：`--log-level flow` 时是 stderr，测试里是内存捕获。
+    pub flow: FlowSink,
     pub engine_factory: EngineFactory,
     pub downloader: DownloaderFactory,
     pub free_space: FreeSpaceFactory,
@@ -337,6 +340,8 @@ pub(super) struct ServeShared {
     allow_provider_fallback: bool,
     /// `--eval-root` 沙箱（M1 评审 P2-3）；`None` = `/api/evaluate` 整体关闭。
     eval_root: Option<EvalRoot>,
+    /// 流动日志出口（M5）。关闭时 [`FlowSink::Off`]：所有记录函数第一次判断就返回。
+    flow: FlowSink,
     engine_state: Mutex<EngineStateMachine>,
     engine: Mutex<Option<Box<dyn OcrBackend>>>,
     /// 引擎加载的互斥：`POST /api/ocr` 的惰性创建、`POST /api/engine/reload` 与 M3 的
@@ -414,6 +419,11 @@ impl ServeShared {
         self.limits
     }
 
+    /// 流动日志出口（M5）。`FlowSink::Off` 时所有记录函数第一次判断就返回。
+    pub fn flow(&self) -> &FlowSink {
+        &self.flow
+    }
+
     /// 引擎配置里的 `min_side_len`（`?max_side=` 的下界：低于它会让预处理区间上下界颠倒）。
     pub fn min_side_len(&self) -> u32 {
         self.plan_snapshot().engine.global.min_side_len as u32
@@ -475,6 +485,15 @@ impl ServeShared {
     /// 上面那条预检的响应体（与 `/api/models` 的 `pipelines.formula` 块同源同序）。
     pub fn formula_blocked_body(&self) -> Body {
         Body::json(409, render_error_body(&self.formula_missing_failure()))
+    }
+
+    /// 上面那条预检的 `(code, detail)`（M5 的流动日志用）。
+    ///
+    /// 与 [`Self::formula_blocked_body`] 读的是**同一份** [`Self::formula_missing_failure`]，
+    /// 因此日志里的 `code`/`detail` 与用户实际收到的响应体逐字一致。
+    pub fn formula_blocked_reason(&self) -> (&'static str, String) {
+        let body = self.formula_missing_failure();
+        (body.code, body.detail.to_string())
     }
 
     /// 公式队列的 409 载荷（`code` 由磁盘上的哈希结论决定，`detail` 是公式作用域）。
@@ -904,17 +923,33 @@ impl ServeShared {
     ///
     /// `reservation` 是第 4 步预留的槽位（准入层给出）。它让"检查 → 入队"之间不再有
     /// 并发窗口：入队成功即提交；本函数任何一次提前返回都会让凭据被丢弃并归还容量。
+    ///
+    /// M5：`flow` 是创建这个任务的请求的流动日志。准入结论（**含它的原因**）与入队位置
+    /// 在这里落一行，任务记录里也存下请求 id，供 worker 的 `running`/终态行沿用。
     pub fn submit_ocr(
         &self,
         bytes: Vec<u8>,
         class: QueueClass,
         max_side: Option<u32>,
         reservation: Option<QueueReservation>,
+        flow: &RequestFlow,
     ) -> Result<Value, ServeError> {
         // §7.6 + M2 的惰性创建：模型缺失/引擎不可用在这里拒绝（不建任务、不入队）。
         // 提前返回时 `reservation` 在函数结束时被丢弃 → 槽位归还（锁在它之前释放，
         // 因为局部变量先于参数析构）。
-        self.admit_ocr()?;
+        let decision = match self.admit_ocr() {
+            Ok(decision) => decision,
+            Err(error) => {
+                // 被拒绝的上传**没有**变成任务：请求 id 是这一行唯一的关联键。
+                flow.job_rejected(
+                    class.name(),
+                    error.status_code(),
+                    error.code(),
+                    &error.detail_text(),
+                );
+                return Err(error);
+            }
+        };
 
         let original_bytes = bytes.len() as u64;
         let mut state = lock(&self.jobs);
@@ -926,6 +961,7 @@ impl ServeShared {
             JobQueue::from_class(class),
             original_bytes,
             monotonic_ms(),
+            flow.id(),
         ) {
             state.scheduler.remove(class, &id);
             return Err(error);
@@ -949,6 +985,17 @@ impl ServeShared {
         // 释放在后：多算的那一格只会让并发请求被保守拒绝，绝不超卖）。
         drop(reservation);
         self.queue_signal.notify_all();
+        // 准入通过的那一行：任务 id、队列、结论与原因、入队位置，全部与请求 id 同行。
+        flowlog::job_admitted(
+            &self.flow,
+            JobIdentity {
+                request: flow.id(),
+                job: &id,
+                queue: class.name(),
+            },
+            position,
+            &decision,
+        );
         Ok(json!({
             "job_id": id,
             "kind": JobKind::Ocr.name(),
@@ -958,6 +1005,20 @@ impl ServeShared {
         }))
     }
 
+    /// 准入通过的**原因**（写进流动日志的 `decision=`）。取值直接来自驱动判定的那一份
+    /// [`OcrAdmission`]（`state.rs` 的 `EngineState::ocr_admission`），因此日志里的原因
+    /// 不可能是凭空拼的第二种说法。
+    fn admission_reason(admission: &OcrAdmission) -> String {
+        match admission {
+            OcrAdmission::Run => "run".to_string(),
+            OcrAdmission::Queue { waiting_for } => format!("queue waiting_for={waiting_for}"),
+            OcrAdmission::Unavailable { reason } => format!("unavailable reason={reason}"),
+            OcrAdmission::ModelsMissing { missing } => {
+                format!("models_missing missing={}", missing.join(","))
+            }
+        }
+    }
+
     /// `POST /api/ocr` 的引擎准入（§7.6 第 3 步 + M2 的惰性创建）。
     ///
     /// - `Ready` → 执行；`Loading`/`Rebuilding` → 入队等待（**不拒绝**）；
@@ -965,14 +1026,21 @@ impl ServeShared {
     ///   刚下载完），转入 `Loading` 并把会话创建留给 worker（推理/建会话绝不在 accept
     ///   线程）；否则 409 + 与 `/api/models` 同源同值的缺失清单；
     /// - `Failed` → 503 `engine_unavailable`（原因在 `/api/status` 与 `detail.reason` 里）。
-    fn admit_ocr(&self) -> Result<(), ServeError> {
+    ///
+    /// 返回准入**通过的原因**（M5 的流动日志 `decision=`）。原因在判定发生的**同一次**
+    /// 调用里算出来，因此日志不可能与真实结论分叉。
+    fn admit_ocr(&self) -> Result<String, ServeError> {
         let admission = self.engine_state().ocr_admission();
         if matches!(admission, OcrAdmission::ModelsMissing { .. }) {
             // 只有这一种结论需要看磁盘上的当前事实（下载可能刚刚补齐模型）。
-            return self.admit_with_models_on_disk();
+            self.admit_with_models_on_disk()?;
+            // 走到这里说明磁盘上的模型已经齐备，状态已被推进到 `Loading`（建会话留给 worker）。
+            return Ok("models_on_disk".to_string());
         }
+        let decision = Self::admission_reason(&admission);
         // `Run`/`Queue` → 通过；`Unavailable` → 503（映射只有一份实现）。
-        ServeError::from_ocr_admission(admission)
+        ServeError::from_ocr_admission(admission)?;
+        Ok(decision)
     }
 
     /// `BlockedModelsMissing` 下的准入：模型现在齐备就转入 `Loading`（惰性创建），否则 409。
@@ -999,7 +1067,7 @@ impl ServeShared {
     /// 请求体里**只有** `set_id`（§7.2 禁止 URL）。集合严格按 id 解析：未知 id → 404
     /// `model_set_not_found`（并列出已知集合），**没有** `sets[0]` 回落。
     /// 两处同步拒绝都给出**两个数值**（§6.2 的预算、§6.5 的磁盘空间）。
-    pub fn submit_download(&self, set_id: &str) -> Result<Value, ServeError> {
+    pub fn submit_download(&self, set_id: &str, flow: &RequestFlow) -> Result<Value, ServeError> {
         if !self.allow_download {
             return Err(ServeError::DownloadsDisabled);
         }
@@ -1050,6 +1118,7 @@ impl ServeShared {
                 JobQueue::Download,
                 0,
                 monotonic_ms(),
+                flow.id(),
             )?;
             state.store.set_download_progress(
                 &id,
@@ -1276,12 +1345,16 @@ impl ServeShared {
         let _ = state
             .store
             .fail_classified(id, JobFailure::from(&error), monotonic_ms());
+        // M5：下载任务也走同一套终态行（请求 id 从记录里读），因此"下载为什么失败"
+        // 与"识别为什么失败"在日志里是同一个形状。
+        self.log_terminal(&state, id, "failed", 0, 0);
     }
 
     /// 下载 worker 用：`Running → Succeeded`（下载产物不是保留结果，因此结果字节为 0）。
     pub(super) fn finish_download_ok(&self, id: &str) {
         let mut state = lock(&self.jobs);
         let _ = state.store.succeed(id, 0, monotonic_ms());
+        self.log_terminal(&state, id, "succeeded", 0, 0);
     }
 
     /// 下载 worker 用：`Running → Cancelled`（§4.3 的 `running → cancelled` 边）。
@@ -1294,6 +1367,7 @@ impl ServeShared {
             let _ = state.store.cancel(id, monotonic_ms());
         }
         let _ = state.store.finish_cancelled(id, monotonic_ms());
+        self.log_terminal(&state, id, "cancelled", 0, 0);
     }
 
     /// 下载 worker 用：登记/刷新进度（§4.3 的作业形状）。
@@ -1346,7 +1420,10 @@ impl ServeShared {
     }
 
     /// OCR worker 用：登记终态载荷并结算任务状态。
-    fn finish(&self, job_id: &str, outcome: Outcome) {
+    ///
+    /// M5：终态那一行在这里落下——`backend_ms` 是调用方（worker）实测的后端调用时长，
+    /// 其余字段直接从任务记录读，因此日志与 `/api/jobs/{id}` 是同一份事实。
+    fn finish(&self, job_id: &str, outcome: Outcome, backend_ms: u64) {
         let now = monotonic_ms();
         let mut state = lock(&self.jobs);
         let bytes = outcome.bytes();
@@ -1358,6 +1435,7 @@ impl ServeShared {
         if !state.results.insert(job_id, outcome) {
             let _ = state.store.fail(job_id, "the result store is full", now);
             state.sync_originals();
+            self.log_terminal(&state, job_id, "failed", 0, backend_ms);
             return;
         }
         match failure {
@@ -1370,6 +1448,71 @@ impl ServeShared {
         }
         // 失败任务的原图已经在记账层释放；成功任务的原图可能因字节预算被释放。
         state.sync_originals();
+        let terminal = state
+            .store
+            .record(job_id)
+            .map(|record| record.state.name())
+            .unwrap_or("succeeded");
+        self.log_terminal(&state, job_id, terminal, bytes, backend_ms);
+    }
+
+    /// `running` 那一行（M5）：从任务记录读请求 id 与排队时长，worker 只提供任务本身。
+    fn log_running(&self, scheduled: &ScheduledJob) {
+        if !self.flow.enabled() {
+            return;
+        }
+        let state = lock(&self.jobs);
+        let Ok(record) = state.store.record(&scheduled.id) else {
+            return;
+        };
+        // `started_ms` 由 `take_next` 在把任务标成 `running` 时写下，因此这里的等待时长
+        // 就是"入队 → 开跑"的真实差值。
+        let wait_ms = record
+            .started_ms
+            .unwrap_or(record.queued_ms)
+            .saturating_sub(record.queued_ms);
+        flowlog::job_running(
+            &self.flow,
+            JobIdentity {
+                request: record.request_id,
+                job: &record.id,
+                queue: record.queue.name(),
+            },
+            wait_ms,
+        );
+    }
+
+    /// 任务终态的一行（M5）。失败时带上状态码 + `code` + `detail`。
+    fn log_terminal(
+        &self,
+        state: &JobState,
+        job_id: &str,
+        terminal: &str,
+        result_bytes: u64,
+        backend_ms: u64,
+    ) {
+        if !self.flow.enabled() {
+            return;
+        }
+        let Ok(record) = state.store.record(job_id) else {
+            return;
+        };
+        let failure = record
+            .failure
+            .as_ref()
+            .map(|failure| (failure.status, failure.code, failure.detail.to_string()));
+        flowlog::job_terminal(
+            &self.flow,
+            JobIdentity {
+                request: record.request_id,
+                job: job_id,
+                queue: record.queue.name(),
+            },
+            terminal,
+            result_bytes,
+            backend_ms,
+            failure,
+        );
     }
 
     /// 建立一次会话（**唯一**实现：钉住模型路径 → 调工厂 → 记录耗时）。
@@ -2026,6 +2169,7 @@ impl ServeRuntime {
             allow_download_hosts: context.allow_download_hosts,
             allow_provider_fallback: context.allow_provider_fallback,
             eval_root: context.eval_root,
+            flow: context.flow,
             engine_state: Mutex::new(machine),
             engine: Mutex::new(backend),
             engine_load: Mutex::new(()),
@@ -2166,26 +2310,38 @@ fn ocr_worker(runtime: Arc<ServeShared>) {
         let Some(scheduled) = next_scheduled(&runtime) else {
             continue;
         };
+        // M5：`running` 那一行在**取到任务、原图还没被取走之前**落笔，因此"任务被标成
+        // running 但原图不见了"这类内部不一致在日志里也是可见的（下面那一支会紧接着
+        // 写出终态行）。`wait_ms` 是排队代价：入队 → 真正开跑。
+        runtime.log_running(&scheduled);
         // M3：原图留在保留区里（`/annotated.png` 还要用它），这里只克隆引用。
         let Some((bytes, max_side)) = runtime.retained_ocr(&scheduled.id) else {
             // 只有取消能走到这里；防御性记录，绝不把任务永久留在 `Running`。
             runtime.finish(
                 &scheduled.id,
                 failure(500, "internal", "the queued image is no longer available"),
+                0,
             );
             continue;
         };
+        // M5：后端调用时长由**这里**实测，并原样写进终态行（日志与 `/api/status` 的
+        // `engine_load_ms` 一样是实测值，不是估算）。
+        let backend_started = Instant::now();
         let outcome = recognize(&runtime, &scheduled.id, bytes, max_side, scheduled.class);
-        runtime.finish(&scheduled.id, outcome);
+        let backend_ms = u64::try_from(backend_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        runtime.finish(&scheduled.id, outcome, backend_ms);
     }
 }
 
 /// 引擎建不起来时，把下一个排队任务按同一份错误映射结算（不执行推理）。
+///
+/// `backend_ms = 0` 是**实测值**：这一支根本没有调用后端（引擎没建起来），
+/// 因此终态行的 `backend_ms=0` 与它的事实一致。
 fn fail_next_queued(runtime: &ServeShared, outcome: Outcome) {
     let Some(scheduled) = next_scheduled(runtime) else {
         return;
     };
-    runtime.finish(&scheduled.id, outcome);
+    runtime.finish(&scheduled.id, outcome, 0);
 }
 
 /// 等一个任务（阻塞在条件变量上，最长 [`WORKER_POLL`]）。

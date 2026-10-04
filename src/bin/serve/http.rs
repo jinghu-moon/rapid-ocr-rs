@@ -40,6 +40,8 @@ use super::cli::ProviderChoice;
 use super::error::ServeError;
 use super::evaluate;
 use super::export::ExportFormat;
+use super::flowlog::RequestFlow;
+use super::jobs::JobQueue;
 use super::queue::QueueClass;
 use super::run::ServeStartError;
 use super::security::{self, SECURITY_HEADERS};
@@ -247,6 +249,9 @@ fn handle(shared: &Arc<ServeShared>, mut request: Request) {
     let url = request.url().to_string();
     let (path, query) = split_url(&url);
     let (decision, route) = route_of(method, path);
+    // M5：这次请求的流动日志。在整个 `handle` 里唯一创建，并交给**真正写响应**的那条
+    // 路径（本线程 / 引擎工作线程 / 评估线程），因此请求 id 与耗时都只有一份来源。
+    let flow = RequestFlow::begin(shared.flow(), method.name(), path);
 
     // §4.4 第 1 步：路由结论先于一切（404/405 不读 body、不校验 token）。
     if decision != RouteDecision::Matched {
@@ -256,15 +261,22 @@ fn handle(shared: &Arc<ServeShared>, mut request: Request) {
             }
             _ => Vec::new(),
         };
-        let _ = respond(request, route_error(decision, method, path), &headers);
+        let _ = respond(
+            request,
+            route_error(decision, method, path),
+            &headers,
+            &flow,
+        );
         return;
     }
     let route = route.expect("a matched route decision always carries its route");
 
     // 第 4 步的预检对象。`queue` 参数在这里**宽容解析**：非法取值不改变判定顺序
     // （token → Host/Origin → 队列 → 长度），它会在准入之后由 `dispatch` 以 400 回答。
+    // 原值留给流动日志：`?queue=formla` 这种拼写错误必须被记成它本来的样子。
+    let queue_raw = query_param(query, "queue");
     let class = match route {
-        Route::Ocr => shared.routing().class_for(query_param(query, "queue")).ok(),
+        Route::Ocr => shared.routing().class_for(queue_raw).ok(),
         _ => None,
     };
     // 第 4 步的**原子预留**入口（评审 P2-1）：`admit` 在判定容量的同一次加锁里占位，
@@ -316,14 +328,24 @@ fn handle(shared: &Arc<ServeShared>, mut request: Request) {
                     decision: route_decision,
                 } => {
                     let body = route_error(*route_decision, *route_method, route_path);
-                    let _ = respond(request, body, &[]);
+                    let _ = respond(request, body, &[], &flow);
                 }
                 AdmissionError::Rejected(_) => {
                     let serve_error = error
                         .rejected()
                         .expect("a Rejected admission error always carries a ServeError");
                     let body = shared.error_body(serve_error);
-                    let _ = respond(request, body, &[]);
+                    // M5：`/api/ocr` 在读 body 之前被挡下（队列满 503 / token 401 /
+                    // Host 421 / Origin 403 / 长度 413）也是一次准入结论，同样要留下原因。
+                    if matches!(route, Route::Ocr) {
+                        flow.job_rejected(
+                            queue_label(class, queue_raw),
+                            serve_error.status_code(),
+                            serve_error.code(),
+                            &serve_error.detail_text(),
+                        );
+                    }
+                    let _ = respond(request, body, &[], &flow);
                 }
             }
             return;
@@ -341,35 +363,63 @@ fn handle(shared: &Arc<ServeShared>, mut request: Request) {
         && class == Some(QueueClass::Formula)
         && !shared.formula_models_ready()
     {
-        let _ = respond(request, shared.formula_blocked_body(), &[]);
+        // M5：公式队列的模型可用性预检同样是一次准入拒绝（**读 body 之前**），
+        // 因此原因要落在请求 id 上，否则"上传没有任何反应"依旧无法解释。
+        let body = shared.formula_blocked_body();
+        let (code, detail) = shared.formula_blocked_reason();
+        flow.job_rejected(queue_label(class, queue_raw), body.status, code, &detail);
+        let _ = respond(request, body, &[], &flow);
         return;
     }
 
-    let outcome = dispatch(shared, &mut request, &route, query, &descriptor, admitted);
+    let outcome = dispatch(
+        shared,
+        &mut request,
+        &route,
+        query,
+        &descriptor,
+        admitted,
+        &flow,
+    );
     match outcome {
         Ok(Dispatch::Respond(body, headers)) => {
-            let _ = respond(request, body, &headers);
+            let _ = respond(request, body, &headers, &flow);
         }
         // 响应由另一个线程写（M3 的 provider 切换 / M2 的按当前文件重建）：本线程立刻回到
         // accept 循环，否则 `/api/status` 与 `/api/ocr` 会在整个建会话序列期间停摆。
+        //
+        // 线程没接手时（已有序列在跑 / 线程起不来）调用方拿回**同一个** `RequestFlow`，
+        // 因此这次请求从头到尾只有一个请求 id（绝不因为换了条分支就换一个）。
         Ok(Dispatch::EngineWork(work)) => {
-            if let Err(failure) = spawn_engine_work(shared, work, request) {
-                // 请求没人接手（已有建会话序列在跑 / 线程起不来）：由本线程如实回答。
-                let (error, request) = *failure;
-                let _ = respond(request, Body::error(&error), &[]);
+            if let Err(failure) = spawn_engine_work(shared, work, request, flow) {
+                let (error, request, flow) = *failure;
+                let _ = respond(request, Body::error(&error), &[], &flow);
             }
         }
         // 响应由评估线程写（M4）：同一个理由（批量推理期间服务必须继续可观测、可提交任务）。
         Ok(Dispatch::Evaluate(manifest)) => {
-            if let Err(failure) = spawn_evaluation(shared, manifest, request) {
-                let (error, request) = *failure;
-                let _ = respond(request, Body::error(&error), &[]);
+            if let Err(failure) = spawn_evaluation(shared, manifest, request, flow) {
+                let (error, request, flow) = *failure;
+                let _ = respond(request, Body::error(&error), &[], &flow);
             }
         }
         Err(error) => {
             let body = shared.error_body(&error);
-            let _ = respond(request, body, &[]);
+            let _ = respond(request, body, &[], &flow);
         }
+    }
+}
+
+/// 流动日志里的队列名（准入在 `class` 解析出来之前就可能被拒绝，因此允许 `None`）。
+///
+/// `class = None` 时**如实写出用户发的是什么**（`raw` 是 `?queue=` 的原值），而不是把它
+/// 冒充成 `text`：一个 `?queue=formla` 的拼写错误如果被记成 `queue=text`，日志就把
+/// "参数非法"这件事说成了"文本队列被拒绝"。
+fn queue_label(class: Option<QueueClass>, raw: Option<&str>) -> &str {
+    match class {
+        Some(QueueClass::Text) => QueueClass::Text.name(),
+        Some(QueueClass::Formula) => QueueClass::Formula.name(),
+        None => raw.filter(|raw| !raw.trim().is_empty()).unwrap_or("text"),
     }
 }
 
@@ -420,6 +470,7 @@ fn dispatch(
     query: &str,
     descriptor: &RequestDescriptor<'_>,
     admitted: admit::Admit,
+    flow: &RequestFlow,
 ) -> Result<Dispatch, ServeError> {
     match route {
         Route::Page => Ok(Dispatch::Respond(
@@ -443,7 +494,7 @@ fn dispatch(
             let max_side = parse_max_side(query_param(query, "max_side"), shared.min_side_len())?;
             let class = shared.routing().class_for(query_param(query, "queue"))?;
             // 第 4 步预留的槽位随请求一路传到这里：入队成功即提交，任何提前返回都会归还容量。
-            let value = shared.submit_ocr(bytes, class, max_side, admitted.reservation)?;
+            let value = shared.submit_ocr(bytes, class, max_side, admitted.reservation, flow)?;
             // §4.2：任务提交返回 **202**（异步任务，不存在"同步返回结果"的第二套语义）。
             Ok(Dispatch::Respond(json_body(202, value)?, Vec::new()))
         }
@@ -451,7 +502,21 @@ fn dispatch(
             check_json_content_type(descriptor.content_type)?;
             let bytes = read_body(request, &admitted)?;
             let set_id = parse_set_id(&bytes)?;
-            let value = shared.submit_download(&set_id)?;
+            let value = match shared.submit_download(&set_id, flow) {
+                Ok(value) => value,
+                Err(error) => {
+                    // M5：下载任务的准入拒绝同样留痕（`--allow-download` 未开、集合未知、
+                    // 超出 `--max-download-mb`、磁盘不足、channel 满）。下载**不经过**双队列，
+                    // 因此它没有 `queued position=` 行；准入失败与终态两行是它的全部记录。
+                    flow.job_rejected(
+                        JobQueue::Download.name(),
+                        error.status_code(),
+                        error.code(),
+                        &error.detail_text(),
+                    );
+                    return Err(error);
+                }
+            };
             Ok(Dispatch::Respond(json_body(202, value)?, Vec::new()))
         }
         Route::ModelsReverify => {
@@ -533,14 +598,18 @@ fn spawn_engine_work(
     shared: &Arc<ServeShared>,
     work: EngineWork,
     request: Request,
-) -> Result<(), Box<(ServeError, Request)>> {
+    flow: RequestFlow,
+) -> Result<(), Box<(ServeError, Request, RequestFlow)>> {
     let Some(guard) = shared.begin_provider_switch() else {
-        return Err(Box::new((ServeError::Busy, request)));
+        return Err(Box::new((ServeError::Busy, request, flow)));
     };
     let shared = Arc::clone(shared);
     // 请求对象经一条容量 1 的 channel 交给新线程：**不**把它 move 进闭包，
     // 因此线程创建失败时它还在这里，可以由调用方写出错误响应。
     let (tx, rx) = std::sync::mpsc::sync_channel::<Request>(1);
+    // 交给线程的是这一份记录的**克隆**（同一个请求 id）：线程起不来时原件还在下面，
+    // 由本线程用它写出错误响应，id 因此不会因为换了条分支而变化。
+    let thread_flow = flow.clone();
     let spawned = thread::Builder::new()
         .name("serve-engine-work".to_string())
         .spawn(move || {
@@ -560,7 +629,8 @@ fn spawn_engine_work(
                 },
                 Err(error) => Body::error(&error),
             };
-            let _ = respond(request, body, &[]);
+            // M5：请求行由**真正写响应**的线程落笔，因此耗时覆盖整段引擎序列。
+            let _ = respond(request, body, &[], &thread_flow);
         });
     match spawned {
         Ok(_) => {
@@ -570,7 +640,7 @@ fn spawn_engine_work(
         }
         Err(error) => {
             eprintln!("serve: cannot start the engine-work thread: {error}");
-            Err(Box::new((ServeError::Internal, request)))
+            Err(Box::new((ServeError::Internal, request, flow)))
         }
     }
 }
@@ -588,12 +658,14 @@ fn spawn_evaluation(
     shared: &Arc<ServeShared>,
     manifest: PathBuf,
     request: Request,
-) -> Result<(), Box<(ServeError, Request)>> {
+    flow: RequestFlow,
+) -> Result<(), Box<(ServeError, Request, RequestFlow)>> {
     let Some(guard) = shared.begin_evaluation() else {
-        return Err(Box::new((ServeError::Busy, request)));
+        return Err(Box::new((ServeError::Busy, request, flow)));
     };
     let shared = Arc::clone(shared);
     let (tx, rx) = std::sync::mpsc::sync_channel::<Request>(1);
+    let thread_flow = flow.clone();
     let spawned = thread::Builder::new()
         .name("serve-evaluate".to_string())
         .spawn(move || {
@@ -611,7 +683,7 @@ fn spawn_evaluation(
                 // `ServeShared::error_body` 是唯一实现。
                 Err(error) => shared.error_body(&error),
             };
-            let _ = respond(request, body, &[]);
+            let _ = respond(request, body, &[], &thread_flow);
         });
     match spawned {
         Ok(_) => {
@@ -620,7 +692,7 @@ fn spawn_evaluation(
         }
         Err(error) => {
             eprintln!("serve: cannot start the evaluation thread: {error}");
-            Err(Box::new((ServeError::Internal, request)))
+            Err(Box::new((ServeError::Internal, request, flow)))
         }
     }
 }
@@ -878,7 +950,16 @@ fn header<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
 ///
 /// 这里**绝不**发送 `Access-Control-Allow-Origin`（§7.2）：CORS 头只可能让浏览器里的
 /// 第三方页面读走本机结果，而本页是同源的，不需要它。
-fn respond(request: Request, body: Body, extra: &[(String, String)]) -> io::Result<()> {
+///
+/// M5：请求行也在这一处落下。`respond` 是**所有**响应的唯一出口（accept 线程、引擎工作
+/// 线程、评估线程都经过它），因此"每个 HTTP 请求一行"不可能漏掉某条分支。
+fn respond(
+    request: Request,
+    body: Body,
+    extra: &[(String, String)],
+    flow: &RequestFlow,
+) -> io::Result<()> {
+    flow.response(body.status, body.bytes.len());
     let mut response = Response::from_data(body.bytes).with_status_code(StatusCode(body.status));
     response.add_header(header_of("Content-Type", body.content_type));
     for (name, value) in SECURITY_HEADERS {

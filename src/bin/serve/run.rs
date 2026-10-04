@@ -27,6 +27,7 @@ use std::process::Command;
 use super::cli::ServeArgs;
 use super::download;
 use super::evaluate;
+use super::flowlog::{FlowSink, LogLevel};
 use super::http::{BoundServer, ServeHandle};
 use super::limits::{DEFAULT_ALLOW_DOWNLOAD, DEFAULT_ALLOW_PROVIDER_FALLBACK, DEFAULT_PROVIDER};
 use super::model_plan::{ModelPlan, ModelPlanError, ModelSnapshot, Pipeline, PlanReverification};
@@ -202,6 +203,23 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
     let nonce = generate_nonce().map_err(ServeStartError::Random)?;
     let page = render_page(&token, &nonce)?;
     println!("serve: token/nonce entropy source: {}", random_source());
+    // M5：流动日志级别（`--log-level` > `RAPID_OCR_SERVE_LOG` > `off`）。取值非法就拒绝启动
+    // —— 一个写错的开关名不应该表现为"日志开关看起来没生效"。
+    let log_level = args.log_level()?;
+    println!(
+        "serve: flow logging: --log-level={} (RAPID_OCR_SERVE_LOG={}); {}",
+        log_level.name(),
+        std::env::var("RAPID_OCR_SERVE_LOG").unwrap_or_else(|_| "<unset>".to_string()),
+        match log_level {
+            LogLevel::Off =>
+                "one line per HTTP request and per job lifecycle is off (pass \
+                              --log-level flow to turn it on)",
+            LogLevel::Flow =>
+                "one line per HTTP request and per job lifecycle is on: \
+                               request id, method/path/status/bytes/duration, and the job's \
+                               admission/running/terminal lines share that request id",
+        }
+    );
 
     // §7.6 第 2 步：运行配置（上限 / provider / 引擎配置）。
     let raw_engine = args.engine_config()?;
@@ -301,6 +319,8 @@ pub(crate) fn run(args: ServeArgs) -> Result<(), ServeStartError> {
         allow_provider_fallback: args.allow_provider_fallback(),
         // M1 评审 P2-3：`/api/evaluate` 的沙箱（`None` = 端点整体关闭）。
         eval_root,
+        // M5：流动日志出口。`off`（默认）时是 `FlowSink::Off`，所有记录函数立即返回。
+        flow: FlowSink::for_level(log_level),
         engine_factory: super::engine::real_engine_factory(),
         downloader: super::download::real_downloader_factory(),
         free_space: super::server::real_free_space(),

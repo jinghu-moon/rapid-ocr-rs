@@ -575,6 +575,18 @@ impl ServeError {
         }
     }
 
+    /// `detail` 的单行文本（流动日志用，M5）：`null` 时是空串，否则是紧凑 JSON。
+    ///
+    /// 与 `detail` 同源（不重算），因此日志里的 `detail=` 与响应体里的 `detail` 一定是
+    /// 同一个值——用户照着日志去找响应不会看到第二种说法。
+    pub fn detail_text(&self) -> String {
+        let detail = self.detail();
+        if detail.is_null() {
+            return String::new();
+        }
+        serde_json::to_string(&detail).unwrap_or_else(|_| detail.to_string())
+    }
+
     /// `detail` 载荷。没有额外信息时是 `null`（键仍然存在）。
     pub fn detail(&self) -> serde_json::Value {
         match self {
